@@ -1,12 +1,12 @@
 [package]
-name = "rusqlite"
+name = "rusqdoltlite"
 # Note: Update version in README.md when you change this.
 version = "0.40.1"
-authors = ["The rusqlite developers"]
+authors = ["Chris Mitchell"]
 edition = "2021"
-description = "Ergonomic wrapper for SQLite"
-repository = "https://github.com/rusqlite/rusqlite"
-documentation = "https://docs.rs/rusqlite/"
+description = "Rusqlite with DoltLite as the backend"
+repository = "https://github.com/chris7/rusqdoltlite"
+documentation = "https://docs.rs/rusqdoltlite/"
 readme = "README.md"
 keywords = ["sqlite", "database", "ffi"]
 license = "MIT"
@@ -21,11 +21,6 @@ exclude = [
     "/codecov.yml",
     "**/*.sh",
 ]
-
-[badges]
-appveyor = { repository = "rusqlite/rusqlite" }
-codecov = { repository = "rusqlite/rusqlite" }
-maintenance = { status = "actively-developed" }
 
 [lib]
 name = "rusqlite"
