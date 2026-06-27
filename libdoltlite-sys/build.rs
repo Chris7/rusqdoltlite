@@ -45,7 +45,7 @@ fn main() {
     if cfg!(feature = "in_gecko") {
         // When inside mozilla-central, we are included into the build with
         // sqlite3.o directly, so we don't want to provide any linker arguments.
-        copy_bindings("sqlite3", "bindgen_bundled_version", out_path);
+        copy_bindings("doltlite", "bindgen_bundled_version", out_path);
         return;
     }
 
@@ -54,49 +54,20 @@ fn main() {
         || cfg!(feature = "loadable_extension")
     {
         build_linked::main(&out_dir, &out_path);
-    } else if cfg!(all(
-        feature = "sqlcipher",
-        not(feature = "bundled-sqlcipher")
-    )) {
-        if cfg!(feature = "bundled") || (win_target() && cfg!(feature = "bundled-windows")) {
-            println!(
-                "cargo:warning=For backwards compatibility, feature 'sqlcipher' overrides
-                features 'bundled' and 'bundled-windows'. If you want a bundled build of
-                SQLCipher (available for the moment only on Unix), use feature 'bundled-sqlcipher'
-                or 'bundled-sqlcipher-vendored-openssl' to also bundle OpenSSL crypto."
-            );
-        }
-        build_linked::main(&out_dir, &out_path);
-    } else if cfg!(feature = "bundled")
-        || (win_target() && cfg!(feature = "bundled-windows"))
-        || cfg!(feature = "bundled-sqlcipher")
-    {
-        #[cfg(any(
-            feature = "bundled",
-            feature = "bundled-windows",
-            feature = "bundled-sqlcipher"
-        ))]
+    } else if cfg!(feature = "bundled") || (win_target() && cfg!(feature = "bundled-windows")) {
+        #[cfg(any(feature = "bundled", feature = "bundled-windows"))]
         build_bundled::main(&out_dir, &out_path);
-        #[cfg(not(any(
-            feature = "bundled",
-            feature = "bundled-windows",
-            feature = "bundled-sqlcipher"
-        )))]
+        #[cfg(not(any(feature = "bundled", feature = "bundled-windows")))]
         panic!("The runtime test should not run this branch, which has not compiled any logic.")
     } else {
         build_linked::main(&out_dir, &out_path);
     }
 }
 
-#[cfg(any(
-    feature = "bundled",
-    feature = "bundled-windows",
-    feature = "bundled-sqlcipher"
-))]
+#[cfg(any(feature = "bundled", feature = "bundled-windows"))]
 mod build_bundled {
     use std::env;
-    use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::{is_compiler, win_target};
 
@@ -118,11 +89,7 @@ mod build_bundled {
             }
         }
         println!("cargo:include={}/{lib_name}", env!("CARGO_MANIFEST_DIR"));
-        let source_file = if cfg!(feature = "bundled-sqlcipher") {
-            "sqlite3.c"
-        } else {
-            "doltlite.c"
-        };
+        let source_file = "doltlite.c";
         println!("cargo:rerun-if-changed={lib_name}/{source_file}");
         let mut cfg = cc::Build::new();
         cfg.file(format!("{lib_name}/{source_file}"))
@@ -146,89 +113,6 @@ mod build_bundled {
             .flag("-DHAVE_ISNAN")
             .flag("-D_POSIX_THREAD_SAFE_FUNCTIONS") // cross compile with MinGW
             .warnings(false);
-
-        if cfg!(feature = "bundled-sqlcipher") {
-            cfg.flag("-DSQLITE_HAS_CODEC")
-                .flag("-DSQLITE_TEMP_STORE=2")
-                .flag("-DSQLITE_EXTRA_INIT=sqlcipher_extra_init")
-                .flag("-DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown")
-                .flag("-DHAVE_STDINT_H=1");
-
-            let target = env::var("TARGET").unwrap();
-            let host = env::var("HOST").unwrap();
-
-            let is_windows = host.contains("windows") && target.contains("windows");
-            let is_apple = host.contains("apple") && target.contains("apple");
-
-            let lib_dir = env("OPENSSL_LIB_DIR").map(PathBuf::from);
-            let inc_dir = env("OPENSSL_INCLUDE_DIR").map(PathBuf::from);
-            let mut use_openssl = false;
-
-            let (lib_dir, inc_dir) = match (lib_dir, inc_dir) {
-                (Some(lib_dir), Some(inc_dir)) => {
-                    use_openssl = true;
-                    (vec![lib_dir], inc_dir)
-                }
-                (lib_dir, inc_dir) => match find_openssl_dir(&host, &target) {
-                    None => {
-                        if is_windows && !cfg!(feature = "bundled-sqlcipher-vendored-openssl") {
-                            panic!("Missing environment variable OPENSSL_DIR or OPENSSL_DIR is not set")
-                        } else {
-                            (vec![PathBuf::new()], PathBuf::new())
-                        }
-                    }
-                    Some(openssl_dir) => {
-                        let lib_dir = lib_dir.map(|d| vec![d]).unwrap_or_else(|| {
-                            let mut lib_dirs = vec![];
-                            // OpenSSL 3.0 now puts its libraries in lib64/ by default,
-                            // check for both it and lib/.
-                            if openssl_dir.join("lib64").exists() {
-                                lib_dirs.push(openssl_dir.join("lib64"));
-                            }
-                            if openssl_dir.join("lib").exists() {
-                                lib_dirs.push(openssl_dir.join("lib"));
-                            }
-                            lib_dirs
-                        });
-                        let inc_dir = inc_dir.unwrap_or_else(|| openssl_dir.join("include"));
-
-                        if !lib_dir.iter().all(|p| p.exists()) {
-                            panic!("OpenSSL library directory does not exist: {lib_dir:?}");
-                        }
-
-                        if !Path::new(&inc_dir).exists() {
-                            panic!(
-                                "OpenSSL include directory does not exist: {}",
-                                inc_dir.to_string_lossy()
-                            );
-                        }
-
-                        use_openssl = true;
-                        (lib_dir, inc_dir)
-                    }
-                },
-            };
-
-            if cfg!(feature = "bundled-sqlcipher-vendored-openssl") {
-                cfg.include(env::var("DEP_OPENSSL_INCLUDE").unwrap());
-                // cargo will resolve downstream to the static lib in
-                // openssl-sys
-            } else if use_openssl {
-                cfg.include(inc_dir.to_string_lossy().as_ref());
-                let lib_name = if is_windows { "libcrypto" } else { "crypto" };
-                println!("cargo:rustc-link-lib=dylib={lib_name}");
-                for lib_dir_item in &lib_dir {
-                    println!("cargo:rustc-link-search={}", lib_dir_item.to_string_lossy());
-                }
-            } else if is_apple {
-                cfg.flag("-DSQLCIPHER_CRYPTO_CC");
-                println!("cargo:rustc-link-lib=framework=Security");
-                println!("cargo:rustc-link-lib=framework=CoreFoundation");
-            } else {
-                // branch not taken on Windows, just `crypto` is fine.
-                println!("cargo:rustc-link-lib=dylib=crypto");
-            }
-        }
 
         // on android sqlite can't figure out where to put the temp files.
         // the bundled sqlite on android also uses `SQLITE_TEMP_STORE=3`.
@@ -313,38 +197,14 @@ mod build_bundled {
 
         println!("cargo:lib_dir={out_dir}");
     }
-
-    fn env(name: &str) -> Option<OsString> {
-        let prefix = env::var("TARGET").unwrap().to_uppercase().replace('-', "_");
-        let prefixed = format!("{prefix}_{name}");
-        let var = env::var_os(prefixed);
-
-        match var {
-            None => env::var_os(name),
-            _ => var,
-        }
-    }
-
-    fn find_openssl_dir(_host: &str, _target: &str) -> Option<PathBuf> {
-        let openssl_dir = env("OPENSSL_DIR");
-        openssl_dir.map(PathBuf::from)
-    }
 }
 
 fn env_prefix() -> &'static str {
-    if cfg!(any(feature = "sqlcipher", feature = "bundled-sqlcipher")) {
-        "SQLCIPHER"
-    } else {
-        "DOLTLITE"
-    }
+    "DOLTLITE"
 }
 
 fn lib_name() -> &'static str {
-    if cfg!(any(feature = "sqlcipher", feature = "bundled-sqlcipher")) {
-        "sqlcipher"
-    } else {
-        "doltlite"
-    }
+    "doltlite"
 }
 
 pub enum HeaderLocation {
@@ -363,8 +223,6 @@ impl From<HeaderLocation> for String {
                 });
                 header.push_str(if cfg!(feature = "loadable_extension") {
                     "/sqlite3ext.h"
-                } else if cfg!(any(feature = "sqlcipher", feature = "bundled-sqlcipher")) {
-                    "/sqlite3.h"
                 } else {
                     "/doltlite.h"
                 });
@@ -401,11 +259,8 @@ mod build_linked {
 
     pub fn main(_out_dir: &str, out_path: &Path) {
         let header = find_sqlite();
-        if (cfg!(any(
-            feature = "bundled_bindings",
-            feature = "bundled",
-            feature = "bundled-sqlcipher"
-        )) || (win_target() && cfg!(feature = "bundled-windows")))
+        if (cfg!(any(feature = "bundled_bindings", feature = "bundled",))
+            || (win_target() && cfg!(feature = "bundled-windows")))
             && !cfg!(feature = "buildtime_bindgen")
         {
             // Generally means the `bundled_bindings` feature is enabled.
@@ -421,8 +276,8 @@ mod build_linked {
 
     #[cfg(not(feature = "loadable_extension"))]
     fn find_link_mode() -> &'static str {
-        // If the user specifies SQLITE3_STATIC (or SQLCIPHER_STATIC), do static
-        // linking, unless it's explicitly set to 0.
+        // If the user specifies DOLTLITE_STATIC, do static linking unless it is
+        // explicitly set to 0.
         match &env::var(format!("{}_STATIC", env_prefix())) {
             Ok(v) if v != "0" => "static",
             _ => "dylib",
@@ -440,8 +295,8 @@ mod build_linked {
         }
 
         // Dependents can access DEP_DOLTLITE_LINK_TARGET to get this value.
-        // This is useful for checking whether the backend is doltlite,
-        // sqlcipher, or another SQLite-compatible library.
+        // This is useful for checking whether the backend is doltlite or
+        // another SQLite-compatible library.
         #[cfg(not(feature = "loadable_extension"))]
         println!("cargo:link-target={link_lib}");
 
@@ -604,9 +459,6 @@ mod bindings {
                 .blocklist_function("sqlite3_prepare");
         }
 
-        if cfg!(any(feature = "sqlcipher", feature = "bundled-sqlcipher")) {
-            bindings = bindings.clang_arg("-DSQLITE_HAS_CODEC");
-        }
         if cfg!(feature = "unlock_notify") {
             bindings = bindings.clang_arg("-DSQLITE_ENABLE_UNLOCK_NOTIFY");
         }

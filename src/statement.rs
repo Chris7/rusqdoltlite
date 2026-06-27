@@ -1311,7 +1311,7 @@ mod test {
             err.sqlite_extended_error_code(),
             Some(crate::ffi::SQLITE_MISUSE)
         );
-        // error msg is different with sqlcipher, so we use assert_ne:
+        // The exact error message can vary by backend, so avoid matching it.
         assert_ne!(err.to_string(), "not an error".to_owned());
         stmt.reset()?; // SQLITE_OMIT_AUTORESET = false
         stmt.execute([]).unwrap_err();

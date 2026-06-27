@@ -1,9 +1,5 @@
 #![expect(non_snake_case, non_camel_case_types)]
 #![cfg_attr(not(test), no_std)]
-// force linking to openssl
-#[cfg(feature = "bundled-sqlcipher-vendored-openssl")]
-extern crate openssl_sys;
-
 pub use self::error::*;
 
 use core::mem;
@@ -27,15 +23,12 @@ mod bindings {
 }
 pub use bindings::*;
 
-#[cfg(not(any(feature = "sqlcipher", feature = "bundled-sqlcipher")))]
 unsafe extern "C" {
     fn doltliteInstallAutoExt() -> core::ffi::c_int;
 }
 
-#[cfg(not(any(feature = "sqlcipher", feature = "bundled-sqlcipher")))]
 static DOLTLITE_INIT_RESULT: AtomicI32 = AtomicI32::new(i32::MIN);
 
-#[cfg(not(any(feature = "sqlcipher", feature = "bundled-sqlcipher")))]
 pub fn initialize_doltlite() -> core::ffi::c_int {
     let existing = DOLTLITE_INIT_RESULT.load(Ordering::Acquire);
     if existing != i32::MIN {
@@ -52,11 +45,6 @@ pub fn initialize_doltlite() -> core::ffi::c_int {
         Ok(_) => result,
         Err(previous) => previous,
     }
-}
-
-#[cfg(any(feature = "sqlcipher", feature = "bundled-sqlcipher"))]
-pub fn initialize_doltlite() -> core::ffi::c_int {
-    SQLITE_OK
 }
 
 impl Default for sqlite3_vtab {

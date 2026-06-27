@@ -51,12 +51,6 @@ functions = []
 trace = []
 # Use bundled SQLite sources (instead of the one provided by your OS / distribution)
 bundled = ["libdoltlite-sys?/bundled", "modern_sqlite"]
-# Use SQLCipher instead of SQLite
-bundled-sqlcipher = ["libdoltlite-sys?/bundled-sqlcipher", "bundled"]
-bundled-sqlcipher-vendored-openssl = [
-    "libdoltlite-sys?/bundled-sqlcipher-vendored-openssl",
-    "bundled-sqlcipher",
-]
 buildtime_bindgen = ["libdoltlite-sys?/buildtime_bindgen", "sqlite-wasm-rs?/bindgen"]
 # sqlite3_limit
 limits = []
@@ -69,7 +63,6 @@ preupdate_hook = ["libdoltlite-sys?/preupdate_hook", "hooks"]
 # u64, usize, NonZeroU64, NonZeroUsize
 fallible_uint = []
 i128_blob = []
-sqlcipher = ["libdoltlite-sys?/sqlcipher"]
 # SQLITE_ENABLE_UNLOCK_NOTIFY
 unlock_notify = ["libdoltlite-sys?/unlock_notify"]
 # if not SQLITE_OMIT_VIRTUALTABLE

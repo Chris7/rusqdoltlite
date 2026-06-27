@@ -8,24 +8,16 @@ description = "Native bindings to the DoltLite SQLite-compatible library"
 license = "MIT"
 links = "doltlite"
 build = "build.rs"
-keywords = ["sqlite", "sqlcipher", "ffi"]
+keywords = ["sqlite", "doltlite", "ffi"]
 categories = ["external-ffi-bindings"]
 exclude = ["**/*.sh"]
 
 [features]
 default = ["min_sqlite_version_3_34_1"]
-# Use bundled SQLite sources (instead of the one provided by your OS / distribution)
+# Use bundled DoltLite sources.
 bundled = ["cc", "bundled_bindings"]
 bundled-windows = ["cc", "bundled_bindings"]
-# Use bundled SQLCipher sources
-bundled-sqlcipher = ["bundled"]
-bundled-sqlcipher-vendored-openssl = [
-    "bundled-sqlcipher",
-    "openssl-sys/vendored",
-]
 buildtime_bindgen = ["bindgen", "pkg-config", "vcpkg"]
-# Use SQLCipher instead of SQLite
-sqlcipher = []
 # Minimal version required by rusqlite
 min_sqlite_version_3_34_1 = ["pkg-config", "vcpkg"]
 # Bundle only the bindings file. Note that this does nothing if
@@ -44,9 +36,6 @@ session = ["preupdate_hook", "buildtime_bindgen"]
 in_gecko = []
 with-asan = []
 wasm32-wasi-vfs = []
-
-[dependencies]
-openssl-sys = { version = "0.9.103", optional = true }
 
 [build-dependencies]
 bindgen = { version = "0.72", optional = true, default-features = false, features = [
