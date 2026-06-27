@@ -1,9 +1,9 @@
 [package]
 name = "libdoltlite-sys"
 version = "0.38.1"
-authors = ["The rusqlite developers"]
+authors = ["Chris Mitchell"]
 edition = "2021"
-repository = "https://github.com/rusqlite/rusqlite"
+repository = "https://github.com/chris7/rusqdoltlite"
 description = "Native bindings to the DoltLite SQLite-compatible library"
 license = "MIT"
 links = "doltlite"
