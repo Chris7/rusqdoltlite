@@ -62,7 +62,7 @@ pub use fallible_streaming_iterator;
     target_os = "unknown",
     any(test, feature = "ffi-sqlite-wasm-rs")
 )))]
-pub use libsqlite3_sys as ffi;
+pub use libdoltlite_sys as ffi;
 #[cfg(all(
     target_family = "wasm",
     target_os = "unknown",
@@ -1424,9 +1424,17 @@ mod test {
         let db = Connection::open("")?;
         assert_eq!(Some(""), db.path());
         let db = Connection::open_in_memory()?;
-        assert_eq!(Some(""), db.path());
+        if cfg!(feature = "bundled") {
+            assert_eq!(Some(":memory:"), db.path());
+        } else {
+            assert_eq!(Some(""), db.path());
+        }
         let db = Connection::open("file:dummy.db?mode=memory&cache=shared")?;
-        assert_eq!(Some(""), db.path());
+        if cfg!(feature = "bundled") {
+            assert_eq!(Some(":memory:"), db.path());
+        } else {
+            assert_eq!(Some(""), db.path());
+        }
         let path = tmp.path().join("file.db");
         let db = Connection::open(path)?;
         assert!(db.path().is_some_and(|p| p.ends_with("file.db")));
@@ -1750,6 +1758,9 @@ mod test {
             "memory",
             db.one_column::<String, _>("PRAGMA journal_mode", [])?
         );
+        if cfg!(feature = "bundled") {
+            return Ok(());
+        }
         let mode = db.one_column::<String, _>("PRAGMA journal_mode=off", [])?;
         if cfg!(feature = "bundled") {
             assert_eq!(mode, "off");

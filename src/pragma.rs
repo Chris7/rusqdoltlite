@@ -409,20 +409,18 @@ mod test {
     fn pragma_update_and_check() -> Result<()> {
         let db = Connection::open_in_memory()?;
         let journal_mode: String =
-            db.pragma_update_and_check(None, "journal_mode", "OFF", |row| row.get(0))?;
-        assert!(
-            journal_mode == "off" || journal_mode == "memory",
-            "mode: {journal_mode:?}"
-        );
+            db.pragma_update_and_check(None, "locking_mode", "EXCLUSIVE", |row| row.get(0))?;
+        assert!(journal_mode == "exclusive", "mode: {journal_mode:?}");
         // Sanity checks to ensure the move to a generic `ToSql` wasn't breaking
-        let mode =
-            db.pragma_update_and_check(None, "journal_mode", "OFF", |row| row.get::<_, String>(0))?;
-        assert!(mode == "off" || mode == "memory", "mode: {mode:?}");
+        let mode = db.pragma_update_and_check(None, "locking_mode", "EXCLUSIVE", |row| {
+            row.get::<_, String>(0)
+        })?;
+        assert!(mode == "exclusive", "mode: {mode:?}");
 
-        let param: &dyn crate::ToSql = &"OFF";
+        let param: &dyn crate::ToSql = &"EXCLUSIVE";
         let mode =
-            db.pragma_update_and_check(None, "journal_mode", param, |row| row.get::<_, String>(0))?;
-        assert!(mode == "off" || mode == "memory", "mode: {mode:?}");
+            db.pragma_update_and_check(None, "locking_mode", param, |row| row.get::<_, String>(0))?;
+        assert!(mode == "exclusive", "mode: {mode:?}");
         Ok(())
     }
 

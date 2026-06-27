@@ -1,7 +1,7 @@
 ignore:
   - "examples"
-  - "libsqlite3-sys/bindgen-bindings"
-  - "libsqlite3-sys/sqlite3"
+  - "libdoltlite-sys/bindgen-bindings"
+  - "libdoltlite-sys/doltlite"
 coverage:
   status:
     project:

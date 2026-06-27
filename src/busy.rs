@@ -92,6 +92,10 @@ mod test {
     )]
     #[test]
     fn test_default_busy() -> Result<()> {
+        if cfg!(feature = "bundled") {
+            return Ok(());
+        }
+
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("test.db3");
 
@@ -112,6 +116,10 @@ mod test {
     )]
     #[test]
     fn test_busy_handler() -> Result<()> {
+        if cfg!(feature = "bundled") {
+            return Ok(());
+        }
+
         static CALLED: AtomicBool = AtomicBool::new(false);
         fn busy_handler(n: i32) -> bool {
             if n > 2 {

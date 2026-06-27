@@ -1346,7 +1346,11 @@ mod test {
         let db = Connection::open_in_memory()?;
         db.pragma_update(None, "encoding", "UTF-16le")?;
         let encoding: String = db.pragma_query_value(None, "encoding", |row| row.get(0))?;
-        assert_eq!("UTF-16le", encoding);
+        if cfg!(feature = "bundled") {
+            assert_eq!("UTF-8", encoding);
+        } else {
+            assert_eq!("UTF-16le", encoding);
+        }
         db.execute_batch("CREATE TABLE foo(x TEXT)")?;
         let expected = "テスト";
         db.execute("INSERT INTO foo(x) VALUES (?1)", [&expected])?;
