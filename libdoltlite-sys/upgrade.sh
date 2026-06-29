@@ -9,15 +9,13 @@ export DOLTLITE_LIB_DIR="$SCRIPT_DIR/doltlite"
 mkdir -p "$TARGET_DIR" "$DOLTLITE_LIB_DIR"
 
 # Download and extract amalgamations
-SQLITE=sqlite-amalgamation-3530200
-DOLTLITE_VERSION=0.11.22
+DOLTLITE_VERSION=0.11.23
 DOLTLITE=doltlite-amalgamation-$DOLTLITE_VERSION
-curl -O https://sqlite.org/2026/$SQLITE.zip
 curl -LO "https://github.com/dolthub/doltlite/releases/download/v$DOLTLITE_VERSION/$DOLTLITE.zip"
 unzip -p "$DOLTLITE.zip" "$DOLTLITE/doltlite.c" > "$DOLTLITE_LIB_DIR/doltlite.c"
-unzip -p "$DOLTLITE.zip" "$DOLTLITE/doltlite.h" > "$DOLTLITE_LIB_DIR/doltlite.h"
-unzip -p "$SQLITE.zip" "$SQLITE/sqlite3ext.h" > "$DOLTLITE_LIB_DIR/sqlite3ext.h"
-rm -f "$SQLITE.zip" "$DOLTLITE.zip"
+unzip -zip" "$DOLTLITE/doltlite.h" > "$DOLTLITE_LIB_DIR/doltlite.h"
+unzip -zip" "$SQLITE/sqlite3ext.h" > "$DOLTLITE_LIB_DIR/sqlite3ext.h"
+rm -f "$DOLTLITE.zip"
 
 # Regenerate bindgen file for doltlite.h
 rm -f "$DOLTLITE_LIB_DIR/bindgen_bundled_version.rs"

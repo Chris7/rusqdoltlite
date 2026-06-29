@@ -55,7 +55,7 @@ loadable_extension = ["libdoltlite-sys?/loadable_extension"]
 hooks = []
 # if SQLITE_ENABLE_PREUPDATE_HOOK
 preupdate_hook = ["libdoltlite-sys?/preupdate_hook", "hooks"]
-# u64, usize, NonZeroU64, NonZeroUsize
+# Compatibility feature: u64, usize, NonZeroU64, and NonZeroUsize are always supported.
 fallible_uint = []
 i128_blob = []
 # SQLITE_ENABLE_UNLOCK_NOTIFY

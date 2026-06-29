@@ -1,5 +1,4 @@
 use super::{Null, Value, ValueRef};
-#[cfg(feature = "fallible_uint")]
 use crate::Error;
 use crate::Result;
 use std::borrow::Cow;
@@ -239,7 +238,6 @@ to_sql_self!(std::num::NonZeroI128);
 #[cfg(feature = "uuid")]
 to_sql_self!(uuid::Uuid);
 
-#[cfg(feature = "fallible_uint")]
 macro_rules! to_sql_self_fallible(
     ($t:ty) => (
         impl ToSql for $t {
@@ -270,13 +268,9 @@ macro_rules! to_sql_self_fallible(
 );
 
 // Special implementations for usize and u64 because these conversions can fail.
-#[cfg(feature = "fallible_uint")]
 to_sql_self_fallible!(u64);
-#[cfg(feature = "fallible_uint")]
 to_sql_self_fallible!(usize);
-#[cfg(feature = "fallible_uint")]
 to_sql_self_fallible!(non_zero std::num::NonZeroU64);
-#[cfg(feature = "fallible_uint")]
 to_sql_self_fallible!(non_zero std::num::NonZeroUsize);
 
 impl<T: ?Sized> ToSql for &'_ T
@@ -374,9 +368,7 @@ mod test {
         is_to_sql::<u8>();
         is_to_sql::<u16>();
         is_to_sql::<u32>();
-        #[cfg(feature = "fallible_uint")]
         is_to_sql::<u64>();
-        #[cfg(feature = "fallible_uint")]
         is_to_sql::<usize>();
     }
 
@@ -390,9 +382,7 @@ mod test {
         is_to_sql::<std::num::NonZeroU8>();
         is_to_sql::<std::num::NonZeroU16>();
         is_to_sql::<std::num::NonZeroU32>();
-        #[cfg(feature = "fallible_uint")]
         is_to_sql::<std::num::NonZeroU64>();
-        #[cfg(feature = "fallible_uint")]
         is_to_sql::<std::num::NonZeroUsize>();
     }
 
