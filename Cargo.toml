@@ -163,10 +163,10 @@ smallvec = "1.6.1"
 rusqlite-macros = { path = "rusqlite-macros", version = "0.4.3", optional = true }
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.2" }
+libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.3" }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.2", optional = true }
+libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.3", optional = true }
 sqlite-wasm-rs = { version = "0.5.1", default-features = false, optional = true }
 chrono = { version = "0.4.42", optional = true, default-features = false, features = ["wasmbind"] }
 jiff = { version = "0.2", optional = true, default-features = false, features = ["js"] }

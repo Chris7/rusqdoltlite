@@ -1,6 +1,6 @@
 [package]
 name = "libdoltlite-sys"
-version = "0.38.2"
+version = "0.38.3"
 authors = ["Chris Mitchell"]
 edition = "2021"
 repository = "https://github.com/chris7/rusqdoltlite"

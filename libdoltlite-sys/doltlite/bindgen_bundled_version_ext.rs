@@ -3045,6 +3045,9 @@ pub struct sqlite3_api_routines {
             arg7: *mut ::core::ffi::c_void,
         ) -> ::core::ffi::c_int,
     >,
+    pub incomplete: ::core::option::Option<
+        unsafe extern "C" fn(arg1: *const ::core::ffi::c_char) -> sqlite3_int64,
+    >,
 }
 pub type sqlite3_loadext_entry = ::core::option::Option<
     unsafe extern "C" fn(
@@ -6990,6 +6993,18 @@ pub unsafe fn sqlite3_carray_bind_v2(
     (fun)(arg1, arg2, arg3, arg4, arg5, arg6, arg7)
 }
 
+static __SQLITE3_INCOMPLETE: ::core::sync::atomic::AtomicPtr<()> = ::core::sync::atomic::AtomicPtr::new(
+    ::core::ptr::null_mut(),
+);
+pub unsafe fn sqlite3_incomplete(arg1: *const ::core::ffi::c_char) -> sqlite3_int64 {
+    let ptr = __SQLITE3_INCOMPLETE.load(::core::sync::atomic::Ordering::Acquire);
+    assert!(! ptr.is_null(), "SQLite API not initialized or SQLite feature omitted");
+    let fun: unsafe extern "C" fn(arg1: *const ::core::ffi::c_char) -> sqlite3_int64 = ::core::mem::transmute(
+        ptr,
+    );
+    (fun)(arg1)
+}
+
 /// Like SQLITE_EXTENSION_INIT2 macro
 pub unsafe fn rusqlite_extension_init2(
     p_api: *mut sqlite3_api_routines,
@@ -7943,6 +7958,10 @@ pub unsafe fn rusqlite_extension_init2(
     }
     if let Some(fun) = (*p_api).carray_bind_v2 {
         __SQLITE3_CARRAY_BIND_V2
+            .store(fun as usize as *mut (), ::core::sync::atomic::Ordering::Release);
+    }
+    if let Some(fun) = (*p_api).incomplete {
+        __SQLITE3_INCOMPLETE
             .store(fun as usize as *mut (), ::core::sync::atomic::Ordering::Release);
     }
     Ok(())
