@@ -10,7 +10,7 @@ export DOLTLITE_INCLUDE_DIR="$SCRIPT_DIR/doltlite"
 mkdir -p "$TARGET_DIR" "$DOLTLITE_LIB_DIR"
 
 # Download and extract amalgamations
-DOLTLITE_VERSION=0.11.24
+DOLTLITE_VERSION=0.11.28
 DOLTLITE=doltlite-amalgamation-$DOLTLITE_VERSION
 curl -LO "https://github.com/dolthub/doltlite/releases/download/v$DOLTLITE_VERSION/$DOLTLITE.zip"
 unzip -p "$DOLTLITE.zip" "$DOLTLITE/doltlite.c" > "$DOLTLITE_LIB_DIR/doltlite.c"
