@@ -98,6 +98,8 @@ pub use crate::ffi::ErrorCode;
 #[cfg(feature = "load_extension")]
 pub use crate::load_extension_guard::LoadExtensionGuard;
 pub use crate::params::{params_from_iter, Params, ParamsFromIter};
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+pub use crate::remote_server::RemoteServer;
 pub use crate::row::{AndThenRows, Map, MappedRows, Row, RowIndex, Rows};
 pub use crate::statement::{Statement, StatementStatus};
 #[cfg(feature = "modern_sqlite")]
@@ -141,6 +143,8 @@ mod load_extension_guard;
 mod params;
 mod pragma;
 mod raw_statement;
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+pub mod remote_server;
 mod row;
 #[cfg(feature = "serialize")]
 pub mod serialize;

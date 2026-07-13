@@ -1,3 +1,10 @@
+# Upgrade model
+
+The files in `doltlite/` are pristine upstream artifacts. RusqDoltLite changes
+belong in [`patches/`](patches/README.md) and are applied to a build-directory
+copy of the amalgamation. This separation is intentional: `upgrade.sh` may
+replace the upstream files without erasing or hiding local behavior.
+
 # Checks
 * new [error code(s)](https://sqlite.org/rescode.html)
   => Update [libsqlite3-sys/src/error.rs](https://github.com/rusqlite/rusqlite/blob/006c8b77e7d235a3072237f006ebabd66b937911/libsqlite3-sys/src/error.rs#L127)

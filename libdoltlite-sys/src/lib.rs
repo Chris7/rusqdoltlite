@@ -23,6 +23,52 @@ mod bindings {
 }
 pub use bindings::*;
 
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+mod remote {
+    use core::ffi::{c_char, c_int};
+
+    #[repr(C)]
+    pub struct DoltliteServer {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct DoltliteServeOpts {
+        pub zDir: *const c_char,
+        pub port: c_int,
+        pub zBindAddr: *const c_char,
+        pub certFile: *const c_char,
+        pub keyFile: *const c_char,
+        pub authKeysDir: *const c_char,
+        pub audience: *const c_char,
+    }
+
+    unsafe extern "C" {
+        pub fn doltliteServe(
+            directory: *const c_char,
+            port: c_int,
+            bind_address: *const c_char,
+        ) -> c_int;
+
+        pub fn doltliteServeAsync(
+            directory: *const c_char,
+            port: c_int,
+            bind_address: *const c_char,
+        ) -> *mut DoltliteServer;
+
+        pub fn doltliteServeOpts(options: *const DoltliteServeOpts) -> c_int;
+
+        pub fn doltliteServeAsyncOpts(options: *const DoltliteServeOpts) -> *mut DoltliteServer;
+
+        pub fn doltliteServerStop(server: *mut DoltliteServer);
+
+        pub fn doltliteServerPort(server: *mut DoltliteServer) -> c_int;
+    }
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+pub use remote::*;
+
 unsafe extern "C" {
     fn doltliteInstallAutoExt() -> core::ffi::c_int;
 }

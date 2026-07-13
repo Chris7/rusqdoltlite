@@ -5,7 +5,7 @@ authors = ["Chris Mitchell"]
 edition = "2021"
 repository = "https://github.com/chris7/rusqdoltlite"
 description = "Native bindings to the DoltLite SQLite-compatible library"
-license = "MIT"
+license = "MIT AND Apache-2.0 AND Zlib"
 links = "doltlite"
 build = "build.rs"
 keywords = ["sqlite", "doltlite", "ffi"]
@@ -17,6 +17,8 @@ default = ["min_sqlite_version_3_34_1"]
 # Use bundled DoltLite sources.
 bundled = ["cc", "bundled_bindings"]
 bundled-windows = ["cc", "bundled_bindings"]
+# Enable the HTTP remote client and in-process remote server APIs.
+remote = []
 buildtime_bindgen = ["bindgen", "pkg-config", "vcpkg"]
 # Minimal version required by rusqlite
 min_sqlite_version_3_34_1 = ["pkg-config", "vcpkg"]

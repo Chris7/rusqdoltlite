@@ -1,0 +1,494 @@
+Subject: [PATCH] Preserve rusqdoltlite history and remote behavior
+Base: DoltLite v0.11.28
+
+This patch contains the DoltLite-internal behavior that cannot be implemented
+through rusqdoltlite's Rust wrapper:
+
+- discover point-in-time tables and columns across non-current refs;
+- support remote set-url and persist pulled and cloned refs;
+- preserve meaningful SQLite codes for HTTP failures; and
+- distinguish oversized chunk uploads from malformed requests.
+
+diff --git a/doltlite.c b/doltlite.c
+index 501059c..b1c5b41 100644
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -23679,6 +23679,7 @@ int chunkStoreFindTag(ChunkStore *cs, const char *zName, ProllyHash *pCommit);
+ int chunkStoreAddRemote(ChunkStore *cs, const char *zName, const char *zUrl);
+ int chunkStoreDeleteRemote(ChunkStore *cs, const char *zName);
+ int chunkStoreFindRemote(ChunkStore *cs, const char *zName, const char **pzUrl);
++int chunkStoreSetRemoteUrl(ChunkStore *cs, const char *zName, const char *zUrl);
+ 
+ int chunkStoreUpdateTracking(ChunkStore *cs, const char *zRemote,
+                              const char *zBranch, const ProllyHash *pCommit);
+@@ -97438,6 +97439,7 @@ int chunkStoreFindTag(ChunkStore *cs, const char *zName, ProllyHash *pCommit);
+ int chunkStoreAddRemote(ChunkStore *cs, const char *zName, const char *zUrl);
+ int chunkStoreDeleteRemote(ChunkStore *cs, const char *zName);
+ int chunkStoreFindRemote(ChunkStore *cs, const char *zName, const char **pzUrl);
++int chunkStoreSetRemoteUrl(ChunkStore *cs, const char *zName, const char *zUrl);
+ 
+ int chunkStoreUpdateTracking(ChunkStore *cs, const char *zRemote,
+                              const char *zBranch, const ProllyHash *pCommit);
+@@ -276011,6 +276013,17 @@ int chunkStoreAddRemote(ChunkStore *cs, const char *zName, const char *zUrl){
+   return SQLITE_OK;
+ }
+ 
++int chunkStoreSetRemoteUrl(ChunkStore *cs, const char *zName, const char *zUrl){
++  int i = findRemoteIdx(cs, zName);
++  char *zNewUrl;
++  if( i<0 ) return SQLITE_NOTFOUND;
++  zNewUrl = sqlite3_mprintf("%s", zUrl);
++  if( !zNewUrl ) return SQLITE_NOMEM;
++  sqlite3_free(cs->refs.aRemotes[i].zUrl);
++  cs->refs.aRemotes[i].zUrl = zNewUrl;
++  return SQLITE_OK;
++}
++
+ int chunkStoreDeleteRemote(ChunkStore *cs, const char *zName){
+   int i = findRemoteIdx(cs, zName);
+   int j;
+@@ -285005,24 +285018,12 @@ struct DoltliteColInfo {
+ 
+ int doltliteGetColumnNames(sqlite3 *db, const char *zTable, DoltliteColInfo *ci);
+ 
+-static inline int doltliteLoadUserTableColumns(
++int doltliteLoadUserTableColumns(
+   sqlite3 *db,
+   const char *zTable,
+   DoltliteColInfo *pCols,
+   char **pzErr
+-){
+-  int rc = doltliteGetColumnNames(db, zTable, pCols);
+-  if( rc!=SQLITE_OK ) return rc;
+-  if( pCols->nCol<=0 ){
+-    if( pzErr ){
+-      *pzErr = sqlite3_mprintf("table '%s' not found or has no columns",
+-                               zTable ? zTable : "");
+-      if( !*pzErr ) return SQLITE_NOMEM;
+-    }
+-    return SQLITE_ERROR;
+-  }
+-  return SQLITE_OK;
+-}
++);
+ 
+ void doltliteFreeColInfo(DoltliteColInfo *ci);
+ 
+@@ -306279,23 +306280,17 @@ int doltliteLoadCommit(sqlite3 *db, const ProllyHash *pHash,
+   return rc;
+ }
+ 
+-int doltliteForEachUserTable(
++static int doltliteRegisterCatalogUserTables(
+   sqlite3 *db,
++  const ProllyHash *pCatalog,
+   const char *zPrefix,
+   const sqlite3_module *pModule
+ ){
+-  ProllyHash headCommit;
+-  ProllyHash headCat;
+   struct TableEntry *aTables = 0;
+   int nTables = 0, i, rc;
+ 
+-  doltliteGetSessionHead(db, &headCommit);
+-  if( prollyHashIsEmpty(&headCommit) ) return SQLITE_OK;
+-
+-  rc = doltliteCommitCatalogHash(db, &headCommit, &headCat);
+-  if( rc!=SQLITE_OK ) return rc;
+-
+-  rc = doltliteLoadCatalog(db, &headCat, &aTables, &nTables, 0);
++  if( !pCatalog || prollyHashIsEmpty(pCatalog) ) return SQLITE_OK;
++  rc = doltliteLoadCatalog(db, pCatalog, &aTables, &nTables, 0);
+   if( rc!=SQLITE_OK ) return rc;
+ 
+   for(i=0; i<nTables; i++){
+@@ -306305,7 +306300,9 @@ int doltliteForEachUserTable(
+         doltliteFreeCatalog(aTables, nTables);
+         return SQLITE_NOMEM;
+       }
+-      rc = sqlite3_create_module(db, zMod, pModule, 0);
++      rc = sqlite3HashFind(&db->aModule, zMod)==0
++         ? sqlite3_create_module(db, zMod, pModule, 0)
++         : SQLITE_OK;
+       sqlite3_free(zMod);
+       if( rc!=SQLITE_OK ){
+         doltliteFreeCatalog(aTables, nTables);
+@@ -306317,6 +306314,65 @@ int doltliteForEachUserTable(
+   return SQLITE_OK;
+ }
+ 
++static int doltliteRegisterCommitUserTables(
++  sqlite3 *db,
++  const ProllyHash *pCommit,
++  const char *zPrefix,
++  const sqlite3_module *pModule
++){
++  ProllyHash catalog;
++  int rc;
++
++  if( !pCommit || prollyHashIsEmpty(pCommit) ) return SQLITE_OK;
++  rc = doltliteCommitCatalogHash(db, pCommit, &catalog);
++  if( rc!=SQLITE_OK ) return rc;
++  return doltliteRegisterCatalogUserTables(db, &catalog, zPrefix, pModule);
++}
++
++int doltliteForEachUserTable(
++  sqlite3 *db,
++  const char *zPrefix,
++  const sqlite3_module *pModule
++){
++  ChunkStore *cs = doltliteGetChunkStore(db);
++  ProllyHash headCommit;
++  const BranchRef *aBranches = 0;
++  const TagRef *aTags = 0;
++  const TrackingBranch *aTracking = 0;
++  int nBranches = 0, nTags = 0, nTracking = 0;
++  int i, rc;
++
++  doltliteGetSessionHead(db, &headCommit);
++  rc = doltliteRegisterCommitUserTables(db, &headCommit, zPrefix, pModule);
++  if( rc!=SQLITE_OK || !cs ) return rc;
++
++  refsTableGetBranches(&cs->refs, &nBranches, &aBranches);
++  for(i=0; i<nBranches; i++){
++    rc = doltliteRegisterCommitUserTables(
++      db, &aBranches[i].commitHash, zPrefix, pModule
++    );
++    if( rc!=SQLITE_OK ) return rc;
++  }
++
++  refsTableGetTags(&cs->refs, &nTags, &aTags);
++  for(i=0; i<nTags; i++){
++    rc = doltliteRegisterCommitUserTables(
++      db, &aTags[i].commitHash, zPrefix, pModule
++    );
++    if( rc!=SQLITE_OK ) return rc;
++  }
++
++  refsTableGetTracking(&cs->refs, &nTracking, &aTracking);
++  for(i=0; i<nTracking; i++){
++    rc = doltliteRegisterCommitUserTables(
++      db, &aTracking[i].commitHash, zPrefix, pModule
++    );
++    if( rc!=SQLITE_OK && rc!=SQLITE_NOTFOUND ) return rc;
++  }
++
++  return SQLITE_OK;
++}
++
+ #endif
+ 
+ /************** End of doltlite_ref.c ****************************************/
+@@ -322423,9 +322479,11 @@ int doltliteGetColumnNames(sqlite3 *db, const char *zTable, DoltliteColInfo *ci)
+   }
+   sqlite3_reset(pStmt);
+ 
+-  ci->azName = sqlite3_malloc(nCol * (int)sizeof(char*));
+-  if( !ci->azName ){ sqlite3_finalize(pStmt); return SQLITE_NOMEM; }
+-  memset(ci->azName, 0, nCol * (int)sizeof(char*));
++  if( nCol>0 ){
++    ci->azName = sqlite3_malloc(nCol * (int)sizeof(char*));
++    if( !ci->azName ){ sqlite3_finalize(pStmt); return SQLITE_NOMEM; }
++    memset(ci->azName, 0, nCol * (int)sizeof(char*));
++  }
+   ci->nCol = 0;
+ 
+   if( nCol>0 ){
+@@ -322494,6 +322552,123 @@ int doltliteGetColumnNames(sqlite3 *db, const char *zTable, DoltliteColInfo *ci)
+   return SQLITE_OK;
+ }
+ 
++static int doltliteLoadCatalogTableColumns(
++  sqlite3 *db,
++  const ProllyHash *pCatalog,
++  const char *zTable,
++  DoltliteColInfo *pCols,
++  int *pFound
++){
++  ChunkStore *cs = doltliteGetChunkStore(db);
++  ProllyCache *pCache = doltliteGetCache(db);
++  SchemaEntry entry;
++  sqlite3 *tmp = 0;
++  int found = 0;
++  int rc;
++
++  *pFound = 0;
++  if( !cs || !pCache || !pCatalog || prollyHashIsEmpty(pCatalog) ){
++    return SQLITE_OK;
++  }
++
++  rc = loadSchemaEntryFromCatalog(
++    db, cs, pCache, pCatalog, zTable, &entry, &found
++  );
++  if( rc!=SQLITE_OK ) return rc;
++  if( !found || !entry.zSql ){
++    clearSchemaEntry(&entry);
++    return SQLITE_OK;
++  }
++
++  rc = sqlite3_open(":memory:", &tmp);
++  if( rc==SQLITE_OK ) rc = sqlite3_exec(tmp, entry.zSql, 0, 0, 0);
++  if( rc==SQLITE_OK ) rc = doltliteGetColumnNames(tmp, zTable, pCols);
++  if( rc==SQLITE_OK && pCols->nCol>0 ) *pFound = 1;
++
++  if( tmp ) sqlite3_close(tmp);
++  clearSchemaEntry(&entry);
++  return rc;
++}
++
++static int doltliteLoadCommitTableColumns(
++  sqlite3 *db,
++  const ProllyHash *pCommit,
++  const char *zTable,
++  DoltliteColInfo *pCols,
++  int *pFound
++){
++  ProllyHash catalog;
++  int rc;
++
++  *pFound = 0;
++  if( !pCommit || prollyHashIsEmpty(pCommit) ) return SQLITE_OK;
++  rc = doltliteCommitCatalogHash(db, pCommit, &catalog);
++  if( rc!=SQLITE_OK ) return rc;
++  return doltliteLoadCatalogTableColumns(
++    db, &catalog, zTable, pCols, pFound
++  );
++}
++
++int doltliteLoadUserTableColumns(
++  sqlite3 *db,
++  const char *zTable,
++  DoltliteColInfo *pCols,
++  char **pzErr
++){
++  ChunkStore *cs = doltliteGetChunkStore(db);
++  ProllyHash headCommit;
++  const BranchRef *aBranches = 0;
++  const TagRef *aTags = 0;
++  const TrackingBranch *aTracking = 0;
++  int nBranches = 0, nTags = 0, nTracking = 0;
++  int found = 0;
++  int i, rc;
++
++  rc = doltliteGetColumnNames(db, zTable, pCols);
++  if( rc!=SQLITE_OK || pCols->nCol>0 ) return rc;
++  doltliteFreeColInfo(pCols);
++
++  doltliteGetSessionHead(db, &headCommit);
++  rc = doltliteLoadCommitTableColumns(
++    db, &headCommit, zTable, pCols, &found
++  );
++  if( rc!=SQLITE_OK || found ) return rc;
++
++  if( cs ){
++    refsTableGetBranches(&cs->refs, &nBranches, &aBranches);
++    for(i=0; i<nBranches && !found; i++){
++      rc = doltliteLoadCommitTableColumns(
++        db, &aBranches[i].commitHash, zTable, pCols, &found
++      );
++      if( rc!=SQLITE_OK ) return rc;
++    }
++
++    refsTableGetTags(&cs->refs, &nTags, &aTags);
++    for(i=0; i<nTags && !found; i++){
++      rc = doltliteLoadCommitTableColumns(
++        db, &aTags[i].commitHash, zTable, pCols, &found
++      );
++      if( rc!=SQLITE_OK ) return rc;
++    }
++
++    refsTableGetTracking(&cs->refs, &nTracking, &aTracking);
++    for(i=0; i<nTracking && !found; i++){
++      rc = doltliteLoadCommitTableColumns(
++        db, &aTracking[i].commitHash, zTable, pCols, &found
++      );
++      if( rc!=SQLITE_OK && rc!=SQLITE_NOTFOUND ) return rc;
++    }
++  }
++
++  if( found ) return SQLITE_OK;
++  if( pzErr ){
++    *pzErr = sqlite3_mprintf("table '%s' not found or has no columns",
++                             zTable ? zTable : "");
++    if( !*pzErr ) return SQLITE_NOMEM;
++  }
++  return SQLITE_ERROR;
++}
++
+ int doltliteParseRecordStrict(
+   const u8 *pData,
+   int nData,
+@@ -327562,13 +327737,14 @@ typedef struct RemoteMutationCtx RemoteMutationCtx;
+ struct RemoteMutationCtx {
+   const char *zName;
+   const char *zUrl;
+-  int isDelete;
++  int action;
+ };
+ 
+ static int mutateRemoteRef(sqlite3 *db, ChunkStore *cs, void *pArg){
+   RemoteMutationCtx *p = (RemoteMutationCtx*)pArg;
+   (void)db;
+-  if( p->isDelete ) return chunkStoreDeleteRemote(cs, p->zName);
++  if( p->action==1 ) return chunkStoreDeleteRemote(cs, p->zName);
++  if( p->action==2 ) return chunkStoreSetRemoteUrl(cs, p->zName, p->zUrl);
+   return chunkStoreAddRemote(cs, p->zName, p->zUrl);
+ }
+ 
+@@ -327745,7 +327921,32 @@ static void doltRemoteFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv)
+       return;
+     }
+     m.zName = zName;
+-    m.isDelete = 1;
++    m.action = 1;
++    rc = doltliteMutateRefs(db, mutateRemoteRef, &m);
++    if( rc!=SQLITE_OK ){
++      (void)doltliteVcSealSavepointError(db);
++      remoteSqlResultError(ctx, rc,
++        rc==SQLITE_NOTFOUND ? "remote not found" : 0);
++      return;
++    }
++  }else if( strcmp(zAction, "set-url")==0 ){
++    const char *zUrl;
++    if( argc<3 ){
++      doltliteVcResultError(ctx, db, "url required for set-url");
++      return;
++    }
++    if( argc>3 ){
++      doltliteVcResultError(ctx, db, "too many arguments");
++      return;
++    }
++    zUrl = (const char*)sqlite3_value_text(argv[2]);
++    if( !zUrl ){
++      doltliteVcResultError(ctx, db, "url required for set-url");
++      return;
++    }
++    m.zName = zName;
++    m.zUrl = zUrl;
++    m.action = 2;
+     rc = doltliteMutateRefs(db, mutateRemoteRef, &m);
+     if( rc!=SQLITE_OK ){
+       (void)doltliteVcSealSavepointError(db);
+@@ -327754,7 +327955,8 @@ static void doltRemoteFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv)
+       return;
+     }
+   }else{
+-    doltliteVcResultError(ctx, db, "unknown action: use 'add' or 'remove'");
++    doltliteVcResultError(ctx, db,
++      "unknown action: use 'add', 'remove', or 'set-url'");
+     return;
+   }
+ 
+@@ -328036,6 +328238,12 @@ static void doltPullFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+   }
+ 
+   if( prollyHashCompare(&localCommit, &trackingCommit)==0 ){
++    rc = doltliteRemotePersistRefs(cs);
++    if( rc!=SQLITE_OK ){
++      remoteSqlRestoreAndReport(ctx, db, cs, &savedState, rc,
++                                "failed to persist pulled branch");
++      return;
++    }
+     remoteSqlClearAndSucceed(ctx, &savedState);
+     return;
+   }
+@@ -328183,6 +328391,16 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+     const BranchRef *aBr;
+     refsTableGetBranches(&cs->refs, &nBr, &aBr);
+ 
++    for(int i=0; i<nBr; i++){
++      rc = chunkStoreUpdateTracking(cs, "origin", aBr[i].zName,
++                                    &aBr[i].commitHash);
++      if( rc!=SQLITE_OK ){
++        remoteSqlRestoreAndReport(ctx, db, cs, &savedState, rc,
++                                  "failed to record origin tracking refs");
++        return;
++      }
++    }
++
+     if( !zDefault && nBr > 0 ){
+       zDefault = aBr[0].zName;
+     }
+@@ -328737,6 +328955,13 @@ static char *buildPath(HttpRemote *p, const char *zSuffix){
+   return z;
+ }
+ 
++static int httpStatusToSqlite(int status){
++  if( status==401 || status==403 ) return SQLITE_AUTH;
++  if( status==409 ) return SQLITE_BUSY;
++  if( status==413 ) return SQLITE_TOOBIG;
++  return SQLITE_ERROR;
++}
++
+ static int httpHasChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
+                          int nHash, u8 *aResult){
+   HttpRemote *p = (HttpRemote*)pRemote;
+@@ -328769,7 +328994,7 @@ static int httpHasChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
+   if( rc != SQLITE_OK ) return rc;
+   if( status != 200 ){
+     sqlite3_free(pResp);
+-    return SQLITE_ERROR;
++    return httpStatusToSqlite(status);
+   }
+ 
+   if( nResp >= nHash ){
+@@ -328817,7 +329042,7 @@ static int httpGetChunk(DoltliteRemote *pRemote, const ProllyHash *pHash,
+   }
+   if( status != 200 ){
+     sqlite3_free(pResp);
+-    return SQLITE_ERROR;
++    return httpStatusToSqlite(status);
+   }
+ 
+   *ppData = pResp;
+@@ -328873,7 +329098,7 @@ static int httpGetRefs(DoltliteRemote *pRemote, u8 **ppData, int *pnData){
+   }
+   if( status != 200 ){
+     sqlite3_free(pResp);
+-    return SQLITE_ERROR;
++    return httpStatusToSqlite(status);
+   }
+ 
+   *ppData = pResp;
+@@ -328934,7 +329159,7 @@ static int httpCommit(DoltliteRemote *pRemote){
+     sqlite3_free(zPath);
+     sqlite3_free(pResp);
+     if( rc != SQLITE_OK ) return rc;
+-    if( status != 200 && status != 204 ) return SQLITE_ERROR;
++    if( status != 200 && status != 204 ) return httpStatusToSqlite(status);
+   }
+ 
+   if( p->pPendingRefs && p->nPendingRefs > 0 ){
+@@ -328962,8 +329187,7 @@ static int httpCommit(DoltliteRemote *pRemote){
+     sqlite3_free(zPath);
+     sqlite3_free(pResp);
+     if( rc != SQLITE_OK ) return rc;
+-    if( status == 409 ) return SQLITE_BUSY;
+-    if( status != 200 && status != 204 ) return SQLITE_ERROR;
++    if( status != 200 && status != 204 ) return httpStatusToSqlite(status);
+   }
+ 
+   {
+@@ -328976,7 +329200,7 @@ static int httpCommit(DoltliteRemote *pRemote){
+     sqlite3_free(zPath);
+     sqlite3_free(pResp);
+     if( rc != SQLITE_OK ) return rc;
+-    if( status != 200 && status != 204 ) return SQLITE_ERROR;
++    if( status != 200 && status != 204 ) return httpStatusToSqlite(status);
+   }
+ 
+   sqlite3_free(p->pUploadBuf);
+@@ -329535,8 +329759,11 @@ static void handlePostChunks(ChunkStore *pStore, DoltliteConn *fd,
+     offset += 4;
+ 
+     /* Compare as unsigned and cap single-chunk memory use. */
+-    if( len > (u32)MAX_CHUNK_BYTES
+-     || len > (u32)(nBody - offset) ){
++    if( len > (u32)MAX_CHUNK_BYTES ){
++      sendPayloadTooLarge(fd);
++      return;
++    }
++    if( len > (u32)(nBody - offset) ){
+       sendBadRequest(fd);
+       return;
+     }

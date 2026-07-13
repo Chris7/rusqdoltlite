@@ -67,7 +67,8 @@ fn main() {
 #[cfg(any(feature = "bundled", feature = "bundled-windows"))]
 mod build_bundled {
     use std::env;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use super::{is_compiler, win_target};
 
@@ -88,12 +89,63 @@ mod build_bundled {
                 super::copy_bindings(lib_name, "bindgen_bundled_version", out_path);
             }
         }
-        println!("cargo:include={}/{lib_name}", env!("CARGO_MANIFEST_DIR"));
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        println!("cargo:include={}/{lib_name}", manifest_dir.display());
         let source_file = "doltlite.c";
         println!("cargo:rerun-if-changed={lib_name}/{source_file}");
+        println!("cargo:rerun-if-changed=patches");
+        let upstream_source = manifest_dir.join(lib_name).join(source_file);
+        let patched_source = apply_local_patches(
+            &upstream_source,
+            &manifest_dir.join("patches"),
+            &Path::new(out_dir).join("patched-doltlite"),
+        );
         let mut cfg = cc::Build::new();
-        cfg.file(format!("{lib_name}/{source_file}"))
-            .flag("-DSQLITE_CORE")
+        cfg.file(patched_source);
+
+        let remote_supported = cfg!(feature = "remote")
+            && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"));
+        if remote_supported {
+            let remote_dir = Path::new(lib_name).join("remote");
+            let ed25519_dir = remote_dir.join("ed25519");
+            let mbedtls_dir = remote_dir.join("mbedtls");
+            let mut mbedtls_sources = std::fs::read_dir(mbedtls_dir.join("library"))
+                .expect("could not read bundled mbedTLS sources")
+                .map(|entry| entry.expect("could not read bundled mbedTLS source").path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "c"))
+                .collect::<Vec<_>>();
+            mbedtls_sources.sort();
+
+            println!("cargo:rerun-if-changed={}", remote_dir.display());
+            cfg.define("DOLTLITE_HAVE_AUTH", None)
+                .file(remote_dir.join("doltlite_creds.c"))
+                .file(remote_dir.join("doltlite_tls.c"))
+                .files(
+                    [
+                        "fe.c",
+                        "ge.c",
+                        "sc.c",
+                        "sha512.c",
+                        "keypair.c",
+                        "sign.c",
+                        "verify.c",
+                    ]
+                    .map(|name| ed25519_dir.join(name)),
+                )
+                .files(mbedtls_sources)
+                .include(&remote_dir)
+                .include(&ed25519_dir)
+                .include(mbedtls_dir.join("include"))
+                .include(mbedtls_dir.join("library"));
+
+            if win_target() {
+                println!("cargo:rustc-link-lib=ws2_32");
+                println!("cargo:rustc-link-lib=bcrypt");
+                println!("cargo:rustc-link-lib=crypt32");
+            }
+        }
+
+        cfg.flag("-DSQLITE_CORE")
             .flag("-DSQLITE_DEFAULT_FOREIGN_KEYS=1")
             .flag("-DSQLITE_ENABLE_API_ARMOR")
             .flag("-DSQLITE_ENABLE_COLUMN_METADATA")
@@ -196,6 +248,72 @@ mod build_bundled {
         cfg.compile(lib_name);
 
         println!("cargo:lib_dir={out_dir}");
+    }
+
+    fn apply_local_patches(upstream_source: &Path, patch_dir: &Path, output_dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(output_dir).unwrap_or_else(|error| {
+            panic!(
+                "could not create DoltLite patch directory {}: {error}",
+                output_dir.display()
+            )
+        });
+        let patched_source = output_dir.join("doltlite.c");
+        std::fs::copy(upstream_source, &patched_source).unwrap_or_else(|error| {
+            panic!(
+                "could not copy pristine DoltLite source to {}: {error}",
+                patched_source.display()
+            )
+        });
+
+        let mut patches = std::fs::read_dir(patch_dir)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not read DoltLite patch directory {}: {error}",
+                    patch_dir.display()
+                )
+            })
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|error| panic!("could not read DoltLite patch: {error}"))
+                    .path()
+            })
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "patch")
+            })
+            .collect::<Vec<_>>();
+        patches.sort();
+        assert!(!patches.is_empty(), "the local DoltLite patch set is empty");
+
+        let ceiling = output_dir
+            .parent()
+            .expect("DoltLite patch output directory must have a parent");
+        let output = Command::new("git")
+            .arg("apply")
+            .args(&patches)
+            .current_dir(output_dir)
+            .env("GIT_CEILING_DIRECTORIES", ceiling)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not run `git apply` for local DoltLite patches: {error}. \
+                     Git is required to build the bundled DoltLite source"
+                )
+            });
+        if !output.status.success() {
+            panic!(
+                "`git apply` could not apply local DoltLite patches to {}:\n{}\
+                 The upstream source may have changed or incorporated a local fix. \
+                 Update the standard Git patches; do not edit the vendored amalgamation.",
+                upstream_source.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        patched_source
     }
 }
 
