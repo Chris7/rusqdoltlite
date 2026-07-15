@@ -12,7 +12,7 @@ mkdir -p "$TARGET_DIR" "$DOLTLITE_LIB_DIR"
 # Download and extract pristine upstream artifacts. RusqDoltLite behavior is
 # maintained separately in patches/ and applied only to Cargo's OUT_DIR by the
 # build script. Never apply those patches to doltlite/doltlite.c here.
-DOLTLITE_VERSION=0.11.29
+DOLTLITE_VERSION=0.11.32
 DOLTLITE=doltlite-amalgamation-$DOLTLITE_VERSION
 curl -LO "https://github.com/dolthub/doltlite/releases/download/v$DOLTLITE_VERSION/$DOLTLITE.zip"
 unzip -p "$DOLTLITE.zip" "$DOLTLITE/doltlite.c" > "$DOLTLITE_LIB_DIR/doltlite.c"
@@ -63,7 +63,7 @@ rm -f "$DOLTLITE_LIB_DIR/bindgen_bundled_version_ext.rs"
 find "$TARGET_DIR" -type f -name bindgen.rs -exec rm {} \;
 env LIBDOLTLITE_SYS_BUNDLING=1 cargo build --features "buildtime_bindgen loadable_extension" --no-default-features
 find "$TARGET_DIR" -type f -name bindgen.rs -exec mv {} "$DOLTLITE_LIB_DIR/bindgen_bundled_version_ext.rs" \;
-mv "$DOLTLITE_LIB_DIR"/doltliteext.h{.bk,}
+mv "$DOLTLITE_LIB_DIR/doltliteext.h.bk" "$DOLTLITE_LIB_DIR/doltliteext.h"
 rm -f "$DOLTLITE_LIB_DIR/sqlite3ext.h"
 
 # Sanity checks
