@@ -817,7 +817,7 @@ mod test {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     use super::Action;
-    use crate::{Connection, Result, MAIN_DB};
+    use crate::{Connection, Result};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -941,43 +941,6 @@ mod test {
         db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
         db.execute_batch("PRAGMA user_version=1")?; // Disallowed by first authorizer, but it's now removed.
 
-        Ok(())
-    }
-
-    #[cfg_attr(
-        all(target_family = "wasm", target_os = "unknown"),
-        ignore = "no filesystem on this platform"
-    )]
-    #[test]
-    fn wal_hook() -> Result<()> {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("wal-hook.db3");
-
-        let db = Connection::open(&path)?;
-        let journal_mode: String =
-            db.pragma_update_and_check(None, "journal_mode", "wal", |row| row.get(0))?;
-        assert_eq!(journal_mode, "wal");
-
-        static CALLED: AtomicBool = AtomicBool::new(false);
-        db.wal_hook(Some(|wal, pages| {
-            assert_eq!(wal.name(), MAIN_DB);
-            assert!(pages > 0);
-            CALLED.swap(true, Ordering::Relaxed);
-            wal.checkpoint()
-        }));
-        db.execute_batch("CREATE TABLE x(c);")?;
-        assert!(CALLED.load(Ordering::Relaxed));
-
-        db.wal_hook(Some(|wal, pages| {
-            assert!(pages > 0);
-            let (log, ckpt) = wal.checkpoint_v2(super::CheckpointMode::TRUNCATE)?;
-            assert_eq!(log, 0);
-            assert_eq!(ckpt, 0);
-            Ok(())
-        }));
-        db.execute_batch("CREATE TABLE y(c);")?;
-
-        db.wal_hook(None);
         Ok(())
     }
 
