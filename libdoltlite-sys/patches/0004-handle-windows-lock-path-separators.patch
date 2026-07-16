@@ -1,0 +1,24 @@
+Subject: [PATCH] Build chunk-store lock paths with Windows separators
+
+File-backed stores serialize writes through a sibling lock file.  Windows
+paths use backslashes, so treating only `/` as a separator made the lock-file
+basename include the full `C:\\...` path, which is not a valid Windows file
+name.  Use the final separator of either kind.
+
+diff --git a/doltlite.c b/doltlite.c
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -275228,7 +275228,12 @@ static int csFileLockHeld(sqlite3_file *pFile){
+ }
+ 
+ static char *csLockPath(const char *path){
+-  const char *zBase = strrchr(path, '/');
++  const char *zSlash = strrchr(path, '/');
++  const char *zBackslash = strrchr(path, '\\');
++  const char *zBase = zSlash;
++  if( zBackslash && (!zBase || zBackslash>zBase) ){
++    zBase = zBackslash;
++  }
+   int nDir = 0;
+ 
+   if( zBase ){
