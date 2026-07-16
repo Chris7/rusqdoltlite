@@ -1,0 +1,22 @@
+Subject: [PATCH] Define the WAL errno shim when Windows SEH is enabled
+
+SQLite's Windows SEH support declares sqlite3PagerWalSystemErrno().
+DoltLite replaces the pager implementation, so provide the corresponding
+no-op shim in the replacement pager section.
+
+diff --git a/doltlite.c b/doltlite.c
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -298165,6 +298165,12 @@ SQLITE_PRIVATE int sqlite3PagerWalCallback(Pager *pPager){
+   (void)pPager;
+   return SQLITE_OK;
+ }
++#if defined(SQLITE_USE_SEH)
++SQLITE_PRIVATE int sqlite3PagerWalSystemErrno(Pager *pPager){
++  (void)pPager;
++  return 0;
++}
++#endif
+ SQLITE_PRIVATE int sqlite3PagerOpenWal(Pager *pPager, int *pisOpen){
+   return getPagerOps(pPager)->xOpenWal(pPager, pisOpen);
+ }
