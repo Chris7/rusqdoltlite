@@ -1,0 +1,26 @@
+Subject: [PATCH] Avoid POSIX strncasecmp in check constraint parsing
+
+MSVC does not provide strncasecmp. The amalgamation already exposes
+sqlite3_strnicmp, so use it for the case-insensitive keyword comparisons.
+
+diff --git a/doltlite.c b/doltlite.c
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -326457,7 +326457,7 @@ static int nextCheckClause(
+ 
+   while( *p ){
+     if( (p[0]=='C' || p[0]=='c')
+-     && strncasecmp(p, "CONSTRAINT", 10)==0
++     && sqlite3_strnicmp(p, "CONSTRAINT", 10)==0
+      && (p[10]==' ' || p[10]=='\t' || p[10]=='\n') ){
+       int i = 0;
+       p += 10;
+@@ -326469,7 +326469,7 @@ static int nextCheckClause(
+       continue;
+     }
+     if( (p[0]=='C' || p[0]=='c')
+-     && strncasecmp(p, "CHECK", 5)==0
++     && sqlite3_strnicmp(p, "CHECK", 5)==0
+      && (p[5]==' ' || p[5]=='\t' || p[5]=='(' || p[5]=='\n') ){
+       p += 5;
+       while( *p==' ' || *p=='\t' || *p=='\n' ) p++;
