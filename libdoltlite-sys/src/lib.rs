@@ -3,6 +3,7 @@
 pub use self::error::*;
 
 use core::mem;
+#[cfg(not(feature = "loadable_extension"))]
 use core::sync::atomic::{AtomicI32, Ordering};
 
 mod error;
@@ -69,12 +70,22 @@ mod remote {
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 pub use remote::*;
 
+#[cfg(not(feature = "loadable_extension"))]
 unsafe extern "C" {
     fn doltliteInstallAutoExt() -> core::ffi::c_int;
 }
 
+#[cfg(not(feature = "loadable_extension"))]
 static DOLTLITE_INIT_RESULT: AtomicI32 = AtomicI32::new(i32::MIN);
 
+#[cfg(feature = "loadable_extension")]
+pub fn initialize_doltlite() -> core::ffi::c_int {
+    // A loadable extension receives its SQLite API from the host process; it
+    // cannot link against, nor install, DoltLite's process-wide auto-extension.
+    SQLITE_OK
+}
+
+#[cfg(not(feature = "loadable_extension"))]
 pub fn initialize_doltlite() -> core::ffi::c_int {
     let existing = DOLTLITE_INIT_RESULT.load(Ordering::Acquire);
     if existing != i32::MIN {
