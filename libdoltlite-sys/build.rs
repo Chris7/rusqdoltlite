@@ -207,10 +207,9 @@ mod build_bundled {
                 .flag("-D_WASI_EMULATED_SIGNAL")
                 .flag("-D_WASI_EMULATED_PROCESS_CLOCKS");
 
-            assert!(
-                !cfg!(feature = "wasm32-wasi-vfs"),
-                "wasm32-wasi-vfs is not available with the bundled DoltLite backend"
-            );
+            if cfg!(feature = "wasm32-wasi-vfs") {
+                panic!("wasm32-wasi-vfs is not available with the bundled DoltLite backend");
+            }
         }
         if cfg!(feature = "unlock_notify") {
             cfg.flag("-DSQLITE_ENABLE_UNLOCK_NOTIFY");
