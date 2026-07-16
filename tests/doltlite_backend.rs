@@ -1,6 +1,7 @@
 #![cfg(feature = "bundled")]
 
 use std::ffi::CStr;
+use std::fs;
 
 use rusqlite::{ffi, Connection, Result};
 
@@ -28,5 +29,27 @@ fn bundled_backend_registers_doltlite_engine_function() -> Result<()> {
         "unexpected DoltLite engine {engine:?}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn bundled_backend_persists_in_gen_directory() -> Result<()> {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let gen_dir = temp.path().join(".gen");
+    fs::create_dir(&gen_dir).expect("create .gen directory");
+    let path = gen_dir.join("default.db");
+
+    {
+        let db = Connection::open(&path)?;
+        db.execute_batch(
+            "CREATE TABLE defaults (id INTEGER PRIMARY KEY); INSERT INTO defaults VALUES (1);",
+        )?;
+    }
+
+    let db = Connection::open(path)?;
+    assert_eq!(
+        1,
+        db.query_row("SELECT id FROM defaults", [], |row| row.get::<_, i64>(0))?
+    );
     Ok(())
 }

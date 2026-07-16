@@ -1390,13 +1390,6 @@ mod test {
         Ok(())
     }
 
-    #[cfg_attr(
-        any(
-            target_os = "windows",
-            all(target_family = "wasm", target_os = "unknown")
-        ),
-        ignore = "DoltLite file-backed persistence is not supported on this platform"
-    )]
     #[test]
     fn test_persistence() -> Result<()> {
         let temp_dir = tempfile::tempdir().unwrap();
