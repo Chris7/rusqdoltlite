@@ -211,6 +211,18 @@ mod build_bundled {
                 panic!("wasm32-wasi-vfs is not available with the bundled DoltLite backend");
             }
         }
+        if env::var("TARGET").is_ok_and(|v| v.contains("emscripten")) {
+            // The amalgamation's unix VFS section has `<fcntl.h>` commented out
+            // unconditionally ("standard include files", ahead of unixOpen/
+            // unixFileLock and the syscall table). glibc/BSD libc headers leak
+            // open()/fcntl()/O_CREAT/struct flock declarations transitively
+            // through other includes, masking this on macOS/Linux, but
+            // Emscripten's musl libc does not, so the same code fails to compile
+            // there with a string of "undeclared identifier" errors. Force-
+            // including the header (rather than patching the amalgamation) fixes
+            // it with no behavior change on other targets, where it's a no-op.
+            cfg.flag("-include").flag("fcntl.h");
+        }
         if cfg!(feature = "unlock_notify") {
             cfg.flag("-DSQLITE_ENABLE_UNLOCK_NOTIFY");
         }
