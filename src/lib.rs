@@ -1342,8 +1342,11 @@ mod test {
     }
 
     #[cfg_attr(
-        all(target_family = "wasm", target_os = "unknown"),
-        ignore = "no filesystem on this platform"
+        any(
+            target_os = "windows",
+            all(target_family = "wasm", target_os = "unknown")
+        ),
+        ignore = "DoltLite file-backed concurrency is not supported on this platform"
     )]
     #[test]
     fn test_concurrent_transactions_busy_commit() -> Result<()> {
@@ -1388,8 +1391,11 @@ mod test {
     }
 
     #[cfg_attr(
-        all(target_family = "wasm", target_os = "unknown"),
-        ignore = "no filesystem on this platform"
+        any(
+            target_os = "windows",
+            all(target_family = "wasm", target_os = "unknown")
+        ),
+        ignore = "DoltLite file-backed persistence is not supported on this platform"
     )]
     #[test]
     fn test_persistence() -> Result<()> {
