@@ -80,8 +80,8 @@ static DOLTLITE_INIT_RESULT: AtomicI32 = AtomicI32::new(i32::MIN);
 
 #[cfg(feature = "loadable_extension")]
 pub fn initialize_doltlite() -> core::ffi::c_int {
-    // A loadable extension receives its SQLite API from the host process; it
-    // cannot link against, nor install, DoltLite's process-wide auto-extension.
+    // A loadable extension runs inside an already-initialized host process;
+    // do not load DoltLite's process-wide auto-extension a second time.
     SQLITE_OK
 }
 
