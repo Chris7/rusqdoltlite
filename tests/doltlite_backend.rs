@@ -18,8 +18,7 @@ fn bundled_backend_reports_doltlite_source_id() {
 
 #[test]
 fn bundled_backend_registers_doltlite_engine_function() -> Result<()> {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let db = Connection::open(temp_dir.path().join("backend-probe.db"))?;
+    let db = Connection::open_in_memory()?;
     db.execute_batch("CREATE TABLE backend_probe(id INTEGER PRIMARY KEY);")?;
 
     let engine: String = db.query_row("SELECT doltlite_engine()", [], |row| row.get(0))?;
