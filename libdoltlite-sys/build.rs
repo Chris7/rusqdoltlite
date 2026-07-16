@@ -103,6 +103,14 @@ mod build_bundled {
         let mut cfg = cc::Build::new();
         cfg.file(patched_source);
 
+        // DoltLite's amalgamation includes both Windows headers used by
+        // SQLite and Winsock2 headers used by the remote implementation.
+        // Without this, <windows.h> may include legacy <winsock.h>, which
+        // conflicts with <winsock2.h> on current Windows SDKs.
+        if win_target() {
+            cfg.define("WIN32_LEAN_AND_MEAN", None);
+        }
+
         let remote_supported = cfg!(feature = "remote")
             && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"));
         if remote_supported {
