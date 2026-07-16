@@ -1306,7 +1306,9 @@ impl InterruptHandle {
     }
 }
 
-#[cfg(doctest)]
+// The README example uses `RemoteServer`, which is available only with the
+// optional `remote` feature.
+#[cfg(all(doctest, feature = "remote"))]
 doc_comment::doctest!("../README.md");
 
 #[cfg(all(test, not(miri)))]
