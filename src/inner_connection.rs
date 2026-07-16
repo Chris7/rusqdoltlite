@@ -71,9 +71,12 @@ impl InnerConnection {
         vfs: Option<&CStr>,
     ) -> Result<Self> {
         ensure_safe_sqlite_threading_mode()?;
-        let r = ffi::initialize_doltlite();
-        if r != ffi::SQLITE_OK {
-            return Err(err!(r, "failed to initialize DoltLite"));
+        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+        {
+            let r = ffi::initialize_doltlite();
+            if r != ffi::SQLITE_OK {
+                return Err(err!(r, "failed to initialize DoltLite"));
+            }
         }
 
         let z_vfs = match vfs {

@@ -829,13 +829,19 @@ mod test {
             assert!(rows.next()?.is_some()); // start reading
             assert_eq!(TransactionState::Read, db.transaction_state::<&str>(None)?);
             db.execute("INSERT INTO t VALUES (1)", [])?; // auto-commit
-            if cfg!(feature = "bundled") {
+            if cfg!(all(
+                feature = "bundled",
+                not(all(target_family = "wasm", target_os = "unknown"))
+            )) {
                 assert_eq!(TransactionState::None, db.transaction_state::<&str>(None)?);
             } else {
                 assert_eq!(TransactionState::Read, db.transaction_state::<&str>(None)?);
             }
             assert!(rows.next()?.is_some()); // still reading
-            if cfg!(feature = "bundled") {
+            if cfg!(all(
+                feature = "bundled",
+                not(all(target_family = "wasm", target_os = "unknown"))
+            )) {
                 assert_eq!(TransactionState::None, db.transaction_state::<&str>(None)?);
             } else {
                 assert_eq!(TransactionState::Read, db.transaction_state::<&str>(None)?);

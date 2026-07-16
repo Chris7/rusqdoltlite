@@ -1346,7 +1346,10 @@ mod test {
         let db = Connection::open_in_memory()?;
         db.pragma_update(None, "encoding", "UTF-16le")?;
         let encoding: String = db.pragma_query_value(None, "encoding", |row| row.get(0))?;
-        if cfg!(feature = "bundled") {
+        if cfg!(all(
+            feature = "bundled",
+            not(all(target_family = "wasm", target_os = "unknown"))
+        )) {
             assert_eq!("UTF-8", encoding);
         } else {
             assert_eq!("UTF-16le", encoding);
