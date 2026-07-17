@@ -275392,10 +275392,15 @@ static int csCanonicalFilename(
 
   rc = sqlite3OsFullPathname(pVfs, zFilename, nPath, zFull);
 #if SQLITE_OS_WIN
-  /* Windows reopens must use the caller's name, not xFullPathname output. */
-  if( rc==SQLITE_OK ){
-    sqlite3_free(zFull);
-    return chunkStoreDupFilenameDoubleNul(zFilename, pzOut);
+  if( rc==SQLITE_OK || rc==SQLITE_OK_SYMLINK ){
+    if( !(zFull[0]=='\\' && zFull[1]=='\\'
+       && (zFull[2]=='?' || zFull[2]=='.') && zFull[3]=='\\') ){
+      char *z = zFull;
+      while( *z ){
+        if( *z=='\\' ) *z = '/';
+        z++;
+      }
+    }
   }
 #endif
   if( rc==SQLITE_OK || rc==SQLITE_OK_SYMLINK ){
@@ -275980,11 +275985,45 @@ int chunkStoreFindBranch(ChunkStore *cs, const char *zName, ProllyHash *pCommit)
   return SQLITE_OK;
 }
 
+/* True when the on-disk store provably matches this handle's in-memory
+** state: same inode (a peer gc replaces the file), physical size equal to
+** the in-memory committed extent (the store is append-only, so any peer
+** commit or crash garbage grows it), and a sealed tail root record carrying
+** this handle's live refs hash (so uncommitted local ref changes, or any
+** size-coincident rewrite, force the slow path). */
+static int csDiskStateMatchesMemory(ChunkStore *cs){
+  int bMoved = 0;
+  i64 contentEnd;
+  i64 physSize = 0;
+  u8 aRoot[1 + CHUNK_MANIFEST_SIZE];
+  if( cs->file.pFile==0 ) return 0;
+  if( cs->wal.nWalData < 1 + CHUNK_MANIFEST_SIZE ) return 0;
+  if( sqlite3OsFileControl(cs->file.pFile, SQLITE_FCNTL_HAS_MOVED,
+                           &bMoved)!=SQLITE_OK || bMoved ){
+    return 0;
+  }
+  contentEnd = cs->wal.iWalOffset + cs->wal.nWalData;
+  if( sqlite3OsFileSize(cs->file.pFile, &physSize)!=SQLITE_OK
+   || physSize!=contentEnd ){
+    return 0;
+  }
+  if( sqlite3OsRead(cs->file.pFile, aRoot, (int)sizeof(aRoot),
+                    contentEnd - (i64)sizeof(aRoot))!=SQLITE_OK ){
+    return 0;
+  }
+  return aRoot[0]==CS_WAL_TAG_ROOT
+      && csManifestHashState(aRoot+1)==CS_MANIFEST_HASH_OK
+      && memcmp(aRoot + 1 + CS_MANIFEST_REFS_HASH_OFF,
+                cs->refs.refsHash.data, PROLLY_HASH_SIZE)==0;
+}
+
 /* Read zName's committed tip straight from disk into *pTip, leaving this
 ** store's in-memory state untouched. Opens a throwaway view of the file (as
 ** csReloadFromDisk does) so a commit/merge head-CAS sees a peer's advance even
 ** when its force-refresh is suppressed (a reentrant lock holder, or a WAL-reuse
-** commit the file-size heuristic misses). *pFound is 0 if the branch is absent.
+** commit the file-size heuristic misses). When the tail root record proves the
+** disk still matches this handle's state, the in-memory tip IS the disk tip
+** and the throwaway open is skipped. *pFound is 0 if the branch is absent.
 ** Caller must hold the chunk-store lock. */
 int chunkStoreReadDiskBranchTip(ChunkStore *cs, const char *zName,
                                 ProllyHash *pTip, int *pFound){
@@ -275993,6 +276032,11 @@ int chunkStoreReadDiskBranchTip(ChunkStore *cs, const char *zName,
 
   *pFound = 0;
   if( cs->isMemory || !cs->file.zFilename ){
+    if( chunkStoreFindBranch(cs, zName, pTip)==SQLITE_OK ) *pFound = 1;
+    return SQLITE_OK;
+  }
+
+  if( csDiskStateMatchesMemory(cs) ){
     if( chunkStoreFindBranch(cs, zName, pTip)==SQLITE_OK ) *pFound = 1;
     return SQLITE_OK;
   }
@@ -277436,6 +277480,13 @@ int chunkStoreForceRefresh(ChunkStore *cs){
   ** under the outer scope's already-current view, so a multi-step VC op that
   ** holds the lock across sub-operations keeps the in-memory state it builds. */
   if( cs->lockDepth != 1 ) return SQLITE_OK;
+  /* Fast path: when the tail root record proves the on-disk store still
+  ** matches this handle's state, the reload — which replays the entire WAL —
+  ** is a no-op and can be skipped. Local uncommitted appends fall through so
+  ** the reload path keeps reporting SQLITE_BUSY_SNAPSHOT. */
+  if( cs->staging.nRecentUncommitted==0 && csDiskStateMatchesMemory(cs) ){
+    return SQLITE_OK;
+  }
   /* Reload even under a pinned snapshot — the VC write needs the true on-disk
   ** branch tips. Unpin around it (the heuristic refresh path suppresses reloads
   ** while pinned), then restore the pin. */
@@ -287367,11 +287418,16 @@ static int appendFallbackSchemaCatalogRows(
   for(i=0; i<nTables; i++){
     SchemaEntry *pSe = 0;
     SchemaCatalogRow *pRow;
-    if( aTables[i].iTable<=1 || !aTables[i].zName ) continue;
+    if( aTables[i].iTable<=1 ) continue;
     if( schemaCatalogHasPgno(aRows, nRows, aTables[i].iTable) ) continue;
     for(j=0; j<nFallback; j++){
       if( !aFallback[j].zName || !aFallback[j].zType ) continue;
-      if( strcmp(aFallback[j].zName, aTables[i].zName)!=0 ) continue;
+      if( aTables[i].zName ){
+        if( strcmp(aFallback[j].zName, aTables[i].zName)!=0 ) continue;
+      }else{
+        if( strcmp(aFallback[j].zType, "index")!=0 ) continue;
+        if( aFallback[j].iRootpage!=aTables[i].iTable ) continue;
+      }
       pSe = &aFallback[j];
       break;
     }
@@ -287469,6 +287525,131 @@ int doltliteSerializeCatalogEntries(
 ){
   return doltliteSerializeCatalogEntriesWithFallbackSchema(
       db, aTables, nTables, 0, 0, ppOut, pnOut);
+}
+
+/* Build a master root for a NAMED staging operation. Rows follow the
+** source of their object's staging: table and index rows for objects
+** named in this operation (azTouched — the staged tables, staged drops,
+** and a staged vtab's shadows) come from the working master, everything
+** else — other tables' rows, view and trigger rows — keeps the
+** previously staged state. Wholesale working adoption leaked unstaged
+** schema changes of untouched objects into the commit; taking only the
+** touched objects' rows keeps the numbering domain of the freshly staged
+** entries while leaving the rest of the staged picture alone. A touched
+** name with no working rows is a staged drop: its old rows simply vanish. */
+int doltliteBuildNamedStageMasterRoot(
+  sqlite3 *db,
+  const ProllyHash *pWorkingMaster, u8 workingFlags,
+  const ProllyHash *pOldMaster, u8 oldFlags,
+  const char **azTouched, int nTouched,
+  ProllyHash *pNewRoot
+){
+  Btree *pBtree;
+  struct TableEntry m;
+  SchemaCatalogRow *aWork = 0, *aOld = 0;
+  int nWork = 0, nOld = 0;
+  ProllyHash ignoreRoot;
+  u8 ignoreFlags;
+  ProllyMutMap mm;
+  struct TableEntry masterEntry;
+  i64 iRowid = 1;
+  int i, t, rc;
+
+  if( !db || db->nDb<=0 || !db->aDb[0].pBt ) return SQLITE_ERROR;
+  pBtree = db->aDb[0].pBt;
+  memset(pNewRoot, 0, sizeof(*pNewRoot));
+
+  memset(&m, 0, sizeof(m));
+  m.iTable = 1;
+  m.root = *pWorkingMaster;
+  m.flags = workingFlags;
+  rc = loadSchemaCatalogRows(pBtree, &m, 1, &aWork, &nWork,
+                             &ignoreRoot, &ignoreFlags);
+  if( rc!=SQLITE_OK ) return rc;
+  if( pOldMaster && !prollyHashIsEmpty(pOldMaster) ){
+    m.root = *pOldMaster;
+    m.flags = oldFlags;
+    rc = loadSchemaCatalogRows(pBtree, &m, 1, &aOld, &nOld,
+                               &ignoreRoot, &ignoreFlags);
+    if( rc!=SQLITE_OK ){
+      freeSchemaCatalogRows(aWork, nWork);
+      return rc;
+    }
+  }
+
+  memset(&mm, 0, sizeof(mm));
+  rc = prollyMutMapInit(&mm, 1);
+  if( rc!=SQLITE_OK ){
+    freeSchemaCatalogRows(aWork, nWork);
+    freeSchemaCatalogRows(aOld, nOld);
+    return rc;
+  }
+  for(i=0; i<nWork+nOld && rc==SQLITE_OK; i++){
+    SchemaCatalogRow *pRow = i<nWork ? &aWork[i] : &aOld[i-nWork];
+    int fromWorking = i<nWork;
+    int isEntryless;
+    int touched = 0;
+    const char *zParent;
+    Pgno iPg;
+    u8 *pRec;
+    int nRec = 0;
+
+    if( !pRow->zType ) continue;
+    isEntryless = strcmp(pRow->zType, "view")==0
+               || strcmp(pRow->zType, "trigger")==0;
+    if( isEntryless ){
+      if( fromWorking ) continue;      /* views/triggers keep staged state */
+    }else{
+      zParent = strcmp(pRow->zType, "index")==0
+                  ? pRow->zTblName : pRow->zName;
+      for(t=0; t<nTouched; t++){
+        if( zParent && azTouched[t]
+         && strcmp(zParent, azTouched[t])==0 ){
+          touched = 1;
+          break;
+        }
+      }
+      if( fromWorking != touched ) continue;
+    }
+    /* Staged entries whose name exists in working are aligned to the
+    ** working table number, so old-sourced table rows must carry that
+    ** number too, or the composed rows collide across numbering domains
+    ** and no longer pair with their entries. Index entries are unnamed
+    ** and never aligned; their rows keep the old number. */
+    iPg = pRow->oldPg;
+    if( !fromWorking && strcmp(pRow->zType, "table")==0 && pRow->zName ){
+      for(t=0; t<nWork; t++){
+        if( aWork[t].zType && strcmp(aWork[t].zType, "table")==0
+         && aWork[t].zName && strcmp(aWork[t].zName, pRow->zName)==0 ){
+          iPg = aWork[t].oldPg;
+          break;
+        }
+      }
+    }
+    pRec = buildSchemaCatalogRecord(pRow->zType, pRow->zName,
+                                    pRow->zTblName, iPg,
+                                    pRow->zSql, &nRec);
+    if( !pRec ){
+      rc = SQLITE_NOMEM;
+      break;
+    }
+    rc = prollyMutMapInsert(&mm, 0, 0, iRowid++, pRec, nRec);
+    sqlite3_free(pRec);
+  }
+  freeSchemaCatalogRows(aWork, nWork);
+  freeSchemaCatalogRows(aOld, nOld);
+  if( rc!=SQLITE_OK ){
+    prollyMutMapFree(&mm);
+    return rc;
+  }
+
+  memset(&masterEntry, 0, sizeof(masterEntry));
+  masterEntry.iTable = 1;
+  masterEntry.flags = workingFlags;
+  rc = applyMutMapToTableRoot(pBtree->pBt, &masterEntry, &mm);
+  prollyMutMapFree(&mm);
+  if( rc==SQLITE_OK ) *pNewRoot = masterEntry.root;
+  return rc;
 }
 
 static int doltliteSerializeCatalogEntriesForBtreeImpl(
@@ -287658,6 +287839,15 @@ static int doltliteSerializeCatalogEntriesForBtreeImpl(
              && strcmp(aRows[j].zName, aTables[i].zName)!=0 ){
               continue;
             }
+            /* Constructed arrays can mix numbering domains, and an
+            ** unnamed entry is always an index: a bare number match
+            ** against a table row is a cross-domain collision, not a
+            ** pairing. */
+            if( !bLiveCatalog
+             && !aTables[i].zName
+             && aRows[j].zType && strcmp(aRows[j].zType, "index")!=0 ){
+              continue;
+            }
             pRow = &aRows[j];
             break;
           }
@@ -287694,6 +287884,50 @@ static int doltliteSerializeCatalogEntriesForBtreeImpl(
     }
     qsort(aSorted, nTables, sizeof(CatalogSerializeEntry), catalogSerializeEntryCmp);
   }
+
+#ifdef DOLTLITE_PROLLY_CHECK
+  /* Two structural failures are detectable at write time regardless of
+  ** intent: an entry that pairs with no schema row and no live meta has
+  ** lost its identity crossing catalog numbering domains, and two entries
+  ** sharing a number would make the serialized catalog ambiguous. Both
+  ** are write-time signatures of the unnamed-entry overlay bug class —
+  ** fail fast instead of publishing the catalog. Only CONSTRUCTED arrays
+  ** (staging, merge, reset) are checked: that is where the overlay bugs
+  ** live, while the LIVE catalog can legitimately reach these states
+  ** through writable_schema vandalism that stock tolerates (deleted or
+  ** rootpage-aliased schema rows). A missing entry for an emitted row
+  ** cannot be checked at all: the row filter intentionally expresses
+  ** subset catalogs, so absence is indistinguishable from a staged
+  ** drop. */
+  for(i=0; aTables!=pBtree->cat.a && i<nTables; i++){
+    if( aSorted[i].iTable<=1 ) continue;
+    if( aSorted[i].zType && strcmp(aSorted[i].zType, "unknown")==0 ){
+      fprintf(stderr,
+        "doltlite: catalog invariant violated: entry %u (%s) pairs with no "
+        "schema row or live meta\n",
+        (unsigned)aSorted[i].iTable,
+        aSorted[i].zName && aSorted[i].zName[0] ? aSorted[i].zName : "unnamed");
+      sqlite3_log(SQLITE_CORRUPT,
+        "catalog entry invariant violated: unpairable entry %u",
+        (unsigned)aSorted[i].iTable);
+      abort();
+    }
+    for(j=i+1; j<nTables; j++){
+      if( aSorted[j].iTable==aSorted[i].iTable ){
+        fprintf(stderr,
+          "doltlite: catalog invariant violated: duplicate entry number %u "
+          "(%s / %s)\n",
+          (unsigned)aSorted[i].iTable,
+          aSorted[i].zName ? aSorted[i].zName : "unnamed",
+          aSorted[j].zName ? aSorted[j].zName : "unnamed");
+        sqlite3_log(SQLITE_CORRUPT,
+          "catalog entry invariant violated: duplicate entry %u",
+          (unsigned)aSorted[i].iTable);
+        abort();
+      }
+    }
+  }
+#endif
 
   for(i=0; i<nTables; i++){
     int nType = aSorted[i].zType ? (int)strlen(aSorted[i].zType) : 0;
@@ -296758,23 +296992,16 @@ void doltliteGetSessionConflictsCatalog(sqlite3 *db, ProllyHash *pHash){
     }
   }
   if( db->autoCommit && sqlite3_txn_state(db, "main")==SQLITE_TXN_NONE ){
-    sqlite3 *db2 = 0;
-    const char *zFilename = sqlite3_db_filename(db, "main");
-    if( zFilename && sqlite3_open_v2(zFilename, &db2, SQLITE_OPEN_READONLY, 0)==SQLITE_OK
-        && db2 && db2->nDb>0 && db2->aDb[0].pBt ){
-      Btree *p2 = db2->aDb[0].pBt;
-      Btree *p = db->aDb[0].pBt;
-      const char *zBr = p->zBranch ? p->zBranch : "main";
-      int rc = btreeLoadWorkingSetBlob(&p2->pBt->store, zBr,
-                                       0, 0, 0, &isMerging,
-                                       0, pHash, 0, 0, 0, 0, 0, 0);
-      sqlite3_close(db2);
-      if( rc!=SQLITE_OK || !isMerging ){
-        memset(pHash, 0, sizeof(*pHash));
-      }
-      return;
+    /* Idle sessions must see the DURABLE working set, not this session's
+    ** cached view. A locked refresh (cheap when the store is unchanged)
+    ** gives the in-memory read below the same guarantee the throwaway
+    ** read-only connection this used to open per call did — without paying
+    ** a full store open and WAL replay every time. */
+    ChunkStore *pStore = &db->aDb[0].pBt->pBt->store;
+    if( chunkStoreLockAndRefresh(pStore)==SQLITE_OK ){
+      (void)chunkStoreForceRefresh(pStore);
+      chunkStoreUnlock(pStore);
     }
-    if( db2 ) sqlite3_close(db2);
   }
   {
     Btree *p = db->aDb[0].pBt;
@@ -300828,7 +301055,17 @@ int doltliteMergeCatalogs(sqlite3 *db,
     const ProllyHash *theirs, ProllyHash *pMergedHash,
     int *pnConflicts, char **pzErrMsg,
     SchemaMergeAction **ppActions, int *pnActions,
-    int bPreferOurMaster);
+    int bPreferOurMaster,
+    char ***pazReindex, int *pnReindex);
+void doltliteFreeNameList(char **az, int n);
+int doltliteIndexSchemaRowsDifferForTable(SchemaEntry *aA, int nA,
+    SchemaEntry *aB, int nB, const char *zTable);
+int doltliteBuildNamedStageMasterRoot(sqlite3 *db,
+    const ProllyHash *pWorkingMaster, u8 workingFlags,
+    const ProllyHash *pOldMaster, u8 oldFlags,
+    const char **azTouched, int nTouched,
+    ProllyHash *pNewRoot);
+int doltliteReindexNamedIndexes(sqlite3 *db, char **az, int n);
 
 struct ProllyDiffChange;
 
@@ -300967,6 +301204,7 @@ extern int doltliteRegisterDiffTables(sqlite3 *db);
 extern int doltliteRegisterWorkspaceTables(sqlite3 *db);
 extern int doltliteAncestorRegister(sqlite3 *db);
 extern int doltliteRegisterAtTables(sqlite3 *db);
+extern int doltliteRegisterAtTablesForCatalog(sqlite3 *db, const ProllyHash *pCatHash);
 extern int doltliteRegisterHistoryTables(sqlite3 *db);
 extern int doltliteRegisterBlameTables(sqlite3 *db);
 extern int doltliteRefreshConstraintViolationTables(sqlite3 *db);
@@ -301681,7 +301919,7 @@ static int addAppendTableEntry(
   if( pEntry->zName ){
     zDup = sqlite3_mprintf("%s", pEntry->zName);
     if( !zDup ){
-      sqlite3_result_error_nomem(context);
+      if( context ) sqlite3_result_error_nomem(context);
       return SQLITE_NOMEM;
     }
   }
@@ -301689,7 +301927,7 @@ static int addAppendTableEntry(
       *paEntries, (*pnEntries + 1) * (int)sizeof(struct TableEntry));
   if( !aNew ){
     sqlite3_free(zDup);
-    sqlite3_result_error_nomem(context);
+    if( context ) sqlite3_result_error_nomem(context);
     return SQLITE_NOMEM;
   }
   *paEntries = aNew;
@@ -301884,6 +302122,58 @@ static int addWriteStagedCatalog(
   return rc;
 }
 
+/* True when the two catalogs' index schema rows for zTable differ: any
+** index added, dropped, re-targeted, or redefined. Index changes carry no
+** named catalog entry, so every surface that reports per-table change
+** (status, the diff summary) attributes them through this comparison. */
+int doltliteIndexSchemaRowsDifferForTable(
+  SchemaEntry *aA, int nA,
+  SchemaEntry *aB, int nB,
+  const char *zTable
+){
+  int i, j, nMatchA = 0, nBForTable = 0;
+  for(i=0; i<nA; i++){
+    int found = 0;
+    if( !aA[i].zType || strcmp(aA[i].zType, "index")!=0
+     || !aA[i].zTblName || strcmp(aA[i].zTblName, zTable)!=0 ){
+      continue;
+    }
+    for(j=0; j<nB; j++){
+      if( aB[j].zType && strcmp(aB[j].zType, "index")==0
+       && aB[j].zTblName && strcmp(aB[j].zTblName, zTable)==0
+       && aB[j].zName && aA[i].zName
+       && strcmp(aB[j].zName, aA[i].zName)==0
+       && ((aB[j].zSql==0)==(aA[i].zSql==0))
+       && (aB[j].zSql==0 || strcmp(aB[j].zSql, aA[i].zSql)==0) ){
+        found = 1;
+        break;
+      }
+    }
+    if( !found ) return 1;
+    nMatchA++;
+  }
+  for(j=0; j<nB; j++){
+    if( aB[j].zType && strcmp(aB[j].zType, "index")==0
+     && aB[j].zTblName && strcmp(aB[j].zTblName, zTable)==0 ){
+      nBForTable++;
+    }
+  }
+  return nMatchA!=nBForTable;
+}
+
+/* True when the final staged entry list contains a table entry named
+** zTbl. Index entries follow their parent table through -a staging, and
+** the parent's presence decides whether an index entry belongs at all. */
+static int amTableStagedByName(struct TableEntry *aStaged, int nStaged,
+                               const char *zTbl){
+  int i;
+  if( !zTbl ) return 0;
+  for(i=0; i<nStaged; i++){
+    if( aStaged[i].zName && strcmp(aStaged[i].zName, zTbl)==0 ) return 1;
+  }
+  return 0;
+}
+
 static int addStageAllTables(
   sqlite3 *db,
   sqlite3_context *context,
@@ -301995,6 +302285,182 @@ static int addStageAllTables(
   return rc;
 }
 
+/* Remove unnamed (index) staged entries whose parent table is zTable,
+** resolving parents through the staged catalog's own schema rows — entry
+** numbers do not carry across catalogs. */
+static void addRemoveIndexEntriesOfTable(
+  struct TableEntry *aStaged,
+  int *pnStaged,
+  SchemaEntry *aStagedSchema,
+  int nStagedSchema,
+  const char *zTable
+){
+  int j, i;
+  for(j=0; j<*pnStaged; ){
+    const char *zParent = 0;
+    if( aStaged[j].iTable<=1 || aStaged[j].zName ){ j++; continue; }
+    for(i=0; i<nStagedSchema; i++){
+      if( aStagedSchema[i].zType
+       && strcmp(aStagedSchema[i].zType, "index")==0
+       && aStagedSchema[i].iRootpage==aStaged[j].iTable ){
+        zParent = aStagedSchema[i].zTblName;
+        break;
+      }
+    }
+    if( !zParent || strcmp(zParent, zTable)!=0 ){ j++; continue; }
+    sqlite3_free(aStaged[j].zName);
+    if( j+1<*pnStaged ){
+      memmove(&aStaged[j], &aStaged[j+1],
+              (*pnStaged-j-1)*(int)sizeof(struct TableEntry));
+    }
+    (*pnStaged)--;
+  }
+}
+
+/* Stage zTable's index entries from the working catalog alongside its
+** table entry: an index travels with its table through staging. */
+static int addAppendIndexEntriesOfTable(
+  sqlite3_context *context,
+  struct TableEntry **paStaged,
+  int *pnStaged,
+  struct TableEntry *aWorking,
+  int nWorking,
+  SchemaEntry *aWorkSchema,
+  int nWorkSchema,
+  const char *zTable
+){
+  int i, j, rc;
+  for(i=0; i<nWorkSchema; i++){
+    if( !aWorkSchema[i].zType
+     || strcmp(aWorkSchema[i].zType, "index")!=0
+     || aWorkSchema[i].iRootpage<=1
+     || !aWorkSchema[i].zTblName
+     || strcmp(aWorkSchema[i].zTblName, zTable)!=0 ){
+      continue;
+    }
+    for(j=0; j<nWorking; j++){
+      if( aWorking[j].iTable==aWorkSchema[i].iRootpage
+       && aWorking[j].zName==0 ){
+        rc = addAppendTableEntry(context, paStaged, pnStaged, &aWorking[j]);
+        if( rc!=SQLITE_OK ) return rc;
+        break;
+      }
+    }
+  }
+  return SQLITE_OK;
+}
+
+/* Virtual tables persist through their shadow tables: staging a vtab by
+** name must carry the shadows (and their indexes) along, exactly as index
+** entries travel with ordinary tables. */
+static int addStageShadowTablesOf(
+  sqlite3 *db,
+  sqlite3_context *context,
+  struct TableEntry **paStaged,
+  int *pnStaged,
+  struct TableEntry *aWorking,
+  int nWorking,
+  SchemaEntry *aWorkSchema,
+  int nWorkSchema,
+  SchemaEntry *aStagedSchema,
+  int nStagedSchema,
+  const char *zTable
+){
+  Table *pTab;
+  int i, k, rc;
+
+  pTab = sqlite3FindTable(db, zTable, "main");
+  if( !pTab || !IsVirtual(pTab) ) return SQLITE_OK;
+
+  for(i=0; i<nWorkSchema; i++){
+    struct TableEntry *pWork;
+    int updated = 0;
+    if( !aWorkSchema[i].zType
+     || strcmp(aWorkSchema[i].zType, "table")!=0
+     || !aWorkSchema[i].zName
+     || strcmp(aWorkSchema[i].zName, zTable)==0
+     || !sqlite3IsShadowTableOf(db, pTab, aWorkSchema[i].zName) ){
+      continue;
+    }
+    pWork = doltliteFindTableByName(aWorking, nWorking, aWorkSchema[i].zName);
+    if( !pWork ) continue;
+    for(k=0; k<*pnStaged; k++){
+      if( (*paStaged)[k].zName
+       && strcmp((*paStaged)[k].zName, pWork->zName)==0 ){
+        char *zDup = sqlite3_mprintf("%s", pWork->zName);
+        if( !zDup ) return SQLITE_NOMEM;
+        sqlite3_free((*paStaged)[k].zName);
+        (*paStaged)[k] = *pWork;
+        (*paStaged)[k].zName = zDup;
+        updated = 1;
+        break;
+      }
+    }
+    if( !updated ){
+      rc = addAppendTableEntry(context, paStaged, pnStaged, pWork);
+      if( rc!=SQLITE_OK ) return rc;
+    }
+    addRemoveIndexEntriesOfTable(*paStaged, pnStaged,
+                                 aStagedSchema, nStagedSchema,
+                                 pWork->zName);
+    rc = addAppendIndexEntriesOfTable(context, paStaged, pnStaged,
+                                      aWorking, nWorking,
+                                      aWorkSchema, nWorkSchema,
+                                      pWork->zName);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  return SQLITE_OK;
+}
+
+/* Remove staged entries for shadow tables of a dropped virtual table. The
+** vtab is gone from the live schema, so shadows are identified through the
+** staged catalog's own rows: table rows prefixed "<zTable>_" whose parent
+** row is a CREATE VIRTUAL TABLE statement and which no longer exist in
+** working. */
+static void addRemoveShadowEntriesOfDroppedVtab(
+  struct TableEntry *aStaged,
+  int *pnStaged,
+  SchemaEntry *aStagedSchema,
+  int nStagedSchema,
+  struct TableEntry *aWorking,
+  int nWorking,
+  const char *zTable
+){
+  SchemaEntry *pParent;
+  size_t nPrefix;
+  int i, k;
+
+  pParent = findSchemaEntry(aStagedSchema, nStagedSchema, zTable);
+  if( !pParent || !pParent->zSql
+   || sqlite3_strnicmp(pParent->zSql, "CREATE VIRTUAL", 14)!=0 ){
+    return;
+  }
+  nPrefix = strlen(zTable);
+  for(i=0; i<nStagedSchema; i++){
+    if( !aStagedSchema[i].zType
+     || strcmp(aStagedSchema[i].zType, "table")!=0
+     || !aStagedSchema[i].zName
+     || sqlite3_strnicmp(aStagedSchema[i].zName, zTable, (int)nPrefix)!=0
+     || aStagedSchema[i].zName[nPrefix]!='_'
+     || doltliteFindTableByName(aWorking, nWorking, aStagedSchema[i].zName) ){
+      continue;
+    }
+    for(k=0; k<*pnStaged; ){
+      if( aStaged[k].zName
+       && strcmp(aStaged[k].zName, aStagedSchema[i].zName)==0 ){
+        sqlite3_free(aStaged[k].zName);
+        if( k+1<*pnStaged ){
+          memmove(&aStaged[k], &aStaged[k+1],
+                  (*pnStaged-k-1)*(int)sizeof(struct TableEntry));
+        }
+        (*pnStaged)--;
+        continue;
+      }
+      k++;
+    }
+  }
+}
+
 static int addStageNamedTables(
   sqlite3 *db,
   sqlite3_context *context,
@@ -302011,12 +302477,64 @@ static int addStageNamedTables(
   int updateMaster = 0;
   int rc;
 
+  SchemaEntry *aWorkSchema = 0;
+  SchemaEntry *aStagedSchema = 0;
+  int nWorkSchema = 0;
+  int nStagedSchema = 0;
+  /* Objects whose master rows follow WORKING in this operation: the named
+  ** tables (adds and staged drops) plus a staged vtab's shadows. Names are
+  ** borrowed from the argv values and schema arrays, which outlive use. */
+  char **azTouched = 0;
+  int nTouched = 0;
+
+  #define ADDNAMED_FREE_ALL() do { \
+    int ft_; \
+    for(ft_=0; ft_<nTouched; ft_++) sqlite3_free(azTouched[ft_]); \
+    sqlite3_free((void*)azTouched); \
+    freeSchemaEntries(aWorkSchema, nWorkSchema); \
+    freeSchemaEntries(aStagedSchema, nStagedSchema); \
+    doltliteFreeCatalog(aWorking, nWorking); \
+    doltliteFreeCatalog(aStaged, nStaged); \
+  } while(0)
+
+  #define ADDNAMED_TOUCH(zN) do { \
+    char **azNew = sqlite3_realloc((void*)azTouched, \
+        (nTouched+1)*(int)sizeof(char*)); \
+    char *zOwn_ = azNew ? sqlite3_mprintf("%s", (zN)) : 0; \
+    if( azNew ) azTouched = azNew; \
+    if( !azNew || !zOwn_ ){ \
+      ADDNAMED_FREE_ALL(); \
+      sqlite3_result_error_nomem(context); \
+      return SQLITE_NOMEM; \
+    } \
+    azTouched[nTouched++] = zOwn_; \
+  } while(0)
+
   rc = addLoadWorkingAndStagedCatalogs(db, pWorkingHash,
                                        &aWorking, &nWorking,
                                        &aStaged, &nStaged);
   if( rc!=SQLITE_OK ){
     sqlite3_result_error(context, "failed to load staged catalog", -1);
     return rc;
+  }
+
+  {
+    ProllyHash stagedSrc;
+    doltliteGetSessionStaged(db, &stagedSrc);
+    if( prollyHashIsEmpty(&stagedSrc) ){
+      (void)doltliteGetHeadCatalogHash(db, &stagedSrc);
+    }
+    rc = loadSchemaFromCatalog(db, cs, doltliteGetCache(db), pWorkingHash,
+                               &aWorkSchema, &nWorkSchema);
+    if( rc==SQLITE_OK && !prollyHashIsEmpty(&stagedSrc) ){
+      rc = loadSchemaFromCatalog(db, cs, doltliteGetCache(db), &stagedSrc,
+                                 &aStagedSchema, &nStagedSchema);
+    }
+    if( rc!=SQLITE_OK ){
+      ADDNAMED_FREE_ALL();
+      sqlite3_result_error(context, "failed to load schema for staging", -1);
+      return rc;
+    }
   }
 
   for(i=0; i<argc; i++){
@@ -302029,11 +302547,41 @@ static int addStageNamedTables(
       int ignored = 0;
       rc = addCheckIgnore(db, context, zTable, &ignored);
       if( rc!=SQLITE_OK ){
-        doltliteFreeCatalog(aWorking, nWorking);
-        doltliteFreeCatalog(aStaged, nStaged);
+        ADDNAMED_FREE_ALL();
         return rc;
       }
       if( ignored ) continue;
+    }
+
+    /* Virtual tables carry no catalog entry of their own (schema row
+    ** only), so the entry-based flow below cannot see them: their commit
+    ** content IS the shadow tables. Stage those, and adopt the working
+    ** master so the vtab's schema row travels too. */
+    {
+      Table *pLive = sqlite3FindTable(db, zTable, "main");
+      if( pLive && IsVirtual(pLive) ){
+        int w;
+        rc = addStageShadowTablesOf(db, context, &aStaged, &nStaged,
+                                    aWorking, nWorking,
+                                    aWorkSchema, nWorkSchema,
+                                    aStagedSchema, nStagedSchema, zTable);
+        if( rc!=SQLITE_OK ){
+          ADDNAMED_FREE_ALL();
+          return rc;
+        }
+        ADDNAMED_TOUCH(zTable);
+        for(w=0; w<nWorkSchema; w++){
+          if( aWorkSchema[w].zType
+           && strcmp(aWorkSchema[w].zType, "table")==0
+           && aWorkSchema[w].zName
+           && strcmp(aWorkSchema[w].zName, zTable)!=0
+           && sqlite3IsShadowTableOf(db, pLive, aWorkSchema[w].zName) ){
+            ADDNAMED_TOUCH(aWorkSchema[w].zName);
+          }
+        }
+        updateMaster = 1;
+        continue;
+      }
     }
 
     rc = doltliteResolveTableName(db, zTable, &iTable);
@@ -302046,6 +302594,11 @@ static int addStageNamedTables(
           found = 1;
           break;
         }
+      }
+      if( !found && findSchemaEntry(aStagedSchema, nStagedSchema, zTable) ){
+        /* A dropped virtual table has a staged schema row but no entry;
+        ** the master adoption below stages the row's removal. */
+        found = 1;
       }
       if( found ){
         for(j=0; j<nStaged; ){
@@ -302066,12 +302619,17 @@ static int addStageNamedTables(
           }
           j++;
         }
+        addRemoveIndexEntriesOfTable(aStaged, &nStaged,
+                                     aStagedSchema, nStagedSchema, zTable);
+        addRemoveShadowEntriesOfDroppedVtab(aStaged, &nStaged,
+                                            aStagedSchema, nStagedSchema,
+                                            aWorking, nWorking, zTable);
+        ADDNAMED_TOUCH(zTable);
         updateMaster = 1;
       }
       if( !found ){
         char *zErr = sqlite3_mprintf("table not found: %s", zTable);
-        doltliteFreeCatalog(aWorking, nWorking);
-        doltliteFreeCatalog(aStaged, nStaged);
+        ADDNAMED_FREE_ALL();
         if( zErr ){
           sqlite3_result_error(context, zErr, -1);
           sqlite3_free(zErr);
@@ -302088,20 +302646,50 @@ static int addStageNamedTables(
         int k;
         int updated = 0;
         for(k=0; k<nStaged; k++){
-          if( aStaged[k].iTable==iTable
-           || (aStaged[k].zName && aWorking[j].zName
-               && strcmp(aStaged[k].zName, aWorking[j].zName)==0) ){
+          int nameMatch = aStaged[k].zName && aWorking[j].zName
+            && strcmp(aStaged[k].zName, aWorking[j].zName)==0;
+          int rootMatch = aStaged[k].iTable==iTable;
+          /* An unnamed staged entry on a bare number match can be a
+          ** cross-domain collision with an index entry; pair only when
+          ** the staged catalog's own schema rows say the entry at this
+          ** number is this very table. */
+          int unnamedRootMatch = 0;
+          int renameRootMatch = rootMatch
+            && aStaged[k].zName && aWorking[j].zName
+            && strcmp(aStaged[k].zName, aWorking[j].zName)!=0
+            && !addFindEntryByName(aWorking, nWorking, aStaged[k].zName)
+            && !addFindEntryByName(aStaged, nStaged, aWorking[j].zName);
+          if( rootMatch && !aStaged[k].zName && aWorking[j].zName ){
+            int r;
+            for(r=0; r<nStagedSchema; r++){
+              if( aStagedSchema[r].iRootpage==aStaged[k].iTable
+               && aStagedSchema[r].zType
+               && strcmp(aStagedSchema[r].zType, "table")==0
+               && aStagedSchema[r].zName
+               && strcmp(aStagedSchema[r].zName, aWorking[j].zName)==0 ){
+                unnamedRootMatch = 1;
+                break;
+              }
+            }
+          }
+          if( nameMatch || unnamedRootMatch || renameRootMatch ){
             int schemaChanged =
               prollyHashCompare(&aStaged[k].schemaHash, &aWorking[j].schemaHash)!=0;
             int nameChanged =
               (!aStaged[k].zName) != (!aWorking[j].zName)
               || (aStaged[k].zName && aWorking[j].zName
                   && strcmp(aStaged[k].zName, aWorking[j].zName)!=0);
-            char *zDup = aWorking[j].zName
+            char *zDup;
+            /* A rename retires the old name: its rows (and its indexes'
+            ** rows, keyed by the old tbl_name) must follow WORKING too,
+            ** where they no longer exist. */
+            if( nameChanged && aStaged[k].zName ){
+              ADDNAMED_TOUCH(aStaged[k].zName);
+            }
+            zDup = aWorking[j].zName
                            ? sqlite3_mprintf("%s", aWorking[j].zName) : 0;
             if( aWorking[j].zName && !zDup ){
-              doltliteFreeCatalog(aWorking, nWorking);
-              doltliteFreeCatalog(aStaged, nStaged);
+              ADDNAMED_FREE_ALL();
               sqlite3_result_error_nomem(context);
               return SQLITE_NOMEM;
             }
@@ -302119,11 +302707,30 @@ static int addStageNamedTables(
           updateMaster = 1;
           rc = addAppendTableEntry(context, &aStaged, &nStaged, &aWorking[j]);
           if( rc!=SQLITE_OK ){
-            doltliteFreeCatalog(aWorking, nWorking);
-            doltliteFreeCatalog(aStaged, nStaged);
+            ADDNAMED_FREE_ALL();
             return rc;
           }
         }
+        /* An index travels with its table: replace whatever index entries
+        ** the staged catalog carried for this table with the working ones. */
+        addRemoveIndexEntriesOfTable(aStaged, &nStaged,
+                                     aStagedSchema, nStagedSchema, zTable);
+        rc = addAppendIndexEntriesOfTable(context, &aStaged, &nStaged,
+                                          aWorking, nWorking,
+                                          aWorkSchema, nWorkSchema, zTable);
+        if( rc!=SQLITE_OK ){
+          ADDNAMED_FREE_ALL();
+          return rc;
+        }
+        rc = addStageShadowTablesOf(db, context, &aStaged, &nStaged,
+                                    aWorking, nWorking,
+                                    aWorkSchema, nWorkSchema,
+                                    aStagedSchema, nStagedSchema, zTable);
+        if( rc!=SQLITE_OK ){
+          ADDNAMED_FREE_ALL();
+          return rc;
+        }
+        ADDNAMED_TOUCH(zTable);
         break;
       }
     }
@@ -302133,15 +302740,34 @@ static int addStageNamedTables(
     struct TableEntry *pWorkingMaster = doltliteFindTableByNumber(aWorking, nWorking, 1);
     struct TableEntry *pStagedMaster = doltliteFindTableByNumber(aStaged, nStaged, 1);
     if( pWorkingMaster ){
+      /* The staged master must share the working numbering domain, but a
+      ** wholesale adoption would carry unstaged view and trigger changes
+      ** into the commit (Dolt keeps them out of a named add). Compose the
+      ** master: table and index rows from working, view and trigger rows
+      ** from the previously staged state. */
+      ProllyHash composedRoot;
+      rc = doltliteBuildNamedStageMasterRoot(db,
+              &pWorkingMaster->root, pWorkingMaster->flags,
+              pStagedMaster ? &pStagedMaster->root : 0,
+              pStagedMaster ? pStagedMaster->flags : 0,
+              (const char**)azTouched, nTouched,
+              &composedRoot);
+      if( rc!=SQLITE_OK ){
+        ADDNAMED_FREE_ALL();
+        sqlite3_result_error_code(context, rc);
+        return rc;
+      }
       if( pStagedMaster ){
-        pStagedMaster->root = pWorkingMaster->root;
+        pStagedMaster->root = composedRoot;
         pStagedMaster->schemaHash = pWorkingMaster->schemaHash;
         pStagedMaster->flags = pWorkingMaster->flags;
       }else{
-        rc = addAppendTableEntry(context, &aStaged, &nStaged, pWorkingMaster);
+        struct TableEntry composed = *pWorkingMaster;
+        composed.zName = 0;
+        composed.root = composedRoot;
+        rc = addAppendTableEntry(context, &aStaged, &nStaged, &composed);
         if( rc!=SQLITE_OK ){
-          doltliteFreeCatalog(aWorking, nWorking);
-          doltliteFreeCatalog(aStaged, nStaged);
+          ADDNAMED_FREE_ALL();
           return rc;
         }
       }
@@ -302150,8 +302776,9 @@ static int addStageNamedTables(
 
   addAlignStagedEntriesToWorking(aWorking, nWorking, aStaged, nStaged);
   rc = addWriteStagedCatalog(db, cs, aStaged, nStaged);
-  doltliteFreeCatalog(aWorking, nWorking);
-  doltliteFreeCatalog(aStaged, nStaged);
+  ADDNAMED_FREE_ALL();
+  #undef ADDNAMED_TOUCH
+  #undef ADDNAMED_FREE_ALL
   if( rc!=SQLITE_OK ){
     sqlite3_result_error_code(context, rc);
   }
@@ -302618,6 +303245,132 @@ static void doltliteCommitFunc(
       k++;
     }
 
+    /* Index entries carry no name, so the by-name overlays above never
+    ** refresh them: the staged list still holds the old index roots under
+    ** tables whose data was just staged from working, committing a catalog
+    ** whose indexes disagree with their tables. Rebuild the unnamed
+    ** entries so each index follows its table's source: indexes of
+    ** working-sourced tables adopt the working entries, indexes kept for
+    ** staged-only tables stay, and indexes of deleted tables go away.
+    ** Parents resolve through each catalog's own schema rows because entry
+    ** numbers are meaningless across catalogs. */
+    {
+      SchemaEntry *aWorkSchema = 0, *aOldSchema = 0;
+      int nWorkSchema = 0, nOldSchema = 0;
+      const ProllyHash *pOldSrcHash =
+          !prollyHashIsEmpty(&stagedHash) ? &stagedHash : &headCatHash;
+      int i2, k2, nAppend = 0;
+
+      rc = loadSchemaFromCatalog(db, cs, doltliteGetCache(db), &workingHash,
+                                 &aWorkSchema, &nWorkSchema);
+      if( rc==SQLITE_OK && !prollyHashIsEmpty(pOldSrcHash) ){
+        rc = loadSchemaFromCatalog(db, cs, doltliteGetCache(db), pOldSrcHash,
+                                   &aOldSchema, &nOldSchema);
+      }
+      if( rc!=SQLITE_OK ){
+        freeSchemaEntries(aWorkSchema, nWorkSchema);
+        freeSchemaEntries(aOldSchema, nOldSchema);
+        sqlite3_result_error(context, "failed to load schema for staging", -1);
+        FREE_ADD_MODIFIED_CATALOGS();
+        return;
+      }
+
+      for(k2=0; k2<nStaged; ){
+        const char *zParent = 0;
+        const char *zIdxName = 0;
+        if( aStaged[k2].iTable<=1 || aStaged[k2].zName ){ k2++; continue; }
+        for(i2=0; i2<nOldSchema; i2++){
+          if( aOldSchema[i2].zType
+           && strcmp(aOldSchema[i2].zType, "index")==0
+           && aOldSchema[i2].iRootpage==aStaged[k2].iTable ){
+            zParent = aOldSchema[i2].zTblName;
+            zIdxName = aOldSchema[i2].zName;
+            break;
+          }
+        }
+        if( zParent
+         && amTableStagedByName(aStaged, nStaged, zParent)
+         && !(addNameIndexFind(&workingIdx, zParent)
+              && addNameIndexFind(&headIdx, zParent)) ){
+          /* Staged-sourced index: its table was staged explicitly and is
+          ** not refreshed from working, so the entry keeps the staged data
+          ** root — but its number is from the add-time catalog's domain,
+          ** which the serializer resolves against working-domain schema
+          ** rows. Renumber by index name so the row pairs; an index that
+          ** no longer exists in working falls through to the drop. */
+          int renumbered = 0;
+          for(i2=0; i2<nWorkSchema; i2++){
+            if( aWorkSchema[i2].zType
+             && strcmp(aWorkSchema[i2].zType, "index")==0
+             && aWorkSchema[i2].zName && zIdxName
+             && strcmp(aWorkSchema[i2].zName, zIdxName)==0 ){
+              aStaged[k2].iTable = aWorkSchema[i2].iRootpage;
+              renumbered = 1;
+              break;
+            }
+          }
+          if( renumbered ){
+            k2++;
+            continue;
+          }
+        }
+        sqlite3_free(aStaged[k2].zName);
+        if( k2+1<nStaged ){
+          memmove(&aStaged[k2], &aStaged[k2+1],
+                  (nStaged-k2-1)*(int)sizeof(struct TableEntry));
+        }
+        nStaged--;
+      }
+
+      for(i2=0; i2<nWorkSchema; i2++){
+        if( aWorkSchema[i2].zType
+         && strcmp(aWorkSchema[i2].zType, "index")==0
+         && aWorkSchema[i2].iRootpage>1
+         && aWorkSchema[i2].zTblName
+         && addNameIndexFind(&workingIdx, aWorkSchema[i2].zTblName)
+         && addNameIndexFind(&headIdx, aWorkSchema[i2].zTblName)
+         && amTableStagedByName(aStaged, nStaged, aWorkSchema[i2].zTblName) ){
+          nAppend++;
+        }
+      }
+      if( nAppend>0 && nStaged+nAppend>nStagedAlloc ){
+        struct TableEntry *aGrown = sqlite3_realloc(
+            aStaged, (nStaged+nAppend)*(int)sizeof(struct TableEntry));
+        if( !aGrown ){
+          freeSchemaEntries(aWorkSchema, nWorkSchema);
+          freeSchemaEntries(aOldSchema, nOldSchema);
+          sqlite3_result_error_nomem(context);
+          FREE_ADD_MODIFIED_CATALOGS();
+          return;
+        }
+        aStaged = aGrown;
+        nStagedAlloc = nStaged + nAppend;
+      }
+      for(i2=0; i2<nWorkSchema; i2++){
+        if( !aWorkSchema[i2].zType
+         || strcmp(aWorkSchema[i2].zType, "index")!=0
+         || aWorkSchema[i2].iRootpage<=1
+         || !aWorkSchema[i2].zTblName
+         || !addNameIndexFind(&workingIdx, aWorkSchema[i2].zTblName)
+         || !addNameIndexFind(&headIdx, aWorkSchema[i2].zTblName)
+         || !amTableStagedByName(aStaged, nStaged, aWorkSchema[i2].zTblName) ){
+          continue;
+        }
+        for(j=0; j<nWorking; j++){
+          if( aWorking[j].iTable==aWorkSchema[i2].iRootpage
+           && aWorking[j].zName==0 ){
+            aStaged[nStaged] = aWorking[j];
+            aStaged[nStaged].zName = 0;
+            nStaged++;
+            break;
+          }
+        }
+      }
+
+      freeSchemaEntries(aWorkSchema, nWorkSchema);
+      freeSchemaEntries(aOldSchema, nOldSchema);
+    }
+
     if( nStaged==0 ){
       sqlite3_result_error(context,
         "nothing to commit, working tree clean (use dolt_add to stage changes)", -1);
@@ -302862,7 +303615,7 @@ static void doltliteCommitFunc(
     sqlite3_result_error_code(context, rc);
     return;
   }
-  rc = doltliteRegisterAtTables(db);
+  rc = doltliteRegisterAtTablesForCatalog(db, &catalogHash);
   if( rc!=SQLITE_OK ){
     sqlite3_result_error_code(context, rc);
     return;
@@ -302959,6 +303712,8 @@ static int resetStageNamedPaths(
         goto done;
       }
       aStaged = aNew;
+      addRemoveIndexEntriesOfTable(aStaged, &nStaged,
+                                   aHeadSchema, nHeadSchema, zTable);
       zDup = aHead[iH].zName ? sqlite3_mprintf("%s", aHead[iH].zName) : 0;
       if( aHead[iH].zName && !zDup ){
         rc = SQLITE_NOMEM;
@@ -302968,6 +303723,11 @@ static int resetStageNamedPaths(
       aStaged[nStaged].zName = zDup;
       aStaged[nStaged].iTable = iNextFree++;
       nStaged++;
+      rc = addAppendIndexEntriesOfTable(0, &aStaged, &nStaged,
+                                        aHead, nHead,
+                                        aHeadSchema, nHeadSchema,
+                                        zTable);
+      if( rc!=SQLITE_OK ) goto done;
     }else{
       /* Take HEAD's content under the STAGED entry's number so the entry
       ** keeps pairing with the staged catalog's schema row. */
@@ -303694,9 +304454,12 @@ static void doltliteMergeFunc(
     char *zMergeErr = 0;
     SchemaMergeAction *aSchemaActions = 0;
     int nSchemaActions = 0;
+    char **azReindex = 0;
+    int nReindex = 0;
     rc = doltliteMergeCatalogs(db, &ancCatHash, &ourCatHash, &theirCatHash,
                                 &mergedCatHash, &nMergeConflicts, &zMergeErr,
-                                &aSchemaActions, &nSchemaActions, 0);
+                                &aSchemaActions, &nSchemaActions, 0,
+                                &azReindex, &nReindex);
     if( rc!=SQLITE_OK ){
       doltliteCommitClear(&ourCommit);
       doltliteCommitClear(&theirCommit);
@@ -303708,6 +304471,7 @@ static void doltliteMergeFunc(
       }
       doltliteTxnStateClear(&savedState);
       freeSchemaMergeActions(aSchemaActions, nSchemaActions);
+      doltliteFreeNameList(azReindex, nReindex);
       return;
     }
     sqlite3_free(zMergeErr);
@@ -303718,6 +304482,7 @@ static void doltliteMergeFunc(
       doltliteCommitClear(&ourCommit);
       doltliteCommitClear(&theirCommit);
       freeSchemaMergeActions(aSchemaActions, nSchemaActions);
+      doltliteFreeNameList(azReindex, nReindex);
       sqlite3_result_error(context,
         "merge conflict: another connection committed to this branch. Please retry your transaction.",
         -1);
@@ -303728,6 +304493,7 @@ static void doltliteMergeFunc(
       doltliteCommitClear(&ourCommit);
       doltliteCommitClear(&theirCommit);
       freeSchemaMergeActions(aSchemaActions, nSchemaActions);
+      doltliteFreeNameList(azReindex, nReindex);
       sqlite3_result_error_code(context, rc);
       return;
     }
@@ -303736,6 +304502,27 @@ static void doltliteMergeFunc(
     rc = doltliteSwitchCatalog(db, &mergedCatHash);
     doltliteCommitClear(&ourCommit);
     doltliteCommitClear(&theirCommit);
+    if( rc!=SQLITE_OK ){
+      if( graphLocked ){
+        chunkStoreUnlock(cs);
+        graphLocked = 0;
+      }
+      freeSchemaMergeActions(aSchemaActions, nSchemaActions);
+      doltliteFreeNameList(azReindex, nReindex);
+      sqlite3_result_error_code(context,
+          doltliteRestoreTxnStateOnFailure(db, &savedState, rc));
+      return;
+    }
+
+    /* Indexes adopted from the other branch carry only that branch's
+    ** rows; rebuild them over the merged tables while the merged catalog
+    ** is live so the flush below captures correct roots. */
+    if( nReindex>0 ){
+      rc = doltliteReindexNamedIndexes(db, azReindex, nReindex);
+    }
+    doltliteFreeNameList(azReindex, nReindex);
+    azReindex = 0;
+    nReindex = 0;
     if( rc!=SQLITE_OK ){
       if( graphLocked ){
         chunkStoreUnlock(cs);
@@ -304077,28 +304864,38 @@ static int applyMergedCatalogAndCommit(
   rc = doltliteSaveTxnState(db, &savedState);
   if( rc!=SQLITE_OK ) return rc;
 
-  rc = doltliteMergeCatalogs(db, ancCatHash, ourCatHash, theirCatHash,
-                              &mergedCatHash, pnConflicts, &zMergeErr, 0, 0,
-                              bPreferOurMaster);
-  if( rc!=SQLITE_OK ){
+  {
+    char **azReindex = 0;
+    int nReindex = 0;
+    rc = doltliteMergeCatalogs(db, ancCatHash, ourCatHash, theirCatHash,
+                                &mergedCatHash, pnConflicts, &zMergeErr, 0, 0,
+                                bPreferOurMaster, &azReindex, &nReindex);
+    if( rc!=SQLITE_OK ){
+      sqlite3_free(zMergeErr);
+      doltliteTxnStateClear(&savedState);
+      doltliteFreeNameList(azReindex, nReindex);
+      return rc;
+    }
     sqlite3_free(zMergeErr);
-    doltliteTxnStateClear(&savedState);
-    return rc;
+
+    rc = doltliteRefreshAndConfirmHead(db, cs, ourHead);
+    if( rc!=SQLITE_OK ){
+      doltliteTxnStateClear(&savedState);
+      doltliteFreeNameList(azReindex, nReindex);
+      return rc;
+    }
+    graphLocked = 1;
+
+    rc = doltliteSwitchCatalog(db, &mergedCatHash);
+    if( rc==SQLITE_OK ){
+      rc = doltlitePrimeSchemaCache(db);
+    }
+    if( rc==SQLITE_OK && nReindex>0 ){
+      rc = doltliteReindexNamedIndexes(db, azReindex, nReindex);
+    }
+    doltliteFreeNameList(azReindex, nReindex);
+    if( rc!=SQLITE_OK ) goto apply_rollback;
   }
-  sqlite3_free(zMergeErr);
-
-  rc = doltliteRefreshAndConfirmHead(db, cs, ourHead);
-  if( rc!=SQLITE_OK ){
-    doltliteTxnStateClear(&savedState);
-    return rc;
-  }
-  graphLocked = 1;
-
-  rc = doltliteSwitchCatalog(db, &mergedCatHash);
-  if( rc!=SQLITE_OK ) goto apply_rollback;
-
-  rc = doltlitePrimeSchemaCache(db);
-  if( rc!=SQLITE_OK ) goto apply_rollback;
 
   rc = doltliteFlushCatalogToHash(db, &liveMergedCatHash);
   if( rc==SQLITE_OK ){
@@ -305200,11 +305997,22 @@ static int rebaseApplyPlanRowCatalog(
     return rc;
   }
 
-  rc = doltliteMergeCatalogs(db, &parentC.catalogHash, pCurCat,
-                             &replayC.catalogHash, pMergedCat,
-                             &nConflicts, 0, 0, 0, 0);
-  if( rc==SQLITE_OK && nConflicts==0 ){
-    rc = doltliteSwitchCatalog(db, pMergedCat);
+  {
+    char **azReindex = 0;
+    int nReindex = 0;
+    rc = doltliteMergeCatalogs(db, &parentC.catalogHash, pCurCat,
+                               &replayC.catalogHash, pMergedCat,
+                               &nConflicts, 0, 0, 0, 0,
+                               &azReindex, &nReindex);
+    if( rc==SQLITE_OK && nConflicts==0 ){
+      rc = doltliteSwitchCatalog(db, pMergedCat);
+    }
+    if( rc==SQLITE_OK && nConflicts==0 && nReindex>0 ){
+      rc = doltliteReindexNamedIndexes(db, azReindex, nReindex);
+      if( rc==SQLITE_OK ) rc = doltliteFlushCatalogToHash(db, pMergedCat);
+      if( rc==SQLITE_OK ) rc = doltliteSwitchCatalog(db, pMergedCat);
+    }
+    doltliteFreeNameList(azReindex, nReindex);
   }
   if( rc==SQLITE_OK && nConflicts==0 && !bSkipConstraintDetect ){
     rc = doltliteDetectPostMergeConstraintViolations(db,
@@ -307105,10 +307913,13 @@ int doltliteCommitAncestorsRegister(sqlite3 *db){
 /* #include "sqliteInt.h" */
 /* #include "prolly_hash.h" */
 /* #include "prolly_cursor.h" */
+/* #include "prolly_diff.h" */
+/* #include "prolly_cache.h" */
 /* #include "chunk_store.h" */
 /* #include "doltlite_commit.h" */
 /* #include "doltlite_internal.h" */
 /* #include "doltlite_ignore.h" */
+/* #include "doltlite_record.h" */
 /* #include "prolly_cursor.h" */
 
 #define STATUS_IDX_STAGED_EQ 0x01
@@ -307325,6 +308136,208 @@ static int addRow(DoltliteStatusCursor *pCur, const char *zName,
   return SQLITE_OK;
 }
 
+static int statusSchemaRecordIsViewOrTrigger(const u8 *pRec, int nRec){
+  DoltliteRecordInfo ri;
+  int st, off, len;
+  const u8 *pBody;
+  if( !pRec || nRec<=0 ) return 0;
+  doltliteParseRecord(pRec, nRec, &ri);
+  if( ri.nField < 1 ) return 0;
+  st = ri.aType[0];
+  off = ri.aOffset[0];
+  if( st < 13 || (st & 1)==0 ) return 0;
+  len = (st - 13) / 2;
+  if( off < 0 || off + len > nRec ) return 0;
+  pBody = pRec + off;
+  if( len==4 && memcmp(pBody, "view", 4)==0 ) return 1;
+  if( len==7 && memcmp(pBody, "trigger", 7)==0 ) return 1;
+  return 0;
+}
+
+static int statusSchemaHasViewOrTrigger(sqlite3 *db,
+                                        const ProllyHash *pRoot,
+                                        u8 flags){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  ProllyCache *pCache = doltliteGetCache(db);
+  ProllyCursor cur;
+  int rc, res;
+  int found = 0;
+  if( !cs || !pCache ) return 0;
+  if( prollyHashIsEmpty(pRoot) ) return 0;
+  prollyCursorInit(&cur, cs, pCache, pRoot, flags);
+  rc = prollyCursorFirst(&cur, &res);
+  if( rc!=SQLITE_OK || res ){
+    prollyCursorClose(&cur);
+    return 0;
+  }
+  while( prollyCursorIsValid(&cur) ){
+    const u8 *pVal;
+    int nVal;
+    prollyCursorValue(&cur, &pVal, &nVal);
+    if( statusSchemaRecordIsViewOrTrigger(pVal, nVal) ){
+      found = 1;
+      break;
+    }
+    if( prollyCursorNext(&cur)!=SQLITE_OK ) break;
+  }
+  prollyCursorClose(&cur);
+  return found;
+}
+
+static int statusSchemaHasViewOrTriggerDiff(sqlite3 *db,
+                                            const ProllyHash *pOldRoot,
+                                            const ProllyHash *pNewRoot,
+                                            u8 flags){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  ProllyCache *pCache = doltliteGetCache(db);
+  ProllyDiffIter iter;
+  ProllyDiffChange *pChange = 0;
+  int rc;
+  int found = 0;
+  if( !cs || !pCache ) return 0;
+  if( prollyHashCompare(pOldRoot, pNewRoot)==0 ) return 0;
+  rc = prollyDiffIterOpen(&iter, cs, pCache, pOldRoot, pNewRoot, flags);
+  if( rc!=SQLITE_OK ) return 0;
+  while( (rc = prollyDiffIterStep(&iter, &pChange))==SQLITE_ROW && pChange ){
+    if( statusSchemaRecordIsViewOrTrigger(pChange->pNewVal, pChange->nNewVal)
+     || statusSchemaRecordIsViewOrTrigger(pChange->pOldVal, pChange->nOldVal) ){
+      found = 1;
+      break;
+    }
+  }
+  prollyDiffIterClose(&iter);
+  return found;
+}
+
+static int statusCompareDoltSchemas(
+  DoltliteStatusCursor *pCur,
+  sqlite3 *db,
+  struct TableEntry *aFrom,
+  int nFrom,
+  struct TableEntry *aTo,
+  int nTo,
+  int staged,
+  const char *zFilter
+){
+  ProllyHash emptyRoot;
+  const ProllyHash *pOldRoot;
+  const ProllyHash *pNewRoot;
+  struct TableEntry *pOldMaster;
+  struct TableEntry *pNewMaster;
+  u8 flags;
+  int oldHas;
+  int newHas;
+
+  if( zFilter && strcmp(zFilter, "dolt_schemas")!=0 ) return SQLITE_OK;
+
+  memset(&emptyRoot, 0, sizeof(emptyRoot));
+  pOldMaster = doltliteFindTableByNumber(aFrom, nFrom, 1);
+  pNewMaster = doltliteFindTableByNumber(aTo, nTo, 1);
+  if( !pOldMaster && !pNewMaster ) return SQLITE_OK;
+
+  pOldRoot = pOldMaster ? &pOldMaster->root : &emptyRoot;
+  pNewRoot = pNewMaster ? &pNewMaster->root : &emptyRoot;
+  flags = pNewMaster ? pNewMaster->flags : pOldMaster->flags;
+
+  if( !statusSchemaHasViewOrTriggerDiff(db, pOldRoot, pNewRoot, flags) ){
+    return SQLITE_OK;
+  }
+
+  oldHas = statusSchemaHasViewOrTrigger(db, pOldRoot, flags);
+  newHas = statusSchemaHasViewOrTrigger(db, pNewRoot, flags);
+  if( !oldHas && newHas ){
+    return addRow(pCur, "dolt_schemas", staged, "new table");
+  }
+  if( oldHas && !newHas ){
+    return addRow(pCur, "dolt_schemas", staged, "deleted");
+  }
+  return addRow(pCur, "dolt_schemas", staged, "modified");
+}
+
+static int statusRowExists(
+  DoltliteStatusCursor *pCur,
+  const char *zName,
+  int staged
+){
+  int i;
+  for(i=0; i<pCur->nRows; i++){
+    if( pCur->aRows[i].staged==staged
+     && pCur->aRows[i].zName
+     && strcmp(pCur->aRows[i].zName, zName)==0 ){
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int statusMaybeAddParentSchemaChange(
+  DoltliteStatusCursor *pCur,
+  const char *zParent,
+  int staged,
+  const char *zFilter
+){
+  if( !zParent ) return SQLITE_OK;
+  if( zFilter && strcmp(zFilter, zParent)!=0 ) return SQLITE_OK;
+  if( statusRowExists(pCur, zParent, staged) ) return SQLITE_OK;
+  return addRow(pCur, zParent, staged, "modified");
+}
+
+static int statusCompareIndexSchemaObjects(
+  DoltliteStatusCursor *pCur,
+  sqlite3 *db,
+  const ProllyHash *pFromCat,
+  const ProllyHash *pToCat,
+  int staged,
+  const char *zFilter
+){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  ProllyCache *pCache = doltliteGetCache(db);
+  SchemaEntry *aFrom = 0;
+  SchemaEntry *aTo = 0;
+  int nFrom = 0;
+  int nTo = 0;
+  int i, j;
+  int rc;
+
+  if( !cs || !pCache ) return SQLITE_OK;
+  rc = loadSchemaFromCatalog(db, cs, pCache, pFromCat, &aFrom, &nFrom);
+  if( rc!=SQLITE_OK ) goto index_schema_done;
+  rc = loadSchemaFromCatalog(db, cs, pCache, pToCat, &aTo, &nTo);
+  if( rc!=SQLITE_OK ) goto index_schema_done;
+
+  /* One comparison per distinct parent table across both row sets; the
+  ** shared comparator decides whether that table's index set changed. */
+  for(i=0; i<nFrom+nTo; i++){
+    SchemaEntry *pRow = i<nFrom ? &aFrom[i] : &aTo[i-nFrom];
+    int seen = 0;
+    if( !pRow->zType || strcmp(pRow->zType, "index")!=0
+     || !pRow->zTblName ){
+      continue;
+    }
+    for(j=0; j<i; j++){
+      SchemaEntry *pPrev = j<nFrom ? &aFrom[j] : &aTo[j-nFrom];
+      if( pPrev->zType && strcmp(pPrev->zType, "index")==0
+       && pPrev->zTblName
+       && strcmp(pPrev->zTblName, pRow->zTblName)==0 ){
+        seen = 1;
+        break;
+      }
+    }
+    if( seen ) continue;
+    if( doltliteIndexSchemaRowsDifferForTable(aFrom, nFrom, aTo, nTo,
+                                              pRow->zTblName) ){
+      rc = statusMaybeAddParentSchemaChange(pCur, pRow->zTblName,
+                                            staged, zFilter);
+      if( rc!=SQLITE_OK ) goto index_schema_done;
+    }
+  }
+
+index_schema_done:
+  freeSchemaEntries(aFrom, nFrom);
+  freeSchemaEntries(aTo, nTo);
+  return rc;
+}
+
 static int statusLoadLiveTableSql(
   sqlite3 *db,
   const char *zName,
@@ -307474,6 +308487,7 @@ rename_done:
 
 static int compareCatalogs(
   DoltliteStatusCursor *pCur, sqlite3 *db,
+  const ProllyHash *pFromCat, const ProllyHash *pToCat,
   struct TableEntry *aFrom, int nFrom,
   struct TableEntry *aTo, int nTo,
   int staged
@@ -307514,6 +308528,10 @@ static int compareCatalogs(
       }
     }
   }
+
+  rc = statusCompareDoltSchemas(pCur, db, aFrom, nFrom, aTo, nTo,
+                                staged, 0);
+  if( rc!=SQLITE_OK ) goto compare_done;
 
   for(i=0; i<nTo; i++){
     struct TableEntry *pFrom;
@@ -307578,7 +308596,8 @@ static int compareCatalogs(
       if( rc!=SQLITE_OK ) goto compare_done;
     }
   }
-  rc = SQLITE_OK;
+  rc = statusCompareIndexSchemaObjects(pCur, db, pFromCat, pToCat,
+                                       staged, 0);
 
 compare_done:
   statusCatalogIndexFree(&fromIdx);
@@ -307641,6 +308660,7 @@ static int statusInitPairIndexes(
 
 static int compareCatalogsFiltered(
   DoltliteStatusCursor *pCur, sqlite3 *db,
+  const ProllyHash *pFromCat, const ProllyHash *pToCat,
   struct TableEntry *aFrom, int nFrom,
   struct TableEntry *aTo, int nTo,
   int staged,
@@ -307657,12 +308677,21 @@ static int compareCatalogsFiltered(
   #define DOLT_STATUS_RENAME_CAP 4096
   useRename = (nFrom <= DOLT_STATUS_RENAME_CAP && nTo <= DOLT_STATUS_RENAME_CAP);
 
-  if( !zFilter ) return compareCatalogs(pCur, db, aFrom, nFrom, aTo, nTo, staged);
+  if( !zFilter ){
+    return compareCatalogs(pCur, db, pFromCat, pToCat,
+                           aFrom, nFrom, aTo, nTo, staged);
+  }
+
+  if( strcmp(zFilter, "dolt_schemas")==0 ){
+    return statusCompareDoltSchemas(pCur, db, aFrom, nFrom, aTo, nTo,
+                                    staged, zFilter);
+  }
 
   if( statusHasUnnamedUserTable(aFrom, nFrom)
    || statusHasUnnamedUserTable(aTo, nTo) ){
     int nStart = pCur->nRows;
-    rc = compareCatalogs(pCur, db, aFrom, nFrom, aTo, nTo, staged);
+    rc = compareCatalogs(pCur, db, pFromCat, pToCat,
+                         aFrom, nFrom, aTo, nTo, staged);
     if( rc==SQLITE_OK ){
       int i, j = nStart;
       for(i=nStart; i<pCur->nRows; i++){
@@ -307776,7 +308805,8 @@ check_deleted:
       if( rc!=SQLITE_OK ) goto filtered_done;
     }
   }
-  rc = SQLITE_OK;
+  rc = statusCompareIndexSchemaObjects(pCur, db, pFromCat, pToCat,
+                                       staged, zFilter);
 
 filtered_done:
   if( idxInit ){
@@ -307882,7 +308912,8 @@ static int statusFilter(sqlite3_vtab_cursor *pCursor,
     rc = doltliteLoadCatalog(db, &stagedCatHash, &aStaged, &nStaged, 0);
     if( rc != SQLITE_OK ) goto status_done;
     stagedLoaded = 1;
-    rc = compareCatalogsFiltered(pCur, db, aHead, nHead, aStaged, nStaged,
+    rc = compareCatalogsFiltered(pCur, db, &headCatHash, &stagedCatHash,
+                                 aHead, nHead, aStaged, nStaged,
                                  1, zTableFilter);
     if( rc != SQLITE_OK ) goto status_done;
   }
@@ -307913,8 +308944,9 @@ static int statusFilter(sqlite3_vtab_cursor *pCursor,
       rc = doltliteLoadCatalog(db, &workingCatHash, &aWorking, &nWorking, 0);
       if( rc != SQLITE_OK ) goto status_done;
       workingLoaded = 1;
-      rc = compareCatalogsFiltered(pCur, db, aBase, nBase,
-                                   aWorking, nWorking, 0, zTableFilter);
+      rc = compareCatalogsFiltered(pCur, db, &baseCatHash, &workingCatHash,
+                                   aBase, nBase, aWorking, nWorking,
+                                   0, zTableFilter);
       if( rc != SQLITE_OK ) goto status_done;
     }
   }
@@ -308298,6 +309330,20 @@ static int batchAppend(DoltliteDiffCursor *pCur,
   return SQLITE_OK;
 }
 
+static int loadIndexSchemaRows(
+  sqlite3 *db,
+  const ProllyHash *pCatHash,
+  SchemaEntry **ppRows,
+  int *pnRows
+){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  *ppRows = 0;
+  *pnRows = 0;
+  if( !cs || !pCatHash || prollyHashIsEmpty(pCatHash) ) return SQLITE_OK;
+  return loadSchemaFromCatalog(db, cs, doltliteGetCache(db), pCatHash,
+                               ppRows, pnRows);
+}
+
 static int diffFilteredTableRoots(
   DoltliteDiffCursor *pCur,
   sqlite3 *db,
@@ -308340,13 +309386,30 @@ static int diffFilteredTableRoots(
   if( !childFound || !parentFound ){
     return batchAppend(pCur, zHex, pCur->zFilterTable, pCommit, 1, 1);
   }
-  if( prollyHashCompare(&childRoot, &parentRoot)==0
-   && prollyHashCompare(&childSchema, &parentSchema)==0 ){
-    return SQLITE_OK;
+  {
+    u8 dataChange = prollyHashCompare(&childRoot, &parentRoot)!=0;
+    u8 schemaChange = prollyHashCompare(&childSchema, &parentSchema)!=0;
+    if( !schemaChange ){
+      SchemaEntry *aChildRows = 0, *aParentRows = 0;
+      int nChildRows = 0, nParentRows = 0;
+      rc = loadIndexSchemaRows(db, pChildCat, &aChildRows, &nChildRows);
+      if( rc==SQLITE_OK ){
+        rc = loadIndexSchemaRows(db, pParentCat, &aParentRows, &nParentRows);
+      }
+      if( rc==SQLITE_OK
+       && doltliteIndexSchemaRowsDifferForTable(aChildRows, nChildRows,
+                                  aParentRows, nParentRows,
+                                  pCur->zFilterTable) ){
+        schemaChange = 1;
+      }
+      freeSchemaEntries(aChildRows, nChildRows);
+      freeSchemaEntries(aParentRows, nParentRows);
+      if( rc!=SQLITE_OK ) return rc;
+    }
+    if( !dataChange && !schemaChange ) return SQLITE_OK;
+    return batchAppend(pCur, zHex, pCur->zFilterTable, pCommit,
+                       dataChange, schemaChange);
   }
-  return batchAppend(pCur, zHex, pCur->zFilterTable, pCommit,
-                     prollyHashCompare(&childRoot, &parentRoot)!=0,
-                     prollyHashCompare(&childSchema, &parentSchema)!=0);
 }
 
 /* Fast path for table_name constrained scans. */
@@ -308410,6 +309473,8 @@ static int diffCatalogPair(
   DoltliteDiffCursor *pCur, sqlite3 *db,
   struct TableEntry *aChild, int nChild,
   struct TableEntry *aParent, int nParent,
+  SchemaEntry *aChildRows, int nChildRows,
+  SchemaEntry *aParentRows, int nParentRows,
   const char *zHex, const DoltliteCommit *pCommit
 ){
   int rc = SQLITE_OK, i;
@@ -308436,6 +309501,9 @@ static int diffCatalogPair(
       ProllyHash emptyRoot;
       const ProllyHash *pOldRoot;
       struct TableEntry *pOldMaster;
+      /* Only the master entry carries schema rows; unnamed index entries
+      ** are attributed to their tables through the row comparison below. */
+      if( e->iTable!=1 ) continue;
       memset(&emptyRoot, 0, sizeof(emptyRoot));
       pOldMaster = doltliteFindTableByNumber(aParent, nParent, 1);
       pOldRoot = pOldMaster ? &pOldMaster->root : &emptyRoot;
@@ -308455,6 +309523,11 @@ static int diffCatalogPair(
     }else{
       dataChange   = (prollyHashCompare(&e->root, &p->root) != 0) ? 1 : 0;
       schemaChange = (prollyHashCompare(&e->schemaHash, &p->schemaHash) != 0) ? 1 : 0;
+      if( !schemaChange
+       && doltliteIndexSchemaRowsDifferForTable(aChildRows, nChildRows,
+                                  aParentRows, nParentRows, e->zName) ){
+        schemaChange = 1;
+      }
       if( !dataChange && !schemaChange ) continue;
     }
     rc = batchAppend(pCur, zHex, e->zName, pCommit, dataChange, schemaChange);
@@ -308508,7 +309581,21 @@ static int computeWorkingBatch(DoltliteDiffCursor *pCur, sqlite3 *db){
   memset(zHexBuf, 0, sizeof(zHexBuf));
   memcpy(zHexBuf, zWorkingHex, sizeof(zWorkingHex));
 
-  rc = diffCatalogPair(pCur, db, aWork, nWork, aHead, nHead, zHexBuf, 0);
+  {
+    SchemaEntry *aWorkRows = 0, *aHeadRows = 0;
+    int nWorkRows = 0, nHeadRows = 0;
+    rc = loadIndexSchemaRows(db, &workCat, &aWorkRows, &nWorkRows);
+    if( rc==SQLITE_OK ){
+      rc = loadIndexSchemaRows(db, &headCat, &aHeadRows, &nHeadRows);
+    }
+    if( rc==SQLITE_OK ){
+      rc = diffCatalogPair(pCur, db, aWork, nWork, aHead, nHead,
+                           aWorkRows, nWorkRows, aHeadRows, nHeadRows,
+                           zHexBuf, 0);
+    }
+    freeSchemaEntries(aWorkRows, nWorkRows);
+    freeSchemaEntries(aHeadRows, nHeadRows);
+  }
 
   doltliteFreeCatalog(aHead, nHead);
   doltliteFreeCatalog(aWork, nWork);
@@ -308550,8 +309637,32 @@ static int computeCommitBatch(DoltliteDiffCursor *pCur, sqlite3 *db,
     }
   }
 
-  rc = diffCatalogPair(pCur, db, aChild, nChild, aParent, nParent,
-                       zCommitHex, pCommit);
+  {
+    SchemaEntry *aChildRows = 0, *aParentRows = 0;
+    int nChildRows = 0, nParentRows = 0;
+    ProllyHash parentCat;
+    memset(&parentCat, 0, sizeof(parentCat));
+    if( hasParent ){
+      rc = doltliteCommitCatalogHash(db, pParentHash, &parentCat);
+      if( rc!=SQLITE_OK ){
+        doltliteFreeCatalog(aChild, nChild);
+        doltliteFreeCatalog(aParent, nParent);
+        return rc;
+      }
+    }
+    rc = loadIndexSchemaRows(db, &pCommit->catalogHash,
+                             &aChildRows, &nChildRows);
+    if( rc==SQLITE_OK && hasParent ){
+      rc = loadIndexSchemaRows(db, &parentCat, &aParentRows, &nParentRows);
+    }
+    if( rc==SQLITE_OK ){
+      rc = diffCatalogPair(pCur, db, aChild, nChild, aParent, nParent,
+                           aChildRows, nChildRows, aParentRows, nParentRows,
+                           zCommitHex, pCommit);
+    }
+    freeSchemaEntries(aChildRows, nChildRows);
+    freeSchemaEntries(aParentRows, nParentRows);
+  }
 
   doltliteFreeCatalog(aChild, nChild);
   doltliteFreeCatalog(aParent, nParent);
@@ -311542,6 +312653,34 @@ static int checkoutMutateRefs(sqlite3 *db, ChunkStore *cs, void *pArg){
   return rc;
 }
 
+static int checkoutCreateFromRemoteTracking(
+  sqlite3 *db,
+  const char *zBranch
+){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  const TrackingBranch *aTk = 0;
+  int nTk = 0;
+  int i;
+  int iMatch = -1;
+  BranchMutationCtx m;
+
+  if( !cs || strchr(zBranch, '/')!=0 ) return SQLITE_NOTFOUND;
+  refsTableGetTracking(&cs->refs, &nTk, &aTk);
+  for(i=0; i<nTk; i++){
+    if( aTk[i].zBranch && strcmp(aTk[i].zBranch, zBranch)==0 ){
+      if( iMatch>=0 ) return SQLITE_NOTFOUND;
+      iMatch = i;
+    }
+  }
+  if( iMatch<0 ) return SQLITE_NOTFOUND;
+  if( prollyHashIsEmpty(&aTk[iMatch].commitHash) ) return SQLITE_NOTFOUND;
+
+  memset(&m, 0, sizeof(m));
+  m.zName = zBranch;
+  memcpy(&m.head, &aTk[iMatch].commitHash, sizeof(ProllyHash));
+  return doltliteMutateRefs(db, mutateBranchRef, &m);
+}
+
 static void doltConnectBranchFunc(
   sqlite3_context *ctx,
   int argc,
@@ -311660,6 +312799,130 @@ int doltliteCheckoutBranchForRebase(sqlite3 *db, const char *zBranch){
   return rc;
 }
 
+/* A restored table's indexes must follow it: named indexes present only in
+** the working schema are dropped, the source's named indexes are (re)created,
+** and differing definitions are replaced. Entry roots are reconciled
+** separately after the catalog flush. */
+static int checkoutReconcileTableIndexes(
+  sqlite3 *db,
+  SchemaEntry *aSourceSchema,
+  int nSourceSchema,
+  const char *zTable
+){
+  sqlite3_stmt *pStmt = 0;
+  char **azDrop = 0;
+  int nDrop = 0;
+  int i, j, rc;
+
+  rc = sqlite3_prepare_v2(db,
+      "SELECT name, sql FROM sqlite_master"
+      " WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL",
+      -1, &pStmt, 0);
+  if( rc!=SQLITE_OK ) return rc;
+  sqlite3_bind_text(pStmt, 1, zTable, -1, SQLITE_STATIC);
+  while( sqlite3_step(pStmt)==SQLITE_ROW ){
+    const char *zName = (const char*)sqlite3_column_text(pStmt, 0);
+    const char *zSql = (const char*)sqlite3_column_text(pStmt, 1);
+    int keep = 0;
+    if( !zName ) continue;
+    for(j=0; j<nSourceSchema; j++){
+      if( aSourceSchema[j].zType && strcmp(aSourceSchema[j].zType, "index")==0
+       && aSourceSchema[j].zTblName && strcmp(aSourceSchema[j].zTblName, zTable)==0
+       && aSourceSchema[j].zName && strcmp(aSourceSchema[j].zName, zName)==0
+       && aSourceSchema[j].zSql ){
+        char *zLiveCanon = doltliteCanonicalizeSchemaSql(zSql ? zSql : "", zName);
+        char *zSrcCanon = doltliteCanonicalizeSchemaSql(aSourceSchema[j].zSql, zName);
+        keep = zLiveCanon && zSrcCanon && strcmp(zLiveCanon, zSrcCanon)==0;
+        sqlite3_free(zLiveCanon);
+        sqlite3_free(zSrcCanon);
+        break;
+      }
+    }
+    if( !keep ){
+      char **azNew = sqlite3_realloc((void*)azDrop, (nDrop+1)*(int)sizeof(char*));
+      char *zOwn = azNew ? sqlite3_mprintf("%s", zName) : 0;
+      if( azNew ) azDrop = azNew;
+      if( !azNew || !zOwn ){
+        sqlite3_finalize(pStmt);
+        doltliteFreeNameList(azDrop, nDrop);
+        return SQLITE_NOMEM;
+      }
+      azDrop[nDrop++] = zOwn;
+    }
+  }
+  rc = sqlite3_finalize(pStmt);
+  if( rc!=SQLITE_OK ){
+    doltliteFreeNameList(azDrop, nDrop);
+    return rc;
+  }
+
+  for(i=0; i<nDrop && rc==SQLITE_OK; i++){
+    char *zSql = sqlite3_mprintf("DROP INDEX \"%w\"", azDrop[i]);
+    if( !zSql ){ rc = SQLITE_NOMEM; break; }
+    rc = sqlite3_exec(db, zSql, 0, 0, 0);
+    sqlite3_free(zSql);
+  }
+  doltliteFreeNameList(azDrop, nDrop);
+  if( rc!=SQLITE_OK ) return rc;
+
+  for(j=0; j<nSourceSchema; j++){
+    int exists;
+    sqlite3_stmt *pChk = 0;
+    if( !aSourceSchema[j].zType || strcmp(aSourceSchema[j].zType, "index")!=0 ) continue;
+    if( !aSourceSchema[j].zTblName || strcmp(aSourceSchema[j].zTblName, zTable)!=0 ) continue;
+    if( !aSourceSchema[j].zName || !aSourceSchema[j].zSql ) continue;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+        -1, &pChk, 0);
+    if( rc!=SQLITE_OK ) return rc;
+    sqlite3_bind_text(pChk, 1, aSourceSchema[j].zName, -1, SQLITE_STATIC);
+    exists = sqlite3_step(pChk)==SQLITE_ROW;
+    sqlite3_finalize(pChk);
+    if( !exists ){
+      rc = sqlite3_exec(db, aSourceSchema[j].zSql, 0, 0, 0);
+      if( rc!=SQLITE_OK ) return rc;
+    }
+  }
+  return SQLITE_OK;
+}
+
+/* Point the freshly flushed working catalog's index entries for zTable at
+** the source's trees. Each side is resolved through its OWN schema rows
+** (index entries are unnamed, so name-keyed overlays cannot see them), and
+** the DDL reconcile above guarantees the two row sets agree by name. */
+static void checkoutAdoptSourceIndexRoots(
+  struct TableEntry *aWorking, int nWorking,
+  SchemaEntry *aWorkSchema, int nWorkSchema,
+  struct TableEntry *aSource, int nSource,
+  SchemaEntry *aSourceSchema, int nSourceSchema,
+  const char *zTable
+){
+  int j, k;
+  for(j=0; j<nSourceSchema; j++){
+    struct TableEntry *pSrcEntry, *pWorkEntry;
+    if( !aSourceSchema[j].zType || strcmp(aSourceSchema[j].zType, "index")!=0 ) continue;
+    if( !aSourceSchema[j].zTblName || strcmp(aSourceSchema[j].zTblName, zTable)!=0 ) continue;
+    if( !aSourceSchema[j].zName ) continue;
+    pSrcEntry = doltliteFindTableByNumber(aSource, nSource,
+                                          aSourceSchema[j].iRootpage);
+    if( !pSrcEntry ) continue;
+    for(k=0; k<nWorkSchema; k++){
+      if( aWorkSchema[k].zType && strcmp(aWorkSchema[k].zType, "index")==0
+       && aWorkSchema[k].zName
+       && strcmp(aWorkSchema[k].zName, aSourceSchema[j].zName)==0 ){
+        break;
+      }
+    }
+    if( k>=nWorkSchema ) continue;
+    pWorkEntry = doltliteFindTableByNumber(aWorking, nWorking,
+                                           aWorkSchema[k].iRootpage);
+    if( !pWorkEntry || pWorkEntry->iTable<=1 ) continue;
+    pWorkEntry->root = pSrcEntry->root;
+    pWorkEntry->schemaHash = pSrcEntry->schemaHash;
+    pWorkEntry->flags = pSrcEntry->flags;
+  }
+}
+
 static int doltliteCheckoutTables(
   sqlite3 *db,
   const char *zSourceRef,
@@ -311673,7 +312936,9 @@ static int doltliteCheckoutTables(
   ProllyHash newWorkingHash;
   CheckoutSchemaInfo *aSchema = 0;
   struct TableEntry *aWorking = 0, *aSource = 0;
+  SchemaEntry *aSourceSchema = 0, *aWorkSchema = 0;
   int nWorking = 0, nSource = 0;
+  int nSourceSchema = 0, nWorkSchema = 0;
   int i, j;
   int rc;
 
@@ -311746,6 +313011,14 @@ static int doltliteCheckoutTables(
     }
   }
 
+  rc = loadSchemaFromCatalog(db, cs, doltliteGetCache(db), &sourceCatHash,
+                             &aSourceSchema, &nSourceSchema);
+  if( rc!=SQLITE_OK ){
+    checkoutSchemaInfoClear(aSchema, nNames);
+    doltliteFreeCatalog(aSource, nSource);
+    return rc;
+  }
+
   for(i=0; i<nNames; i++){
     const char *zName = (const char*)sqlite3_value_text(argv[iFirstName + i]);
     int bSchemaChanged;
@@ -311756,42 +313029,45 @@ static int doltliteCheckoutTables(
       || (aSchema[i].hasCurrent && aSchema[i].hasSource
           && strcmp(aSchema[i].zCurrentSql ? aSchema[i].zCurrentSql : "",
                     aSchema[i].zSourceSql ? aSchema[i].zSourceSql : "")!=0);
-    if( !bSchemaChanged ) continue;
-
-    if( aSchema[i].hasCurrent ){
-      zDrop = sqlite3_mprintf("DROP TABLE \"%w\"", zName);
-      if( !zDrop ){
-        checkoutSchemaInfoClear(aSchema, nNames);
-        doltliteFreeCatalog(aSource, nSource);
-        return SQLITE_NOMEM;
+    if( bSchemaChanged ){
+      if( aSchema[i].hasCurrent ){
+        zDrop = sqlite3_mprintf("DROP TABLE \"%w\"", zName);
+        if( !zDrop ){
+          rc = SQLITE_NOMEM;
+          break;
+        }
+        rc = sqlite3_exec(db, zDrop, 0, 0, 0);
+        sqlite3_free(zDrop);
+        if( rc!=SQLITE_OK ) break;
       }
-      rc = sqlite3_exec(db, zDrop, 0, 0, 0);
-      sqlite3_free(zDrop);
-      if( rc!=SQLITE_OK ){
-        checkoutSchemaInfoClear(aSchema, nNames);
-        doltliteFreeCatalog(aSource, nSource);
-        return rc;
+      if( aSchema[i].hasSource ){
+        rc = sqlite3_exec(db, aSchema[i].zSourceSql, 0, 0, 0);
+        if( rc!=SQLITE_OK ) break;
       }
+      aSchema[i].rebuilt = 1;
     }
     if( aSchema[i].hasSource ){
-      rc = sqlite3_exec(db, aSchema[i].zSourceSql, 0, 0, 0);
-      if( rc!=SQLITE_OK ){
-        checkoutSchemaInfoClear(aSchema, nNames);
-        doltliteFreeCatalog(aSource, nSource);
-        return rc;
-      }
+      rc = checkoutReconcileTableIndexes(db, aSourceSchema, nSourceSchema, zName);
+      if( rc!=SQLITE_OK ) break;
     }
-    aSchema[i].rebuilt = 1;
+  }
+  if( rc!=SQLITE_OK ){
+    freeSchemaEntries(aSourceSchema, nSourceSchema);
+    checkoutSchemaInfoClear(aSchema, nNames);
+    doltliteFreeCatalog(aSource, nSource);
+    return rc;
   }
 
   rc = doltliteFlushCatalogToHash(db, &workingHash);
   if( rc!=SQLITE_OK ){
+    freeSchemaEntries(aSourceSchema, nSourceSchema);
     checkoutSchemaInfoClear(aSchema, nNames);
     doltliteFreeCatalog(aSource, nSource);
     return rc;
   }
   rc = doltliteLoadCatalog(db, &workingHash, &aWorking, &nWorking, 0);
   if( rc!=SQLITE_OK ){
+    freeSchemaEntries(aSourceSchema, nSourceSchema);
     checkoutSchemaInfoClear(aSchema, nNames);
     doltliteFreeCatalog(aSource, nSource);
     return rc;
@@ -311818,6 +313094,7 @@ static int doltliteCheckoutTables(
       if( aSchema[i].rebuilt && !aSchema[i].hasSource ){
         continue;
       }
+      freeSchemaEntries(aSourceSchema, nSourceSchema);
       checkoutSchemaInfoClear(aSchema, nNames);
       doltliteFreeCatalog(aWorking, nWorking);
       doltliteFreeCatalog(aSource, nSource);
@@ -311836,6 +313113,7 @@ static int doltliteCheckoutTables(
       struct TableEntry *aNew = sqlite3_realloc(aWorking,
           (nWorking+1)*(int)sizeof(struct TableEntry));
       if( !aNew ){
+        freeSchemaEntries(aSourceSchema, nSourceSchema);
         checkoutSchemaInfoClear(aSchema, nNames);
         doltliteFreeCatalog(aWorking, nWorking);
         doltliteFreeCatalog(aSource, nSource);
@@ -311845,6 +313123,7 @@ static int doltliteCheckoutTables(
       zDup = aSource[srcIdx].zName
                ? sqlite3_mprintf("%s", aSource[srcIdx].zName) : 0;
       if( aSource[srcIdx].zName && !zDup ){
+        freeSchemaEntries(aSourceSchema, nSourceSchema);
         checkoutSchemaInfoClear(aSchema, nNames);
         doltliteFreeCatalog(aWorking, nWorking);
         doltliteFreeCatalog(aSource, nSource);
@@ -311857,6 +313136,7 @@ static int doltliteCheckoutTables(
       zDup = aSource[srcIdx].zName
                ? sqlite3_mprintf("%s", aSource[srcIdx].zName) : 0;
       if( aSource[srcIdx].zName && !zDup ){
+        freeSchemaEntries(aSourceSchema, nSourceSchema);
         checkoutSchemaInfoClear(aSchema, nNames);
         doltliteFreeCatalog(aWorking, nWorking);
         doltliteFreeCatalog(aSource, nSource);
@@ -311872,6 +313152,24 @@ static int doltliteCheckoutTables(
         aWorking[workIdx].zName = zDup;
       }
     }
+  }
+
+  rc = loadSchemaFromCatalog(db, cs, doltliteGetCache(db), &workingHash,
+                             &aWorkSchema, &nWorkSchema);
+  if( rc!=SQLITE_OK ){
+    freeSchemaEntries(aSourceSchema, nSourceSchema);
+    checkoutSchemaInfoClear(aSchema, nNames);
+    doltliteFreeCatalog(aWorking, nWorking);
+    doltliteFreeCatalog(aSource, nSource);
+    return rc;
+  }
+  for(i=0; i<nNames; i++){
+    const char *zName = (const char*)sqlite3_value_text(argv[iFirstName + i]);
+    if( !zName ) continue;
+    checkoutAdoptSourceIndexRoots(aWorking, nWorking,
+                                  aWorkSchema, nWorkSchema,
+                                  aSource, nSource,
+                                  aSourceSchema, nSourceSchema, zName);
   }
 
   {
@@ -311893,6 +313191,8 @@ static int doltliteCheckoutTables(
     }
   }
 
+  freeSchemaEntries(aSourceSchema, nSourceSchema);
+  freeSchemaEntries(aWorkSchema, nWorkSchema);
   checkoutSchemaInfoClear(aSchema, nNames);
   doltliteFreeCatalog(aWorking, nWorking);
   doltliteFreeCatalog(aSource, nSource);
@@ -312024,6 +313324,42 @@ static void doltCheckoutFunc(sqlite3_context *ctx, int argc, sqlite3_value **arg
   sqlite3_free(zCurrentBranch);
   zCurrentBranch = 0;
   if( rc==SQLITE_NOTFOUND ){
+    rc = checkoutCreateFromRemoteTracking(db, zBranch);
+    if( rc==SQLITE_OK ){
+      memset(&m, 0, sizeof(m));
+      doltliteGetSessionHead(db, &m.oldCommitHash);
+      zCurrentBranch = sqlite3_mprintf("%s", doltliteGetSessionBranch(db));
+      if( !zCurrentBranch ){
+        (void)doltliteVcSealSavepointError(db);
+        sqlite3_result_error_nomem(ctx);
+        return;
+      }
+      rc = checkoutCaptureOldCatalog(db, cs, &m.oldCatHash);
+      if( rc!=SQLITE_OK ){
+        sqlite3_free(zCurrentBranch);
+        doltliteVcResultError(ctx, db, "failed to snapshot current branch state");
+        return;
+      }
+      m.haveOldState = 1;
+      checkoutSaveSession(db, &m);
+      m.zTargetBranch = zBranch;
+      m.zCurrentBranch = zCurrentBranch;
+      rc = doltliteMutateRefs(db, checkoutMutateRefs, &m);
+      if( rc!=SQLITE_OK ){
+        checkoutRestoreSession(db, &m);
+        {
+          int restoreRc = doltliteMutateRefs(db, checkoutRestoreDurableState, &m);
+          if( restoreRc!=SQLITE_OK ) rc = restoreRc;
+        }
+      }
+      sqlite3_free(zCurrentBranch);
+      zCurrentBranch = 0;
+      goto checkout_done;
+    }
+    if( rc!=SQLITE_NOTFOUND ){
+      doltliteVcResultError(ctx, db, "checkout failed");
+      return;
+    }
 
     rc = doltliteCheckoutTables(db, 0, argv, 0, argc);
     if( rc==SQLITE_NOTFOUND ){
@@ -312048,6 +313384,7 @@ static void doltCheckoutFunc(sqlite3_context *ctx, int argc, sqlite3_value **arg
     sqlite3_result_int(ctx, 0);
     return;
   }
+checkout_done:
   if( rc==SQLITE_EMPTY ){
     doltliteVcResultError(ctx, db, "target branch has no commits");
     return;
@@ -314485,6 +315822,9 @@ static SchemaEntry *mergedSchemaChoice(
                                                aTheirsSchema, nTheirsSchema, zName);
   if( oursChanged && !theirsChanged ) return pOurs;
   if( theirsChanged && !oursChanged ) return pTheirs;
+  /* Both sides dropped the object: falling back to the ancestor would
+  ** resurrect it in the merged catalog. */
+  if( oursChanged && theirsChanged && !pOurs && !pTheirs ) return 0;
   if( pOurs ) return pOurs;
   if( pTheirs ) return pTheirs;
   return pAnc;
@@ -314907,10 +316247,23 @@ do_merge_entry:
       if( !theirsEntry ){
 
         if( oursChanged ){
+          /* An index root moves whenever its table's data changes, so a
+          ** changed root alone does not make an index "modified". If its
+          ** definition matches the ancestor, the other branch's DROP wins
+          ** and the entry goes away; redefined-versus-dropped stays a real
+          ** conflict. */
+          if( !zName && zSchemaMergeName && zSchemaMergeName[0]
+           && !schemaEntryChangedByName(aAncSchema, nAncSchema,
+                                        aOursSchema, nOursSchema,
+                                        zSchemaMergeName) ){
+            continue;
+          }
           if( pzErrMsg ){
             *pzErrMsg = sqlite3_mprintf(
-              "schema conflict: table '%s' modified on one branch "
-              "and deleted on the other", zLogicalName ? zLogicalName : "");
+              "schema conflict: %s '%s' modified on one branch "
+              "and deleted on the other",
+              zName ? "table" : "index",
+              zLogicalName ? zLogicalName : "");
           }
           return SQLITE_ERROR;
         }
@@ -315199,7 +316552,9 @@ static int mergeCatalogPass2(
   Pgno *piNextMerged,
   int bDisjointSchemaChanges,
   SchemaRootpageRemap **ppaRemap,
-  int *pnRemap
+  int *pnRemap,
+  char ***pazReindex,
+  int *pnReindex
 ){
   int i;
 
@@ -315248,6 +316603,19 @@ static int mergeCatalogPass2(
             }
             if( newEntry.iTable >= *piNextMerged ) *piNextMerged = newEntry.iTable + 1;
             aMerged[(*pnMerged)++] = newEntry;
+            /* The adopted tree covers only theirs' rows; ours' row changes
+            ** never touched it. Record the index for a rebuild over the
+            ** merged table once the merged catalog is live. */
+            if( pazReindex ){
+              char **azNew = sqlite3_realloc(*pazReindex,
+                  (*pnReindex+1)*(int)sizeof(char*));
+              char *zDup;
+              if( !azNew ) return SQLITE_NOMEM;
+              *pazReindex = azNew;
+              zDup = sqlite3_mprintf("%s", pTheirSe->zName);
+              if( !zDup ) return SQLITE_NOMEM;
+              (*pazReindex)[(*pnReindex)++] = zDup;
+            }
           }else{
             /* Honor our explicit DROP; theirs may only have auto-updated it. */
           }
@@ -315410,7 +316778,9 @@ int doltliteMergeCatalogs(
   char **pzErrMsg,
   SchemaMergeAction **ppActions,
   int *pnActions,
-  int bPreferOurMaster
+  int bPreferOurMaster,
+  char ***pazReindex,
+  int *pnReindex
 ){
   struct TableEntry *aAnc = 0, *aOurs = 0, *aTheirs = 0;
   int nAnc = 0, nOurs = 0, nTheirs = 0;
@@ -315484,7 +316854,8 @@ int doltliteMergeCatalogs(
                           aTheirsSchema, nTheirsSchema,
                           aMerged, &nMerged, &iNextMerged,
                           bDisjointSchemaChanges,
-                          &aRemap, &nRemap);
+                          &aRemap, &nRemap,
+                          pazReindex, pnReindex);
   if( rc!=SQLITE_OK ) goto merge_cleanup;
 
   rc = rebuildDisjointSchemaRows(db, aMerged, nMerged,
@@ -315516,6 +316887,23 @@ merge_cleanup:
 }
 
 #endif
+
+void doltliteFreeNameList(char **az, int n){
+  int i;
+  for(i=0; i<n; i++) sqlite3_free(az[i]);
+  sqlite3_free(az);
+}
+
+int doltliteReindexNamedIndexes(sqlite3 *db, char **az, int n){
+  int i, rc = SQLITE_OK;
+  for(i=0; i<n && rc==SQLITE_OK; i++){
+    char *zSql = sqlite3_mprintf("REINDEX \"%w\"", az[i]);
+    if( !zSql ) return SQLITE_NOMEM;
+    rc = sqlite3_exec(db, zSql, 0, 0, 0);
+    sqlite3_free(zSql);
+  }
+  return rc;
+}
 
 /************** End of doltlite_merge.c **************************************/
 /************** Begin file doltlite_schema_merge.c ***************************/
@@ -319423,6 +320811,19 @@ static int atRegisterCatalogTables(
     }
   }
   doltliteFreeCatalog(aTables, nTables);
+  return rc;
+}
+
+/* Register AT vtables for one catalog only. A new commit can introduce
+** table names only from its own catalog — every historical name was
+** registered by the full-graph walk at connection init — so the commit path
+** uses this instead of re-walking the whole commit graph per commit. */
+int doltliteRegisterAtTablesForCatalog(sqlite3 *db, const ProllyHash *pCatHash){
+  AtSeenTable seen;
+  int rc;
+  memset(&seen, 0, sizeof(seen));
+  rc = atRegisterCatalogTables(db, pCatHash, &seen);
+  atSeenTableClear(&seen);
   return rc;
 }
 
@@ -326457,7 +327858,7 @@ static int nextCheckClause(
 
   while( *p ){
     if( (p[0]=='C' || p[0]=='c')
-     && strncasecmp(p, "CONSTRAINT", 10)==0
+     && sqlite3_strnicmp(p, "CONSTRAINT", 10)==0
      && (p[10]==' ' || p[10]=='\t' || p[10]=='\n') ){
       int i = 0;
       p += 10;
@@ -326469,7 +327870,7 @@ static int nextCheckClause(
       continue;
     }
     if( (p[0]=='C' || p[0]=='c')
-     && strncasecmp(p, "CHECK", 5)==0
+     && sqlite3_strnicmp(p, "CHECK", 5)==0
      && (p[5]==' ' || p[5]=='\t' || p[5]=='(' || p[5]=='\n') ){
       p += 5;
       while( *p==' ' || *p=='\t' || *p=='\n' ) p++;
