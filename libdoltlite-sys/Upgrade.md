@@ -5,6 +5,13 @@ belong in [`patches/`](patches/README.md) and are applied to a build-directory
 copy of the amalgamation. This separation is intentional: `upgrade.sh` may
 replace the upstream files without erasing or hiding local behavior.
 
+Use `upgrade.sh` to vendor a tagged DoltLite release. Use
+`upgrade_git.sh` to clone the upstream Git ref configured by
+`DOLTLITE_GIT_REF` in that script, build its amalgamation, vendor the matching
+remote sources, regenerate bindings, check the local patch series, and run the
+same bundled test suites. The ref defaults to `master` and may also be set to a
+tag for a reproducible upgrade.
+
 # Checks
 * new [error code(s)](https://sqlite.org/rescode.html)
   => Update [libsqlite3-sys/src/error.rs](https://github.com/rusqlite/rusqlite/blob/006c8b77e7d235a3072237f006ebabd66b937911/libsqlite3-sys/src/error.rs#L127)

@@ -15,6 +15,10 @@ To update DoltLite:
 1. Change `DOLTLITE_VERSION` in `../upgrade.sh`.
 2. Run `../upgrade.sh`. It downloads pristine release artifacts and matching
    remote sidecars.
+   To build from Git instead, run `../upgrade_git.sh`; it builds the pristine
+   amalgamation from a fresh clone of the `DOLTLITE_GIT_REF` configured in that
+   script and then performs the same vendoring and validation workflow. The ref
+   may be a branch or tag.
 3. If a patch no longer applies, check whether upstream incorporated that
    behavior. Remove the obsolete hunk or refresh only that patch; never edit
    `../doltlite/doltlite.c`.
