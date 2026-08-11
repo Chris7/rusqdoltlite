@@ -26,7 +26,7 @@ pub use bindings::*;
 
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 mod remote {
-    use core::ffi::{c_char, c_int};
+    use core::ffi::{c_char, c_int, c_long};
 
     #[repr(C)]
     pub struct DoltliteServer {
@@ -42,6 +42,7 @@ mod remote {
         pub keyFile: *const c_char,
         pub authKeysDir: *const c_char,
         pub audience: *const c_char,
+        pub timeoutMs: c_int,
     }
 
     unsafe extern "C" {
@@ -64,6 +65,14 @@ mod remote {
         pub fn doltliteServerStop(server: *mut DoltliteServer);
 
         pub fn doltliteServerPort(server: *mut DoltliteServer) -> c_int;
+
+        pub fn doltliteCredsVerifyBearer(
+            authorization: *const c_char,
+            expected_audience: *const c_char,
+            authorized_keys_directory: *const c_char,
+            now: c_long,
+            key_id: *mut *mut c_char,
+        ) -> c_int;
     }
 }
 

@@ -29,7 +29,8 @@ To update DoltLite:
 matches. A failed build is an upgrade-review signal, not permission to silently
 skip a local change.
 
-`0001-rusqdoltlite-behavior-fixes.patch` contains the DoltLite-internal parts
-of point-in-time table discovery and remote correctness. Its header maps the
-individual behaviors to the patch so an upstreamed fix can be removed without
-reconstructing the change from the amalgamation.
+Each patch owns one independently removable behavior. Currently,
+`0001-support-remote-set-url.patch` adds `dolt_remote('set-url', ...)`.
+
+Keep new behavior isolated the same way so an upstreamed fix can be removed
+without rebasing unrelated changes.

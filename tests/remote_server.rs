@@ -2,12 +2,15 @@
 
 use std::{
     io::{Read as _, Write as _},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{Arc, Barrier},
     thread,
+    time::Duration,
 };
 
-use rusqlite::{params, Connection, Error, RemoteServer, Result};
+use rusqlite::{
+    params, Connection, Error, RemoteAuthenticator, RemoteServer, RemoteServerOptions, Result,
+};
 
 #[test]
 fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
@@ -50,6 +53,45 @@ fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
     assert_eq!(value, "remote value");
     assert_eq!(tracking_hash, branch_hash);
     assert!(server_root.join("origin.db").exists());
+
+    Ok(())
+}
+
+#[test]
+fn remote_server_options_enable_authentication_and_timeout() -> Result<()> {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let server_root = temp.path().join("server");
+    let authorized_keys = temp.path().join("authorized-keys");
+    std::fs::create_dir(&server_root).expect("server directory");
+    std::fs::create_dir(&authorized_keys).expect("authorized keys directory");
+
+    let options = RemoteServerOptions::new()
+        .authentication(&authorized_keys, "remote.example.test")
+        .request_timeout(Duration::from_secs(1));
+    let server = RemoteServer::start_with_options(&server_root, &options)?;
+    assert!(server.database_url("repo.db").starts_with("http://"));
+
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port())).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream
+        .write_all(
+            b"GET /repo.db/refs HTTP/1.1\r\nHost: remote.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .expect("write request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    assert!(response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+
+    let authenticator = RemoteAuthenticator::new(&authorized_keys, "remote.example.test")?;
+    let error = authenticator
+        .authenticate("Bearer invalid")
+        .expect_err("invalid bearer token");
+    assert!(matches!(
+        error,
+        Error::SqliteFailure(code, _) if code.extended_code == rusqlite::ffi::SQLITE_AUTH
+    ));
 
     Ok(())
 }

@@ -59,6 +59,11 @@ cp "$SOURCE_DIR/src/doltlite_creds.c" \
   "$SOURCE_DIR/src/doltlite_net.h" \
   "$SOURCE_DIR/src/doltlite_remotesrv.h" \
   "$DOLTLITE_LIB_DIR/remote/"
+# Newer credential sources share strict decimal parsing with the amalgamation
+# through this private header. Older tags do not need or provide it.
+if [ -f "$SOURCE_DIR/src/doltlite_parse.h" ]; then
+  cp "$SOURCE_DIR/src/doltlite_parse.h" "$DOLTLITE_LIB_DIR/remote/"
+fi
 cp -R "$SOURCE_DIR/ext/ed25519/." "$DOLTLITE_LIB_DIR/remote/ed25519/"
 cp "$SOURCE_DIR/ext/mbedtls/LICENSE" "$DOLTLITE_LIB_DIR/remote/mbedtls/"
 cp -R "$SOURCE_DIR/ext/mbedtls/include" \

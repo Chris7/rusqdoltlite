@@ -99,7 +99,7 @@ pub use crate::ffi::ErrorCode;
 pub use crate::load_extension_guard::LoadExtensionGuard;
 pub use crate::params::{params_from_iter, Params, ParamsFromIter};
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
-pub use crate::remote_server::RemoteServer;
+pub use crate::remote_server::{RemoteAuthenticator, RemoteServer, RemoteServerOptions};
 pub use crate::row::{AndThenRows, Map, MappedRows, Row, RowIndex, Rows};
 pub use crate::statement::{Statement, StatementStatus};
 #[cfg(feature = "modern_sqlite")]

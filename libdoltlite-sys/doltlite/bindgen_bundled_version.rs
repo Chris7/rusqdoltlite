@@ -26,10 +26,10 @@ extern "C" {
 pub const SQLITE_VERSION: &::core::ffi::CStr = c"3.54.0";
 pub const SQLITE_VERSION_NUMBER: i32 = 3054000;
 pub const SQLITE_SOURCE_ID: &::core::ffi::CStr =
-    c"2026-05-31 19:41:16 3c0a277e6741c72281e12c44d85902aa6780890a7f59bacc3ac2b35ba27falt1";
+    c"2026-08-01 15:08:48 be245e136a550faa7c84694156c40dc9778f50b00016892c29a2314bef14alt1";
 pub const SQLITE_SCM_BRANCH: &::core::ffi::CStr = c"trunk";
 pub const SQLITE_SCM_TAGS: &::core::ffi::CStr = c"";
-pub const SQLITE_SCM_DATETIME: &::core::ffi::CStr = c"2026-05-31T19:41:16.173Z";
+pub const SQLITE_SCM_DATETIME: &::core::ffi::CStr = c"2026-08-01T15:08:48.942Z";
 pub const SQLITE_OK: i32 = 0;
 pub const SQLITE_ERROR: i32 = 1;
 pub const SQLITE_INTERNAL: i32 = 2;
@@ -334,7 +334,6 @@ pub const SQLITE_CREATE_VTABLE: i32 = 29;
 pub const SQLITE_DROP_VTABLE: i32 = 30;
 pub const SQLITE_FUNCTION: i32 = 31;
 pub const SQLITE_SAVEPOINT: i32 = 32;
-pub const SQLITE_COPY: i32 = 0;
 pub const SQLITE_RECURSIVE: i32 = 33;
 pub const SQLITE_TRACE_STMT: ::core::ffi::c_uint = 1;
 pub const SQLITE_TRACE_PROFILE: ::core::ffi::c_uint = 2;
@@ -353,6 +352,7 @@ pub const SQLITE_LIMIT_VARIABLE_NUMBER: i32 = 9;
 pub const SQLITE_LIMIT_TRIGGER_DEPTH: i32 = 10;
 pub const SQLITE_LIMIT_WORKER_THREADS: i32 = 11;
 pub const SQLITE_LIMIT_PARSER_DEPTH: i32 = 12;
+pub const SQLITE_LIMIT_SCHEMA: i32 = 13;
 pub const SQLITE_PREPARE_PERSISTENT: ::core::ffi::c_uint = 1;
 pub const SQLITE_PREPARE_NORMALIZE: ::core::ffi::c_uint = 2;
 pub const SQLITE_PREPARE_NO_VTAB: ::core::ffi::c_uint = 4;
@@ -456,6 +456,9 @@ pub const SQLITE_TESTCTRL_LOGEST: i32 = 33;
 pub const SQLITE_TESTCTRL_USELONGDOUBLE: i32 = 34;
 pub const SQLITE_TESTCTRL_ATOF: i32 = 34;
 pub const SQLITE_TESTCTRL_LAST: i32 = 34;
+pub const SQLITE_COPY: i32 = 0;
+pub const SQLITE_XFER: i32 = 1;
+pub const SQLITE_FINISH: i32 = 2;
 pub const SQLITE_STATUS_MEMORY_USED: i32 = 0;
 pub const SQLITE_STATUS_PAGECACHE_USED: i32 = 1;
 pub const SQLITE_STATUS_PAGECACHE_OVERFLOW: i32 = 2;
@@ -2214,6 +2217,13 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn sqlite3_str_free(arg1: *mut sqlite3_str);
+}
+unsafe extern "C" {
+    pub fn sqlite3_result_str(
+        arg1: *mut sqlite3_context,
+        arg2: *mut sqlite3_str,
+        arg3: ::core::ffi::c_int,
+    );
 }
 unsafe extern "C" {
     pub fn sqlite3_str_appendf(arg1: *mut sqlite3_str, zFormat: *const ::core::ffi::c_char, ...);
