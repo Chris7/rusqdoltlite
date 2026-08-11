@@ -111,8 +111,10 @@ mod build_bundled {
             cfg.define("WIN32_LEAN_AND_MEAN", None);
         }
 
+        // Remote-auth server uses pthreads, unported to Windows/MSVC.
         let remote_supported = cfg!(feature = "remote")
-            && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"));
+            && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"))
+            && !win_target();
         if remote_supported {
             let remote_dir = Path::new(lib_name).join("remote");
             let ed25519_dir = remote_dir.join("ed25519");
