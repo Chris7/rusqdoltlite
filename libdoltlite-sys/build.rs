@@ -123,6 +123,12 @@ mod build_bundled {
         // conflicts with <winsock2.h> on current Windows SDKs.
         if win_target() {
             cfg.define("WIN32_LEAN_AND_MEAN", None);
+            // The v0.11.50 amalgamation always includes its remote client and
+            // auth implementation, even when the Rust `remote` feature (which
+            // exposes the in-process server) is disabled.
+            println!("cargo:rustc-link-lib=ws2_32");
+            println!("cargo:rustc-link-lib=bcrypt");
+            println!("cargo:rustc-link-lib=crypt32");
         }
 
         if remote_supported {
@@ -157,12 +163,6 @@ mod build_bundled {
                         .map(|name| ed25519_dir.join(name)),
                     )
                     .files(mbedtls_sources);
-            }
-
-            if win_target() {
-                println!("cargo:rustc-link-lib=ws2_32");
-                println!("cargo:rustc-link-lib=bcrypt");
-                println!("cargo:rustc-link-lib=crypt32");
             }
         }
 
