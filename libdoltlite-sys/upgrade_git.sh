@@ -57,6 +57,7 @@ cp "$SOURCE_DIR/src/doltlite_creds.c" \
   "$SOURCE_DIR/src/doltlite_tls.c" \
   "$SOURCE_DIR/src/doltlite_tls.h" \
   "$SOURCE_DIR/src/doltlite_net.h" \
+  "$SOURCE_DIR/src/doltlite_remotesrv.c" \
   "$SOURCE_DIR/src/doltlite_remotesrv.h" \
   "$DOLTLITE_LIB_DIR/remote/"
 # Newer credential sources share strict decimal parsing with the amalgamation

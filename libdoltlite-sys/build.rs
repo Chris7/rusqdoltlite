@@ -67,6 +67,7 @@ fn main() {
 #[cfg(any(feature = "bundled", feature = "bundled-windows"))]
 mod build_bundled {
     use std::env;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -100,8 +101,21 @@ mod build_bundled {
             &manifest_dir.join("patches"),
             &Path::new(out_dir).join("patched-doltlite"),
         );
+        // Remote-auth server uses pthreads, unported to Windows/MSVC.
+        let remote_supported = cfg!(feature = "remote")
+            && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"))
+            && !win_target();
+        let remote_dir = Path::new(lib_name).join("remote");
+        let auth_is_in_amalgamation = if remote_supported {
+            append_remote_server_if_missing(
+                &patched_source,
+                &manifest_dir.join(&remote_dir).join("doltlite_remotesrv.c"),
+            )
+        } else {
+            false
+        };
         let mut cfg = cc::Build::new();
-        cfg.file(patched_source);
+        cfg.file(&patched_source);
 
         // DoltLite's amalgamation includes both Windows headers used by
         // SQLite and Winsock2 headers used by the remote implementation.
@@ -111,12 +125,7 @@ mod build_bundled {
             cfg.define("WIN32_LEAN_AND_MEAN", None);
         }
 
-        // Remote-auth server uses pthreads, unported to Windows/MSVC.
-        let remote_supported = cfg!(feature = "remote")
-            && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"))
-            && !win_target();
         if remote_supported {
-            let remote_dir = Path::new(lib_name).join("remote");
             let ed25519_dir = remote_dir.join("ed25519");
             let mbedtls_dir = remote_dir.join("mbedtls");
             let mut mbedtls_sources = std::fs::read_dir(mbedtls_dir.join("library"))
@@ -128,25 +137,27 @@ mod build_bundled {
 
             println!("cargo:rerun-if-changed={}", remote_dir.display());
             cfg.define("DOLTLITE_HAVE_AUTH", None)
-                .file(remote_dir.join("doltlite_creds.c"))
-                .file(remote_dir.join("doltlite_tls.c"))
-                .files(
-                    [
-                        "fe.c",
-                        "ge.c",
-                        "sc.c",
-                        "sha512.c",
-                        "keypair.c",
-                        "sign.c",
-                        "verify.c",
-                    ]
-                    .map(|name| ed25519_dir.join(name)),
-                )
-                .files(mbedtls_sources)
                 .include(&remote_dir)
                 .include(&ed25519_dir)
                 .include(mbedtls_dir.join("include"))
                 .include(mbedtls_dir.join("library"));
+            if !auth_is_in_amalgamation {
+                cfg.file(remote_dir.join("doltlite_creds.c"))
+                    .file(remote_dir.join("doltlite_tls.c"))
+                    .files(
+                        [
+                            "fe.c",
+                            "ge.c",
+                            "sc.c",
+                            "sha512.c",
+                            "keypair.c",
+                            "sign.c",
+                            "verify.c",
+                        ]
+                        .map(|name| ed25519_dir.join(name)),
+                    )
+                    .files(mbedtls_sources);
+            }
 
             if win_target() {
                 println!("cargo:rustc-link-lib=ws2_32");
@@ -267,8 +278,92 @@ mod build_bundled {
         println!("cargo:rerun-if-env-changed=LIBSQLITE3_FLAGS");
 
         cfg.compile(lib_name);
+        if remote_supported && auth_is_in_amalgamation {
+            compile_server_tls(&remote_dir);
+        }
 
         println!("cargo:lib_dir={out_dir}");
+    }
+
+    fn append_remote_server_if_missing(amalgamation: &Path, server_source: &Path) -> bool {
+        let current = std::fs::read_to_string(amalgamation).unwrap_or_else(|error| {
+            panic!(
+                "could not inspect DoltLite amalgamation {}: {error}",
+                amalgamation.display()
+            )
+        });
+        let auth_is_in_amalgamation = current.contains("DOLTLITE_AMALGAMATION_AUTH");
+        if current.contains("Begin file doltlite_remotesrv.c") {
+            return auth_is_in_amalgamation;
+        }
+
+        let source = std::fs::read_to_string(server_source).unwrap_or_else(|error| {
+            panic!(
+                "could not read DoltLite remote-server source {}: {error}",
+                server_source.display()
+            )
+        });
+        let amalgamated_headers = [
+            "#include \"sqliteInt.h\"",
+            "#include \"chunk_store.h\"",
+            "#include \"prolly_hash.h\"",
+            "#include \"doltlite_remote.h\"",
+            "#include \"doltlite_commit.h\"",
+        ];
+        let mut appended = String::with_capacity(source.len() + 256);
+        appended.push_str(
+            "\n/* Cargo-bundled upstream remote server sidecar. */\n\
+             #undef DOLTLITE_AUTH_CLIENT_ONLY\n\
+             #undef DOLTLITE_TLS_H\n",
+        );
+        for line in source.lines() {
+            if amalgamated_headers.contains(&line.trim()) {
+                continue;
+            }
+            appended.push_str(line);
+            appended.push('\n');
+        }
+
+        let mut output = std::fs::OpenOptions::new()
+            .append(true)
+            .open(amalgamation)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not open patched DoltLite amalgamation {}: {error}",
+                    amalgamation.display()
+                )
+            });
+        output
+            .write_all(appended.as_bytes())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not append DoltLite remote-server source to {}: {error}",
+                    amalgamation.display()
+                )
+            });
+        auth_is_in_amalgamation
+    }
+
+    fn compile_server_tls(remote_dir: &Path) {
+        let mbedtls_dir = remote_dir.join("mbedtls");
+        let mut cfg = cc::Build::new();
+        cfg.file(remote_dir.join("doltlite_tls.c"))
+            .define(
+                "doltliteConnOpenTimeout",
+                "doltliteBundledClientConnOpenTimeout",
+            )
+            .define("doltliteConnOpen", "doltliteBundledClientConnOpen")
+            .define("doltliteConnWriteAll", "doltliteBundledClientConnWriteAll")
+            .define("doltliteConnRead", "doltliteBundledClientConnRead")
+            .define("doltliteConnClose", "doltliteBundledClientConnClose")
+            .include(remote_dir)
+            .include(mbedtls_dir.join("include"))
+            .include(mbedtls_dir.join("library"))
+            .warnings(false);
+        if win_target() {
+            cfg.define("WIN32_LEAN_AND_MEAN", None);
+        }
+        cfg.compile("doltlite_server_tls");
     }
 
     fn apply_local_patches(upstream_source: &Path, patch_dir: &Path, output_dir: &Path) -> PathBuf {

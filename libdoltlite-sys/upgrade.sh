@@ -12,7 +12,7 @@ mkdir -p "$TARGET_DIR" "$DOLTLITE_LIB_DIR"
 # Download and extract pristine upstream artifacts. RusqDoltLite behavior is
 # maintained separately in patches/ and applied only to Cargo's OUT_DIR by the
 # build script. Never apply those patches to doltlite/doltlite.c here.
-DOLTLITE_VERSION=0.11.35
+DOLTLITE_VERSION=0.11.50
 DOLTLITE=doltlite-amalgamation-$DOLTLITE_VERSION
 curl -LO "https://github.com/dolthub/doltlite/releases/download/v$DOLTLITE_VERSION/$DOLTLITE.zip"
 unzip -p "$DOLTLITE.zip" "$DOLTLITE/doltlite.c" > "$DOLTLITE_LIB_DIR/doltlite.c"
@@ -37,14 +37,27 @@ cp "$SOURCE_DIR/src/doltlite_creds.c" \
   "$SOURCE_DIR/src/doltlite_tls.c" \
   "$SOURCE_DIR/src/doltlite_tls.h" \
   "$SOURCE_DIR/src/doltlite_net.h" \
+  "$SOURCE_DIR/src/doltlite_remotesrv.c" \
   "$SOURCE_DIR/src/doltlite_remotesrv.h" \
   "$DOLTLITE_LIB_DIR/remote/"
+# Newer credential sources share strict decimal parsing with the amalgamation
+# through this private header. Older tags do not need or provide it.
+if [ -f "$SOURCE_DIR/src/doltlite_parse.h" ]; then
+  cp "$SOURCE_DIR/src/doltlite_parse.h" "$DOLTLITE_LIB_DIR/remote/"
+fi
 cp -R "$SOURCE_DIR/ext/ed25519/." "$DOLTLITE_LIB_DIR/remote/ed25519/"
 cp "$SOURCE_DIR/ext/mbedtls/LICENSE" "$DOLTLITE_LIB_DIR/remote/mbedtls/"
 cp -R "$SOURCE_DIR/ext/mbedtls/include" \
   "$SOURCE_DIR/ext/mbedtls/library" \
   "$DOLTLITE_LIB_DIR/remote/mbedtls/"
 rm -rf "$SOURCE_ARCHIVE" "$SOURCE_DIR"
+
+# Fail early if the release has moved beyond the local patch context. Bundled
+# Cargo builds apply the same patch series to an OUT_DIR copy.
+(
+  cd "$DOLTLITE_LIB_DIR" || exit 1
+  git apply --check "$SCRIPT_DIR"/patches/*.patch
+)
 
 # Regenerate bindgen file for doltlite.h
 rm -f "$DOLTLITE_LIB_DIR/bindgen_bundled_version.rs"

@@ -1,5 +1,5 @@
 Subject: [PATCH] Support dolt_remote set-url
-Base: DoltLite master 1af39f06d5f121d0a78bd039dc40402b19040c32
+Base: DoltLite v0.11.50 (b29e5ff7b968c3d770beaf941ced83b87fa9a573)
 
 Add dolt_remote('set-url', name, url) so an existing remote can be
 retargeted without removing and recreating it.

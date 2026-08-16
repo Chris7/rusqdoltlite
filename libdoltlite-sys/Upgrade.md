@@ -12,6 +12,12 @@ remote sources, regenerate bindings, check the local patch series, and run the
 same bundled test suites. The ref defaults to `master` and may also be set to a
 tag for a reproducible upgrade.
 
+Some releases, including `v0.11.50`, keep `doltlite_remotesrv.c` in the native
+library but omit it from the published amalgamation. Both upgraders vendor that
+pristine sidecar. For Cargo builds with the `remote` feature, `build.rs` adds an
+amalgamation-compatible copy only under `OUT_DIR` and compiles the matching
+server-side TLS supplement; checked-in upstream sources remain unchanged.
+
 # Checks
 * new [error code(s)](https://sqlite.org/rescode.html)
   => Update [libsqlite3-sys/src/error.rs](https://github.com/rusqlite/rusqlite/blob/006c8b77e7d235a3072237f006ebabd66b937911/libsqlite3-sys/src/error.rs#L127)
