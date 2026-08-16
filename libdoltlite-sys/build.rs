@@ -123,12 +123,6 @@ mod build_bundled {
         // conflicts with <winsock2.h> on current Windows SDKs.
         if win_target() {
             cfg.define("WIN32_LEAN_AND_MEAN", None);
-            // The v0.11.50 amalgamation always includes its remote client and
-            // auth implementation, even when the Rust `remote` feature (which
-            // exposes the in-process server) is disabled.
-            println!("cargo:rustc-link-lib=ws2_32");
-            println!("cargo:rustc-link-lib=bcrypt");
-            println!("cargo:rustc-link-lib=crypt32");
         }
 
         if remote_supported {
@@ -278,6 +272,15 @@ mod build_bundled {
         println!("cargo:rerun-if-env-changed=LIBSQLITE3_FLAGS");
 
         cfg.compile(lib_name);
+        if win_target() {
+            // The v0.11.50 amalgamation always includes its remote client and
+            // auth implementation, even when the Rust `remote` feature (which
+            // exposes the in-process server) is disabled. Emit these after the
+            // static archive because GNU linkers resolve libraries in order.
+            println!("cargo:rustc-link-lib=ws2_32");
+            println!("cargo:rustc-link-lib=bcrypt");
+            println!("cargo:rustc-link-lib=crypt32");
+        }
         if remote_supported && auth_is_in_amalgamation {
             compile_server_tls(&remote_dir);
         }
