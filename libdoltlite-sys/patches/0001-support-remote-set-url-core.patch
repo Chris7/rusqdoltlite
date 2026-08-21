@@ -1,0 +1,37 @@
+Subject: [PATCH] Support dolt_remote set-url core storage
+Base: DoltLite v0.11.52
+
+Add storage support for retargeting an existing remote.
+
+diff --git a/doltlite.c b/doltlite.c
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -24014,4 +24014,5 @@ int chunkStoreAddRemote(ChunkStore *cs, const char *zName, const char *zUrl);
+ int chunkStoreAddRemote(ChunkStore *cs, const char *zName, const char *zUrl);
+ int chunkStoreDeleteRemote(ChunkStore *cs, const char *zName);
+ int chunkStoreFindRemote(ChunkStore *cs, const char *zName, const char **pzUrl);
++int chunkStoreSetRemoteUrl(ChunkStore *cs, const char *zName, const char *zUrl);
+ 
+@@ -87852,4 +87852,5 @@ int chunkStoreAddRemote(ChunkStore *cs, const char *zName, const char *zUrl);
+ int chunkStoreAddRemote(ChunkStore *cs, const char *zName, const char *zUrl);
+ int chunkStoreDeleteRemote(ChunkStore *cs, const char *zName);
+ int chunkStoreFindRemote(ChunkStore *cs, const char *zName, const char **pzUrl);
++int chunkStoreSetRemoteUrl(ChunkStore *cs, const char *zName, const char *zUrl);
+ 
+@@ -476914,5 +476914,16 @@ int chunkStoreAddRemote(ChunkStore *cs, const char *zName, const char *zUrl){
+   cs->refs.nRemotes++;
+   return SQLITE_OK;
+ }
+ 
++int chunkStoreSetRemoteUrl(ChunkStore *cs, const char *zName, const char *zUrl){
++  int i = findRemoteIdx(cs, zName);
++  char *zNewUrl;
++  if( i<0 ) return SQLITE_NOTFOUND;
++  zNewUrl = sqlite3_mprintf("%s", zUrl);
++  if( !zNewUrl ) return SQLITE_NOMEM;
++  sqlite3_free(cs->refs.aRemotes[i].zUrl);
++  cs->refs.aRemotes[i].zUrl = zNewUrl;
++  return SQLITE_OK;
++}
++
+ int chunkStoreDeleteRemote(ChunkStore *cs, const char *zName){

@@ -9,9 +9,8 @@ export DOLTLITE_LIB_DIR="$SCRIPT_DIR/doltlite"
 export DOLTLITE_INCLUDE_DIR="$SCRIPT_DIR/doltlite"
 mkdir -p "$TARGET_DIR" "$DOLTLITE_LIB_DIR"
 
-# Set this to master for the latest upstream source, or to a tag such as
-# v0.11.35 for a reproducible Git-based upgrade.
-DOLTLITE_GIT_REF=master
+# Set this to an exact upstream release tag for a reproducible upgrade.
+DOLTLITE_GIT_REF=v0.11.52
 
 # Build pristine upstream artifacts from the configured Git ref. RusqDoltLite
 # behavior is maintained separately in patches/ and applied only to Cargo's

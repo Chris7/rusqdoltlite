@@ -1,0 +1,59 @@
+Subject: [PATCH] Support dolt_remote set-url SQL action
+Base: DoltLite v0.11.52
+
+Expose remote URL replacement through dolt_remote('set-url', ...).
+
+diff --git a/doltlite.c b/doltlite.c
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -549542,6 +549542,7 @@ typedef struct RemoteMutationCtx RemoteMutationCtx;
+ typedef struct RemoteMutationCtx RemoteMutationCtx;
+ struct RemoteMutationCtx {
+   const char *zName;
+   const char *zUrl;
+   int isDelete;
++  int action;
+ };
+@@ -549571,5 +549571,6 @@ static int mutateRemoteRef(sqlite3 *db, ChunkStore *cs, void *pArg){
+ static int mutateRemoteRef(sqlite3 *db, ChunkStore *cs, void *pArg){
+   RemoteMutationCtx *p = (RemoteMutationCtx*)pArg;
+   (void)db;
+   if( p->isDelete ) return chunkStoreDeleteRemote(cs, p->zName);
++  if( p->action==2 ) return chunkStoreSetRemoteUrl(cs, p->zName, p->zUrl);
+   return chunkStoreAddRemote(cs, p->zName, p->zUrl);
+@@ -549792,5 +549792,33 @@ static void doltRemoteFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv)
+     }
+   }else{
+-    doltliteVcResultError(ctx, db, "unknown action: use 'add' or 'remove'");
++    if( strcmp(zAction, "set-url")==0 ){
++      const char *zUrl;
++      if( argc<3 ){
++        doltliteVcResultError(ctx, db, "url required for set-url");
++        return;
++      }
++      if( argc>3 ){
++        doltliteVcResultError(ctx, db, "too many arguments");
++        return;
++      }
++      zUrl = (const char*)sqlite3_value_text(argv[2]);
++      if( !zUrl ){
++        doltliteVcResultError(ctx, db, "url required for set-url");
++        return;
++      }
++      m.zName = zName;
++      m.zUrl = zUrl;
++      m.action = 2;
++      rc = doltliteMutateRefs(db, mutateRemoteRef, &m);
++      if( rc!=SQLITE_OK ){
++        (void)doltliteVcSealSavepointError(db);
++        remoteSqlResultError(ctx, rc,
++          rc==SQLITE_NOTFOUND ? "remote not found" : 0);
++        return;
++      }
++    }else{
++      doltliteVcResultError(ctx, db,
++        "unknown action: use 'add', 'remove', or 'set-url'");
++      return;
++    }
+-    return;
+   }

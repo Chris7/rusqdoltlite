@@ -273,7 +273,7 @@ mod build_bundled {
 
         cfg.compile(lib_name);
         if win_target() {
-            // The v0.11.50 amalgamation always includes its remote client and
+            // The v0.11.52 amalgamation always includes its remote client and
             // auth implementation, even when the Rust `remote` feature (which
             // exposes the in-process server) is disabled. Emit these after the
             // static archive because GNU linkers resolve libraries in order.
@@ -636,7 +636,7 @@ mod bindings {
 
     // Are we generating the bundled bindings? Used to avoid emitting things
     // that would be problematic in bundled builds. This env var is set by
-    // `upgrade.sh`.
+    // `upgrade_git.sh`.
     fn generating_bundled_bindings() -> bool {
         // Hacky way to know if we're generating the bundled bindings
         println!("cargo:rerun-if-env-changed=LIBDOLTLITE_SYS_BUNDLING");

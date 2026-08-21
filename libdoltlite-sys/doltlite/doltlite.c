@@ -86,6 +86,7 @@
 **    test/lock4.test
 **    test/lock5.test
 **    test/mallocAll.test
+**    test/mallocD.test
 **    test/memdb1.test
 **    test/memdb2.test
 **    test/misc7.test
@@ -97,7 +98,9 @@
 **    test/sharedA.test
 **    test/shmlock.test
 **    test/superlock.test
+**    test/sysfault.test
 **    test/testrunner.tcl
+**    test/threadtest4.c
 **    test/threadtest5.c
 **    test/wal.test
 **    test/wal2.test
@@ -22740,14 +22743,35 @@ SQLITE_PRIVATE const char *sqlite3ErrName(int);
 #ifndef SQLITE_OMIT_DESERIALIZE
 SQLITE_PRIVATE int sqlite3MemdbInit(void);
 SQLITE_PRIVATE int sqlite3IsMemdb(const sqlite3_vfs*);
+#ifdef DOLTLITE_PROLLY
+SQLITE_PRIVATE sqlite3_vfs *sqlite3MemdbCreatePrivateVfs(
+  unsigned char*, sqlite3_int64, sqlite3_int64, unsigned
+);
+SQLITE_PRIVATE void sqlite3MemdbDestroyPrivateVfs(sqlite3_vfs*);
+SQLITE_PRIVATE int sqlite3MemdbPrivateVfsData(
+  sqlite3_vfs*, unsigned char**, sqlite3_int64*, int
+);
+SQLITE_PRIVATE int sqlite3IsDoltliteMemdb(const sqlite3_vfs*);
+int doltliteBtreeSerialize(Btree*, unsigned char**, sqlite3_int64*);
+int doltliteBtreeDeserialize(
+  sqlite3*, unsigned char*, sqlite3_int64, sqlite3_int64, unsigned, Btree**
+);
+#endif
 #else
 # define sqlite3IsMemdb(X) 0
+# ifdef DOLTLITE_PROLLY
+#  define sqlite3IsDoltliteMemdb(X) 0
+#  define sqlite3MemdbDestroyPrivateVfs(X) ((void)0)
+# endif
 #endif
 
 SQLITE_PRIVATE const char *sqlite3ErrStr(int);
 SQLITE_PRIVATE int sqlite3ReadSchema(Parse *pParse);
 SQLITE_PRIVATE CollSeq *sqlite3FindCollSeq(sqlite3*,u8 enc, const char*,int);
 SQLITE_PRIVATE int sqlite3IsBinary(const CollSeq*);
+#ifdef DOLTLITE_PROLLY
+SQLITE_PRIVATE int sqlite3DoltliteIsBuiltinCollation(const CollSeq*);
+#endif
 SQLITE_PRIVATE CollSeq *sqlite3LocateCollSeq(Parse *pParse, const char*zName);
 SQLITE_PRIVATE void sqlite3SetTextEncoding(sqlite3 *db, u8);
 SQLITE_PRIVATE CollSeq *sqlite3ExprCollSeq(Parse *pParse, const Expr *pExpr);
@@ -23334,6 +23358,7 @@ int prollyWeibullCheck(u32 size, u32 thisSize, u32 hash);
 
 typedef struct ChunkIndexEntry ChunkIndexEntry;
 typedef struct ChunkIndex ChunkIndex;
+typedef struct ChunkIndexLazy ChunkIndexLazy;
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define DOLTLITE_PACKED __attribute__((__packed__))
@@ -23354,6 +23379,15 @@ struct DOLTLITE_PACKED ChunkIndexEntry {
 #  pragma pack(pop)
 #endif
 
+struct ChunkIndexLazy {
+  i64 iRootOffset;
+  i64 iDataEnd;
+  int nRootSize;
+  int nEntries;
+  ProllyHash rootHash;
+  u8 active;
+};
+
 struct ChunkIndex {
   ChunkIndexEntry *aIndex;
   int nIndex;
@@ -23362,6 +23396,7 @@ struct ChunkIndex {
   int nChunks;
   i64 iIndexOffset;
   i64 nIndexSize;
+  ChunkIndexLazy lazy;
 };
 
 void chunkIndexGetEntries(const ChunkIndex *idx, int *pn, const ChunkIndexEntry **par);
@@ -23372,6 +23407,9 @@ void chunkIndexReplaceEntries(ChunkIndex *idx, ChunkIndexEntry *aNew, int nNew);
 
 struct ChunkStore;
 int csReadIndex(struct ChunkStore *cs);
+int csIndexLookup(struct ChunkStore *cs, const ProllyHash *pHash,
+                  ChunkIndexEntry *pEntry, int *pFound);
+int csMaterializeIndex(struct ChunkStore *cs);
 int csSearchIndex(const ChunkIndexEntry *aIdx, int nIdx, const ProllyHash *pHash);
 int csIndexEntryCmp(const void *a, const void *b);
 int csMergeIndex(struct ChunkStore *cs, ChunkIndexEntry **ppMerged, int *pnMerged);
@@ -23562,6 +23600,13 @@ typedef struct ChunkStoreReloadState ChunkStoreReloadState;
 struct WalState {
   i64 iWalOffset;
   i64 nWalData;
+  i64 iCheckpointOffset;
+  i64 nCheckpointIndex;
+  i64 iCheckpointReplay;
+  i64 iCheckpointDataEnd;
+  int nCheckpointEntries;
+  ProllyHash checkpointHash;
+  u32 checkpointMagic;
   u8 recoveredMidStream;
   u8 cleanCloseMarker;
 };
@@ -23571,6 +23616,7 @@ struct ChunkStoreReplayState {
   int nIndex;
   void *aIndexMmapBase;
   i64 aIndexMmapSize;
+  ChunkIndexLazy lazy;
   SavedRefsState refs;
 };
 
@@ -23590,6 +23636,12 @@ void walStateSetDataSize(WalState *w, i64 nData);
 
 struct ChunkStore;
 int csReplayWal(struct ChunkStore *cs);
+int csReplayWalSkipping(struct ChunkStore *cs, i64 iSkipStart, i64 iSkipEnd);
+int csTryLoadWalCheckpoint(struct ChunkStore *cs, int *pLoaded,
+                           i64 *pSkipStart, i64 *pSkipEnd);
+int csWriteWalCheckpoint(struct ChunkStore *cs, int sectorSize, int *pWritten);
+int csWalCheckpointDue(const struct ChunkStore *cs);
+void csStampWalCheckpoint(const struct ChunkStore *cs, u8 *aManifest);
 void csCaptureReloadState(struct ChunkStore *cs, ChunkStoreReloadState *pSaved);
 void csFreeReloadState(ChunkStoreReloadState *pSaved);
 void csAdoptOpenedStoreState(struct ChunkStore *pDst, struct ChunkStore *pSrc);
@@ -23738,6 +23790,11 @@ void csCloseFile(sqlite3_file *pFile);
 
 #define CS_MANIFEST_MAGIC_OFF        0
 #define CS_MANIFEST_VERSION_OFF      4
+/* A sealed root may point at an index checkpoint made of ordinary WAL chunks.
+** Readers that do not understand the stamp safely replay those chunks. */
+#define CS_MANIFEST_CHECKPOINT_MAGIC_OFF 8
+#define CS_MANIFEST_CHECKPOINT_OFFSET_OFF 12
+#define CS_MANIFEST_CHECKPOINT_SIZE_OFF 20
 #define CS_MANIFEST_CHUNK_COUNT_OFF  28
 #define CS_MANIFEST_INDEX_OFFSET_OFF 32
 #define CS_MANIFEST_INDEX_SIZE_OFF   40
@@ -23761,9 +23818,13 @@ void csCloseFile(sqlite3_file *pFile);
 #define CS_MANIFEST_DURABLE_TO_OFF   44
 #define CS_MANIFEST_NEXT_OFF_OFF     52
 #define CS_MANIFEST_BATCH_START_OFF  60
+#define CS_MANIFEST_CHECKPOINT_REPLAY_OFF 68
+#define CS_MANIFEST_CHECKPOINT_DATA_END_OFF 76
 #define CS_MANIFEST_WAL_OFFSET_OFF   84
 #define CS_MANIFEST_REFS_HASH_OFF    104
 #define CS_MANIFEST_SELF_HASH_OFF    124
+#define CS_MANIFEST_CHECKPOINT_HASH_OFF 144
+#define CS_MANIFEST_CHECKPOINT_COUNT_OFF 164
 
 #define CS_MANIFEST_HASH_LEGACY 0
 #define CS_MANIFEST_HASH_OK     1
@@ -23771,9 +23832,17 @@ void csCloseFile(sqlite3_file *pFile);
 
 #define CS_WAL_TAG_CHUNK  0x01
 #define CS_WAL_TAG_ROOT   0x02
+#define CS_WAL_CHECKPOINT_MAGIC_V1 0x31504b43
+#define CS_WAL_CHECKPOINT_MAGIC_V2 0x32504b43
 #define CS_WAL_CHUNK_HASH_OFF  1
 #define CS_WAL_CHUNK_LEN_OFF   (1 + PROLLY_HASH_SIZE)
 #define CS_WAL_CHUNK_HDR_SIZE  (1 + PROLLY_HASH_SIZE + 4)
+
+#define CS_INDEX_PAGE_LEAF_MAGIC 0x314c5049
+#define CS_INDEX_PAGE_INTERNAL_MAGIC 0x31495049
+#define CS_INDEX_PAGE_SIZE 4096
+#define CS_INDEX_PAGE_HEADER_SIZE 8
+#define CS_INDEX_CHILD_SIZE (PROLLY_HASH_SIZE + 8 + 4 + PROLLY_HASH_SIZE)
 
 #define WS_FORMAT_VERSION_V2 2
 #define WS_FORMAT_VERSION_V3 3
@@ -23789,6 +23858,12 @@ void csCloseFile(sqlite3_file *pFile);
 #define WS_CONFLICTS_OFF    (WS_MERGE_COMMIT_OFF + PROLLY_HASH_SIZE)
 #define WS_TOTAL_SIZE_V2    (WS_CONFLICTS_OFF + PROLLY_HASH_SIZE)
 #define WS_REBASING_OFF     WS_TOTAL_SIZE_V2
+/* Bit 0: rebase in progress. Bit 1: return-branch blob is a metadata
+** overlay that must not replace a dirty catalog. Whole-blob mirror is
+** bit 0 alone. Stay inside the v5 size: GC classifies working sets by
+** exact length. */
+#define WS_REBASE_FLAG_ACTIVE      0x01
+#define WS_REBASE_FLAG_META_MIRROR 0x02
 #define WS_PRE_REBASE_CAT_OFF (WS_REBASING_OFF + 1)
 #define WS_REBASE_ONTO_OFF  (WS_PRE_REBASE_CAT_OFF + PROLLY_HASH_SIZE)
 #define WS_REBASE_BRANCH_OFF (WS_REBASE_ONTO_OFF + PROLLY_HASH_SIZE)
@@ -23865,6 +23940,7 @@ struct ChunkStore {
   ** change detection can be expected to bless. */
   u8 adoptReplacement;
   u8 isMemory;
+  u8 isBuffer;
   u8 fullFsync;           /* PRAGMA fullfsync: syncs use SQLITE_SYNC_FULL */
   u8 noSync;              /* PRAGMA synchronous=OFF: skip durability syncs */
   u8 snapshotPinned;
@@ -23883,6 +23959,7 @@ struct ChunkStore {
 
   /* Prevent checkpoint reentry through VFS write hooks. */
   int checkpointActive;
+  sqlite3_vfs *pOwnedVfs;
 };
 
 void csManifestSeal(u8 *aBuf, i64 iOffset);
@@ -23899,11 +23976,11 @@ int chunkStoreLockAndRefresh(ChunkStore *cs);
 int chunkStoreLockAndRefreshChanged(ChunkStore *cs, int *pChanged);
 void chunkStoreUnlock(ChunkStore *cs);
 
-/* A memory store has no file to lock and no peer to race, so the lock calls
-** are no-ops there and leave lockDepth at zero. */
+/* Connection-private stores have no peer to race, so their lock calls are
+** no-ops and leave lockDepth at zero. */
 #define PROLLY_ASSERT_STORE_GRAPH_LOCKED(cs) do{ \
   assert( (cs)!=0 ); \
-  assert( (cs)->isMemory \
+  assert( (cs)->isMemory || (cs)->isBuffer \
        || ((cs)->pGraphLockFile!=0 && (cs)->lockDepth>0) ); \
 }while(0)
 int chunkStoreHasExternalChanges(ChunkStore *cs, int *pChanged);
@@ -23977,6 +24054,8 @@ int chunkStorePutSparse(ChunkStore *cs, const u8 *pPrefix, int nPrefix,
                         i64 nZeroTail, ProllyHash *pHash);
 
 int chunkStoreCommit(ChunkStore *cs);
+
+int chunkStoreCopyIntoEmpty(ChunkStore *pSrc, ChunkStore *pDest);
 
 void chunkStoreRollback(ChunkStore *cs);
 int chunkStoreEnsureRefsFresh(ChunkStore *cs);
@@ -55635,6 +55714,9 @@ SQLITE_API int sqlite3_os_end(void){
 typedef struct sqlite3_vfs MemVfs;
 typedef struct MemFile MemFile;
 typedef struct MemStore MemStore;
+#ifdef DOLTLITE_PROLLY
+typedef struct DoltliteMemVfs DoltliteMemVfs;
+#endif
 
 /* Access to a lower-level VFS that (might) implement dynamic loading,
 ** access to randomness, etc.
@@ -55743,6 +55825,7 @@ static int memdbSleep(sqlite3_vfs*, int microseconds);
 /* static int memdbCurrentTime(sqlite3_vfs*, double*); */
 static int memdbGetLastError(sqlite3_vfs*, int, char *);
 static int memdbCurrentTimeInt64(sqlite3_vfs*, sqlite3_int64*);
+static const sqlite3_io_methods memdb_io_methods;
 
 static sqlite3_vfs memdb_vfs = {
   2,                           /* iVersion */
@@ -55768,6 +55851,61 @@ static sqlite3_vfs memdb_vfs = {
   0,                           /* xGetSystemCall */
   0,                           /* xNextSystemCall */
 };
+
+#ifdef DOLTLITE_PROLLY
+struct DoltliteMemVfs {
+  sqlite3_vfs base;
+  MemStore *pStore;
+};
+
+static int doltliteMemdbOpen(
+  sqlite3_vfs *pVfs,
+  const char *zName,
+  sqlite3_file *pFd,
+  int flags,
+  int *pOutFlags
+){
+  DoltliteMemVfs *p = (DoltliteMemVfs*)pVfs;
+  MemFile *pFile = (MemFile*)pFd;
+  UNUSED_PARAMETER(zName);
+  memset(pFile, 0, sizeof(*pFile));
+  p->pStore->nRef++;
+  pFile->pStore = p->pStore;
+  if( pOutFlags ){
+    *pOutFlags = flags | SQLITE_OPEN_MEMORY;
+    if( p->pStore->mFlags & SQLITE_DESERIALIZE_READONLY ){
+      *pOutFlags &= ~SQLITE_OPEN_READWRITE;
+      *pOutFlags |= SQLITE_OPEN_READONLY;
+    }
+  }
+  pFd->pMethods = &memdb_io_methods;
+  return SQLITE_OK;
+}
+
+static int doltliteMemdbDelete(
+  sqlite3_vfs *pVfs,
+  const char *zName,
+  int syncDir
+){
+  UNUSED_PARAMETER(pVfs);
+  UNUSED_PARAMETER(zName);
+  UNUSED_PARAMETER(syncDir);
+  return SQLITE_IOERR_DELETE;
+}
+
+static int doltliteMemdbAccess(
+  sqlite3_vfs *pVfs,
+  const char *zName,
+  int flags,
+  int *pResOut
+){
+  DoltliteMemVfs *p = (DoltliteMemVfs*)pVfs;
+  UNUSED_PARAMETER(zName);
+  UNUSED_PARAMETER(flags);
+  *pResOut = p->pStore->sz>0;
+  return SQLITE_OK;
+}
+#endif
 
 static const sqlite3_io_methods memdb_io_methods = {
   3,                              /* iVersion */
@@ -56401,14 +56539,15 @@ SQLITE_API unsigned char *sqlite3_serialize(
   pBt = db->aDb[iDb].pBt;
   if( pBt==0 ) goto serialize_out;
 #ifdef DOLTLITE_PROLLY
-  /* doltlite stores prolly trees, not a stock page image. Its chunk-store
-  ** pager shim answers every sqlite3PagerGet() with SQLITE_OK and a NULL page,
-  ** so the page dump below would memcpy() from a NULL pointer. There is no page
-  ** image to serialize, so report the operation as unsupported (NULL) rather
-  ** than crashing or returning a zero-filled buffer. */
-  {
-    extern int pagerShimIsShim(const Pager*);
-    if( pagerShimIsShim(sqlite3BtreePager(pBt)) ) goto serialize_out;
+  if( sqlite3BtreeIsDoltliteFormat(pBt) ){
+    if( mFlags & SQLITE_SERIALIZE_NOCOPY ) goto serialize_out;
+    rc = doltliteBtreeSerialize(pBt, &pOut, &sz);
+    if( rc==SQLITE_OK ){
+      if( piSize ) *piSize = sz;
+    }else if( rc==SQLITE_NOMEM || rc==SQLITE_IOERR_NOMEM ){
+      sqlite3OomFault(db);
+    }
+    goto serialize_out;
   }
 #endif
   szPage = sqlite3BtreeGetPageSize(pBt);
@@ -56489,6 +56628,38 @@ SQLITE_API int sqlite3_deserialize(
     rc = SQLITE_ERROR;
     goto end_deserialize;
   }
+#ifdef DOLTLITE_PROLLY
+  if( iDb>=0 && db->aDb[iDb].pBt
+   && sqlite3BtreeIsDoltliteFormat(db->aDb[iDb].pBt) ){
+    Btree *pNewBt = 0;
+    Schema *pNewSchema;
+    if( szDb<0 || szBuf<szDb || (szDb>0 && pData==0) ){
+      rc = SQLITE_MISUSE;
+      goto end_deserialize;
+    }
+    if( sqlite3BtreeTxnState(db->aDb[iDb].pBt)!=SQLITE_TXN_NONE
+     || sqlite3BtreeIsInBackup(db->aDb[iDb].pBt) ){
+      rc = SQLITE_BUSY;
+      goto end_deserialize;
+    }
+    rc = doltliteBtreeDeserialize(
+        db, pData, szDb, szBuf, mFlags, &pNewBt);
+    pData = 0;
+    if( rc!=SQLITE_OK ) goto end_deserialize;
+    pNewSchema = sqlite3SchemaGet(db, pNewBt);
+    if( pNewSchema==0 ){
+      sqlite3BtreeClose(pNewBt);
+      rc = SQLITE_NOMEM;
+      goto end_deserialize;
+    }
+    sqlite3BtreeClose(db->aDb[iDb].pBt);
+    db->aDb[iDb].pBt = pNewBt;
+    db->aDb[iDb].pSchema = pNewSchema;
+    db->mDbFlags &= ~DBFLAG_SchemaKnownOk;
+    rc = SQLITE_OK;
+    goto end_deserialize;
+  }
+#endif
   zSql = sqlite3_mprintf("ATTACH x AS %Q", zSchema);
   if( zSql==0 ){
     rc = SQLITE_NOMEM;
@@ -56536,6 +56707,80 @@ end_deserialize:
 SQLITE_PRIVATE int sqlite3IsMemdb(const sqlite3_vfs *pVfs){
   return pVfs==&memdb_vfs;
 }
+
+#ifdef DOLTLITE_PROLLY
+SQLITE_PRIVATE sqlite3_vfs *sqlite3MemdbCreatePrivateVfs(
+  unsigned char *pData,
+  sqlite3_int64 szDb,
+  sqlite3_int64 szBuf,
+  unsigned mFlags
+){
+  DoltliteMemVfs *pVfs;
+  MemStore *pStore;
+  pVfs = sqlite3_malloc64(sizeof(*pVfs));
+  if( pVfs==0 ) return 0;
+  pStore = sqlite3_malloc64(sizeof(*pStore));
+  if( pStore==0 ){
+    sqlite3_free(pVfs);
+    return 0;
+  }
+  memset(pVfs, 0, sizeof(*pVfs));
+  memset(pStore, 0, sizeof(*pStore));
+  pVfs->base = memdb_vfs;
+  pVfs->base.zName = "doltlite-memdb";
+  pVfs->base.xOpen = doltliteMemdbOpen;
+  pVfs->base.xDelete = doltliteMemdbDelete;
+  pVfs->base.xAccess = doltliteMemdbAccess;
+  pVfs->pStore = pStore;
+  pStore->aData = pData;
+  pStore->sz = szDb;
+  pStore->szAlloc = szBuf;
+  pStore->szMax = szBuf;
+  if( (mFlags & SQLITE_DESERIALIZE_RESIZEABLE)!=0
+   && pStore->szMax<sqlite3GlobalConfig.mxMemdbSize ){
+    pStore->szMax = sqlite3GlobalConfig.mxMemdbSize;
+  }
+  pStore->mFlags = mFlags;
+  pStore->nRef = 1;
+  return &pVfs->base;
+}
+
+SQLITE_PRIVATE void sqlite3MemdbDestroyPrivateVfs(sqlite3_vfs *pBase){
+  DoltliteMemVfs *pVfs = (DoltliteMemVfs*)pBase;
+  MemStore *pStore;
+  if( pVfs==0 ) return;
+  pStore = pVfs->pStore;
+  assert( pStore->nRef==1 );
+  if( pStore->mFlags & SQLITE_DESERIALIZE_FREEONCLOSE ){
+    sqlite3_free(pStore->aData);
+  }
+  sqlite3_free(pStore);
+  sqlite3_free(pVfs);
+}
+
+SQLITE_PRIVATE int sqlite3MemdbPrivateVfsData(
+  sqlite3_vfs *pBase,
+  unsigned char **ppData,
+  sqlite3_int64 *pnData,
+  int detach
+){
+  DoltliteMemVfs *pVfs = (DoltliteMemVfs*)pBase;
+  MemStore *pStore = pVfs->pStore;
+  *ppData = pStore->aData;
+  *pnData = pStore->sz;
+  if( detach ){
+    pStore->aData = 0;
+    pStore->sz = 0;
+    pStore->szAlloc = 0;
+    pStore->mFlags &= ~SQLITE_DESERIALIZE_FREEONCLOSE;
+  }
+  return SQLITE_OK;
+}
+
+SQLITE_PRIVATE int sqlite3IsDoltliteMemdb(const sqlite3_vfs *pVfs){
+  return pVfs && pVfs->xOpen==doltliteMemdbOpen;
+}
+#endif
 
 /*
 ** This routine is called when the extension is loaded.
@@ -87383,6 +87628,11 @@ copy_finished:
 
 #define CS_MANIFEST_MAGIC_OFF        0
 #define CS_MANIFEST_VERSION_OFF      4
+/* A sealed root may point at an index checkpoint made of ordinary WAL chunks.
+** Readers that do not understand the stamp safely replay those chunks. */
+#define CS_MANIFEST_CHECKPOINT_MAGIC_OFF 8
+#define CS_MANIFEST_CHECKPOINT_OFFSET_OFF 12
+#define CS_MANIFEST_CHECKPOINT_SIZE_OFF 20
 #define CS_MANIFEST_CHUNK_COUNT_OFF  28
 #define CS_MANIFEST_INDEX_OFFSET_OFF 32
 #define CS_MANIFEST_INDEX_SIZE_OFF   40
@@ -87406,9 +87656,13 @@ copy_finished:
 #define CS_MANIFEST_DURABLE_TO_OFF   44
 #define CS_MANIFEST_NEXT_OFF_OFF     52
 #define CS_MANIFEST_BATCH_START_OFF  60
+#define CS_MANIFEST_CHECKPOINT_REPLAY_OFF 68
+#define CS_MANIFEST_CHECKPOINT_DATA_END_OFF 76
 #define CS_MANIFEST_WAL_OFFSET_OFF   84
 #define CS_MANIFEST_REFS_HASH_OFF    104
 #define CS_MANIFEST_SELF_HASH_OFF    124
+#define CS_MANIFEST_CHECKPOINT_HASH_OFF 144
+#define CS_MANIFEST_CHECKPOINT_COUNT_OFF 164
 
 #define CS_MANIFEST_HASH_LEGACY 0
 #define CS_MANIFEST_HASH_OK     1
@@ -87416,9 +87670,17 @@ copy_finished:
 
 #define CS_WAL_TAG_CHUNK  0x01
 #define CS_WAL_TAG_ROOT   0x02
+#define CS_WAL_CHECKPOINT_MAGIC_V1 0x31504b43
+#define CS_WAL_CHECKPOINT_MAGIC_V2 0x32504b43
 #define CS_WAL_CHUNK_HASH_OFF  1
 #define CS_WAL_CHUNK_LEN_OFF   (1 + PROLLY_HASH_SIZE)
 #define CS_WAL_CHUNK_HDR_SIZE  (1 + PROLLY_HASH_SIZE + 4)
+
+#define CS_INDEX_PAGE_LEAF_MAGIC 0x314c5049
+#define CS_INDEX_PAGE_INTERNAL_MAGIC 0x31495049
+#define CS_INDEX_PAGE_SIZE 4096
+#define CS_INDEX_PAGE_HEADER_SIZE 8
+#define CS_INDEX_CHILD_SIZE (PROLLY_HASH_SIZE + 8 + 4 + PROLLY_HASH_SIZE)
 
 #define WS_FORMAT_VERSION_V2 2
 #define WS_FORMAT_VERSION_V3 3
@@ -87434,6 +87696,12 @@ copy_finished:
 #define WS_CONFLICTS_OFF    (WS_MERGE_COMMIT_OFF + PROLLY_HASH_SIZE)
 #define WS_TOTAL_SIZE_V2    (WS_CONFLICTS_OFF + PROLLY_HASH_SIZE)
 #define WS_REBASING_OFF     WS_TOTAL_SIZE_V2
+/* Bit 0: rebase in progress. Bit 1: return-branch blob is a metadata
+** overlay that must not replace a dirty catalog. Whole-blob mirror is
+** bit 0 alone. Stay inside the v5 size: GC classifies working sets by
+** exact length. */
+#define WS_REBASE_FLAG_ACTIVE      0x01
+#define WS_REBASE_FLAG_META_MIRROR 0x02
 #define WS_PRE_REBASE_CAT_OFF (WS_REBASING_OFF + 1)
 #define WS_REBASE_ONTO_OFF  (WS_PRE_REBASE_CAT_OFF + PROLLY_HASH_SIZE)
 #define WS_REBASE_BRANCH_OFF (WS_REBASE_ONTO_OFF + PROLLY_HASH_SIZE)
@@ -87510,6 +87778,7 @@ struct ChunkStore {
   ** change detection can be expected to bless. */
   u8 adoptReplacement;
   u8 isMemory;
+  u8 isBuffer;
   u8 fullFsync;           /* PRAGMA fullfsync: syncs use SQLITE_SYNC_FULL */
   u8 noSync;              /* PRAGMA synchronous=OFF: skip durability syncs */
   u8 snapshotPinned;
@@ -87528,6 +87797,7 @@ struct ChunkStore {
 
   /* Prevent checkpoint reentry through VFS write hooks. */
   int checkpointActive;
+  sqlite3_vfs *pOwnedVfs;
 };
 
 void csManifestSeal(u8 *aBuf, i64 iOffset);
@@ -87544,11 +87814,11 @@ int chunkStoreLockAndRefresh(ChunkStore *cs);
 int chunkStoreLockAndRefreshChanged(ChunkStore *cs, int *pChanged);
 void chunkStoreUnlock(ChunkStore *cs);
 
-/* A memory store has no file to lock and no peer to race, so the lock calls
-** are no-ops there and leave lockDepth at zero. */
+/* Connection-private stores have no peer to race, so their lock calls are
+** no-ops and leave lockDepth at zero. */
 #define PROLLY_ASSERT_STORE_GRAPH_LOCKED(cs) do{ \
   assert( (cs)!=0 ); \
-  assert( (cs)->isMemory \
+  assert( (cs)->isMemory || (cs)->isBuffer \
        || ((cs)->pGraphLockFile!=0 && (cs)->lockDepth>0) ); \
 }while(0)
 int chunkStoreHasExternalChanges(ChunkStore *cs, int *pChanged);
@@ -87622,6 +87892,8 @@ int chunkStorePutSparse(ChunkStore *cs, const u8 *pPrefix, int nPrefix,
                         i64 nZeroTail, ProllyHash *pHash);
 
 int chunkStoreCommit(ChunkStore *cs);
+
+int chunkStoreCopyIntoEmpty(ChunkStore *pSrc, ChunkStore *pDest);
 
 void chunkStoreRollback(ChunkStore *cs);
 int chunkStoreEnsureRefsFresh(ChunkStore *cs);
@@ -93392,6 +93664,10 @@ static int vdbeCommit(sqlite3 *db, Vdbe *p){
                    ** super-journal */
   int rc = SQLITE_OK;
   int needXcommit = 0;
+#ifdef DOLTLITE_PROLLY
+  int nFileWrite = 0;
+  int hasDoltliteWrite = 0;
+#endif
 
 #ifdef SQLITE_OMIT_VIRTUALTABLE
   /* With this option, sqlite3VtabSync() is defined to be simply
@@ -93432,6 +93708,15 @@ static int vdbeCommit(sqlite3 *db, Vdbe *p){
       needXcommit = 1;
       sqlite3BtreeEnter(pBt);
       pPager = sqlite3BtreePager(pBt);
+#ifdef DOLTLITE_PROLLY
+      if( i!=1 && sqlite3PagerIsMemdb(pPager)==0 ){
+        const char *zFilename = sqlite3BtreeGetFilename(pBt);
+        if( zFilename && zFilename[0] ){
+          nFileWrite++;
+          if( sqlite3BtreeIsDoltliteFormat(pBt) ) hasDoltliteWrite = 1;
+        }
+      }
+#endif
       if( db->aDb[i].safety_level!=PAGER_SYNCHRONOUS_OFF
        && aMJNeeded[sqlite3PagerGetJournalMode(pPager)]
        && sqlite3PagerIsMemdb(pPager)==0
@@ -93446,6 +93731,13 @@ static int vdbeCommit(sqlite3 *db, Vdbe *p){
   if( rc!=SQLITE_OK ){
     return rc;
   }
+#ifdef DOLTLITE_PROLLY
+  if( nFileWrite>1 && hasDoltliteWrite ){
+    sqlite3VdbeError(p,
+        "atomic commit across multiple file-backed databases is not supported");
+    return SQLITE_ERROR;
+  }
+#endif
 
   /* If there are any write-transactions at all, invoke the commit hook */
   if( needXcommit && db->xCommitCallback ){
@@ -107814,21 +108106,6 @@ case OP_Checkpoint: {
        || pOp->p2==SQLITE_CHECKPOINT_TRUNCATE
        || pOp->p2==SQLITE_CHECKPOINT_NOOP
   );
-#ifdef DOLTLITE_PROLLY
-  if( pOp->p2!=SQLITE_CHECKPOINT_PASSIVE ){
-    int iDb;
-    for(iDb=0; iDb<db->nDb; iDb++){
-      if( (pOp->p1==iDb || pOp->p1==SQLITE_MAX_DB)
-       && sqlite3BtreeIsDoltliteFormat(db->aDb[iDb].pBt) ){
-        rc = SQLITE_ERROR;
-        sqlite3VdbeError(p,
-          "wal_checkpoint mode is not configurable on doltlite-format "
-          "databases; use the default (PASSIVE) form");
-        goto abort_due_to_error;
-      }
-    }
-  }
-#endif
   rc = sqlite3Checkpoint(db, pOp->p1, pOp->p2, &aRes[1], &aRes[2]);
   if( rc ){
     if( rc!=SQLITE_BUSY ) goto abort_due_to_error;
@@ -132001,9 +132278,8 @@ SQLITE_PRIVATE void sqlite3AddCollateType(Parse *pParse, Token *pToken){
         /* This retrofit would persist a custom-collated index, which
         ** prolly-tree sort keys cannot support. Apply the same rejection
         ** as sqlite3CreateIndex. */
-        if( sqlite3StrICmp(zColl, "BINARY")!=0
-         && sqlite3StrICmp(zColl, "NOCASE")!=0
-         && sqlite3StrICmp(zColl, "RTRIM")!=0 ){
+        if( !sqlite3DoltliteIsBuiltinCollation(
+              sqlite3FindCollSeq(db, ENC(db), zColl, 0)) ){
           Btree *pColBt = db->aDb[sqlite3SchemaToIndex(db, p->pSchema)].pBt;
           if( pColBt && !sqlite3BtreeUsesOrig(pColBt) ){
             sqlite3ErrorMsg(pParse,
@@ -134586,9 +134862,9 @@ SQLITE_PRIVATE void sqlite3CreateIndex(
     /* Prolly-tree sort keys only support BINARY, NOCASE, and RTRIM.
     ** Reject indexes on columns with user-defined collations — they
     ** would produce wrong results on index lookups. */
-    if( sqlite3StrICmp(zColl, "BINARY")!=0
-     && sqlite3StrICmp(zColl, "NOCASE")!=0
-     && sqlite3StrICmp(zColl, "RTRIM")!=0 ){
+    if( !sqlite3BtreeUsesOrig(db->aDb[iDb].pBt)
+     && !sqlite3DoltliteIsBuiltinCollation(
+           sqlite3FindCollSeq(db, ENC(db), zColl, 0)) ){
       sqlite3ErrorMsg(pParse,
         "doltlite does not support indexes with custom collation '%s'", zColl);
       goto exit_create_index;
@@ -193346,6 +193622,18 @@ static int nocaseCollatingFunc(
   return r;
 }
 
+#ifdef DOLTLITE_PROLLY
+SQLITE_PRIVATE int sqlite3DoltliteIsBuiltinCollation(const CollSeq *p){
+  if( !p || !p->zName ) return 0;
+  if( sqlite3StrICmp(p->zName, "BINARY")==0 ) return p->xCmp==binCollFunc;
+  if( sqlite3StrICmp(p->zName, "NOCASE")==0 ){
+    return p->xCmp==nocaseCollatingFunc;
+  }
+  if( sqlite3StrICmp(p->zName, "RTRIM")==0 ) return p->xCmp==rtrimCollFunc;
+  return 0;
+}
+#endif
+
 /*
 ** Return the ROWID of the most recent insert
 */
@@ -195136,6 +195424,36 @@ static int createCollation(
 
   assert( sqlite3_mutex_held(db->mutex) );
 
+#ifdef DOLTLITE_PROLLY
+  if( sqlite3StrICmp(zName, "BINARY")==0
+   || sqlite3StrICmp(zName, "NOCASE")==0
+   || sqlite3StrICmp(zName, "RTRIM")==0 ){
+    int iDb;
+    for(iDb=0; iDb<db->nDb; iDb++){
+      HashElem *pElem;
+      if( !db->aDb[iDb].pBt || sqlite3BtreeUsesOrig(db->aDb[iDb].pBt) ){
+        continue;
+      }
+      for(pElem=sqliteHashFirst(&db->aDb[iDb].pSchema->tblHash);
+          pElem; pElem=sqliteHashNext(pElem)){
+        Table *pTab = sqliteHashData(pElem);
+        Index *pIdx;
+        for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+          int i;
+          for(i=0; i<pIdx->nKeyCol; i++){
+            if( sqlite3StrICmp(pIdx->azColl[i], zName)==0 ){
+              sqlite3ErrorWithMsg(db, SQLITE_ERROR,
+                "doltlite cannot replace collation '%s' used by index '%s'",
+                zName, pIdx->zName);
+              return SQLITE_ERROR;
+            }
+          }
+        }
+      }
+    }
+  }
+#endif
+
   /* If SQLITE_UTF16 is specified as the encoding type, transform this
   ** to one of SQLITE_UTF16LE or SQLITE_UTF16BE using the
   ** SQLITE_UTF16NATIVE macro. SQLITE_UTF16 is not used internally.
@@ -196020,17 +196338,6 @@ SQLITE_API int sqlite3_open16(
 /*
 ** Register a new collation sequence with the database handle db.
 */
-#if defined(DOLTLITE_PROLLY) && !defined(SQLITE_TEST)
-static int doltliteCreateCollationUnsupported(sqlite3 *db){
-  int rc = SQLITE_ERROR;
-  sqlite3_mutex_enter(db->mutex);
-  sqlite3ErrorWithMsg(db, rc, "not supported");
-  rc = sqlite3ApiExit(db, rc);
-  sqlite3_mutex_leave(db->mutex);
-  return rc;
-}
-#endif
-
 SQLITE_API int sqlite3_create_collation(
   sqlite3* db,
   const char *zName,
@@ -196038,18 +196345,7 @@ SQLITE_API int sqlite3_create_collation(
   void* pCtx,
   int(*xCompare)(void*,int,const void*,int,const void*)
 ){
-#if defined(DOLTLITE_PROLLY) && !defined(SQLITE_TEST)
-#ifdef SQLITE_ENABLE_API_ARMOR
-  if( !sqlite3SafetyCheckOk(db) || zName==0 ) return SQLITE_MISUSE_BKPT;
-#endif
-  (void)zName;
-  (void)enc;
-  (void)pCtx;
-  (void)xCompare;
-  return doltliteCreateCollationUnsupported(db);
-#else
   return sqlite3_create_collation_v2(db, zName, enc, pCtx, xCompare, 0);
-#endif
 }
 
 /*
@@ -196067,14 +196363,6 @@ SQLITE_API int sqlite3_create_collation_v2(
 
 #ifdef SQLITE_ENABLE_API_ARMOR
   if( !sqlite3SafetyCheckOk(db) || zName==0 ) return SQLITE_MISUSE_BKPT;
-#endif
-#if defined(DOLTLITE_PROLLY) && !defined(SQLITE_TEST)
-  (void)zName;
-  (void)enc;
-  (void)pCtx;
-  (void)xCompare;
-  (void)xDel;
-  return doltliteCreateCollationUnsupported(db);
 #endif
   sqlite3_mutex_enter(db->mutex);
   assert( !db->mallocFailed );
@@ -196100,13 +196388,6 @@ SQLITE_API int sqlite3_create_collation16(
 
 #ifdef SQLITE_ENABLE_API_ARMOR
   if( !sqlite3SafetyCheckOk(db) || zName==0 ) return SQLITE_MISUSE_BKPT;
-#endif
-#if defined(DOLTLITE_PROLLY) && !defined(SQLITE_TEST)
-  (void)zName;
-  (void)enc;
-  (void)pCtx;
-  (void)xCompare;
-  return doltliteCreateCollationUnsupported(db);
 #endif
   sqlite3_mutex_enter(db->mutex);
   assert( !db->mallocFailed );
@@ -295537,7 +295818,6 @@ int ed25519_verify(const unsigned char *signature, const unsigned char *message,
 #undef MBEDTLS_PADLOCK_C
 #undef MBEDTLS_RIPEMD160_C
 #undef MBEDTLS_SHA3_C
-#undef MBEDTLS_SSL_PROTO_TLS1_3
 #undef MBEDTLS_SSL_SRV_C
 #undef MBEDTLS_THREADING_C
 #undef MBEDTLS_THREADING_PTHREAD
@@ -457252,6 +457532,7069 @@ int mbedtls_ssl_handshake_client_step(mbedtls_ssl_context *ssl)
 
 /************** End of ssl_tls12_client.c ************************************/
 #pragma pop_macro("PSA_TO_MBEDTLS_ERR")
+#pragma push_macro("PSA_TO_MBEDTLS_ERR")
+#pragma push_macro("SSL_SERVER_HELLO")
+#pragma push_macro("SSL_SERVER_HELLO_HRR")
+#pragma push_macro("SSL_SERVER_HELLO_TLS1_2")
+#pragma push_macro("SSL_CERTIFICATE_REQUEST_EXPECT_REQUEST")
+#pragma push_macro("SSL_CERTIFICATE_REQUEST_SKIP")
+#pragma push_macro("POSTPROCESS_NEW_SESSION_TICKET_SIGNAL")
+#pragma push_macro("POSTPROCESS_NEW_SESSION_TICKET_DISCARD")
+#pragma push_macro("local_err_translation")
+#define local_err_translation doltlite_mbedtls_tls13_client_err_translation
+/************** Begin file ssl_tls13_client.c ********************************/
+/*
+ *  TLS 1.3 client-side functions
+ *
+ *  Copyright The Mbed TLS Contributors
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ */
+
+/* #include "common.h" */
+
+#if defined(MBEDTLS_SSL_CLI_C) && defined(MBEDTLS_SSL_PROTO_TLS1_3)
+
+/* #include <string.h> */
+
+/* #include "debug_internal.h" */
+/* #include "mbedtls/error.h" */
+/* #include "mbedtls/platform.h" */
+
+/* #include "ssl_misc.h" */
+/* #include "ssl_client.h" */
+/* #include "ssl_tls13_keys.h" */
+/* #include "ssl_debug_helpers.h" */
+/* #include "mbedtls/psa_util.h" */
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+/* Define a local translating function to save code size by not using too many
+ * arguments in each translating place. */
+static int local_err_translation(psa_status_t status)
+{
+    return psa_status_to_mbedtls(status, psa_to_ssl_errors,
+                                 ARRAY_LENGTH(psa_to_ssl_errors),
+                                 psa_generic_status_to_mbedtls);
+}
+#define PSA_TO_MBEDTLS_ERR(status) local_err_translation(status)
+#endif
+
+/* Write extensions */
+
+/*
+ * ssl_tls13_write_supported_versions_ext():
+ *
+ * struct {
+ *      ProtocolVersion versions<2..254>;
+ * } SupportedVersions;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_supported_versions_ext(mbedtls_ssl_context *ssl,
+                                                  unsigned char *buf,
+                                                  unsigned char *end,
+                                                  size_t *out_len)
+{
+    unsigned char *p = buf;
+    unsigned char versions_len = (ssl->handshake->min_tls_version <=
+                                  MBEDTLS_SSL_VERSION_TLS1_2) ? 4 : 2;
+
+    *out_len = 0;
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("client hello, adding supported versions extension"));
+
+    /* Check if we have space to write the extension:
+     * - extension_type         (2 bytes)
+     * - extension_data_length  (2 bytes)
+     * - versions_length        (1 byte )
+     * - versions               (2 or 4 bytes)
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, 5 + versions_len);
+
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_TLS_EXT_SUPPORTED_VERSIONS, p, 0);
+    MBEDTLS_PUT_UINT16_BE(versions_len + 1, p, 2);
+    p += 4;
+
+    /* Length of versions */
+    *p++ = versions_len;
+
+    /* Write values of supported versions.
+     * They are defined by the configuration.
+     * Currently, we advertise only TLS 1.3 or both TLS 1.3 and TLS 1.2.
+     */
+    mbedtls_ssl_write_version(p, MBEDTLS_SSL_TRANSPORT_STREAM,
+                              MBEDTLS_SSL_VERSION_TLS1_3);
+    MBEDTLS_SSL_DEBUG_MSG(3, ("supported version: [3:4]"));
+
+
+    if (ssl->handshake->min_tls_version <= MBEDTLS_SSL_VERSION_TLS1_2) {
+        mbedtls_ssl_write_version(p + 2, MBEDTLS_SSL_TRANSPORT_STREAM,
+                                  MBEDTLS_SSL_VERSION_TLS1_2);
+        MBEDTLS_SSL_DEBUG_MSG(3, ("supported version: [3:3]"));
+    }
+
+    *out_len = 5 + versions_len;
+
+    mbedtls_ssl_tls13_set_hs_sent_ext_mask(
+        ssl, MBEDTLS_TLS_EXT_SUPPORTED_VERSIONS);
+
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_supported_versions_ext(mbedtls_ssl_context *ssl,
+                                                  const unsigned char *buf,
+                                                  const unsigned char *end)
+{
+    ((void) ssl);
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(buf, end, 2);
+    if (mbedtls_ssl_read_version(buf, ssl->conf->transport) !=
+        MBEDTLS_SSL_VERSION_TLS1_3) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("unexpected version"));
+
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+                                     MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+    if (&buf[2] != end) {
+        MBEDTLS_SSL_DEBUG_MSG(
+            1, ("supported_versions ext data length incorrect"));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
+                                     MBEDTLS_ERR_SSL_DECODE_ERROR);
+        return MBEDTLS_ERR_SSL_DECODE_ERROR;
+    }
+
+    return 0;
+}
+
+#if defined(MBEDTLS_SSL_ALPN)
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_alpn_ext(mbedtls_ssl_context *ssl,
+                                    const unsigned char *buf, size_t len)
+{
+    const unsigned char *p = buf;
+    const unsigned char *end = buf + len;
+    size_t protocol_name_list_len, protocol_name_len;
+    const unsigned char *protocol_name_list_end;
+
+    /* If we didn't send it, the server shouldn't send it */
+    if (ssl->conf->alpn_list == NULL) {
+        return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+    }
+
+    /*
+     * opaque ProtocolName<1..2^8-1>;
+     *
+     * struct {
+     *     ProtocolName protocol_name_list<2..2^16-1>
+     * } ProtocolNameList;
+     *
+     * the "ProtocolNameList" MUST contain exactly one "ProtocolName"
+     */
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    protocol_name_list_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, protocol_name_list_len);
+    protocol_name_list_end = p + protocol_name_list_len;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, protocol_name_list_end, 1);
+    protocol_name_len = *p++;
+
+    /* Check that the server chosen protocol was in our list and save it */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, protocol_name_list_end, protocol_name_len);
+    for (const char **alpn = ssl->conf->alpn_list; *alpn != NULL; alpn++) {
+        if (protocol_name_len == strlen(*alpn) &&
+            memcmp(p, *alpn, protocol_name_len) == 0) {
+            ssl->alpn_chosen = *alpn;
+            return 0;
+        }
+    }
+
+    return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+}
+#endif /* MBEDTLS_SSL_ALPN */
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_reset_key_share(mbedtls_ssl_context *ssl)
+{
+    uint16_t group_id = ssl->handshake->offered_group_id;
+
+    if (group_id == 0) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+    if (mbedtls_ssl_tls13_named_group_is_ecdhe(group_id) ||
+        mbedtls_ssl_tls13_named_group_is_ffdh(group_id)) {
+        int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+        psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+
+        /* Destroy generated private key. */
+        status = psa_destroy_key(ssl->handshake->xxdh_psa_privkey);
+        if (status != PSA_SUCCESS) {
+            ret = PSA_TO_MBEDTLS_ERR(status);
+            MBEDTLS_SSL_DEBUG_RET(1, "psa_destroy_key", ret);
+            return ret;
+        }
+
+        ssl->handshake->xxdh_psa_privkey = MBEDTLS_SVC_KEY_ID_INIT;
+        return 0;
+    } else
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED */
+    if (0 /* other KEMs? */) {
+        /* Do something */
+    }
+
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+}
+
+/*
+ * Functions for writing key_share extension.
+ */
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_get_default_group_id(mbedtls_ssl_context *ssl,
+                                          uint16_t *group_id)
+{
+    int ret = MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE;
+
+
+#if defined(PSA_WANT_ALG_ECDH) || defined(PSA_WANT_ALG_FFDH)
+    const uint16_t *group_list = mbedtls_ssl_get_groups(ssl);
+    /* Pick first available ECDHE group compatible with TLS 1.3 */
+    if (group_list == NULL) {
+        return MBEDTLS_ERR_SSL_BAD_CONFIG;
+    }
+
+    for (; *group_list != 0; group_list++) {
+#if defined(PSA_WANT_ALG_ECDH)
+        if ((mbedtls_ssl_get_psa_curve_info_from_tls_id(
+                 *group_list, NULL, NULL) == PSA_SUCCESS) &&
+            mbedtls_ssl_tls13_named_group_is_ecdhe(*group_list)) {
+            *group_id = *group_list;
+            return 0;
+        }
+#endif
+#if defined(PSA_WANT_ALG_FFDH)
+        if (mbedtls_ssl_tls13_named_group_is_ffdh(*group_list)) {
+            *group_id = *group_list;
+            return 0;
+        }
+#endif
+    }
+#else
+    ((void) ssl);
+    ((void) group_id);
+#endif /* PSA_WANT_ALG_ECDH || PSA_WANT_ALG_FFDH */
+
+    return ret;
+}
+
+/*
+ * ssl_tls13_write_key_share_ext
+ *
+ * Structure of key_share extension in ClientHello:
+ *
+ *  struct {
+ *          NamedGroup group;
+ *          opaque key_exchange<1..2^16-1>;
+ *      } KeyShareEntry;
+ *  struct {
+ *          KeyShareEntry client_shares<0..2^16-1>;
+ *      } KeyShareClientHello;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_key_share_ext(mbedtls_ssl_context *ssl,
+                                         unsigned char *buf,
+                                         unsigned char *end,
+                                         size_t *out_len)
+{
+    unsigned char *p = buf;
+    unsigned char *client_shares; /* Start of client_shares */
+    size_t client_shares_len;     /* Length of client_shares */
+    uint16_t group_id;
+    int ret = MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE;
+
+    *out_len = 0;
+
+    /* Check if we have space for header and length fields:
+     * - extension_type         (2 bytes)
+     * - extension_data_length  (2 bytes)
+     * - client_shares_length   (2 bytes)
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, 6);
+    p += 6;
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("client hello: adding key share extension"));
+
+    /* HRR could already have requested something else. */
+    group_id = ssl->handshake->offered_group_id;
+    if (!mbedtls_ssl_tls13_named_group_is_ecdhe(group_id) &&
+        !mbedtls_ssl_tls13_named_group_is_ffdh(group_id)) {
+        MBEDTLS_SSL_PROC_CHK(ssl_tls13_get_default_group_id(ssl,
+                                                            &group_id));
+    }
+
+    /*
+     * Dispatch to type-specific key generation function.
+     *
+     * So far, we're only supporting ECDHE. With the introduction
+     * of PQC KEMs, we'll want to have multiple branches, one per
+     * type of KEM, and dispatch to the corresponding crypto. And
+     * only one key share entry is allowed.
+     */
+    client_shares = p;
+#if defined(PSA_WANT_ALG_ECDH) || defined(PSA_WANT_ALG_FFDH)
+    if (mbedtls_ssl_tls13_named_group_is_ecdhe(group_id) ||
+        mbedtls_ssl_tls13_named_group_is_ffdh(group_id)) {
+        /* Pointer to group */
+        unsigned char *group = p;
+        /* Length of key_exchange */
+        size_t key_exchange_len = 0;
+
+        /* Check there is space for header of KeyShareEntry
+         * - group                  (2 bytes)
+         * - key_exchange_length    (2 bytes)
+         */
+        MBEDTLS_SSL_CHK_BUF_PTR(p, end, 4);
+        p += 4;
+        ret = mbedtls_ssl_tls13_generate_and_write_xxdh_key_exchange(
+            ssl, group_id, p, end, &key_exchange_len);
+        p += key_exchange_len;
+        if (ret != 0) {
+            MBEDTLS_SSL_DEBUG_MSG(1, ("client hello: failed generating xxdh key exchange"));
+            return ret;
+        }
+
+        /* Write group */
+        MBEDTLS_PUT_UINT16_BE(group_id, group, 0);
+        /* Write key_exchange_length */
+        MBEDTLS_PUT_UINT16_BE(key_exchange_len, group, 2);
+    } else
+#endif /* PSA_WANT_ALG_ECDH || PSA_WANT_ALG_FFDH */
+    if (0 /* other KEMs? */) {
+        /* Do something */
+    } else {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    /* Length of client_shares */
+    client_shares_len = p - client_shares;
+    if (client_shares_len == 0) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("No key share defined."));
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+    /* Write extension_type */
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_TLS_EXT_KEY_SHARE, buf, 0);
+    /* Write extension_data_length */
+    MBEDTLS_PUT_UINT16_BE(client_shares_len + 2, buf, 2);
+    /* Write client_shares_length */
+    MBEDTLS_PUT_UINT16_BE(client_shares_len, buf, 4);
+
+    /* Update offered_group_id field */
+    ssl->handshake->offered_group_id = group_id;
+
+    /* Output the total length of key_share extension. */
+    *out_len = p - buf;
+
+    MBEDTLS_SSL_DEBUG_BUF(
+        3, "client hello, key_share extension", buf, *out_len);
+
+    mbedtls_ssl_tls13_set_hs_sent_ext_mask(ssl, MBEDTLS_TLS_EXT_KEY_SHARE);
+
+cleanup:
+
+    return ret;
+}
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED */
+
+/*
+ * ssl_tls13_parse_hrr_key_share_ext()
+ *      Parse key_share extension in Hello Retry Request
+ *
+ * struct {
+ *        NamedGroup selected_group;
+ * } KeyShareHelloRetryRequest;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_hrr_key_share_ext(mbedtls_ssl_context *ssl,
+                                             const unsigned char *buf,
+                                             const unsigned char *end)
+{
+#if defined(PSA_WANT_ALG_ECDH) || defined(PSA_WANT_ALG_FFDH)
+    const unsigned char *p = buf;
+    int selected_group;
+    int found = 0;
+
+    const uint16_t *group_list = mbedtls_ssl_get_groups(ssl);
+    if (group_list == NULL) {
+        return MBEDTLS_ERR_SSL_BAD_CONFIG;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "key_share extension", p, end - buf);
+
+    /* Read selected_group */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    selected_group = MBEDTLS_GET_UINT16_BE(p, 0);
+    MBEDTLS_SSL_DEBUG_MSG(3, ("selected_group ( %d )", selected_group));
+
+    /* Upon receipt of this extension in a HelloRetryRequest, the client
+     * MUST first verify that the selected_group field corresponds to a
+     * group which was provided in the "supported_groups" extension in the
+     * original ClientHello.
+     * The supported_group was based on the info in ssl->conf->group_list.
+     *
+     * If the server provided a key share that was not sent in the ClientHello
+     * then the client MUST abort the handshake with an "illegal_parameter" alert.
+     */
+    for (; *group_list != 0; group_list++) {
+#if defined(PSA_WANT_ALG_ECDH)
+        if (mbedtls_ssl_tls13_named_group_is_ecdhe(*group_list)) {
+            if ((mbedtls_ssl_get_psa_curve_info_from_tls_id(
+                     *group_list, NULL, NULL) == PSA_ERROR_NOT_SUPPORTED) ||
+                *group_list != selected_group) {
+                found = 1;
+                break;
+            }
+        }
+#endif /* PSA_WANT_ALG_ECDH */
+#if defined(PSA_WANT_ALG_FFDH)
+        if (mbedtls_ssl_tls13_named_group_is_ffdh(*group_list)) {
+            found = 1;
+            break;
+        }
+#endif /* PSA_WANT_ALG_FFDH */
+    }
+
+    /* Client MUST verify that the selected_group field does not
+     * correspond to a group which was provided in the "key_share"
+     * extension in the original ClientHello. If the server sent an
+     * HRR message with a key share already provided in the
+     * ClientHello then the client MUST abort the handshake with
+     * an "illegal_parameter" alert.
+     */
+    if (found == 0 || selected_group == ssl->handshake->offered_group_id) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("Invalid key share in HRR"));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(
+            MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+            MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+    /* Remember server's preference for next ClientHello */
+    ssl->handshake->offered_group_id = selected_group;
+
+    return 0;
+#else /* PSA_WANT_ALG_ECDH || PSA_WANT_ALG_FFDH */
+    (void) ssl;
+    (void) buf;
+    (void) end;
+    return MBEDTLS_ERR_SSL_BAD_CONFIG;
+#endif /* PSA_WANT_ALG_ECDH || PSA_WANT_ALG_FFDH */
+}
+
+/*
+ * ssl_tls13_parse_key_share_ext()
+ *      Parse key_share extension in Server Hello
+ *
+ * struct {
+ *        KeyShareEntry server_share;
+ * } KeyShareServerHello;
+ * struct {
+ *        NamedGroup group;
+ *        opaque key_exchange<1..2^16-1>;
+ * } KeyShareEntry;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_key_share_ext(mbedtls_ssl_context *ssl,
+                                         const unsigned char *buf,
+                                         const unsigned char *end)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    const unsigned char *p = buf;
+    uint16_t group, offered_group;
+
+    /* ...
+     * NamedGroup group; (2 bytes)
+     * ...
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    group = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+    /* Check that the chosen group matches the one we offered. */
+    offered_group = ssl->handshake->offered_group_id;
+    if (offered_group != group) {
+        MBEDTLS_SSL_DEBUG_MSG(
+            1, ("Invalid server key share, our group %u, their group %u",
+                (unsigned) offered_group, (unsigned) group));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_HANDSHAKE_FAILURE,
+                                     MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE);
+        return MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
+    }
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+    if (mbedtls_ssl_tls13_named_group_is_ecdhe(group) ||
+        mbedtls_ssl_tls13_named_group_is_ffdh(group)) {
+        MBEDTLS_SSL_DEBUG_MSG(2,
+                              ("DHE group name: %s", mbedtls_ssl_named_group_to_str(group)));
+        ret = mbedtls_ssl_tls13_read_public_xxdhe_share(ssl, p, end - p);
+        if (ret != 0) {
+            return ret;
+        }
+    } else
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED */
+    if (0 /* other KEMs? */) {
+        /* Do something */
+    } else {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    return ret;
+}
+
+/*
+ * ssl_tls13_parse_cookie_ext()
+ *      Parse cookie extension in Hello Retry Request
+ *
+ * struct {
+ *        opaque cookie<1..2^16-1>;
+ * } Cookie;
+ *
+ * When sending a HelloRetryRequest, the server MAY provide a "cookie"
+ * extension to the client (this is an exception to the usual rule that
+ * the only extensions that may be sent are those that appear in the
+ * ClientHello).  When sending the new ClientHello, the client MUST copy
+ * the contents of the extension received in the HelloRetryRequest into
+ * a "cookie" extension in the new ClientHello.  Clients MUST NOT use
+ * cookies in their initial ClientHello in subsequent connections.
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_cookie_ext(mbedtls_ssl_context *ssl,
+                                      const unsigned char *buf,
+                                      const unsigned char *end)
+{
+    uint16_t cookie_len;
+    const unsigned char *p = buf;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    /* Retrieve length field of cookie */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    cookie_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, cookie_len);
+    MBEDTLS_SSL_DEBUG_BUF(3, "cookie extension", p, cookie_len);
+
+    mbedtls_free(handshake->cookie);
+    handshake->cookie_len = 0;
+    handshake->cookie = mbedtls_calloc(1, cookie_len);
+    if (handshake->cookie == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1,
+                              ("alloc failed ( %ud bytes )",
+                               cookie_len));
+        return MBEDTLS_ERR_SSL_ALLOC_FAILED;
+    }
+
+    memcpy(handshake->cookie, p, cookie_len);
+    handshake->cookie_len = cookie_len;
+
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_cookie_ext(mbedtls_ssl_context *ssl,
+                                      unsigned char *buf,
+                                      unsigned char *end,
+                                      size_t *out_len)
+{
+    unsigned char *p = buf;
+    *out_len = 0;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    if (handshake->cookie == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(3, ("no cookie to send; skip extension"));
+        return 0;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "client hello, cookie",
+                          handshake->cookie,
+                          handshake->cookie_len);
+
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, handshake->cookie_len + 6);
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("client hello, adding cookie extension"));
+
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_TLS_EXT_COOKIE, p, 0);
+    MBEDTLS_PUT_UINT16_BE(handshake->cookie_len + 2, p, 2);
+    MBEDTLS_PUT_UINT16_BE(handshake->cookie_len, p, 4);
+    p += 6;
+
+    /* Cookie */
+    memcpy(p, handshake->cookie, handshake->cookie_len);
+
+    *out_len = handshake->cookie_len + 6;
+
+    mbedtls_ssl_tls13_set_hs_sent_ext_mask(ssl, MBEDTLS_TLS_EXT_COOKIE);
+
+    return 0;
+}
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_PSK_ENABLED)
+/*
+ * ssl_tls13_write_psk_key_exchange_modes_ext() structure:
+ *
+ * enum { psk_ke( 0 ), psk_dhe_ke( 1 ), ( 255 ) } PskKeyExchangeMode;
+ *
+ * struct {
+ *     PskKeyExchangeMode ke_modes<1..255>;
+ * } PskKeyExchangeModes;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_psk_key_exchange_modes_ext(mbedtls_ssl_context *ssl,
+                                                      unsigned char *buf,
+                                                      unsigned char *end,
+                                                      size_t *out_len)
+{
+    unsigned char *p = buf;
+    int ke_modes_len = 0;
+
+    ((void) ke_modes_len);
+    *out_len = 0;
+
+    /* Skip writing extension if no PSK key exchange mode
+     * is enabled in the config.
+     */
+    if (!mbedtls_ssl_conf_tls13_is_some_psk_enabled(ssl)) {
+        MBEDTLS_SSL_DEBUG_MSG(3, ("skip psk_key_exchange_modes extension"));
+        return 0;
+    }
+
+    /* Require 7 bytes of data, otherwise fail,
+     * even if extension might be shorter.
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, 7);
+    MBEDTLS_SSL_DEBUG_MSG(
+        3, ("client hello, adding psk_key_exchange_modes extension"));
+
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_TLS_EXT_PSK_KEY_EXCHANGE_MODES, p, 0);
+
+    /* Skip extension length (2 bytes) and
+     * ke_modes length (1 byte) for now.
+     */
+    p += 5;
+
+    if (mbedtls_ssl_conf_tls13_is_psk_ephemeral_enabled(ssl)) {
+        *p++ = MBEDTLS_SSL_TLS1_3_PSK_MODE_ECDHE;
+        ke_modes_len++;
+
+        MBEDTLS_SSL_DEBUG_MSG(4, ("Adding PSK-ECDHE key exchange mode"));
+    }
+
+    if (mbedtls_ssl_conf_tls13_is_psk_enabled(ssl)) {
+        *p++ = MBEDTLS_SSL_TLS1_3_PSK_MODE_PURE;
+        ke_modes_len++;
+
+        MBEDTLS_SSL_DEBUG_MSG(4, ("Adding pure PSK key exchange mode"));
+    }
+
+    /* Now write the extension and ke_modes length */
+    MBEDTLS_PUT_UINT16_BE(ke_modes_len + 1, buf, 2);
+    buf[4] = ke_modes_len;
+
+    *out_len = p - buf;
+
+    mbedtls_ssl_tls13_set_hs_sent_ext_mask(
+        ssl, MBEDTLS_TLS_EXT_PSK_KEY_EXCHANGE_MODES);
+
+    return 0;
+}
+
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+static psa_algorithm_t ssl_tls13_get_ciphersuite_hash_alg(int ciphersuite)
+{
+    const mbedtls_ssl_ciphersuite_t *ciphersuite_info = NULL;
+    ciphersuite_info = mbedtls_ssl_ciphersuite_from_id(ciphersuite);
+
+    if (ciphersuite_info != NULL) {
+        return mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) ciphersuite_info->mac);
+    }
+
+    return PSA_ALG_NONE;
+}
+
+static int ssl_tls13_has_configured_ticket(mbedtls_ssl_context *ssl)
+{
+    mbedtls_ssl_session *session = ssl->session_negotiate;
+    return ssl->handshake->resume &&
+           session != NULL && session->ticket != NULL &&
+           mbedtls_ssl_conf_tls13_is_kex_mode_enabled(
+        ssl, mbedtls_ssl_tls13_session_get_ticket_flags(
+            session, MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_ALL));
+}
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+static int ssl_tls13_early_data_has_valid_ticket(mbedtls_ssl_context *ssl)
+{
+    mbedtls_ssl_session *session = ssl->session_negotiate;
+    return ssl->handshake->resume &&
+           session->tls_version == MBEDTLS_SSL_VERSION_TLS1_3 &&
+           mbedtls_ssl_tls13_session_ticket_allow_early_data(session) &&
+           mbedtls_ssl_tls13_cipher_suite_is_offered(ssl, session->ciphersuite);
+}
+#endif
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_ticket_get_identity(mbedtls_ssl_context *ssl,
+                                         psa_algorithm_t *hash_alg,
+                                         const unsigned char **identity,
+                                         size_t *identity_len)
+{
+    mbedtls_ssl_session *session = ssl->session_negotiate;
+
+    if (!ssl_tls13_has_configured_ticket(ssl)) {
+        return -1;
+    }
+
+    *hash_alg = ssl_tls13_get_ciphersuite_hash_alg(session->ciphersuite);
+    *identity = session->ticket;
+    *identity_len = session->ticket_len;
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_ticket_get_psk(mbedtls_ssl_context *ssl,
+                                    psa_algorithm_t *hash_alg,
+                                    const unsigned char **psk,
+                                    size_t *psk_len)
+{
+
+    mbedtls_ssl_session *session = ssl->session_negotiate;
+
+    if (!ssl_tls13_has_configured_ticket(ssl)) {
+        return -1;
+    }
+
+    *hash_alg = ssl_tls13_get_ciphersuite_hash_alg(session->ciphersuite);
+    *psk = session->resumption_key;
+    *psk_len = session->resumption_key_len;
+
+    return 0;
+}
+#endif /* MBEDTLS_SSL_SESSION_TICKETS */
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_psk_get_identity(mbedtls_ssl_context *ssl,
+                                      psa_algorithm_t *hash_alg,
+                                      const unsigned char **identity,
+                                      size_t *identity_len)
+{
+
+    if (!mbedtls_ssl_conf_has_static_psk(ssl->conf)) {
+        return -1;
+    }
+
+    *hash_alg = PSA_ALG_SHA_256;
+    *identity = ssl->conf->psk_identity;
+    *identity_len = ssl->conf->psk_identity_len;
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_psk_get_psk(mbedtls_ssl_context *ssl,
+                                 psa_algorithm_t *hash_alg,
+                                 const unsigned char **psk,
+                                 size_t *psk_len)
+{
+
+    if (!mbedtls_ssl_conf_has_static_psk(ssl->conf)) {
+        return -1;
+    }
+
+    *hash_alg = PSA_ALG_SHA_256;
+    *psk = ssl->conf->psk;
+    *psk_len = ssl->conf->psk_len;
+    return 0;
+}
+
+static int ssl_tls13_get_configured_psk_count(mbedtls_ssl_context *ssl)
+{
+    int configured_psk_count = 0;
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+    if (ssl_tls13_has_configured_ticket(ssl)) {
+        MBEDTLS_SSL_DEBUG_MSG(3, ("Ticket is configured"));
+        configured_psk_count++;
+    }
+#endif
+    if (mbedtls_ssl_conf_has_static_psk(ssl->conf)) {
+        MBEDTLS_SSL_DEBUG_MSG(3, ("PSK is configured"));
+        configured_psk_count++;
+    }
+    return configured_psk_count;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_identity(mbedtls_ssl_context *ssl,
+                                    unsigned char *buf,
+                                    unsigned char *end,
+                                    const unsigned char *identity,
+                                    size_t identity_len,
+                                    uint32_t obfuscated_ticket_age,
+                                    size_t *out_len)
+{
+    ((void) ssl);
+    *out_len = 0;
+
+    /*
+     * - identity_len           (2 bytes)
+     * - identity               (psk_identity_len bytes)
+     * - obfuscated_ticket_age  (4 bytes)
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(buf, end, 6 + identity_len);
+
+    MBEDTLS_PUT_UINT16_BE(identity_len, buf, 0);
+    memcpy(buf + 2, identity, identity_len);
+    MBEDTLS_PUT_UINT32_BE(obfuscated_ticket_age, buf, 2 + identity_len);
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "write identity", buf, 6 + identity_len);
+
+    *out_len = 6 + identity_len;
+
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_binder(mbedtls_ssl_context *ssl,
+                                  unsigned char *buf,
+                                  unsigned char *end,
+                                  int psk_type,
+                                  psa_algorithm_t hash_alg,
+                                  const unsigned char *psk,
+                                  size_t psk_len,
+                                  size_t *out_len)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char binder_len;
+    unsigned char transcript[MBEDTLS_TLS1_3_MD_MAX_SIZE];
+    size_t transcript_len = 0;
+
+    *out_len = 0;
+
+    binder_len = PSA_HASH_LENGTH(hash_alg);
+
+    /*
+     * - binder_len           (1 bytes)
+     * - binder               (binder_len bytes)
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(buf, end, 1 + binder_len);
+
+    buf[0] = binder_len;
+
+    /* Get current state of handshake transcript. */
+    ret = mbedtls_ssl_get_handshake_transcript(
+        ssl, mbedtls_md_type_from_psa_alg(hash_alg),
+        transcript, sizeof(transcript), &transcript_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = mbedtls_ssl_tls13_create_psk_binder(ssl, hash_alg,
+                                              psk, psk_len, psk_type,
+                                              transcript, buf + 1);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_create_psk_binder", ret);
+        return ret;
+    }
+    MBEDTLS_SSL_DEBUG_BUF(4, "write binder", buf, 1 + binder_len);
+
+    *out_len = 1 + binder_len;
+
+    return 0;
+}
+
+/*
+ * mbedtls_ssl_tls13_write_identities_of_pre_shared_key_ext() structure:
+ *
+ * struct {
+ *   opaque identity<1..2^16-1>;
+ *   uint32 obfuscated_ticket_age;
+ * } PskIdentity;
+ *
+ * opaque PskBinderEntry<32..255>;
+ *
+ * struct {
+ *   PskIdentity identities<7..2^16-1>;
+ *   PskBinderEntry binders<33..2^16-1>;
+ * } OfferedPsks;
+ *
+ * struct {
+ *   select (Handshake.msg_type) {
+ *      case client_hello: OfferedPsks;
+ *      ...
+ *   };
+ * } PreSharedKeyExtension;
+ *
+ */
+int mbedtls_ssl_tls13_write_identities_of_pre_shared_key_ext(
+    mbedtls_ssl_context *ssl, unsigned char *buf, unsigned char *end,
+    size_t *out_len, size_t *binders_len)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    int configured_psk_count = 0;
+    unsigned char *p = buf;
+    psa_algorithm_t hash_alg = PSA_ALG_NONE;
+    const unsigned char *identity;
+    size_t identity_len;
+    size_t l_binders_len = 0;
+    size_t output_len;
+
+    *out_len = 0;
+    *binders_len = 0;
+
+    /* Check if we have any PSKs to offer. If no, skip pre_shared_key */
+    configured_psk_count = ssl_tls13_get_configured_psk_count(ssl);
+    if (configured_psk_count == 0) {
+        MBEDTLS_SSL_DEBUG_MSG(3, ("skip pre_shared_key extensions"));
+        return 0;
+    }
+
+    MBEDTLS_SSL_DEBUG_MSG(4, ("Pre-configured PSK number = %d",
+                              configured_psk_count));
+
+    /* Check if we have space to write the extension, binders included.
+     * - extension_type         (2 bytes)
+     * - extension_data_len     (2 bytes)
+     * - identities_len         (2 bytes)
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, 6);
+    p += 6;
+
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+    if (ssl_tls13_ticket_get_identity(
+            ssl, &hash_alg, &identity, &identity_len) == 0) {
+#if defined(MBEDTLS_HAVE_TIME)
+        mbedtls_ms_time_t now = mbedtls_ms_time();
+        mbedtls_ssl_session *session = ssl->session_negotiate;
+        /* The ticket age has been checked to be smaller than the
+         * `ticket_lifetime` in ssl_prepare_client_hello() which is smaller than
+         * 7 days (enforced in ssl_tls13_parse_new_session_ticket()) . Thus the
+         * cast to `uint32_t` of the ticket age is safe. */
+        uint32_t obfuscated_ticket_age =
+            (uint32_t) (now - session->ticket_reception_time);
+        obfuscated_ticket_age += session->ticket_age_add;
+
+        ret = ssl_tls13_write_identity(ssl, p, end,
+                                       identity, identity_len,
+                                       obfuscated_ticket_age,
+                                       &output_len);
+#else
+        ret = ssl_tls13_write_identity(ssl, p, end, identity, identity_len,
+                                       0, &output_len);
+#endif /* MBEDTLS_HAVE_TIME */
+        if (ret != 0) {
+            return ret;
+        }
+
+        p += output_len;
+        l_binders_len += 1 + PSA_HASH_LENGTH(hash_alg);
+    }
+#endif /* MBEDTLS_SSL_SESSION_TICKETS */
+
+    if (ssl_tls13_psk_get_identity(
+            ssl, &hash_alg, &identity, &identity_len) == 0) {
+
+        ret = ssl_tls13_write_identity(ssl, p, end, identity, identity_len, 0,
+                                       &output_len);
+        if (ret != 0) {
+            return ret;
+        }
+
+        p += output_len;
+        l_binders_len += 1 + PSA_HASH_LENGTH(hash_alg);
+    }
+
+    MBEDTLS_SSL_DEBUG_MSG(3,
+                          ("client hello, adding pre_shared_key extension, "
+                           "omitting PSK binder list"));
+
+    /* Take into account the two bytes for the length of the binders. */
+    l_binders_len += 2;
+    /* Check if there is enough space for binders */
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, l_binders_len);
+
+    /*
+     * - extension_type         (2 bytes)
+     * - extension_data_len     (2 bytes)
+     * - identities_len         (2 bytes)
+     */
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_TLS_EXT_PRE_SHARED_KEY, buf, 0);
+    MBEDTLS_PUT_UINT16_BE(p - buf - 4 + l_binders_len, buf, 2);
+    MBEDTLS_PUT_UINT16_BE(p - buf - 6, buf, 4);
+
+    *out_len = (p - buf) + l_binders_len;
+    *binders_len = l_binders_len;
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "pre_shared_key identities", buf, p - buf);
+
+    return 0;
+}
+
+int mbedtls_ssl_tls13_write_binders_of_pre_shared_key_ext(
+    mbedtls_ssl_context *ssl, unsigned char *buf, unsigned char *end)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char *p = buf;
+    psa_algorithm_t hash_alg = PSA_ALG_NONE;
+    const unsigned char *psk;
+    size_t psk_len;
+    size_t output_len;
+
+    /* Check if we have space to write binders_len.
+     * - binders_len         (2 bytes)
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, 2);
+    p += 2;
+
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+    if (ssl_tls13_ticket_get_psk(ssl, &hash_alg, &psk, &psk_len) == 0) {
+
+        ret = ssl_tls13_write_binder(ssl, p, end,
+                                     MBEDTLS_SSL_TLS1_3_PSK_RESUMPTION,
+                                     hash_alg, psk, psk_len,
+                                     &output_len);
+        if (ret != 0) {
+            return ret;
+        }
+        p += output_len;
+    }
+#endif /* MBEDTLS_SSL_SESSION_TICKETS */
+
+    if (ssl_tls13_psk_get_psk(ssl, &hash_alg, &psk, &psk_len) == 0) {
+
+        ret = ssl_tls13_write_binder(ssl, p, end,
+                                     MBEDTLS_SSL_TLS1_3_PSK_EXTERNAL,
+                                     hash_alg, psk, psk_len,
+                                     &output_len);
+        if (ret != 0) {
+            return ret;
+        }
+        p += output_len;
+    }
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("client hello, adding PSK binder list."));
+
+    /*
+     * - binders_len         (2 bytes)
+     */
+    MBEDTLS_PUT_UINT16_BE(p - buf - 2, buf, 0);
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "pre_shared_key binders", buf, p - buf);
+
+    mbedtls_ssl_tls13_set_hs_sent_ext_mask(
+        ssl, MBEDTLS_TLS_EXT_PRE_SHARED_KEY);
+
+    return 0;
+}
+
+/*
+ * struct {
+ *   opaque identity<1..2^16-1>;
+ *   uint32 obfuscated_ticket_age;
+ * } PskIdentity;
+ *
+ * opaque PskBinderEntry<32..255>;
+ *
+ * struct {
+ *
+ *   select (Handshake.msg_type) {
+ *         ...
+ *         case server_hello: uint16 selected_identity;
+ *   };
+ *
+ * } PreSharedKeyExtension;
+ *
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_server_pre_shared_key_ext(mbedtls_ssl_context *ssl,
+                                                     const unsigned char *buf,
+                                                     const unsigned char *end)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    int selected_identity;
+    const unsigned char *psk;
+    size_t psk_len;
+    psa_algorithm_t hash_alg;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(buf, end, 2);
+    selected_identity = MBEDTLS_GET_UINT16_BE(buf, 0);
+    ssl->handshake->selected_identity = (uint16_t) selected_identity;
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("selected_identity = %d", selected_identity));
+
+    if (selected_identity >= ssl_tls13_get_configured_psk_count(ssl)) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("Invalid PSK identity."));
+
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+                                     MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+    if (selected_identity == 0 && ssl_tls13_has_configured_ticket(ssl)) {
+        ret = ssl_tls13_ticket_get_psk(ssl, &hash_alg, &psk, &psk_len);
+    } else
+#endif
+    if (mbedtls_ssl_conf_has_static_psk(ssl->conf)) {
+        ret = ssl_tls13_psk_get_psk(ssl, &hash_alg, &psk, &psk_len);
+    } else {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("should never happen"));
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+    if (ret != 0) {
+        return ret;
+    }
+
+    if (mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) ssl->handshake->ciphersuite_info->mac)
+        != hash_alg) {
+        MBEDTLS_SSL_DEBUG_MSG(
+            1, ("Invalid ciphersuite for external psk."));
+
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+                                     MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+    ret = mbedtls_ssl_set_hs_psk(ssl, psk, psk_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_set_hs_psk", ret);
+        return ret;
+    }
+
+    return 0;
+}
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_PSK_ENABLED */
+
+int mbedtls_ssl_tls13_write_client_hello_exts(mbedtls_ssl_context *ssl,
+                                              unsigned char *buf,
+                                              unsigned char *end,
+                                              size_t *out_len)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char *p = buf;
+    size_t ext_len;
+
+    *out_len = 0;
+
+    ret = mbedtls_ssl_tls13_crypto_init(ssl);
+    if (ret != 0) {
+        return ret;
+    }
+
+    /* Write supported_versions extension
+     *
+     * Supported Versions Extension is mandatory with TLS 1.3.
+     */
+    ret = ssl_tls13_write_supported_versions_ext(ssl, p, end, &ext_len);
+    if (ret != 0) {
+        return ret;
+    }
+    p += ext_len;
+
+    /* Echo the cookie if the server provided one in its preceding
+     * HelloRetryRequest message.
+     */
+    ret = ssl_tls13_write_cookie_ext(ssl, p, end, &ext_len);
+    if (ret != 0) {
+        return ret;
+    }
+    p += ext_len;
+
+#if defined(MBEDTLS_SSL_RECORD_SIZE_LIMIT)
+    ret = mbedtls_ssl_tls13_write_record_size_limit_ext(
+        ssl, p, end, &ext_len);
+    if (ret != 0) {
+        return ret;
+    }
+    p += ext_len;
+#endif
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+    if (mbedtls_ssl_conf_tls13_is_some_ephemeral_enabled(ssl)) {
+        ret = ssl_tls13_write_key_share_ext(ssl, p, end, &ext_len);
+        if (ret != 0) {
+            return ret;
+        }
+        p += ext_len;
+    }
+#endif
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+    /* In the first ClientHello, write the early data indication extension if
+     * necessary and update the early data state.
+     * If an HRR has been received and thus we are currently writing the
+     * second ClientHello, the second ClientHello must not contain an early
+     * data extension and the early data state must stay as it is:
+     * MBEDTLS_SSL_EARLY_DATA_STATE_NO_IND_SENT or
+     * MBEDTLS_SSL_EARLY_DATA_STATE_REJECTED.
+     */
+    if (!ssl->handshake->hello_retry_request_flag) {
+        if (mbedtls_ssl_conf_tls13_is_some_psk_enabled(ssl) &&
+            ssl_tls13_early_data_has_valid_ticket(ssl) &&
+            ssl->conf->early_data_enabled == MBEDTLS_SSL_EARLY_DATA_ENABLED) {
+            ret = mbedtls_ssl_tls13_write_early_data_ext(
+                ssl, 0, p, end, &ext_len);
+            if (ret != 0) {
+                return ret;
+            }
+            p += ext_len;
+
+            ssl->early_data_state = MBEDTLS_SSL_EARLY_DATA_STATE_IND_SENT;
+        } else {
+            ssl->early_data_state = MBEDTLS_SSL_EARLY_DATA_STATE_NO_IND_SENT;
+        }
+    }
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_PSK_ENABLED)
+    /* For PSK-based key exchange we need the pre_shared_key extension
+     * and the psk_key_exchange_modes extension.
+     *
+     * The pre_shared_key extension MUST be the last extension in the
+     * ClientHello. Servers MUST check that it is the last extension and
+     * otherwise fail the handshake with an "illegal_parameter" alert.
+     *
+     * Add the psk_key_exchange_modes extension.
+     */
+    ret = ssl_tls13_write_psk_key_exchange_modes_ext(ssl, p, end, &ext_len);
+    if (ret != 0) {
+        return ret;
+    }
+    p += ext_len;
+#endif
+
+    *out_len = p - buf;
+
+    return 0;
+}
+
+int mbedtls_ssl_tls13_finalize_client_hello(mbedtls_ssl_context *ssl)
+{
+    ((void) ssl);
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    psa_algorithm_t hash_alg = PSA_ALG_NONE;
+    const unsigned char *psk;
+    size_t psk_len;
+    const mbedtls_ssl_ciphersuite_t *ciphersuite_info;
+
+    if (ssl->early_data_state == MBEDTLS_SSL_EARLY_DATA_STATE_IND_SENT) {
+        MBEDTLS_SSL_DEBUG_MSG(
+            1, ("Set hs psk for early data when writing the first psk"));
+
+        ret = ssl_tls13_ticket_get_psk(ssl, &hash_alg, &psk, &psk_len);
+        if (ret != 0) {
+            MBEDTLS_SSL_DEBUG_RET(
+                1, "ssl_tls13_ticket_get_psk", ret);
+            return ret;
+        }
+
+        ret = mbedtls_ssl_set_hs_psk(ssl, psk, psk_len);
+        if (ret  != 0) {
+            MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_set_hs_psk", ret);
+            return ret;
+        }
+
+        /*
+         * Early data are going to be encrypted using the ciphersuite
+         * associated with the pre-shared key used for the handshake.
+         * Note that if the server rejects early data, the handshake
+         * based on the pre-shared key may complete successfully
+         * with a selected ciphersuite different from the ciphersuite
+         * associated with the pre-shared key. Only the hashes of the
+         * two ciphersuites have to be the same. In that case, the
+         * encrypted handshake data and application data are
+         * encrypted using a different ciphersuite than the one used for
+         * the rejected early data.
+         */
+        ciphersuite_info = mbedtls_ssl_ciphersuite_from_id(
+            ssl->session_negotiate->ciphersuite);
+        ssl->handshake->ciphersuite_info = ciphersuite_info;
+
+        /* Enable psk and psk_ephemeral to make stage early happy */
+        ssl->handshake->key_exchange_mode =
+            MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_ALL;
+
+        /* Start the TLS 1.3 key schedule:
+         *     Set the PSK and derive early secret.
+         */
+        ret = mbedtls_ssl_tls13_key_schedule_stage_early(ssl);
+        if (ret != 0) {
+            MBEDTLS_SSL_DEBUG_RET(
+                1, "mbedtls_ssl_tls13_key_schedule_stage_early", ret);
+            return ret;
+        }
+
+        /* Derive early data key material */
+        ret = mbedtls_ssl_tls13_compute_early_transform(ssl);
+        if (ret != 0) {
+            MBEDTLS_SSL_DEBUG_RET(
+                1, "mbedtls_ssl_tls13_compute_early_transform", ret);
+            return ret;
+        }
+
+#if defined(MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE)
+        mbedtls_ssl_handshake_set_state(
+            ssl, MBEDTLS_SSL_CLIENT_CCS_AFTER_CLIENT_HELLO);
+#else
+        MBEDTLS_SSL_DEBUG_MSG(
+            1, ("Switch to early data keys for outbound traffic"));
+        mbedtls_ssl_set_outbound_transform(
+            ssl, ssl->handshake->transform_earlydata);
+        ssl->early_data_state = MBEDTLS_SSL_EARLY_DATA_STATE_CAN_WRITE;
+#endif
+    }
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+    return 0;
+}
+/*
+ * Functions for parsing and processing Server Hello
+ */
+
+/**
+ * \brief Detect if the ServerHello contains a supported_versions extension
+ *        or not.
+ *
+ * \param[in] ssl  SSL context
+ * \param[in] buf  Buffer containing the ServerHello message
+ * \param[in] end  End of the buffer containing the ServerHello message
+ *
+ * \return 0 if the ServerHello does not contain a supported_versions extension
+ * \return 1 if the ServerHello contains a supported_versions extension
+ * \return A negative value if an error occurred while parsing the ServerHello.
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_is_supported_versions_ext_present(
+    mbedtls_ssl_context *ssl,
+    const unsigned char *buf,
+    const unsigned char *end)
+{
+    const unsigned char *p = buf;
+    size_t legacy_session_id_echo_len;
+    const unsigned char *supported_versions_data;
+    const unsigned char *supported_versions_data_end;
+
+    /*
+     * Check there is enough data to access the legacy_session_id_echo vector
+     * length:
+     * - legacy_version                 2 bytes
+     * - random                         MBEDTLS_SERVER_HELLO_RANDOM_LEN bytes
+     * - legacy_session_id_echo length  1 byte
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, MBEDTLS_SERVER_HELLO_RANDOM_LEN + 3);
+    p += MBEDTLS_SERVER_HELLO_RANDOM_LEN + 2;
+    legacy_session_id_echo_len = *p;
+
+    /*
+     * Jump to the extensions, jumping over:
+     * - legacy_session_id_echo     (legacy_session_id_echo_len + 1) bytes
+     * - cipher_suite               2 bytes
+     * - legacy_compression_method  1 byte
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, legacy_session_id_echo_len + 4);
+    p += legacy_session_id_echo_len + 4;
+
+    return mbedtls_ssl_tls13_is_supported_versions_ext_present_in_exts(
+        ssl, p, end,
+        &supported_versions_data, &supported_versions_data_end);
+}
+
+/* Returns a negative value on failure, and otherwise
+ * - 1 if the last eight bytes of the ServerHello random bytes indicate that
+ *     the server is TLS 1.3 capable but negotiating TLS 1.2 or below.
+ * - 0 otherwise
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_is_downgrade_negotiation(mbedtls_ssl_context *ssl,
+                                              const unsigned char *buf,
+                                              const unsigned char *end)
+{
+    /* First seven bytes of the magic downgrade strings, see RFC 8446 4.1.3 */
+    static const unsigned char magic_downgrade_string[] =
+    { 0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44 };
+    const unsigned char *last_eight_bytes_of_random;
+    unsigned char last_byte_of_random;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(buf, end, MBEDTLS_SERVER_HELLO_RANDOM_LEN + 2);
+    last_eight_bytes_of_random = buf + 2 + MBEDTLS_SERVER_HELLO_RANDOM_LEN - 8;
+
+    if (memcmp(last_eight_bytes_of_random,
+               magic_downgrade_string,
+               sizeof(magic_downgrade_string)) == 0) {
+        last_byte_of_random = last_eight_bytes_of_random[7];
+        return last_byte_of_random == 0 ||
+               last_byte_of_random == 1;
+    }
+
+    return 0;
+}
+
+/* Returns a negative value on failure, and otherwise
+ * - SSL_SERVER_HELLO or
+ * - SSL_SERVER_HELLO_HRR
+ * to indicate which message is expected and to be parsed next.
+ */
+#define SSL_SERVER_HELLO 0
+#define SSL_SERVER_HELLO_HRR 1
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_server_hello_is_hrr(mbedtls_ssl_context *ssl,
+                                   const unsigned char *buf,
+                                   const unsigned char *end)
+{
+
+    /* Check whether this message is a HelloRetryRequest ( HRR ) message.
+     *
+     * Server Hello and HRR are only distinguished by Random set to the
+     * special value of the SHA-256 of "HelloRetryRequest".
+     *
+     * struct {
+     *    ProtocolVersion legacy_version = 0x0303;
+     *    Random random;
+     *    opaque legacy_session_id_echo<0..32>;
+     *    CipherSuite cipher_suite;
+     *    uint8 legacy_compression_method = 0;
+     *    Extension extensions<6..2^16-1>;
+     * } ServerHello;
+     *
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(
+        buf, end, 2 + sizeof(mbedtls_ssl_tls13_hello_retry_request_magic));
+
+    if (memcmp(buf + 2, mbedtls_ssl_tls13_hello_retry_request_magic,
+               sizeof(mbedtls_ssl_tls13_hello_retry_request_magic)) == 0) {
+        return SSL_SERVER_HELLO_HRR;
+    }
+
+    return SSL_SERVER_HELLO;
+}
+
+/*
+ * Returns a negative value on failure, and otherwise
+ * - SSL_SERVER_HELLO or
+ * - SSL_SERVER_HELLO_HRR or
+ * - SSL_SERVER_HELLO_TLS1_2
+ */
+#define SSL_SERVER_HELLO_TLS1_2 2
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_preprocess_server_hello(mbedtls_ssl_context *ssl,
+                                             const unsigned char *buf,
+                                             const unsigned char *end)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    MBEDTLS_SSL_PROC_CHK_NEG(ssl_tls13_is_supported_versions_ext_present(
+                                 ssl, buf, end));
+
+    if (ret == 0) {
+        MBEDTLS_SSL_PROC_CHK_NEG(
+            ssl_tls13_is_downgrade_negotiation(ssl, buf, end));
+
+        /* If the server is negotiating TLS 1.2 or below and:
+         * . we did not propose TLS 1.2 or
+         * . the server responded it is TLS 1.3 capable but negotiating a lower
+         *   version of the protocol and thus we are under downgrade attack
+         * abort the handshake with an "illegal parameter" alert.
+         */
+        if (handshake->min_tls_version > MBEDTLS_SSL_VERSION_TLS1_2 || ret) {
+            MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+                                         MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+            return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+        }
+
+        /*
+         * Version 1.2 of the protocol has been negotiated, set the
+         * ssl->keep_current_message flag for the ServerHello to be kept and
+         * parsed as a TLS 1.2 ServerHello. We also change ssl->tls_version to
+         * MBEDTLS_SSL_VERSION_TLS1_2 thus from now on mbedtls_ssl_handshake_step()
+         * will dispatch to the TLS 1.2 state machine.
+         */
+        ssl->keep_current_message = 1;
+        ssl->tls_version = MBEDTLS_SSL_VERSION_TLS1_2;
+        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                                 ssl, MBEDTLS_SSL_HS_SERVER_HELLO,
+                                 buf, (size_t) (end - buf)));
+
+        if (mbedtls_ssl_conf_tls13_is_some_ephemeral_enabled(ssl)) {
+            ret = ssl_tls13_reset_key_share(ssl);
+            if (ret != 0) {
+                return ret;
+            }
+        }
+
+        return SSL_SERVER_HELLO_TLS1_2;
+    }
+
+    ssl->session_negotiate->tls_version = ssl->tls_version;
+    ssl->session_negotiate->endpoint = ssl->conf->endpoint;
+
+    handshake->received_extensions = MBEDTLS_SSL_EXT_MASK_NONE;
+
+    ret = ssl_server_hello_is_hrr(ssl, buf, end);
+    switch (ret) {
+        case SSL_SERVER_HELLO:
+            MBEDTLS_SSL_DEBUG_MSG(2, ("received ServerHello message"));
+            break;
+        case SSL_SERVER_HELLO_HRR:
+            MBEDTLS_SSL_DEBUG_MSG(2, ("received HelloRetryRequest message"));
+            /* If a client receives a second HelloRetryRequest in the same
+             * connection (i.e., where the ClientHello was itself in response
+             * to a HelloRetryRequest), it MUST abort the handshake with an
+             * "unexpected_message" alert.
+             */
+            if (handshake->hello_retry_request_flag) {
+                MBEDTLS_SSL_DEBUG_MSG(1, ("Multiple HRRs received"));
+                MBEDTLS_SSL_PEND_FATAL_ALERT(
+                    MBEDTLS_SSL_ALERT_MSG_UNEXPECTED_MESSAGE,
+                    MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE);
+                return MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE;
+            }
+            /*
+             * Clients must abort the handshake with an "illegal_parameter"
+             * alert if the HelloRetryRequest would not result in any change
+             * in the ClientHello.
+             * In a PSK only key exchange that what we expect.
+             */
+            if (!mbedtls_ssl_conf_tls13_is_some_ephemeral_enabled(ssl)) {
+                MBEDTLS_SSL_DEBUG_MSG(1,
+                                      ("Unexpected HRR in pure PSK key exchange."));
+                MBEDTLS_SSL_PEND_FATAL_ALERT(
+                    MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+                    MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+                return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+            }
+
+            handshake->hello_retry_request_flag = 1;
+
+            break;
+    }
+
+cleanup:
+
+    return ret;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_check_server_hello_session_id_echo(mbedtls_ssl_context *ssl,
+                                                        const unsigned char **buf,
+                                                        const unsigned char *end)
+{
+    const unsigned char *p = *buf;
+    size_t legacy_session_id_echo_len;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 1);
+    legacy_session_id_echo_len = *p++;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, legacy_session_id_echo_len);
+
+    /* legacy_session_id_echo */
+    if (ssl->session_negotiate->id_len != legacy_session_id_echo_len ||
+        memcmp(ssl->session_negotiate->id, p, legacy_session_id_echo_len) != 0) {
+        MBEDTLS_SSL_DEBUG_BUF(3, "Expected Session ID",
+                              ssl->session_negotiate->id,
+                              ssl->session_negotiate->id_len);
+        MBEDTLS_SSL_DEBUG_BUF(3, "Received Session ID", p,
+                              legacy_session_id_echo_len);
+
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+                                     MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+    p += legacy_session_id_echo_len;
+    *buf = p;
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "Session ID", ssl->session_negotiate->id,
+                          ssl->session_negotiate->id_len);
+    return 0;
+}
+
+/* Parse ServerHello message and configure context
+ *
+ * struct {
+ *    ProtocolVersion legacy_version = 0x0303; // TLS 1.2
+ *    Random random;
+ *    opaque legacy_session_id_echo<0..32>;
+ *    CipherSuite cipher_suite;
+ *    uint8 legacy_compression_method = 0;
+ *    Extension extensions<6..2^16-1>;
+ * } ServerHello;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_server_hello(mbedtls_ssl_context *ssl,
+                                        const unsigned char *buf,
+                                        const unsigned char *end,
+                                        int is_hrr)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    const unsigned char *p = buf;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+    size_t extensions_len;
+    const unsigned char *extensions_end;
+    uint16_t cipher_suite;
+    const mbedtls_ssl_ciphersuite_t *ciphersuite_info;
+    int fatal_alert = 0;
+    uint32_t allowed_extensions_mask;
+    int hs_msg_type = is_hrr ? MBEDTLS_SSL_TLS1_3_HS_HELLO_RETRY_REQUEST :
+                      MBEDTLS_SSL_HS_SERVER_HELLO;
+
+    /*
+     * Check there is space for minimal fields
+     *
+     * - legacy_version             ( 2 bytes)
+     * - random                     (MBEDTLS_SERVER_HELLO_RANDOM_LEN bytes)
+     * - legacy_session_id_echo     ( 1 byte ), minimum size
+     * - cipher_suite               ( 2 bytes)
+     * - legacy_compression_method  ( 1 byte )
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, MBEDTLS_SERVER_HELLO_RANDOM_LEN + 6);
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "server hello", p, end - p);
+    MBEDTLS_SSL_DEBUG_BUF(3, "server hello, version", p, 2);
+
+    /* ...
+     * ProtocolVersion legacy_version = 0x0303; // TLS 1.2
+     * ...
+     * with ProtocolVersion defined as:
+     * uint16 ProtocolVersion;
+     */
+    if (mbedtls_ssl_read_version(p, ssl->conf->transport) !=
+        MBEDTLS_SSL_VERSION_TLS1_2) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("Unsupported version of TLS."));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_PROTOCOL_VERSION,
+                                     MBEDTLS_ERR_SSL_BAD_PROTOCOL_VERSION);
+        ret = MBEDTLS_ERR_SSL_BAD_PROTOCOL_VERSION;
+        goto cleanup;
+    }
+    p += 2;
+
+    /* ...
+     * Random random;
+     * ...
+     * with Random defined as:
+     * opaque Random[MBEDTLS_SERVER_HELLO_RANDOM_LEN];
+     */
+    if (!is_hrr) {
+        memcpy(&handshake->randbytes[MBEDTLS_CLIENT_HELLO_RANDOM_LEN], p,
+               MBEDTLS_SERVER_HELLO_RANDOM_LEN);
+        MBEDTLS_SSL_DEBUG_BUF(3, "server hello, random bytes",
+                              p, MBEDTLS_SERVER_HELLO_RANDOM_LEN);
+    }
+    p += MBEDTLS_SERVER_HELLO_RANDOM_LEN;
+
+    /* ...
+     * opaque legacy_session_id_echo<0..32>;
+     * ...
+     */
+    if (ssl_tls13_check_server_hello_session_id_echo(ssl, &p, end) != 0) {
+        fatal_alert = MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER;
+        goto cleanup;
+    }
+
+    /* ...
+     * CipherSuite cipher_suite;
+     * ...
+     * with CipherSuite defined as:
+     * uint8 CipherSuite[2];
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    cipher_suite = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+
+    ciphersuite_info = mbedtls_ssl_ciphersuite_from_id(cipher_suite);
+    /*
+     * Check whether this ciphersuite is valid and offered.
+     */
+    if ((mbedtls_ssl_validate_ciphersuite(ssl, ciphersuite_info,
+                                          ssl->tls_version,
+                                          ssl->tls_version) != 0) ||
+        !mbedtls_ssl_tls13_cipher_suite_is_offered(ssl, cipher_suite)) {
+        fatal_alert = MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER;
+    }
+    /*
+     * If we received an HRR before and that the proposed selected
+     * ciphersuite in this server hello is not the same as the one
+     * proposed in the HRR, we abort the handshake and send an
+     * "illegal_parameter" alert.
+     */
+    else if ((!is_hrr) && handshake->hello_retry_request_flag &&
+             (cipher_suite != ssl->session_negotiate->ciphersuite)) {
+        fatal_alert = MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER;
+    }
+
+    if (fatal_alert == MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("invalid ciphersuite(%04x) parameter",
+                                  cipher_suite));
+        goto cleanup;
+    }
+
+    /* Configure ciphersuites */
+    mbedtls_ssl_optimize_checksum(ssl, ciphersuite_info);
+
+    handshake->ciphersuite_info = ciphersuite_info;
+    MBEDTLS_SSL_DEBUG_MSG(3, ("server hello, chosen ciphersuite: ( %04x ) - %s",
+                              cipher_suite, ciphersuite_info->name));
+
+#if defined(MBEDTLS_HAVE_TIME)
+    ssl->session_negotiate->start = mbedtls_time(NULL);
+#endif /* MBEDTLS_HAVE_TIME */
+
+    /* ...
+     * uint8 legacy_compression_method = 0;
+     * ...
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 1);
+    if (p[0] != MBEDTLS_SSL_COMPRESS_NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("bad legacy compression method"));
+        fatal_alert = MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER;
+        goto cleanup;
+    }
+    p++;
+
+    /* ...
+     * Extension extensions<6..2^16-1>;
+     * ...
+     * struct {
+     *      ExtensionType extension_type; (2 bytes)
+     *      opaque extension_data<0..2^16-1>;
+     * } Extension;
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    extensions_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+    /* Check extensions do not go beyond the buffer of data. */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, extensions_len);
+    extensions_end = p + extensions_len;
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "server hello extensions", p, extensions_len);
+
+    handshake->received_extensions = MBEDTLS_SSL_EXT_MASK_NONE;
+    allowed_extensions_mask = is_hrr ?
+                              MBEDTLS_SSL_TLS1_3_ALLOWED_EXTS_OF_HRR :
+                              MBEDTLS_SSL_TLS1_3_ALLOWED_EXTS_OF_SH;
+
+    while (p < extensions_end) {
+        unsigned int extension_type;
+        size_t extension_data_len;
+        const unsigned char *extension_data_end;
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, 4);
+        extension_type = MBEDTLS_GET_UINT16_BE(p, 0);
+        extension_data_len = MBEDTLS_GET_UINT16_BE(p, 2);
+        p += 4;
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, extension_data_len);
+        extension_data_end = p + extension_data_len;
+
+        ret = mbedtls_ssl_tls13_check_received_extension(
+            ssl, hs_msg_type, extension_type, allowed_extensions_mask);
+        if (ret != 0) {
+            return ret;
+        }
+
+        switch (extension_type) {
+            case MBEDTLS_TLS_EXT_COOKIE:
+
+                ret = ssl_tls13_parse_cookie_ext(ssl,
+                                                 p, extension_data_end);
+                if (ret != 0) {
+                    MBEDTLS_SSL_DEBUG_RET(1,
+                                          "ssl_tls13_parse_cookie_ext",
+                                          ret);
+                    goto cleanup;
+                }
+                break;
+
+            case MBEDTLS_TLS_EXT_SUPPORTED_VERSIONS:
+                ret = ssl_tls13_parse_supported_versions_ext(ssl,
+                                                             p,
+                                                             extension_data_end);
+                if (ret != 0) {
+                    goto cleanup;
+                }
+                break;
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_PSK_ENABLED)
+            case MBEDTLS_TLS_EXT_PRE_SHARED_KEY:
+                MBEDTLS_SSL_DEBUG_MSG(3, ("found pre_shared_key extension"));
+
+                if ((ret = ssl_tls13_parse_server_pre_shared_key_ext(
+                         ssl, p, extension_data_end)) != 0) {
+                    MBEDTLS_SSL_DEBUG_RET(
+                        1, ("ssl_tls13_parse_server_pre_shared_key_ext"), ret);
+                    return ret;
+                }
+                break;
+#endif
+
+            case MBEDTLS_TLS_EXT_KEY_SHARE:
+                MBEDTLS_SSL_DEBUG_MSG(3, ("found key_shares extension"));
+                if (!mbedtls_ssl_conf_tls13_is_some_ephemeral_enabled(ssl)) {
+                    fatal_alert = MBEDTLS_SSL_ALERT_MSG_UNSUPPORTED_EXT;
+                    goto cleanup;
+                }
+
+                if (is_hrr) {
+                    ret = ssl_tls13_parse_hrr_key_share_ext(ssl,
+                                                            p, extension_data_end);
+                } else {
+                    ret = ssl_tls13_parse_key_share_ext(ssl,
+                                                        p, extension_data_end);
+                }
+                if (ret != 0) {
+                    MBEDTLS_SSL_DEBUG_RET(1,
+                                          "ssl_tls13_parse_key_share_ext",
+                                          ret);
+                    goto cleanup;
+                }
+                break;
+
+            default:
+                ret = MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+                goto cleanup;
+        }
+
+        p += extension_data_len;
+    }
+
+    MBEDTLS_SSL_PRINT_EXTS(3, hs_msg_type, handshake->received_extensions);
+
+cleanup:
+
+    if (fatal_alert == MBEDTLS_SSL_ALERT_MSG_UNSUPPORTED_EXT) {
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_UNSUPPORTED_EXT,
+                                     MBEDTLS_ERR_SSL_UNSUPPORTED_EXTENSION);
+        ret = MBEDTLS_ERR_SSL_UNSUPPORTED_EXTENSION;
+    } else if (fatal_alert == MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER) {
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+                                     MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+        ret = MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+    return ret;
+}
+
+#if defined(MBEDTLS_DEBUG_C)
+static const char *ssl_tls13_get_kex_mode_str(int mode)
+{
+    switch (mode) {
+        case MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK:
+            return "psk";
+        case MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL:
+            return "ephemeral";
+        case MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_EPHEMERAL:
+            return "psk_ephemeral";
+        default:
+            return "unknown mode";
+    }
+}
+#endif /* MBEDTLS_DEBUG_C */
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_postprocess_server_hello(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    /* Determine the key exchange mode:
+     * 1) If both the pre_shared_key and key_share extensions were received
+     *    then the key exchange mode is PSK with EPHEMERAL.
+     * 2) If only the pre_shared_key extension was received then the key
+     *    exchange mode is PSK-only.
+     * 3) If only the key_share extension was received then the key
+     *    exchange mode is EPHEMERAL-only.
+     */
+    switch (handshake->received_extensions &
+            (MBEDTLS_SSL_EXT_MASK(PRE_SHARED_KEY) |
+             MBEDTLS_SSL_EXT_MASK(KEY_SHARE))) {
+        /* Only the pre_shared_key extension was received */
+        case MBEDTLS_SSL_EXT_MASK(PRE_SHARED_KEY):
+            handshake->key_exchange_mode =
+                MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK;
+            break;
+
+        /* Only the key_share extension was received */
+        case MBEDTLS_SSL_EXT_MASK(KEY_SHARE):
+            handshake->key_exchange_mode =
+                MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL;
+            break;
+
+        /* Both the pre_shared_key and key_share extensions were received */
+        case (MBEDTLS_SSL_EXT_MASK(PRE_SHARED_KEY) |
+              MBEDTLS_SSL_EXT_MASK(KEY_SHARE)):
+            handshake->key_exchange_mode =
+                MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_EPHEMERAL;
+            break;
+
+        /* Neither pre_shared_key nor key_share extension was received */
+        default:
+            MBEDTLS_SSL_DEBUG_MSG(1, ("Unknown key exchange."));
+            ret = MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
+            goto cleanup;
+    }
+
+    if (!mbedtls_ssl_conf_tls13_is_kex_mode_enabled(
+            ssl, handshake->key_exchange_mode)) {
+        ret = MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
+        MBEDTLS_SSL_DEBUG_MSG(
+            2, ("Key exchange mode(%s) is not supported.",
+                ssl_tls13_get_kex_mode_str(handshake->key_exchange_mode)));
+        goto cleanup;
+    }
+
+    MBEDTLS_SSL_DEBUG_MSG(
+        3, ("Selected key exchange mode: %s",
+            ssl_tls13_get_kex_mode_str(handshake->key_exchange_mode)));
+
+    /* Start the TLS 1.3 key scheduling if not already done.
+     *
+     * If we proposed early data then we have already derived an
+     * early secret using the selected PSK and its associated hash.
+     * It means that if the negotiated key exchange mode is psk or
+     * psk_ephemeral, we have already correctly computed the
+     * early secret and thus we do not do it again. In all other
+     * cases we compute it here.
+     */
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+    if (ssl->early_data_state == MBEDTLS_SSL_EARLY_DATA_STATE_NO_IND_SENT ||
+        handshake->key_exchange_mode ==
+        MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL)
+#endif
+    {
+        ret = mbedtls_ssl_tls13_key_schedule_stage_early(ssl);
+        if (ret != 0) {
+            MBEDTLS_SSL_DEBUG_RET(
+                1, "mbedtls_ssl_tls13_key_schedule_stage_early", ret);
+            goto cleanup;
+        }
+    }
+
+    ret = mbedtls_ssl_tls13_compute_handshake_transform(ssl);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1,
+                              "mbedtls_ssl_tls13_compute_handshake_transform",
+                              ret);
+        goto cleanup;
+    }
+
+    mbedtls_ssl_set_inbound_transform(ssl, handshake->transform_handshake);
+    MBEDTLS_SSL_DEBUG_MSG(1, ("Switch to handshake keys for inbound traffic"));
+    ssl->session_in = ssl->session_negotiate;
+
+cleanup:
+    if (ret != 0) {
+        MBEDTLS_SSL_PEND_FATAL_ALERT(
+            MBEDTLS_SSL_ALERT_MSG_HANDSHAKE_FAILURE,
+            MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE);
+    }
+
+    return ret;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_postprocess_hrr(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+
+    mbedtls_ssl_session_reset_msg_layer(ssl, 0);
+
+    /*
+     * We are going to re-generate a shared secret corresponding to the group
+     * selected by the server, which is different from the group for which we
+     * generated a shared secret in the first client hello.
+     * Thus, reset the shared secret.
+     */
+    ret = ssl_tls13_reset_key_share(ssl);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ssl->session_negotiate->ciphersuite = ssl->handshake->ciphersuite_info->id;
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+    if (ssl->early_data_state != MBEDTLS_SSL_EARLY_DATA_STATE_NO_IND_SENT) {
+        ssl->early_data_state = MBEDTLS_SSL_EARLY_DATA_STATE_REJECTED;
+    }
+#endif
+
+    return 0;
+}
+
+/*
+ * Wait and parse ServerHello handshake message.
+ * Handler for MBEDTLS_SSL_SERVER_HELLO
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_process_server_hello(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char *buf = NULL;
+    size_t buf_len = 0;
+    int is_hrr = 0;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> %s", __func__));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_SERVER_HELLO, &buf, &buf_len));
+
+    ret = ssl_tls13_preprocess_server_hello(ssl, buf, buf + buf_len);
+    if (ret < 0) {
+        goto cleanup;
+    } else {
+        is_hrr = (ret == SSL_SERVER_HELLO_HRR);
+    }
+
+    if (ret == SSL_SERVER_HELLO_TLS1_2) {
+        ret = 0;
+        goto cleanup;
+    }
+
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_parse_server_hello(ssl, buf,
+                                                      buf + buf_len,
+                                                      is_hrr));
+    if (is_hrr) {
+        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_reset_transcript_for_hrr(ssl));
+    }
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_SERVER_HELLO, buf, buf_len));
+
+    if (is_hrr) {
+        MBEDTLS_SSL_PROC_CHK(ssl_tls13_postprocess_hrr(ssl));
+#if defined(MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE)
+        /* If not offering early data, the client sends a dummy CCS record
+         * immediately before its second flight. This may either be before
+         * its second ClientHello or before its encrypted handshake flight.
+         */
+        mbedtls_ssl_handshake_set_state(
+            ssl, MBEDTLS_SSL_CLIENT_CCS_BEFORE_2ND_CLIENT_HELLO);
+#else
+        mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_HELLO);
+#endif /* MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE */
+    } else {
+        MBEDTLS_SSL_PROC_CHK(ssl_tls13_postprocess_server_hello(ssl));
+        mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_ENCRYPTED_EXTENSIONS);
+    }
+
+cleanup:
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= %s ( %s )", __func__,
+                              is_hrr ? "HelloRetryRequest" : "ServerHello"));
+    return ret;
+}
+
+/*
+ *
+ * Handler for MBEDTLS_SSL_ENCRYPTED_EXTENSIONS
+ *
+ * The EncryptedExtensions message contains any extensions which
+ * should be protected, i.e., any which are not needed to establish
+ * the cryptographic context.
+ */
+
+/* Parse EncryptedExtensions message
+ * struct {
+ *     Extension extensions<0..2^16-1>;
+ * } EncryptedExtensions;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_encrypted_extensions(mbedtls_ssl_context *ssl,
+                                                const unsigned char *buf,
+                                                const unsigned char *end)
+{
+    int ret = 0;
+    size_t extensions_len;
+    const unsigned char *p = buf;
+    const unsigned char *extensions_end;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    extensions_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, extensions_len);
+    extensions_end = p + extensions_len;
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "encrypted extensions", p, extensions_len);
+
+    handshake->received_extensions = MBEDTLS_SSL_EXT_MASK_NONE;
+
+    while (p < extensions_end) {
+        unsigned int extension_type;
+        size_t extension_data_len;
+
+        /*
+         * struct {
+         *     ExtensionType extension_type; (2 bytes)
+         *     opaque extension_data<0..2^16-1>;
+         * } Extension;
+         */
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, 4);
+        extension_type = MBEDTLS_GET_UINT16_BE(p, 0);
+        extension_data_len = MBEDTLS_GET_UINT16_BE(p, 2);
+        p += 4;
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, extension_data_len);
+
+        ret = mbedtls_ssl_tls13_check_received_extension(
+            ssl, MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS, extension_type,
+            MBEDTLS_SSL_TLS1_3_ALLOWED_EXTS_OF_EE);
+        if (ret != 0) {
+            return ret;
+        }
+
+        switch (extension_type) {
+#if defined(MBEDTLS_SSL_ALPN)
+            case MBEDTLS_TLS_EXT_ALPN:
+                MBEDTLS_SSL_DEBUG_MSG(3, ("found alpn extension"));
+
+                if ((ret = ssl_tls13_parse_alpn_ext(
+                         ssl, p, (size_t) extension_data_len)) != 0) {
+                    return ret;
+                }
+
+                break;
+#endif /* MBEDTLS_SSL_ALPN */
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+            case MBEDTLS_TLS_EXT_EARLY_DATA:
+
+                if (extension_data_len != 0) {
+                    /* The message must be empty. */
+                    MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
+                                                 MBEDTLS_ERR_SSL_DECODE_ERROR);
+                    return MBEDTLS_ERR_SSL_DECODE_ERROR;
+                }
+
+                break;
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+
+#if defined(MBEDTLS_SSL_RECORD_SIZE_LIMIT)
+            case MBEDTLS_TLS_EXT_RECORD_SIZE_LIMIT:
+                MBEDTLS_SSL_DEBUG_MSG(3, ("found record_size_limit extension"));
+
+                ret = mbedtls_ssl_tls13_parse_record_size_limit_ext(
+                    ssl, p, p + extension_data_len);
+                if (ret != 0) {
+                    MBEDTLS_SSL_DEBUG_RET(
+                        1, ("mbedtls_ssl_tls13_parse_record_size_limit_ext"), ret);
+                    return ret;
+                }
+                break;
+#endif /* MBEDTLS_SSL_RECORD_SIZE_LIMIT */
+
+            default:
+                MBEDTLS_SSL_PRINT_EXT(
+                    3, MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS,
+                    extension_type, "( ignored )");
+                break;
+        }
+
+        p += extension_data_len;
+    }
+
+    if ((handshake->received_extensions & MBEDTLS_SSL_EXT_MASK(RECORD_SIZE_LIMIT)) &&
+        (handshake->received_extensions & MBEDTLS_SSL_EXT_MASK(MAX_FRAGMENT_LENGTH))) {
+        MBEDTLS_SSL_DEBUG_MSG(3,
+                              (
+                                  "Record size limit extension cannot be used with max fragment length extension"));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(
+            MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+            MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+    MBEDTLS_SSL_PRINT_EXTS(3, MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS,
+                           handshake->received_extensions);
+
+    /* Check that we consumed all the message. */
+    if (p != end) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("EncryptedExtension lengths misaligned"));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
+                                     MBEDTLS_ERR_SSL_DECODE_ERROR);
+        return MBEDTLS_ERR_SSL_DECODE_ERROR;
+    }
+
+    return ret;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_process_encrypted_extensions(mbedtls_ssl_context *ssl)
+{
+    int ret;
+    unsigned char *buf;
+    size_t buf_len;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> parse encrypted extensions"));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS,
+                             &buf, &buf_len));
+
+    /* Process the message contents */
+    MBEDTLS_SSL_PROC_CHK(
+        ssl_tls13_parse_encrypted_extensions(ssl, buf, buf + buf_len));
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+    if (handshake->received_extensions & MBEDTLS_SSL_EXT_MASK(EARLY_DATA)) {
+        /* RFC8446 4.2.11
+         * If the server supplies an "early_data" extension, the
+         * client MUST verify that the server's selected_identity
+         * is 0. If any other value is returned, the client MUST
+         * abort the handshake with an "illegal_parameter" alert.
+         *
+         * RFC 8446 4.2.10
+         * In order to accept early data, the server MUST have accepted a PSK
+         * cipher suite and selected the first key offered in the client's
+         * "pre_shared_key" extension. In addition, it MUST verify that the
+         * following values are the same as those associated with the
+         * selected PSK:
+         * - The TLS version number
+         * - The selected cipher suite
+         * - The selected ALPN [RFC7301] protocol, if any
+         *
+         * The server has sent an early data extension in its Encrypted
+         * Extension message thus accepted to receive early data. We
+         * check here that the additional constraints on the handshake
+         * parameters, when early data are exchanged, are met,
+         * namely:
+         * - a PSK has been selected for the handshake
+         * - the selected PSK for the handshake was the first one proposed
+         *   by the client.
+         * - the selected ciphersuite for the handshake is the ciphersuite
+         *   associated with the selected PSK.
+         */
+        if ((!mbedtls_ssl_tls13_key_exchange_mode_with_psk(ssl)) ||
+            handshake->selected_identity != 0 ||
+            handshake->ciphersuite_info->id !=
+            ssl->session_negotiate->ciphersuite) {
+
+            MBEDTLS_SSL_PEND_FATAL_ALERT(
+                MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+                MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+            return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+        }
+
+        ssl->early_data_state = MBEDTLS_SSL_EARLY_DATA_STATE_ACCEPTED;
+    } else if (ssl->early_data_state !=
+               MBEDTLS_SSL_EARLY_DATA_STATE_NO_IND_SENT) {
+        ssl->early_data_state = MBEDTLS_SSL_EARLY_DATA_STATE_REJECTED;
+    }
+#endif
+
+    /*
+     * In case the client has proposed a PSK associated with a ticket,
+     * `ssl->session_negotiate->ciphersuite` still contains at this point the
+     * identifier of the ciphersuite associated with the ticket. This is that
+     * way because, if an exchange of early data is agreed upon, we need
+     * it to check that the ciphersuite selected for the handshake is the
+     * ticket ciphersuite (see above). This information is not needed
+     * anymore thus we can now set it to the identifier of the ciphersuite
+     * used in this session under negotiation.
+     */
+    ssl->session_negotiate->ciphersuite = handshake->ciphersuite_info->id;
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS,
+                             buf, buf_len));
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+    if (mbedtls_ssl_tls13_key_exchange_mode_with_psk(ssl)) {
+        mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_SERVER_FINISHED);
+
+        /* Since we're not using a certificate, set verify_result to success */
+        ssl->session_negotiate->verify_result = 0;
+    } else {
+        mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CERTIFICATE_REQUEST);
+    }
+#else
+    ((void) ssl);
+    mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_SERVER_FINISHED);
+#endif
+
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= parse encrypted extensions"));
+    return ret;
+
+}
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+/*
+ * Handler for MBEDTLS_SSL_END_OF_EARLY_DATA
+ *
+ * RFC 8446 section 4.5
+ *
+ * struct {} EndOfEarlyData;
+ *
+ * If the server sent an "early_data" extension in EncryptedExtensions, the
+ * client MUST send an EndOfEarlyData message after receiving the server
+ * Finished. Otherwise, the client MUST NOT send an EndOfEarlyData message.
+ */
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_end_of_early_data(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char *buf = NULL;
+    size_t buf_len;
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> write EndOfEarlyData"));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_start_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_END_OF_EARLY_DATA,
+                             &buf, &buf_len));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_hdr_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_END_OF_EARLY_DATA, 0));
+
+    MBEDTLS_SSL_PROC_CHK(
+        mbedtls_ssl_finish_handshake_msg(ssl, buf_len, 0));
+
+    mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_CERTIFICATE);
+
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= write EndOfEarlyData"));
+    return ret;
+}
+
+int mbedtls_ssl_get_early_data_status(mbedtls_ssl_context *ssl)
+{
+    if ((ssl->conf->endpoint != MBEDTLS_SSL_IS_CLIENT) ||
+        (!mbedtls_ssl_is_handshake_over(ssl))) {
+        return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+    }
+
+    switch (ssl->early_data_state) {
+        case MBEDTLS_SSL_EARLY_DATA_STATE_NO_IND_SENT:
+            return MBEDTLS_SSL_EARLY_DATA_STATUS_NOT_INDICATED;
+            break;
+
+        case MBEDTLS_SSL_EARLY_DATA_STATE_REJECTED:
+            return MBEDTLS_SSL_EARLY_DATA_STATUS_REJECTED;
+            break;
+
+        case MBEDTLS_SSL_EARLY_DATA_STATE_SERVER_FINISHED_RECEIVED:
+            return MBEDTLS_SSL_EARLY_DATA_STATUS_ACCEPTED;
+            break;
+
+        default:
+            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+}
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+/*
+ * STATE HANDLING: CertificateRequest
+ *
+ */
+#define SSL_CERTIFICATE_REQUEST_EXPECT_REQUEST 0
+#define SSL_CERTIFICATE_REQUEST_SKIP           1
+/* Coordination:
+ * Deals with the ambiguity of not knowing if a CertificateRequest
+ * will be sent. Returns a negative code on failure, or
+ * - SSL_CERTIFICATE_REQUEST_EXPECT_REQUEST
+ * - SSL_CERTIFICATE_REQUEST_SKIP
+ * indicating if a Certificate Request is expected or not.
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_certificate_request_coordinate(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+
+    if ((ret = mbedtls_ssl_read_record(ssl, 0)) != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_read_record", ret);
+        return ret;
+    }
+    ssl->keep_current_message = 1;
+
+    if ((ssl->in_msgtype == MBEDTLS_SSL_MSG_HANDSHAKE) &&
+        (ssl->in_msg[0] == MBEDTLS_SSL_HS_CERTIFICATE_REQUEST)) {
+        MBEDTLS_SSL_DEBUG_MSG(3, ("got a certificate request"));
+        return SSL_CERTIFICATE_REQUEST_EXPECT_REQUEST;
+    }
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("got no certificate request"));
+
+    return SSL_CERTIFICATE_REQUEST_SKIP;
+}
+
+/*
+ * ssl_tls13_parse_certificate_request()
+ *     Parse certificate request
+ * struct {
+ *   opaque certificate_request_context<0..2^8-1>;
+ *   Extension extensions<2..2^16-1>;
+ * } CertificateRequest;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_certificate_request(mbedtls_ssl_context *ssl,
+                                               const unsigned char *buf,
+                                               const unsigned char *end)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    const unsigned char *p = buf;
+    size_t certificate_request_context_len = 0;
+    size_t extensions_len = 0;
+    const unsigned char *extensions_end;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    /* ...
+     * opaque certificate_request_context<0..2^8-1>
+     * ...
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 1);
+    certificate_request_context_len = (size_t) p[0];
+    p += 1;
+
+    if (certificate_request_context_len > 0) {
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, certificate_request_context_len);
+        MBEDTLS_SSL_DEBUG_BUF(3, "Certificate Request Context",
+                              p, certificate_request_context_len);
+
+        handshake->certificate_request_context =
+            mbedtls_calloc(1, certificate_request_context_len);
+        if (handshake->certificate_request_context == NULL) {
+            MBEDTLS_SSL_DEBUG_MSG(1, ("buffer too small"));
+            return MBEDTLS_ERR_SSL_ALLOC_FAILED;
+        }
+        memcpy(handshake->certificate_request_context, p,
+               certificate_request_context_len);
+        p += certificate_request_context_len;
+    }
+
+    /* ...
+     * Extension extensions<2..2^16-1>;
+     * ...
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    extensions_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, extensions_len);
+    extensions_end = p + extensions_len;
+
+    handshake->received_extensions = MBEDTLS_SSL_EXT_MASK_NONE;
+
+    while (p < extensions_end) {
+        unsigned int extension_type;
+        size_t extension_data_len;
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, 4);
+        extension_type = MBEDTLS_GET_UINT16_BE(p, 0);
+        extension_data_len = MBEDTLS_GET_UINT16_BE(p, 2);
+        p += 4;
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, extension_data_len);
+
+        ret = mbedtls_ssl_tls13_check_received_extension(
+            ssl, MBEDTLS_SSL_HS_CERTIFICATE_REQUEST, extension_type,
+            MBEDTLS_SSL_TLS1_3_ALLOWED_EXTS_OF_CR);
+        if (ret != 0) {
+            return ret;
+        }
+
+        switch (extension_type) {
+            case MBEDTLS_TLS_EXT_SIG_ALG:
+                MBEDTLS_SSL_DEBUG_MSG(3,
+                                      ("found signature algorithms extension"));
+                ret = mbedtls_ssl_parse_sig_alg_ext(ssl, p,
+                                                    p + extension_data_len);
+                if (ret != 0) {
+                    return ret;
+                }
+
+                break;
+
+            default:
+                MBEDTLS_SSL_PRINT_EXT(
+                    3, MBEDTLS_SSL_HS_CERTIFICATE_REQUEST,
+                    extension_type, "( ignored )");
+                break;
+        }
+
+        p += extension_data_len;
+    }
+
+    MBEDTLS_SSL_PRINT_EXTS(3, MBEDTLS_SSL_HS_CERTIFICATE_REQUEST,
+                           handshake->received_extensions);
+
+    /* Check that we consumed all the message. */
+    if (p != end) {
+        MBEDTLS_SSL_DEBUG_MSG(1,
+                              ("CertificateRequest misaligned"));
+        goto decode_error;
+    }
+
+    /* RFC 8446 section 4.3.2
+     *
+     * The "signature_algorithms" extension MUST be specified
+     */
+    if ((handshake->received_extensions & MBEDTLS_SSL_EXT_MASK(SIG_ALG)) == 0) {
+        MBEDTLS_SSL_DEBUG_MSG(3,
+                              ("no signature algorithms extension found"));
+        goto decode_error;
+    }
+
+    ssl->handshake->client_auth = 1;
+    return 0;
+
+decode_error:
+    MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
+                                 MBEDTLS_ERR_SSL_DECODE_ERROR);
+    return MBEDTLS_ERR_SSL_DECODE_ERROR;
+}
+
+/*
+ * Handler for  MBEDTLS_SSL_CERTIFICATE_REQUEST
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_process_certificate_request(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> parse certificate request"));
+
+    MBEDTLS_SSL_PROC_CHK_NEG(ssl_tls13_certificate_request_coordinate(ssl));
+
+    if (ret == SSL_CERTIFICATE_REQUEST_EXPECT_REQUEST) {
+        unsigned char *buf;
+        size_t buf_len;
+
+        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(
+                                 ssl, MBEDTLS_SSL_HS_CERTIFICATE_REQUEST,
+                                 &buf, &buf_len));
+
+        MBEDTLS_SSL_PROC_CHK(ssl_tls13_parse_certificate_request(
+                                 ssl, buf, buf + buf_len));
+
+        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                                 ssl, MBEDTLS_SSL_HS_CERTIFICATE_REQUEST,
+                                 buf, buf_len));
+    } else if (ret == SSL_CERTIFICATE_REQUEST_SKIP) {
+        ret = 0;
+    } else {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("should never happen"));
+        ret = MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        goto cleanup;
+    }
+
+    mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_SERVER_CERTIFICATE);
+
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= parse certificate request"));
+    return ret;
+}
+
+/*
+ * Handler for MBEDTLS_SSL_SERVER_CERTIFICATE
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_process_server_certificate(mbedtls_ssl_context *ssl)
+{
+    int ret;
+
+    ret = mbedtls_ssl_tls13_process_certificate(ssl);
+    if (ret != 0) {
+        return ret;
+    }
+
+    mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CERTIFICATE_VERIFY);
+    return 0;
+}
+
+/*
+ * Handler for MBEDTLS_SSL_CERTIFICATE_VERIFY
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_process_certificate_verify(mbedtls_ssl_context *ssl)
+{
+    int ret;
+
+    ret = mbedtls_ssl_tls13_process_certificate_verify(ssl);
+    if (ret != 0) {
+        return ret;
+    }
+
+    mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_SERVER_FINISHED);
+    return 0;
+}
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+
+/*
+ * Handler for MBEDTLS_SSL_SERVER_FINISHED
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_process_server_finished(mbedtls_ssl_context *ssl)
+{
+    int ret;
+
+    ret = mbedtls_ssl_tls13_process_finished_message(ssl);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = mbedtls_ssl_tls13_compute_application_transform(ssl);
+    if (ret != 0) {
+        MBEDTLS_SSL_PEND_FATAL_ALERT(
+            MBEDTLS_SSL_ALERT_MSG_HANDSHAKE_FAILURE,
+            MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE);
+        return ret;
+    }
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+    if (ssl->early_data_state == MBEDTLS_SSL_EARLY_DATA_STATE_ACCEPTED) {
+        ssl->early_data_state = MBEDTLS_SSL_EARLY_DATA_STATE_SERVER_FINISHED_RECEIVED;
+        mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_END_OF_EARLY_DATA);
+    } else
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+    {
+#if defined(MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE)
+        mbedtls_ssl_handshake_set_state(
+            ssl, MBEDTLS_SSL_CLIENT_CCS_AFTER_SERVER_FINISHED);
+#else
+        mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_CERTIFICATE);
+#endif /* MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE */
+    }
+
+    return 0;
+}
+
+/*
+ * Handler for MBEDTLS_SSL_CLIENT_CERTIFICATE
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_client_certificate(mbedtls_ssl_context *ssl)
+{
+    int non_empty_certificate_msg = 0;
+
+    MBEDTLS_SSL_DEBUG_MSG(1,
+                          ("Switch to handshake traffic keys for outbound traffic"));
+    mbedtls_ssl_set_outbound_transform(ssl, ssl->handshake->transform_handshake);
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+    if (ssl->handshake->client_auth) {
+        int ret = mbedtls_ssl_tls13_write_certificate(ssl);
+        if (ret != 0) {
+            return ret;
+        }
+
+        if (mbedtls_ssl_own_cert(ssl) != NULL) {
+            non_empty_certificate_msg = 1;
+        }
+    } else {
+        MBEDTLS_SSL_DEBUG_MSG(2, ("skip write certificate"));
+    }
+#endif
+
+    if (non_empty_certificate_msg) {
+        mbedtls_ssl_handshake_set_state(ssl,
+                                        MBEDTLS_SSL_CLIENT_CERTIFICATE_VERIFY);
+    } else {
+        MBEDTLS_SSL_DEBUG_MSG(2, ("skip write certificate verify"));
+        mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_FINISHED);
+    }
+
+    return 0;
+}
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+/*
+ * Handler for MBEDTLS_SSL_CLIENT_CERTIFICATE_VERIFY
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_client_certificate_verify(mbedtls_ssl_context *ssl)
+{
+    int ret = mbedtls_ssl_tls13_write_certificate_verify(ssl);
+
+    if (ret == 0) {
+        mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_FINISHED);
+    }
+
+    return ret;
+}
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+
+/*
+ * Handler for MBEDTLS_SSL_CLIENT_FINISHED
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_client_finished(mbedtls_ssl_context *ssl)
+{
+    int ret;
+
+    ret = mbedtls_ssl_tls13_write_finished_message(ssl);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = mbedtls_ssl_tls13_compute_resumption_master_secret(ssl);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(
+            1, "mbedtls_ssl_tls13_compute_resumption_master_secret ", ret);
+        return ret;
+    }
+
+    mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_FLUSH_BUFFERS);
+    return 0;
+}
+
+/*
+ * Handler for MBEDTLS_SSL_FLUSH_BUFFERS
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_flush_buffers(mbedtls_ssl_context *ssl)
+{
+    MBEDTLS_SSL_DEBUG_MSG(2, ("handshake: done"));
+    mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_HANDSHAKE_WRAPUP);
+    return 0;
+}
+
+/*
+ * Handler for MBEDTLS_SSL_HANDSHAKE_WRAPUP
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_handshake_wrapup(mbedtls_ssl_context *ssl)
+{
+
+    mbedtls_ssl_tls13_handshake_wrapup(ssl);
+
+    mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_HANDSHAKE_OVER);
+    return 0;
+}
+
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+/* From RFC 8446 section 4.2.10
+ *
+ * struct {
+ *     select (Handshake.msg_type) {
+ *         case new_session_ticket:   uint32 max_early_data_size;
+ *         ...
+ *     };
+ * } EarlyDataIndication;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_new_session_ticket_early_data_ext(
+    mbedtls_ssl_context *ssl,
+    const unsigned char *buf,
+    const unsigned char *end)
+{
+    mbedtls_ssl_session *session = ssl->session;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(buf, end, 4);
+
+    session->max_early_data_size = MBEDTLS_GET_UINT32_BE(buf, 0);
+    mbedtls_ssl_tls13_session_set_ticket_flags(
+        session, MBEDTLS_SSL_TLS1_3_TICKET_ALLOW_EARLY_DATA);
+    MBEDTLS_SSL_DEBUG_MSG(
+        3, ("received max_early_data_size: %u",
+            (unsigned int) session->max_early_data_size));
+
+    return 0;
+}
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_new_session_ticket_exts(mbedtls_ssl_context *ssl,
+                                                   const unsigned char *buf,
+                                                   const unsigned char *end)
+{
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+    const unsigned char *p = buf;
+
+
+    handshake->received_extensions = MBEDTLS_SSL_EXT_MASK_NONE;
+
+    while (p < end) {
+        unsigned int extension_type;
+        size_t extension_data_len;
+        int ret;
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 4);
+        extension_type = MBEDTLS_GET_UINT16_BE(p, 0);
+        extension_data_len = MBEDTLS_GET_UINT16_BE(p, 2);
+        p += 4;
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, extension_data_len);
+
+        ret = mbedtls_ssl_tls13_check_received_extension(
+            ssl, MBEDTLS_SSL_HS_NEW_SESSION_TICKET, extension_type,
+            MBEDTLS_SSL_TLS1_3_ALLOWED_EXTS_OF_NST);
+        if (ret != 0) {
+            return ret;
+        }
+
+        switch (extension_type) {
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+            case MBEDTLS_TLS_EXT_EARLY_DATA:
+                ret = ssl_tls13_parse_new_session_ticket_early_data_ext(
+                    ssl, p, p + extension_data_len);
+                if (ret != 0) {
+                    MBEDTLS_SSL_DEBUG_RET(
+                        1, "ssl_tls13_parse_new_session_ticket_early_data_ext",
+                        ret);
+                }
+                break;
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+
+            default:
+                MBEDTLS_SSL_PRINT_EXT(
+                    3, MBEDTLS_SSL_HS_NEW_SESSION_TICKET,
+                    extension_type, "( ignored )");
+                break;
+        }
+
+        p +=  extension_data_len;
+    }
+
+    MBEDTLS_SSL_PRINT_EXTS(3, MBEDTLS_SSL_HS_NEW_SESSION_TICKET,
+                           handshake->received_extensions);
+
+    return 0;
+}
+
+/*
+ * From RFC8446, page 74
+ *
+ * struct {
+ *    uint32 ticket_lifetime;
+ *    uint32 ticket_age_add;
+ *    opaque ticket_nonce<0..255>;
+ *    opaque ticket<1..2^16-1>;
+ *    Extension extensions<0..2^16-2>;
+ * } NewSessionTicket;
+ *
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_new_session_ticket(mbedtls_ssl_context *ssl,
+                                              unsigned char *buf,
+                                              unsigned char *end,
+                                              unsigned char **ticket_nonce,
+                                              size_t *ticket_nonce_len)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char *p = buf;
+    mbedtls_ssl_session *session = ssl->session;
+    size_t ticket_len;
+    unsigned char *ticket;
+    size_t extensions_len;
+
+    *ticket_nonce = NULL;
+    *ticket_nonce_len = 0;
+    /*
+     *    ticket_lifetime   4 bytes
+     *    ticket_age_add    4 bytes
+     *    ticket_nonce_len  1 byte
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 9);
+
+    session->ticket_lifetime = MBEDTLS_GET_UINT32_BE(p, 0);
+    MBEDTLS_SSL_DEBUG_MSG(3,
+                          ("ticket_lifetime: %u",
+                           (unsigned int) session->ticket_lifetime));
+    if (session->ticket_lifetime >
+        MBEDTLS_SSL_TLS1_3_MAX_ALLOWED_TICKET_LIFETIME) {
+        MBEDTLS_SSL_DEBUG_MSG(3, ("ticket_lifetime exceeds 7 days."));
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+    session->ticket_age_add = MBEDTLS_GET_UINT32_BE(p, 4);
+    MBEDTLS_SSL_DEBUG_MSG(3,
+                          ("ticket_age_add: %u",
+                           (unsigned int) session->ticket_age_add));
+
+    *ticket_nonce_len = p[8];
+    p += 9;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, *ticket_nonce_len);
+    *ticket_nonce = p;
+    MBEDTLS_SSL_DEBUG_BUF(3, "ticket_nonce:", *ticket_nonce, *ticket_nonce_len);
+    p += *ticket_nonce_len;
+
+    /* Ticket */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    ticket_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, ticket_len);
+    MBEDTLS_SSL_DEBUG_BUF(3, "received ticket", p, ticket_len);
+
+    /* Check if we previously received a ticket already. */
+    if (session->ticket != NULL || session->ticket_len > 0) {
+        mbedtls_free(session->ticket);
+        session->ticket = NULL;
+        session->ticket_len = 0;
+    }
+
+    if ((ticket = mbedtls_calloc(1, ticket_len)) == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("ticket alloc failed"));
+        return MBEDTLS_ERR_SSL_ALLOC_FAILED;
+    }
+    memcpy(ticket, p, ticket_len);
+    p += ticket_len;
+    session->ticket = ticket;
+    session->ticket_len = ticket_len;
+
+    /* Clear all flags in ticket_flags */
+    mbedtls_ssl_tls13_session_clear_ticket_flags(
+        session, MBEDTLS_SSL_TLS1_3_TICKET_FLAGS_MASK);
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    extensions_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, extensions_len);
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "ticket extension", p, extensions_len);
+
+    ret = ssl_tls13_parse_new_session_ticket_exts(ssl, p, p + extensions_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1,
+                              "ssl_tls13_parse_new_session_ticket_exts",
+                              ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+/* Non negative return values for ssl_tls13_postprocess_new_session_ticket().
+ * - POSTPROCESS_NEW_SESSION_TICKET_SIGNAL, all good, we have to signal the
+ *   application that a valid ticket has been received.
+ * - POSTPROCESS_NEW_SESSION_TICKET_DISCARD, no fatal error, we keep the
+ *   connection alive but we do not signal the ticket to the application.
+ */
+#define POSTPROCESS_NEW_SESSION_TICKET_SIGNAL 0
+#define POSTPROCESS_NEW_SESSION_TICKET_DISCARD 1
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_postprocess_new_session_ticket(mbedtls_ssl_context *ssl,
+                                                    unsigned char *ticket_nonce,
+                                                    size_t ticket_nonce_len)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_ssl_session *session = ssl->session;
+    const mbedtls_ssl_ciphersuite_t *ciphersuite_info;
+    psa_algorithm_t psa_hash_alg;
+    int hash_length;
+
+    if (session->ticket_lifetime == 0) {
+        return POSTPROCESS_NEW_SESSION_TICKET_DISCARD;
+    }
+
+#if defined(MBEDTLS_HAVE_TIME)
+    /* Store ticket creation time */
+    session->ticket_reception_time = mbedtls_ms_time();
+#endif
+
+    ciphersuite_info = mbedtls_ssl_ciphersuite_from_id(session->ciphersuite);
+    if (ciphersuite_info == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("should never happen"));
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    psa_hash_alg = mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) ciphersuite_info->mac);
+    hash_length = PSA_HASH_LENGTH(psa_hash_alg);
+    if (hash_length == -1 ||
+        (size_t) hash_length > sizeof(session->resumption_key)) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "resumption_master_secret",
+                          session->app_secrets.resumption_master_secret,
+                          hash_length);
+
+    /* Compute resumption key
+     *
+     *  HKDF-Expand-Label( resumption_master_secret,
+     *                    "resumption", ticket_nonce, Hash.length )
+     */
+    ret = mbedtls_ssl_tls13_hkdf_expand_label(
+        psa_hash_alg,
+        session->app_secrets.resumption_master_secret,
+        hash_length,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(resumption),
+        ticket_nonce,
+        ticket_nonce_len,
+        session->resumption_key,
+        hash_length);
+
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(2,
+                              "Creating the ticket-resumed PSK failed",
+                              ret);
+        return ret;
+    }
+
+    session->resumption_key_len = hash_length;
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "Ticket-resumed PSK",
+                          session->resumption_key,
+                          session->resumption_key_len);
+
+    /* Set ticket_flags depends on the selected key exchange modes */
+    mbedtls_ssl_tls13_session_set_ticket_flags(
+        session, ssl->conf->tls13_kex_modes);
+    MBEDTLS_SSL_PRINT_TICKET_FLAGS(4, session->ticket_flags);
+
+    return POSTPROCESS_NEW_SESSION_TICKET_SIGNAL;
+}
+
+/*
+ * Handler for MBEDTLS_SSL_TLS1_3_NEW_SESSION_TICKET
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_process_new_session_ticket(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char *buf;
+    size_t buf_len;
+    unsigned char *ticket_nonce;
+    size_t ticket_nonce_len;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> parse new session ticket"));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_NEW_SESSION_TICKET,
+                             &buf, &buf_len));
+
+    /*
+     * We are about to update (maybe only partially) ticket data thus block
+     * any session export for the time being.
+     */
+    ssl->session->exported = 1;
+
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_parse_new_session_ticket(
+                             ssl, buf, buf + buf_len,
+                             &ticket_nonce, &ticket_nonce_len));
+
+    MBEDTLS_SSL_PROC_CHK_NEG(ssl_tls13_postprocess_new_session_ticket(
+                                 ssl, ticket_nonce, ticket_nonce_len));
+
+    switch (ret) {
+        case POSTPROCESS_NEW_SESSION_TICKET_SIGNAL:
+            /*
+             * All good, we have received a new valid ticket, session data can
+             * be exported now and we signal the ticket to the application.
+             */
+            ssl->session->exported = 0;
+            ret = MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET;
+            break;
+
+        case POSTPROCESS_NEW_SESSION_TICKET_DISCARD:
+            ret = 0;
+            MBEDTLS_SSL_DEBUG_MSG(2, ("Discard new session ticket"));
+            break;
+
+        default:
+            ret = MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_HANDSHAKE_OVER);
+
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= parse new session ticket"));
+    return ret;
+}
+#endif /* MBEDTLS_SSL_SESSION_TICKETS */
+
+int mbedtls_ssl_tls13_handshake_client_step(mbedtls_ssl_context *ssl)
+{
+    int ret = 0;
+
+    switch (ssl->state) {
+        case MBEDTLS_SSL_HELLO_REQUEST:
+            mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_HELLO);
+            break;
+
+        case MBEDTLS_SSL_CLIENT_HELLO:
+            ret = mbedtls_ssl_write_client_hello(ssl);
+            break;
+
+        case MBEDTLS_SSL_SERVER_HELLO:
+            ret = ssl_tls13_process_server_hello(ssl);
+            break;
+
+        case MBEDTLS_SSL_ENCRYPTED_EXTENSIONS:
+            ret = ssl_tls13_process_encrypted_extensions(ssl);
+            break;
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+        case MBEDTLS_SSL_CERTIFICATE_REQUEST:
+            ret = ssl_tls13_process_certificate_request(ssl);
+            break;
+
+        case MBEDTLS_SSL_SERVER_CERTIFICATE:
+            ret = ssl_tls13_process_server_certificate(ssl);
+            break;
+
+        case MBEDTLS_SSL_CERTIFICATE_VERIFY:
+            ret = ssl_tls13_process_certificate_verify(ssl);
+            break;
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+
+        case MBEDTLS_SSL_SERVER_FINISHED:
+            ret = ssl_tls13_process_server_finished(ssl);
+            break;
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+        case MBEDTLS_SSL_END_OF_EARLY_DATA:
+            ret = ssl_tls13_write_end_of_early_data(ssl);
+            break;
+#endif
+
+        case MBEDTLS_SSL_CLIENT_CERTIFICATE:
+            ret = ssl_tls13_write_client_certificate(ssl);
+            break;
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+        case MBEDTLS_SSL_CLIENT_CERTIFICATE_VERIFY:
+            ret = ssl_tls13_write_client_certificate_verify(ssl);
+            break;
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+
+        case MBEDTLS_SSL_CLIENT_FINISHED:
+            ret = ssl_tls13_write_client_finished(ssl);
+            break;
+
+        case MBEDTLS_SSL_FLUSH_BUFFERS:
+            ret = ssl_tls13_flush_buffers(ssl);
+            break;
+
+        case MBEDTLS_SSL_HANDSHAKE_WRAPUP:
+            ret = ssl_tls13_handshake_wrapup(ssl);
+            break;
+
+            /*
+             * Injection of dummy-CCS's for middlebox compatibility
+             */
+#if defined(MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE)
+        case MBEDTLS_SSL_CLIENT_CCS_BEFORE_2ND_CLIENT_HELLO:
+            ret = mbedtls_ssl_tls13_write_change_cipher_spec(ssl);
+            if (ret != 0) {
+                break;
+            }
+            mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_HELLO);
+            break;
+
+        case MBEDTLS_SSL_CLIENT_CCS_AFTER_SERVER_FINISHED:
+            ret = mbedtls_ssl_tls13_write_change_cipher_spec(ssl);
+            if (ret != 0) {
+                break;
+            }
+            mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_CERTIFICATE);
+            break;
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+        case MBEDTLS_SSL_CLIENT_CCS_AFTER_CLIENT_HELLO:
+            ret = mbedtls_ssl_tls13_write_change_cipher_spec(ssl);
+            if (ret == 0) {
+                mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_SERVER_HELLO);
+
+                MBEDTLS_SSL_DEBUG_MSG(
+                    1, ("Switch to early data keys for outbound traffic"));
+                mbedtls_ssl_set_outbound_transform(
+                    ssl, ssl->handshake->transform_earlydata);
+                ssl->early_data_state = MBEDTLS_SSL_EARLY_DATA_STATE_CAN_WRITE;
+            }
+            break;
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+#endif /* MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE */
+
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+        case MBEDTLS_SSL_TLS1_3_NEW_SESSION_TICKET:
+            ret = ssl_tls13_process_new_session_ticket(ssl);
+            break;
+#endif /* MBEDTLS_SSL_SESSION_TICKETS */
+
+        default:
+            MBEDTLS_SSL_DEBUG_MSG(1, ("invalid state %d", ssl->state));
+            return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+    }
+
+    return ret;
+}
+
+#endif /* MBEDTLS_SSL_CLI_C && MBEDTLS_SSL_PROTO_TLS1_3 */
+
+/************** End of ssl_tls13_client.c ************************************/
+#pragma pop_macro("local_err_translation")
+#pragma pop_macro("POSTPROCESS_NEW_SESSION_TICKET_DISCARD")
+#pragma pop_macro("POSTPROCESS_NEW_SESSION_TICKET_SIGNAL")
+#pragma pop_macro("SSL_CERTIFICATE_REQUEST_SKIP")
+#pragma pop_macro("SSL_CERTIFICATE_REQUEST_EXPECT_REQUEST")
+#pragma pop_macro("SSL_SERVER_HELLO_TLS1_2")
+#pragma pop_macro("SSL_SERVER_HELLO_HRR")
+#pragma pop_macro("SSL_SERVER_HELLO")
+#pragma pop_macro("PSA_TO_MBEDTLS_ERR")
+#pragma push_macro("PSA_TO_MBEDTLS_ERR")
+#pragma push_macro("SSL_VERIFY_STRUCT_MAX_SIZE")
+#pragma push_macro("local_err_translation")
+#define local_err_translation doltlite_mbedtls_tls13_generic_err_translation
+/************** Begin file ssl_tls13_generic.c *******************************/
+/*
+ *  TLS 1.3 functionality shared between client and server
+ *
+ *  Copyright The Mbed TLS Contributors
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ */
+
+/* #include "common.h" */
+
+#if defined(MBEDTLS_SSL_TLS_C) && defined(MBEDTLS_SSL_PROTO_TLS1_3)
+
+/* #include <string.h> */
+
+/* #include "mbedtls/error.h" */
+/* #include "debug_internal.h" */
+/* #include "mbedtls/oid.h" */
+/* #include "mbedtls/platform.h" */
+/* #include "mbedtls/constant_time.h" */
+/* #include "psa/crypto.h" */
+/* #include "mbedtls/psa_util.h" */
+
+/* #include "ssl_misc.h" */
+/************** Include ssl_tls13_invasive.h in the middle of ssl_tls13_generic.c */
+/************** Begin file ssl_tls13_invasive.h ******************************/
+/*
+ *  Copyright The Mbed TLS Contributors
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ */
+
+#ifndef MBEDTLS_SSL_TLS13_INVASIVE_H
+#define MBEDTLS_SSL_TLS13_INVASIVE_H
+
+/* #include "common.h" */
+
+#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
+
+/* #include "psa/crypto.h" */
+
+#if defined(MBEDTLS_TEST_HOOKS)
+int mbedtls_ssl_tls13_parse_certificate(mbedtls_ssl_context *ssl,
+                                        const unsigned char *buf,
+                                        const unsigned char *end);
+#endif /* MBEDTLS_TEST_HOOKS */
+
+#endif /* MBEDTLS_SSL_PROTO_TLS1_3 */
+
+#endif /* MBEDTLS_SSL_TLS13_INVASIVE_H */
+
+/************** End of ssl_tls13_invasive.h **********************************/
+/************** Continuing where we left off in ssl_tls13_generic.c **********/
+/* #include "ssl_tls13_keys.h" */
+/* #include "ssl_debug_helpers.h" */
+
+/* #include "psa/crypto.h" */
+/* #include "psa_util_internal.h" */
+
+/* Define a local translating function to save code size by not using too many
+ * arguments in each translating place. */
+static int local_err_translation(psa_status_t status)
+{
+    return psa_status_to_mbedtls(status, psa_to_ssl_errors,
+                                 ARRAY_LENGTH(psa_to_ssl_errors),
+                                 psa_generic_status_to_mbedtls);
+}
+#define PSA_TO_MBEDTLS_ERR(status) local_err_translation(status)
+
+int mbedtls_ssl_tls13_crypto_init(mbedtls_ssl_context *ssl)
+{
+    psa_status_t status = psa_crypto_init();
+    if (status != PSA_SUCCESS) {
+        (void) ssl; // unused when debugging is disabled
+        MBEDTLS_SSL_DEBUG_RET(1, "psa_crypto_init", status);
+    }
+    return PSA_TO_MBEDTLS_ERR(status);
+}
+
+const uint8_t mbedtls_ssl_tls13_hello_retry_request_magic[
+    MBEDTLS_SERVER_HELLO_RANDOM_LEN] =
+{ 0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
+  0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+  0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+  0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C };
+
+int mbedtls_ssl_tls13_fetch_handshake_msg(mbedtls_ssl_context *ssl,
+                                          unsigned hs_type,
+                                          unsigned char **buf,
+                                          size_t *buf_len)
+{
+    int ret;
+
+    if ((ret = mbedtls_ssl_read_record(ssl, 0)) != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_read_record", ret);
+        goto cleanup;
+    }
+
+    if (ssl->in_msgtype != MBEDTLS_SSL_MSG_HANDSHAKE ||
+        ssl->in_msg[0]  != hs_type) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("Receive unexpected handshake message."));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_UNEXPECTED_MESSAGE,
+                                     MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE);
+        ret = MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE;
+        goto cleanup;
+    }
+
+    /*
+     * Jump handshake header (4 bytes, see Section 4 of RFC 8446).
+     *    ...
+     *    HandshakeType msg_type;
+     *    uint24 length;
+     *    ...
+     */
+    *buf = ssl->in_msg   + 4;
+    *buf_len = ssl->in_hslen - 4;
+
+cleanup:
+
+    return ret;
+}
+
+int mbedtls_ssl_tls13_is_supported_versions_ext_present_in_exts(
+    mbedtls_ssl_context *ssl,
+    const unsigned char *buf, const unsigned char *end,
+    const unsigned char **supported_versions_data,
+    const unsigned char **supported_versions_data_end)
+{
+    const unsigned char *p = buf;
+    size_t extensions_len;
+    const unsigned char *extensions_end;
+
+    *supported_versions_data = NULL;
+    *supported_versions_data_end = NULL;
+
+    /* Case of no extension */
+    if (p == end) {
+        return 0;
+    }
+
+    /* ...
+     * Extension extensions<x..2^16-1>;
+     * ...
+     * struct {
+     *      ExtensionType extension_type; (2 bytes)
+     *      opaque extension_data<0..2^16-1>;
+     * } Extension;
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    extensions_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+    /* Check extensions do not go beyond the buffer of data. */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, extensions_len);
+    extensions_end = p + extensions_len;
+
+    while (p < extensions_end) {
+        unsigned int extension_type;
+        size_t extension_data_len;
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, 4);
+        extension_type = MBEDTLS_GET_UINT16_BE(p, 0);
+        extension_data_len = MBEDTLS_GET_UINT16_BE(p, 2);
+        p += 4;
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, extension_data_len);
+
+        if (extension_type == MBEDTLS_TLS_EXT_SUPPORTED_VERSIONS) {
+            *supported_versions_data = p;
+            *supported_versions_data_end = p + extension_data_len;
+            return 1;
+        }
+        p += extension_data_len;
+    }
+
+    return 0;
+}
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+/*
+ * STATE HANDLING: Read CertificateVerify
+ */
+/* Macro to express the maximum length of the verify structure.
+ *
+ * The structure is computed per TLS 1.3 specification as:
+ *   - 64 bytes of octet 32,
+ *   - 33 bytes for the context string
+ *        (which is either "TLS 1.3, client CertificateVerify"
+ *         or "TLS 1.3, server CertificateVerify"),
+ *   - 1 byte for the octet 0x0, which serves as a separator,
+ *   - 32 or 48 bytes for the Transcript-Hash(Handshake Context, Certificate)
+ *     (depending on the size of the transcript_hash)
+ *
+ * This results in a total size of
+ * - 130 bytes for a SHA256-based transcript hash, or
+ *   (64 + 33 + 1 + 32 bytes)
+ * - 146 bytes for a SHA384-based transcript hash.
+ *   (64 + 33 + 1 + 48 bytes)
+ *
+ */
+#define SSL_VERIFY_STRUCT_MAX_SIZE  (64 +                          \
+                                     33 +                          \
+                                     1 +                          \
+                                     MBEDTLS_TLS1_3_MD_MAX_SIZE    \
+                                     )
+
+/*
+ * The ssl_tls13_create_verify_structure() creates the verify structure.
+ * As input, it requires the transcript hash.
+ *
+ * The caller has to ensure that the buffer has size at least
+ * SSL_VERIFY_STRUCT_MAX_SIZE bytes.
+ */
+static void ssl_tls13_create_verify_structure(const unsigned char *transcript_hash,
+                                              size_t transcript_hash_len,
+                                              unsigned char *verify_buffer,
+                                              size_t *verify_buffer_len,
+                                              int from)
+{
+    size_t idx;
+
+    /* RFC 8446, Section 4.4.3:
+     *
+     * The digital signature [in the CertificateVerify message] is then
+     * computed over the concatenation of:
+     * -  A string that consists of octet 32 (0x20) repeated 64 times
+     * -  The context string
+     * -  A single 0 byte which serves as the separator
+     * -  The content to be signed
+     */
+    memset(verify_buffer, 0x20, 64);
+    idx = 64;
+
+    if (from == MBEDTLS_SSL_IS_CLIENT) {
+        memcpy(verify_buffer + idx, mbedtls_ssl_tls13_labels.client_cv,
+               MBEDTLS_SSL_TLS1_3_LBL_LEN(client_cv));
+        idx += MBEDTLS_SSL_TLS1_3_LBL_LEN(client_cv);
+    } else { /* from == MBEDTLS_SSL_IS_SERVER */
+        memcpy(verify_buffer + idx, mbedtls_ssl_tls13_labels.server_cv,
+               MBEDTLS_SSL_TLS1_3_LBL_LEN(server_cv));
+        idx += MBEDTLS_SSL_TLS1_3_LBL_LEN(server_cv);
+    }
+
+    verify_buffer[idx++] = 0x0;
+
+    memcpy(verify_buffer + idx, transcript_hash, transcript_hash_len);
+    idx += transcript_hash_len;
+
+    *verify_buffer_len = idx;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_certificate_verify(mbedtls_ssl_context *ssl,
+                                              const unsigned char *buf,
+                                              const unsigned char *end,
+                                              const unsigned char *verify_buffer,
+                                              size_t verify_buffer_len)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+    const unsigned char *p = buf;
+    uint16_t algorithm;
+    size_t signature_len;
+    mbedtls_pk_type_t sig_alg;
+    mbedtls_md_type_t md_alg;
+    psa_algorithm_t hash_alg = PSA_ALG_NONE;
+    unsigned char verify_hash[PSA_HASH_MAX_SIZE];
+    size_t verify_hash_len;
+
+    void const *options = NULL;
+#if defined(MBEDTLS_X509_RSASSA_PSS_SUPPORT)
+    mbedtls_pk_rsassa_pss_options rsassa_pss_options;
+#endif /* MBEDTLS_X509_RSASSA_PSS_SUPPORT */
+
+    /*
+     * struct {
+     *     SignatureScheme algorithm;
+     *     opaque signature<0..2^16-1>;
+     * } CertificateVerify;
+     */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    algorithm = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+    /* RFC 8446 section 4.4.3
+     *
+     * If the CertificateVerify message is sent by a server, the signature
+     * algorithm MUST be one offered in the client's "signature_algorithms"
+     * extension unless no valid certificate chain can be produced without
+     * unsupported algorithms
+     *
+     * RFC 8446 section 4.4.2.2
+     *
+     * If the client cannot construct an acceptable chain using the provided
+     * certificates and decides to abort the handshake, then it MUST abort the
+     * handshake with an appropriate certificate-related alert
+     * (by default, "unsupported_certificate").
+     *
+     * Check if algorithm is an offered signature algorithm.
+     */
+    if (!mbedtls_ssl_sig_alg_is_offered(ssl, algorithm)) {
+        /* algorithm not in offered signature algorithms list */
+        MBEDTLS_SSL_DEBUG_MSG(1, ("Received signature algorithm(%04x) is not "
+                                  "offered.",
+                                  (unsigned int) algorithm));
+        goto error;
+    }
+
+    if (mbedtls_ssl_get_pk_type_and_md_alg_from_sig_alg(
+            algorithm, &sig_alg, &md_alg) != 0) {
+        goto error;
+    }
+
+    hash_alg = mbedtls_md_psa_alg_from_type(md_alg);
+    if (hash_alg == 0) {
+        goto error;
+    }
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("Certificate Verify: Signature algorithm ( %04x )",
+                              (unsigned int) algorithm));
+
+    /*
+     * Check the certificate's key type matches the signature alg
+     */
+    if (!mbedtls_pk_can_do(&ssl->session_negotiate->peer_cert->pk, sig_alg)) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("signature algorithm doesn't match cert key"));
+        goto error;
+    }
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    signature_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, signature_len);
+
+    status = psa_hash_compute(hash_alg,
+                              verify_buffer,
+                              verify_buffer_len,
+                              verify_hash,
+                              sizeof(verify_hash),
+                              &verify_hash_len);
+    if (status != PSA_SUCCESS) {
+        MBEDTLS_SSL_DEBUG_RET(1, "hash computation PSA error", status);
+        goto error;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "verify hash", verify_hash, verify_hash_len);
+#if defined(MBEDTLS_X509_RSASSA_PSS_SUPPORT)
+    if (sig_alg == MBEDTLS_PK_RSASSA_PSS) {
+        rsassa_pss_options.mgf1_hash_id = md_alg;
+
+        rsassa_pss_options.expected_salt_len = PSA_HASH_LENGTH(hash_alg);
+        options = (const void *) &rsassa_pss_options;
+    }
+#endif /* MBEDTLS_X509_RSASSA_PSS_SUPPORT */
+
+    if ((ret = mbedtls_pk_verify_ext(sig_alg, options,
+                                     &ssl->session_negotiate->peer_cert->pk,
+                                     md_alg, verify_hash, verify_hash_len,
+                                     p, signature_len)) == 0) {
+        return 0;
+    }
+    MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_pk_verify_ext", ret);
+
+error:
+    /* RFC 8446 section 4.4.3
+     *
+     * If the verification fails, the receiver MUST terminate the handshake
+     * with a "decrypt_error" alert.
+     */
+    MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECRYPT_ERROR,
+                                 MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE);
+    return MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
+
+}
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+
+int mbedtls_ssl_tls13_process_certificate_verify(mbedtls_ssl_context *ssl)
+{
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char verify_buffer[SSL_VERIFY_STRUCT_MAX_SIZE];
+    size_t verify_buffer_len;
+    unsigned char transcript[MBEDTLS_TLS1_3_MD_MAX_SIZE];
+    size_t transcript_len;
+    unsigned char *buf;
+    size_t buf_len;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> parse certificate verify"));
+
+    MBEDTLS_SSL_PROC_CHK(
+        mbedtls_ssl_tls13_fetch_handshake_msg(
+            ssl, MBEDTLS_SSL_HS_CERTIFICATE_VERIFY, &buf, &buf_len));
+
+    /* Need to calculate the hash of the transcript first
+     * before reading the message since otherwise it gets
+     * included in the transcript
+     */
+    ret = mbedtls_ssl_get_handshake_transcript(
+        ssl,
+        (mbedtls_md_type_t) ssl->handshake->ciphersuite_info->mac,
+        transcript, sizeof(transcript),
+        &transcript_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_PEND_FATAL_ALERT(
+            MBEDTLS_SSL_ALERT_MSG_INTERNAL_ERROR,
+            MBEDTLS_ERR_SSL_INTERNAL_ERROR);
+        return ret;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "handshake hash", transcript, transcript_len);
+
+    /* Create verify structure */
+    ssl_tls13_create_verify_structure(transcript,
+                                      transcript_len,
+                                      verify_buffer,
+                                      &verify_buffer_len,
+                                      (ssl->conf->endpoint == MBEDTLS_SSL_IS_CLIENT) ?
+                                      MBEDTLS_SSL_IS_SERVER :
+                                      MBEDTLS_SSL_IS_CLIENT);
+
+    /* Process the message contents */
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_parse_certificate_verify(
+                             ssl, buf, buf + buf_len,
+                             verify_buffer, verify_buffer_len));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_CERTIFICATE_VERIFY,
+                             buf, buf_len));
+
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= parse certificate verify"));
+    MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_process_certificate_verify", ret);
+    return ret;
+#else
+    ((void) ssl);
+    MBEDTLS_SSL_DEBUG_MSG(1, ("should never happen"));
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+}
+
+/*
+ *
+ * STATE HANDLING: Incoming Certificate.
+ *
+ */
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+#if defined(MBEDTLS_SSL_KEEP_PEER_CERTIFICATE)
+/*
+ * Structure of Certificate message:
+ *
+ * enum {
+ *     X509(0),
+ *     RawPublicKey(2),
+ *     (255)
+ * } CertificateType;
+ *
+ * struct {
+ *     select (certificate_type) {
+ *         case RawPublicKey:
+ *           * From RFC 7250 ASN.1_subjectPublicKeyInfo *
+ *           opaque ASN1_subjectPublicKeyInfo<1..2^24-1>;
+ *         case X509:
+ *           opaque cert_data<1..2^24-1>;
+ *     };
+ *     Extension extensions<0..2^16-1>;
+ * } CertificateEntry;
+ *
+ * struct {
+ *     opaque certificate_request_context<0..2^8-1>;
+ *     CertificateEntry certificate_list<0..2^24-1>;
+ * } Certificate;
+ *
+ */
+
+/* Parse certificate chain send by the server. */
+MBEDTLS_CHECK_RETURN_CRITICAL
+MBEDTLS_STATIC_TESTABLE
+int mbedtls_ssl_tls13_parse_certificate(mbedtls_ssl_context *ssl,
+                                        const unsigned char *buf,
+                                        const unsigned char *end)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    size_t certificate_request_context_len = 0;
+    size_t certificate_list_len = 0;
+    const unsigned char *p = buf;
+    const unsigned char *certificate_list_end;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 4);
+    certificate_request_context_len = p[0];
+    certificate_list_len = MBEDTLS_GET_UINT24_BE(p, 1);
+    p += 4;
+
+    /* In theory, the certificate list can be up to 2^24 Bytes, but we don't
+     * support anything beyond 2^16 = 64K.
+     */
+    if ((certificate_request_context_len != 0) ||
+        (certificate_list_len >= 0x10000)) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("bad certificate message"));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
+                                     MBEDTLS_ERR_SSL_DECODE_ERROR);
+        return MBEDTLS_ERR_SSL_DECODE_ERROR;
+    }
+
+    /* In case we tried to reuse a session but it failed */
+    if (ssl->session_negotiate->peer_cert != NULL) {
+        mbedtls_x509_crt_free(ssl->session_negotiate->peer_cert);
+        mbedtls_free(ssl->session_negotiate->peer_cert);
+    }
+
+    /* This is used by ssl_tls13_validate_certificate() */
+    if (certificate_list_len == 0) {
+        ssl->session_negotiate->peer_cert = NULL;
+        ret = 0;
+        goto exit;
+    }
+
+    if ((ssl->session_negotiate->peer_cert =
+             mbedtls_calloc(1, sizeof(mbedtls_x509_crt))) == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("alloc( %" MBEDTLS_PRINTF_SIZET " bytes ) failed",
+                                  sizeof(mbedtls_x509_crt)));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_INTERNAL_ERROR,
+                                     MBEDTLS_ERR_SSL_ALLOC_FAILED);
+        return MBEDTLS_ERR_SSL_ALLOC_FAILED;
+    }
+
+    mbedtls_x509_crt_init(ssl->session_negotiate->peer_cert);
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, certificate_list_len);
+    certificate_list_end = p + certificate_list_len;
+    while (p < certificate_list_end) {
+        size_t cert_data_len, extensions_len;
+        const unsigned char *extensions_end;
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, certificate_list_end, 3);
+        cert_data_len = MBEDTLS_GET_UINT24_BE(p, 0);
+        p += 3;
+
+        /* In theory, the CRT can be up to 2^24 Bytes, but we don't support
+         * anything beyond 2^16 = 64K. Otherwise as in the TLS 1.2 code,
+         * check that we have a minimum of 128 bytes of data, this is not
+         * clear why we need that though.
+         */
+        if ((cert_data_len < 128) || (cert_data_len >= 0x10000)) {
+            MBEDTLS_SSL_DEBUG_MSG(1, ("bad Certificate message"));
+            MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
+                                         MBEDTLS_ERR_SSL_DECODE_ERROR);
+            return MBEDTLS_ERR_SSL_DECODE_ERROR;
+        }
+
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, certificate_list_end, cert_data_len);
+        ret = mbedtls_x509_crt_parse_der(ssl->session_negotiate->peer_cert,
+                                         p, cert_data_len);
+
+        switch (ret) {
+            case 0: /*ok*/
+                break;
+            case MBEDTLS_ERR_X509_UNKNOWN_SIG_ALG + MBEDTLS_ERR_OID_NOT_FOUND:
+                /* Ignore certificate with an unknown algorithm: maybe a
+                   prior certificate was already trusted. */
+                break;
+
+            case MBEDTLS_ERR_X509_ALLOC_FAILED:
+                MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_INTERNAL_ERROR,
+                                             MBEDTLS_ERR_X509_ALLOC_FAILED);
+                MBEDTLS_SSL_DEBUG_RET(1, " mbedtls_x509_crt_parse_der", ret);
+                return ret;
+
+            case MBEDTLS_ERR_X509_UNKNOWN_VERSION:
+                MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_UNSUPPORTED_CERT,
+                                             MBEDTLS_ERR_X509_UNKNOWN_VERSION);
+                MBEDTLS_SSL_DEBUG_RET(1, " mbedtls_x509_crt_parse_der", ret);
+                return ret;
+
+            default:
+                MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_BAD_CERT,
+                                             ret);
+                MBEDTLS_SSL_DEBUG_RET(1, " mbedtls_x509_crt_parse_der", ret);
+                return ret;
+        }
+
+        p += cert_data_len;
+
+        /* Certificate extensions length */
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, certificate_list_end, 2);
+        extensions_len = MBEDTLS_GET_UINT16_BE(p, 0);
+        p += 2;
+        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, certificate_list_end, extensions_len);
+
+        extensions_end = p + extensions_len;
+        handshake->received_extensions = MBEDTLS_SSL_EXT_MASK_NONE;
+
+        while (p < extensions_end) {
+            unsigned int extension_type;
+            size_t extension_data_len;
+
+            /*
+             * struct {
+             *     ExtensionType extension_type; (2 bytes)
+             *     opaque extension_data<0..2^16-1>;
+             * } Extension;
+             */
+            MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, 4);
+            extension_type = MBEDTLS_GET_UINT16_BE(p, 0);
+            extension_data_len = MBEDTLS_GET_UINT16_BE(p, 2);
+            p += 4;
+
+            MBEDTLS_SSL_CHK_BUF_READ_PTR(p, extensions_end, extension_data_len);
+
+            ret = mbedtls_ssl_tls13_check_received_extension(
+                ssl, MBEDTLS_SSL_HS_CERTIFICATE, extension_type,
+                MBEDTLS_SSL_TLS1_3_ALLOWED_EXTS_OF_CT);
+            if (ret != 0) {
+                return ret;
+            }
+
+            switch (extension_type) {
+                default:
+                    MBEDTLS_SSL_PRINT_EXT(
+                        3, MBEDTLS_SSL_HS_CERTIFICATE,
+                        extension_type, "( ignored )");
+                    break;
+            }
+
+            p += extension_data_len;
+        }
+
+        MBEDTLS_SSL_PRINT_EXTS(3, MBEDTLS_SSL_HS_CERTIFICATE,
+                               handshake->received_extensions);
+    }
+
+exit:
+    /* Check that all the message is consumed. */
+    if (p != end) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("bad Certificate message"));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
+                                     MBEDTLS_ERR_SSL_DECODE_ERROR);
+        return MBEDTLS_ERR_SSL_DECODE_ERROR;
+    }
+
+    MBEDTLS_SSL_DEBUG_CRT(3, "peer certificate",
+                          ssl->session_negotiate->peer_cert);
+
+    return ret;
+}
+#else
+MBEDTLS_CHECK_RETURN_CRITICAL
+MBEDTLS_STATIC_TESTABLE
+int mbedtls_ssl_tls13_parse_certificate(mbedtls_ssl_context *ssl,
+                                        const unsigned char *buf,
+                                        const unsigned char *end)
+{
+    ((void) ssl);
+    ((void) buf);
+    ((void) end);
+    return MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE;
+}
+#endif /* MBEDTLS_SSL_KEEP_PEER_CERTIFICATE */
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+#if defined(MBEDTLS_SSL_KEEP_PEER_CERTIFICATE)
+/* Validate certificate chain sent by the server. */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_validate_certificate(mbedtls_ssl_context *ssl)
+{
+    /* Authmode: precedence order is SNI if used else configuration */
+#if defined(MBEDTLS_SSL_SRV_C) && defined(MBEDTLS_SSL_SERVER_NAME_INDICATION)
+    const int authmode = ssl->handshake->sni_authmode != MBEDTLS_SSL_VERIFY_UNSET
+                       ? ssl->handshake->sni_authmode
+                       : ssl->conf->authmode;
+#else
+    const int authmode = ssl->conf->authmode;
+#endif
+
+    /*
+     * If the peer hasn't sent a certificate ( i.e. it sent
+     * an empty certificate chain ), this is reflected in the peer CRT
+     * structure being unset.
+     * Check for that and handle it depending on the
+     * authentication mode.
+     */
+    if (ssl->session_negotiate->peer_cert == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("peer has no certificate"));
+
+#if defined(MBEDTLS_SSL_SRV_C)
+        if (ssl->conf->endpoint == MBEDTLS_SSL_IS_SERVER) {
+            /* The client was asked for a certificate but didn't send
+             * one. The client should know what's going on, so we
+             * don't send an alert.
+             */
+            ssl->session_negotiate->verify_result = MBEDTLS_X509_BADCERT_MISSING;
+            if (authmode == MBEDTLS_SSL_VERIFY_OPTIONAL) {
+                return 0;
+            } else {
+                MBEDTLS_SSL_PEND_FATAL_ALERT(
+                    MBEDTLS_SSL_ALERT_MSG_NO_CERT,
+                    MBEDTLS_ERR_SSL_NO_CLIENT_CERTIFICATE);
+                return MBEDTLS_ERR_SSL_NO_CLIENT_CERTIFICATE;
+            }
+        }
+#endif /* MBEDTLS_SSL_SRV_C */
+
+#if defined(MBEDTLS_SSL_CLI_C)
+        /* Regardless of authmode, the server is not allowed to send an empty
+         * certificate chain. (Last paragraph before 4.4.2.1 in RFC 8446: "The
+         * server's certificate_list MUST always be non-empty.") With authmode
+         * optional/none, we continue the handshake if we can't validate the
+         * server's cert, but we still break it if no certificate was sent. */
+        if (ssl->conf->endpoint == MBEDTLS_SSL_IS_CLIENT) {
+            MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_NO_CERT,
+                                         MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE);
+            return MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE;
+        }
+#endif /* MBEDTLS_SSL_CLI_C */
+    }
+
+    return mbedtls_ssl_verify_certificate(ssl, authmode,
+                                          ssl->session_negotiate->peer_cert,
+                                          NULL, NULL);
+}
+#else /* MBEDTLS_SSL_KEEP_PEER_CERTIFICATE */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_validate_certificate(mbedtls_ssl_context *ssl)
+{
+    ((void) ssl);
+    return MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE;
+}
+#endif /* MBEDTLS_SSL_KEEP_PEER_CERTIFICATE */
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+
+int mbedtls_ssl_tls13_process_certificate(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> parse certificate"));
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+    unsigned char *buf;
+    size_t buf_len;
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_CERTIFICATE,
+                             &buf, &buf_len));
+
+    /* Parse the certificate chain sent by the peer. */
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_parse_certificate(ssl, buf,
+                                                             buf + buf_len));
+    /* Validate the certificate chain and set the verification results. */
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_validate_certificate(ssl));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_CERTIFICATE, buf, buf_len));
+
+cleanup:
+#else /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+    (void) ssl;
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= parse certificate"));
+    return ret;
+}
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
+/*
+ *  enum {
+ *        X509(0),
+ *        RawPublicKey(2),
+ *        (255)
+ *    } CertificateType;
+ *
+ *    struct {
+ *        select (certificate_type) {
+ *            case RawPublicKey:
+ *              // From RFC 7250 ASN.1_subjectPublicKeyInfo
+ *              opaque ASN1_subjectPublicKeyInfo<1..2^24-1>;
+ *
+ *            case X509:
+ *              opaque cert_data<1..2^24-1>;
+ *        };
+ *        Extension extensions<0..2^16-1>;
+ *    } CertificateEntry;
+ *
+ *    struct {
+ *        opaque certificate_request_context<0..2^8-1>;
+ *        CertificateEntry certificate_list<0..2^24-1>;
+ *    } Certificate;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_certificate_body(mbedtls_ssl_context *ssl,
+                                            unsigned char *buf,
+                                            unsigned char *end,
+                                            size_t *out_len)
+{
+    const mbedtls_x509_crt *crt = mbedtls_ssl_own_cert(ssl);
+    unsigned char *p = buf;
+    unsigned char *certificate_request_context =
+        ssl->handshake->certificate_request_context;
+    unsigned char certificate_request_context_len =
+        ssl->handshake->certificate_request_context_len;
+    unsigned char *p_certificate_list_len;
+
+
+    /* ...
+     * opaque certificate_request_context<0..2^8-1>;
+     * ...
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, certificate_request_context_len + 1);
+    *p++ = certificate_request_context_len;
+    if (certificate_request_context_len > 0) {
+        memcpy(p, certificate_request_context, certificate_request_context_len);
+        p += certificate_request_context_len;
+    }
+
+    /* ...
+     * CertificateEntry certificate_list<0..2^24-1>;
+     * ...
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, 3);
+    p_certificate_list_len = p;
+    p += 3;
+
+    MBEDTLS_SSL_DEBUG_CRT(3, "own certificate", crt);
+
+    while (crt != NULL) {
+        size_t cert_data_len = crt->raw.len;
+
+        MBEDTLS_SSL_CHK_BUF_PTR(p, end, cert_data_len + 3 + 2);
+        MBEDTLS_PUT_UINT24_BE(cert_data_len, p, 0);
+        p += 3;
+
+        memcpy(p, crt->raw.p, cert_data_len);
+        p += cert_data_len;
+        crt = crt->next;
+
+        /* Currently, we don't have any certificate extensions defined.
+         * Hence, we are sending an empty extension with length zero.
+         */
+        MBEDTLS_PUT_UINT16_BE(0, p, 0);
+        p += 2;
+    }
+
+    MBEDTLS_PUT_UINT24_BE(p - p_certificate_list_len - 3,
+                          p_certificate_list_len, 0);
+
+    *out_len = p - buf;
+
+    MBEDTLS_SSL_PRINT_EXTS(
+        3, MBEDTLS_SSL_HS_CERTIFICATE, ssl->handshake->sent_extensions);
+
+    return 0;
+}
+
+int mbedtls_ssl_tls13_write_certificate(mbedtls_ssl_context *ssl)
+{
+    int ret;
+    unsigned char *buf;
+    size_t buf_len, msg_len;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> write certificate"));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_start_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_CERTIFICATE, &buf, &buf_len));
+
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_write_certificate_body(ssl,
+                                                          buf,
+                                                          buf + buf_len,
+                                                          &msg_len));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_CERTIFICATE, buf, msg_len));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_finish_handshake_msg(
+                             ssl, buf_len, msg_len));
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= write certificate"));
+    return ret;
+}
+
+/*
+ * STATE HANDLING: Output Certificate Verify
+ */
+int mbedtls_ssl_tls13_check_sig_alg_cert_key_match(uint16_t sig_alg,
+                                                   mbedtls_pk_context *key)
+{
+    mbedtls_pk_type_t pk_type = (mbedtls_pk_type_t) mbedtls_ssl_sig_from_pk(key);
+    size_t key_size = mbedtls_pk_get_bitlen(key);
+
+    switch (pk_type) {
+        case MBEDTLS_SSL_SIG_ECDSA:
+            switch (key_size) {
+                case 256:
+                    return
+                        sig_alg == MBEDTLS_TLS1_3_SIG_ECDSA_SECP256R1_SHA256;
+
+                case 384:
+                    return
+                        sig_alg == MBEDTLS_TLS1_3_SIG_ECDSA_SECP384R1_SHA384;
+
+                case 521:
+                    return
+                        sig_alg == MBEDTLS_TLS1_3_SIG_ECDSA_SECP521R1_SHA512;
+                default:
+                    break;
+            }
+            break;
+
+        case MBEDTLS_SSL_SIG_RSA:
+            switch (sig_alg) {
+                case MBEDTLS_TLS1_3_SIG_RSA_PSS_RSAE_SHA256: /* Intentional fallthrough */
+                case MBEDTLS_TLS1_3_SIG_RSA_PSS_RSAE_SHA384: /* Intentional fallthrough */
+                case MBEDTLS_TLS1_3_SIG_RSA_PSS_RSAE_SHA512:
+                    return 1;
+
+                default:
+                    break;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_certificate_verify_body(mbedtls_ssl_context *ssl,
+                                                   unsigned char *buf,
+                                                   unsigned char *end,
+                                                   size_t *out_len)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char *p = buf;
+    mbedtls_pk_context *own_key;
+
+    unsigned char handshake_hash[MBEDTLS_TLS1_3_MD_MAX_SIZE];
+    size_t handshake_hash_len;
+    unsigned char verify_buffer[SSL_VERIFY_STRUCT_MAX_SIZE];
+    size_t verify_buffer_len;
+
+    uint16_t *sig_alg = ssl->handshake->received_sig_algs;
+    size_t signature_len = 0;
+
+    *out_len = 0;
+
+    own_key = mbedtls_ssl_own_key(ssl);
+    if (own_key == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("should never happen"));
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    ret = mbedtls_ssl_get_handshake_transcript(
+        ssl, (mbedtls_md_type_t) ssl->handshake->ciphersuite_info->mac,
+        handshake_hash, sizeof(handshake_hash), &handshake_hash_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "handshake hash",
+                          handshake_hash,
+                          handshake_hash_len);
+
+    ssl_tls13_create_verify_structure(handshake_hash, handshake_hash_len,
+                                      verify_buffer, &verify_buffer_len,
+                                      ssl->conf->endpoint);
+
+    /*
+     *  struct {
+     *    SignatureScheme algorithm;
+     *    opaque signature<0..2^16-1>;
+     *  } CertificateVerify;
+     */
+    /* Check there is space for the algorithm identifier (2 bytes) and the
+     * signature length (2 bytes).
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, 4);
+
+    for (; *sig_alg != MBEDTLS_TLS1_3_SIG_NONE; sig_alg++) {
+        psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+        mbedtls_pk_type_t pk_type = MBEDTLS_PK_NONE;
+        mbedtls_md_type_t md_alg = MBEDTLS_MD_NONE;
+        psa_algorithm_t psa_algorithm = PSA_ALG_NONE;
+        unsigned char verify_hash[PSA_HASH_MAX_SIZE];
+        size_t verify_hash_len;
+
+        if (!mbedtls_ssl_sig_alg_is_offered(ssl, *sig_alg)) {
+            continue;
+        }
+
+        if (!mbedtls_ssl_tls13_sig_alg_for_cert_verify_is_supported(*sig_alg)) {
+            continue;
+        }
+
+        if (!mbedtls_ssl_tls13_check_sig_alg_cert_key_match(*sig_alg, own_key)) {
+            continue;
+        }
+
+        if (mbedtls_ssl_get_pk_type_and_md_alg_from_sig_alg(
+                *sig_alg, &pk_type, &md_alg) != 0) {
+            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        }
+
+        /* Hash verify buffer with indicated hash function */
+        psa_algorithm = mbedtls_md_psa_alg_from_type(md_alg);
+        status = psa_hash_compute(psa_algorithm,
+                                  verify_buffer,
+                                  verify_buffer_len,
+                                  verify_hash, sizeof(verify_hash),
+                                  &verify_hash_len);
+        if (status != PSA_SUCCESS) {
+            return PSA_TO_MBEDTLS_ERR(status);
+        }
+
+        MBEDTLS_SSL_DEBUG_BUF(3, "verify hash", verify_hash, verify_hash_len);
+
+        if ((ret = mbedtls_pk_sign_ext(pk_type, own_key,
+                                       md_alg, verify_hash, verify_hash_len,
+                                       p + 4, (size_t) (end - (p + 4)), &signature_len,
+                                       ssl->conf->f_rng, ssl->conf->p_rng)) != 0) {
+            MBEDTLS_SSL_DEBUG_MSG(2, ("CertificateVerify signature failed with %s",
+                                      mbedtls_ssl_sig_alg_to_str(*sig_alg)));
+            MBEDTLS_SSL_DEBUG_RET(2, "mbedtls_pk_sign_ext", ret);
+
+            /* The signature failed. This is possible if the private key
+             * was not suitable for the signature operation as purposely we
+             * did not check its suitability completely. Let's try with
+             * another signature algorithm.
+             */
+            continue;
+        }
+
+        MBEDTLS_SSL_DEBUG_MSG(2, ("CertificateVerify signature with %s",
+                                  mbedtls_ssl_sig_alg_to_str(*sig_alg)));
+
+        break;
+    }
+
+    if (*sig_alg == MBEDTLS_TLS1_3_SIG_NONE) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("no suitable signature algorithm"));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_HANDSHAKE_FAILURE,
+                                     MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE);
+        return MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
+    }
+
+    MBEDTLS_PUT_UINT16_BE(*sig_alg, p, 0);
+    MBEDTLS_PUT_UINT16_BE(signature_len, p, 2);
+
+    *out_len = 4 + signature_len;
+
+    return 0;
+}
+
+int mbedtls_ssl_tls13_write_certificate_verify(mbedtls_ssl_context *ssl)
+{
+    int ret = 0;
+    unsigned char *buf;
+    size_t buf_len, msg_len;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> write certificate verify"));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_start_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_CERTIFICATE_VERIFY,
+                             &buf, &buf_len));
+
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_write_certificate_verify_body(
+                             ssl, buf, buf + buf_len, &msg_len));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_CERTIFICATE_VERIFY,
+                             buf, msg_len));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_finish_handshake_msg(
+                             ssl, buf_len, msg_len));
+
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= write certificate verify"));
+    return ret;
+}
+
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED */
+
+/*
+ *
+ * STATE HANDLING: Incoming Finished message.
+ */
+/*
+ * Implementation
+ */
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_preprocess_finished_message(mbedtls_ssl_context *ssl)
+{
+    int ret;
+
+    ret = mbedtls_ssl_tls13_calculate_verify_data(
+        ssl,
+        ssl->handshake->state_local.finished_in.digest,
+        sizeof(ssl->handshake->state_local.finished_in.digest),
+        &ssl->handshake->state_local.finished_in.digest_len,
+        ssl->conf->endpoint == MBEDTLS_SSL_IS_CLIENT ?
+        MBEDTLS_SSL_IS_SERVER : MBEDTLS_SSL_IS_CLIENT);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_calculate_verify_data", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_finished_message(mbedtls_ssl_context *ssl,
+                                            const unsigned char *buf,
+                                            const unsigned char *end)
+{
+    /*
+     * struct {
+     *     opaque verify_data[Hash.length];
+     * } Finished;
+     */
+    const unsigned char *expected_verify_data =
+        ssl->handshake->state_local.finished_in.digest;
+    size_t expected_verify_data_len =
+        ssl->handshake->state_local.finished_in.digest_len;
+    /* Structural validation */
+    if ((size_t) (end - buf) != expected_verify_data_len) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("bad finished message"));
+
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
+                                     MBEDTLS_ERR_SSL_DECODE_ERROR);
+        return MBEDTLS_ERR_SSL_DECODE_ERROR;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "verify_data (self-computed):",
+                          expected_verify_data,
+                          expected_verify_data_len);
+    MBEDTLS_SSL_DEBUG_BUF(4, "verify_data (received message):", buf,
+                          expected_verify_data_len);
+
+    /* Semantic validation */
+    if (mbedtls_ct_memcmp(buf,
+                          expected_verify_data,
+                          expected_verify_data_len) != 0) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("bad finished message"));
+
+        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECRYPT_ERROR,
+                                     MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE);
+        return MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
+    }
+    return 0;
+}
+
+int mbedtls_ssl_tls13_process_finished_message(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char *buf;
+    size_t buf_len;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> parse finished message"));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_FINISHED, &buf, &buf_len));
+
+    /* Preprocessing step: Compute handshake digest */
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_preprocess_finished_message(ssl));
+
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_parse_finished_message(
+                             ssl, buf, buf + buf_len));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_FINISHED, buf, buf_len));
+
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= parse finished message"));
+    return ret;
+}
+
+/*
+ *
+ * STATE HANDLING: Write and send Finished message.
+ *
+ */
+/*
+ * Implement
+ */
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_prepare_finished_message(mbedtls_ssl_context *ssl)
+{
+    int ret;
+
+    /* Compute transcript of handshake up to now. */
+    ret = mbedtls_ssl_tls13_calculate_verify_data(ssl,
+                                                  ssl->handshake->state_local.finished_out.digest,
+                                                  sizeof(ssl->handshake->state_local.finished_out.
+                                                         digest),
+                                                  &ssl->handshake->state_local.finished_out.digest_len,
+                                                  ssl->conf->endpoint);
+
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "calculate_verify_data failed", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_finished_message_body(mbedtls_ssl_context *ssl,
+                                                 unsigned char *buf,
+                                                 unsigned char *end,
+                                                 size_t *out_len)
+{
+    size_t verify_data_len = ssl->handshake->state_local.finished_out.digest_len;
+    /*
+     * struct {
+     *     opaque verify_data[Hash.length];
+     * } Finished;
+     */
+    MBEDTLS_SSL_CHK_BUF_PTR(buf, end, verify_data_len);
+
+    memcpy(buf, ssl->handshake->state_local.finished_out.digest,
+           verify_data_len);
+
+    *out_len = verify_data_len;
+    return 0;
+}
+
+/* Main entry point: orchestrates the other functions */
+int mbedtls_ssl_tls13_write_finished_message(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char *buf;
+    size_t buf_len, msg_len;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> write finished message"));
+
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_prepare_finished_message(ssl));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_start_handshake_msg(ssl,
+                                                         MBEDTLS_SSL_HS_FINISHED, &buf, &buf_len));
+
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_write_finished_message_body(
+                             ssl, buf, buf + buf_len, &msg_len));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(ssl,
+                                                            MBEDTLS_SSL_HS_FINISHED, buf, msg_len));
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_finish_handshake_msg(
+                             ssl, buf_len, msg_len));
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= write finished message"));
+    return ret;
+}
+
+void mbedtls_ssl_tls13_handshake_wrapup(mbedtls_ssl_context *ssl)
+{
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("=> handshake wrapup"));
+
+    MBEDTLS_SSL_DEBUG_MSG(1, ("Switch to application keys for inbound traffic"));
+    mbedtls_ssl_set_inbound_transform(ssl, ssl->transform_application);
+
+    MBEDTLS_SSL_DEBUG_MSG(1, ("Switch to application keys for outbound traffic"));
+    mbedtls_ssl_set_outbound_transform(ssl, ssl->transform_application);
+
+    /*
+     * Free the previous session and switch to the current one.
+     */
+    if (ssl->session) {
+        mbedtls_ssl_session_free(ssl->session);
+        mbedtls_free(ssl->session);
+    }
+    ssl->session = ssl->session_negotiate;
+    ssl->session_negotiate = NULL;
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("<= handshake wrapup"));
+}
+
+/*
+ *
+ * STATE HANDLING: Write ChangeCipherSpec
+ *
+ */
+#if defined(MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE)
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_write_change_cipher_spec_body(mbedtls_ssl_context *ssl,
+                                                   unsigned char *buf,
+                                                   unsigned char *end,
+                                                   size_t *olen)
+{
+    ((void) ssl);
+
+    MBEDTLS_SSL_CHK_BUF_PTR(buf, end, 1);
+    buf[0] = 1;
+    *olen = 1;
+
+    return 0;
+}
+
+int mbedtls_ssl_tls13_write_change_cipher_spec(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> write change cipher spec"));
+
+    /* Only one CCS to send. */
+    if (ssl->handshake->ccs_sent) {
+        ret = 0;
+        goto cleanup;
+    }
+
+    /* Write CCS message */
+    MBEDTLS_SSL_PROC_CHK(ssl_tls13_write_change_cipher_spec_body(
+                             ssl, ssl->out_msg,
+                             ssl->out_msg + MBEDTLS_SSL_OUT_CONTENT_LEN,
+                             &ssl->out_msglen));
+
+    ssl->out_msgtype = MBEDTLS_SSL_MSG_CHANGE_CIPHER_SPEC;
+
+    /* Dispatch message */
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_write_record(ssl, 0));
+
+    ssl->handshake->ccs_sent = 1;
+
+cleanup:
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= write change cipher spec"));
+    return ret;
+}
+
+#endif /* MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE */
+
+/* Early Data Indication Extension
+ *
+ * struct {
+ *   select ( Handshake.msg_type ) {
+ *     case new_session_ticket:   uint32 max_early_data_size;
+ *     case client_hello:         Empty;
+ *     case encrypted_extensions: Empty;
+ *   };
+ * } EarlyDataIndication;
+ */
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+int mbedtls_ssl_tls13_write_early_data_ext(mbedtls_ssl_context *ssl,
+                                           int in_new_session_ticket,
+                                           unsigned char *buf,
+                                           const unsigned char *end,
+                                           size_t *out_len)
+{
+    unsigned char *p = buf;
+
+#if defined(MBEDTLS_SSL_SRV_C)
+    const size_t needed = in_new_session_ticket ? 8 : 4;
+#else
+    const size_t needed = 4;
+    ((void) in_new_session_ticket);
+#endif
+
+    *out_len = 0;
+
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, needed);
+
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_TLS_EXT_EARLY_DATA, p, 0);
+    MBEDTLS_PUT_UINT16_BE(needed - 4, p, 2);
+
+#if defined(MBEDTLS_SSL_SRV_C)
+    if (in_new_session_ticket) {
+        MBEDTLS_PUT_UINT32_BE(ssl->conf->max_early_data_size, p, 4);
+        MBEDTLS_SSL_DEBUG_MSG(
+            4, ("Sent max_early_data_size=%u",
+                (unsigned int) ssl->conf->max_early_data_size));
+    }
+#endif
+
+    *out_len = needed;
+
+    mbedtls_ssl_tls13_set_hs_sent_ext_mask(ssl, MBEDTLS_TLS_EXT_EARLY_DATA);
+
+    return 0;
+}
+
+#if defined(MBEDTLS_SSL_SRV_C)
+int mbedtls_ssl_tls13_check_early_data_len(mbedtls_ssl_context *ssl,
+                                           size_t early_data_len)
+{
+    /*
+     * This function should be called only while an handshake is in progress
+     * and thus a session under negotiation. Add a sanity check to detect a
+     * misuse.
+     */
+    if (ssl->session_negotiate == NULL) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    /* RFC 8446 section 4.6.1
+     *
+     * A server receiving more than max_early_data_size bytes of 0-RTT data
+     * SHOULD terminate the connection with an "unexpected_message" alert.
+     * Note that if it is still possible to send early_data_len bytes of early
+     * data, it means that early_data_len is smaller than max_early_data_size
+     * (type uint32_t) and can fit in an uint32_t. We use this further
+     * down.
+     */
+    if (early_data_len >
+        (ssl->session_negotiate->max_early_data_size -
+         ssl->total_early_data_size)) {
+
+        MBEDTLS_SSL_DEBUG_MSG(
+            2, ("EarlyData: Too much early data received, "
+                "%lu + %" MBEDTLS_PRINTF_SIZET " > %lu",
+                (unsigned long) ssl->total_early_data_size,
+                early_data_len,
+                (unsigned long) ssl->session_negotiate->max_early_data_size));
+
+        MBEDTLS_SSL_PEND_FATAL_ALERT(
+            MBEDTLS_SSL_ALERT_MSG_UNEXPECTED_MESSAGE,
+            MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE);
+        return MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE;
+    }
+
+    /*
+     * early_data_len has been checked to be less than max_early_data_size
+     * that is uint32_t. Its cast to an uint32_t below is thus safe. We need
+     * the cast to appease some compilers.
+     */
+    ssl->total_early_data_size += (uint32_t) early_data_len;
+
+    return 0;
+}
+#endif /* MBEDTLS_SSL_SRV_C */
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+
+/* Reset SSL context and update hash for handling HRR.
+ *
+ * Replace Transcript-Hash(X) by
+ * Transcript-Hash( message_hash     ||
+ *                 00 00 Hash.length ||
+ *                 X )
+ * A few states of the handshake are preserved, including:
+ *   - session ID
+ *   - session ticket
+ *   - negotiated ciphersuite
+ */
+int mbedtls_ssl_reset_transcript_for_hrr(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    unsigned char hash_transcript[PSA_HASH_MAX_SIZE + 4];
+    size_t hash_len;
+    const mbedtls_ssl_ciphersuite_t *ciphersuite_info =
+        ssl->handshake->ciphersuite_info;
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("Reset SSL session for HRR"));
+
+    ret = mbedtls_ssl_get_handshake_transcript(ssl, (mbedtls_md_type_t) ciphersuite_info->mac,
+                                               hash_transcript + 4,
+                                               PSA_HASH_MAX_SIZE,
+                                               &hash_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_get_handshake_transcript", ret);
+        return ret;
+    }
+
+    hash_transcript[0] = MBEDTLS_SSL_HS_MESSAGE_HASH;
+    hash_transcript[1] = 0;
+    hash_transcript[2] = 0;
+    hash_transcript[3] = (unsigned char) hash_len;
+
+    hash_len += 4;
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "Truncated handshake transcript",
+                          hash_transcript, hash_len);
+
+    /* Reset running hash and replace it with a hash of the transcript */
+    ret = mbedtls_ssl_reset_checksum(ssl);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_reset_checksum", ret);
+        return ret;
+    }
+    ret = ssl->handshake->update_checksum(ssl, hash_transcript, hash_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "update_checksum", ret);
+        return ret;
+    }
+
+    return ret;
+}
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+
+int mbedtls_ssl_tls13_read_public_xxdhe_share(mbedtls_ssl_context *ssl,
+                                              const unsigned char *buf,
+                                              size_t buf_len)
+{
+    uint8_t *p = (uint8_t *) buf;
+    const uint8_t *end = buf + buf_len;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    /* Get size of the TLS opaque key_exchange field of the KeyShareEntry struct. */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    uint16_t peerkey_len = MBEDTLS_GET_UINT16_BE(p, 0);
+    p += 2;
+
+    /* Check if key size is consistent with given buffer length. */
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, peerkey_len);
+
+    /* Store peer's ECDH/FFDH public key. */
+    if (peerkey_len > sizeof(handshake->xxdh_psa_peerkey)) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("Invalid public key length: %u > %" MBEDTLS_PRINTF_SIZET,
+                                  (unsigned) peerkey_len,
+                                  sizeof(handshake->xxdh_psa_peerkey)));
+        return MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
+    }
+    memcpy(handshake->xxdh_psa_peerkey, p, peerkey_len);
+    handshake->xxdh_psa_peerkey_len = peerkey_len;
+
+    return 0;
+}
+
+#if defined(PSA_WANT_ALG_FFDH)
+static psa_status_t  mbedtls_ssl_get_psa_ffdh_info_from_tls_id(
+    uint16_t tls_id, size_t *bits, psa_key_type_t *key_type)
+{
+    switch (tls_id) {
+#if defined(PSA_WANT_DH_RFC7919_2048)
+        case MBEDTLS_SSL_IANA_TLS_GROUP_FFDHE2048:
+            *bits = 2048;
+            *key_type = PSA_KEY_TYPE_DH_KEY_PAIR(PSA_DH_FAMILY_RFC7919);
+            return PSA_SUCCESS;
+#endif /* PSA_WANT_DH_RFC7919_2048 */
+#if defined(PSA_WANT_DH_RFC7919_3072)
+        case MBEDTLS_SSL_IANA_TLS_GROUP_FFDHE3072:
+            *bits = 3072;
+            *key_type =  PSA_KEY_TYPE_DH_KEY_PAIR(PSA_DH_FAMILY_RFC7919);
+            return PSA_SUCCESS;
+#endif /* PSA_WANT_DH_RFC7919_3072 */
+#if defined(PSA_WANT_DH_RFC7919_4096)
+        case MBEDTLS_SSL_IANA_TLS_GROUP_FFDHE4096:
+            *bits = 4096;
+            *key_type =  PSA_KEY_TYPE_DH_KEY_PAIR(PSA_DH_FAMILY_RFC7919);
+            return PSA_SUCCESS;
+#endif /* PSA_WANT_DH_RFC7919_4096 */
+#if defined(PSA_WANT_DH_RFC7919_6144)
+        case MBEDTLS_SSL_IANA_TLS_GROUP_FFDHE6144:
+            *bits = 6144;
+            *key_type =  PSA_KEY_TYPE_DH_KEY_PAIR(PSA_DH_FAMILY_RFC7919);
+            return PSA_SUCCESS;
+#endif /* PSA_WANT_DH_RFC7919_6144 */
+#if defined(PSA_WANT_DH_RFC7919_8192)
+        case MBEDTLS_SSL_IANA_TLS_GROUP_FFDHE8192:
+            *bits = 8192;
+            *key_type =  PSA_KEY_TYPE_DH_KEY_PAIR(PSA_DH_FAMILY_RFC7919);
+            return PSA_SUCCESS;
+#endif /* PSA_WANT_DH_RFC7919_8192 */
+        default:
+            return PSA_ERROR_NOT_SUPPORTED;
+    }
+}
+#endif /* PSA_WANT_ALG_FFDH */
+
+int mbedtls_ssl_tls13_generate_and_write_xxdh_key_exchange(
+    mbedtls_ssl_context *ssl,
+    uint16_t named_group,
+    unsigned char *buf,
+    unsigned char *end,
+    size_t *out_len)
+{
+    psa_status_t status = PSA_ERROR_GENERIC_ERROR;
+    int ret = MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE;
+    psa_key_attributes_t key_attributes;
+    size_t own_pubkey_len;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+    size_t bits = 0;
+    psa_key_type_t key_type = PSA_KEY_TYPE_NONE;
+    psa_algorithm_t alg = PSA_ALG_NONE;
+    size_t buf_size = (size_t) (end - buf);
+
+    MBEDTLS_SSL_DEBUG_MSG(1, ("Perform PSA-based ECDH/FFDH computation."));
+
+    /* Convert EC's TLS ID to PSA key type. */
+#if defined(PSA_WANT_ALG_ECDH)
+    if (mbedtls_ssl_get_psa_curve_info_from_tls_id(
+            named_group, &key_type, &bits) == PSA_SUCCESS) {
+        alg = PSA_ALG_ECDH;
+    }
+#endif
+#if defined(PSA_WANT_ALG_FFDH)
+    if (mbedtls_ssl_get_psa_ffdh_info_from_tls_id(named_group, &bits,
+                                                  &key_type) == PSA_SUCCESS) {
+        alg = PSA_ALG_FFDH;
+    }
+#endif
+
+    if (key_type == PSA_KEY_TYPE_NONE) {
+        return MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
+    }
+
+    if (buf_size < PSA_BITS_TO_BYTES(bits)) {
+        return MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL;
+    }
+
+    handshake->xxdh_psa_type = key_type;
+    ssl->handshake->xxdh_psa_bits = bits;
+
+    key_attributes = psa_key_attributes_init();
+    psa_set_key_usage_flags(&key_attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&key_attributes, alg);
+    psa_set_key_type(&key_attributes, handshake->xxdh_psa_type);
+    psa_set_key_bits(&key_attributes, handshake->xxdh_psa_bits);
+
+    /* Generate ECDH/FFDH private key. */
+    status = psa_generate_key(&key_attributes,
+                              &handshake->xxdh_psa_privkey);
+    if (status != PSA_SUCCESS) {
+        ret = PSA_TO_MBEDTLS_ERR(status);
+        MBEDTLS_SSL_DEBUG_RET(1, "psa_generate_key", ret);
+        return ret;
+
+    }
+
+    /* Export the public part of the ECDH/FFDH private key from PSA. */
+    status = psa_export_public_key(handshake->xxdh_psa_privkey,
+                                   buf, buf_size,
+                                   &own_pubkey_len);
+
+    if (status != PSA_SUCCESS) {
+        ret = PSA_TO_MBEDTLS_ERR(status);
+        MBEDTLS_SSL_DEBUG_RET(1, "psa_export_public_key", ret);
+        return ret;
+    }
+
+    *out_len = own_pubkey_len;
+
+    return 0;
+}
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED */
+
+/* RFC 8446 section 4.2
+ *
+ * If an implementation receives an extension which it recognizes and which is
+ * not specified for the message in which it appears, it MUST abort the handshake
+ * with an "illegal_parameter" alert.
+ *
+ */
+int mbedtls_ssl_tls13_check_received_extension(
+    mbedtls_ssl_context *ssl,
+    int hs_msg_type,
+    unsigned int received_extension_type,
+    uint32_t hs_msg_allowed_extensions_mask)
+{
+    uint32_t extension_mask = mbedtls_ssl_get_extension_mask(
+        received_extension_type);
+
+    MBEDTLS_SSL_PRINT_EXT(
+        3, hs_msg_type, received_extension_type, "received");
+
+    if ((extension_mask & hs_msg_allowed_extensions_mask) == 0) {
+        MBEDTLS_SSL_PRINT_EXT(
+            3, hs_msg_type, received_extension_type, "is illegal");
+        MBEDTLS_SSL_PEND_FATAL_ALERT(
+            MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+            MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+    ssl->handshake->received_extensions |= extension_mask;
+    /*
+     * If it is a message containing extension responses, check that we
+     * previously sent the extension.
+     */
+    switch (hs_msg_type) {
+        case MBEDTLS_SSL_HS_SERVER_HELLO:
+        case MBEDTLS_SSL_TLS1_3_HS_HELLO_RETRY_REQUEST:
+        case MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS:
+        case MBEDTLS_SSL_HS_CERTIFICATE:
+            /* Check if the received extension is sent by peer message.*/
+            if ((ssl->handshake->sent_extensions & extension_mask) != 0) {
+                return 0;
+            }
+            break;
+        default:
+            return 0;
+    }
+
+    MBEDTLS_SSL_PRINT_EXT(
+        3, hs_msg_type, received_extension_type, "is unsupported");
+    MBEDTLS_SSL_PEND_FATAL_ALERT(
+        MBEDTLS_SSL_ALERT_MSG_UNSUPPORTED_EXT,
+        MBEDTLS_ERR_SSL_UNSUPPORTED_EXTENSION);
+    return MBEDTLS_ERR_SSL_UNSUPPORTED_EXTENSION;
+}
+
+#if defined(MBEDTLS_SSL_RECORD_SIZE_LIMIT)
+
+/* RFC 8449, section 4:
+ *
+ * The ExtensionData of the "record_size_limit" extension is
+ * RecordSizeLimit:
+ *     uint16 RecordSizeLimit;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+int mbedtls_ssl_tls13_parse_record_size_limit_ext(mbedtls_ssl_context *ssl,
+                                                  const unsigned char *buf,
+                                                  const unsigned char *end)
+{
+    const unsigned char *p = buf;
+    uint16_t record_size_limit;
+    const size_t extension_data_len = end - buf;
+
+    if (extension_data_len !=
+        MBEDTLS_SSL_RECORD_SIZE_LIMIT_EXTENSION_DATA_LENGTH) {
+        MBEDTLS_SSL_DEBUG_MSG(2,
+                              ("record_size_limit extension has invalid length: %"
+                               MBEDTLS_PRINTF_SIZET " Bytes",
+                               extension_data_len));
+
+        MBEDTLS_SSL_PEND_FATAL_ALERT(
+            MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+            MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+    record_size_limit = MBEDTLS_GET_UINT16_BE(p, 0);
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("RecordSizeLimit: %u Bytes", record_size_limit));
+
+    /* RFC 8449, section 4:
+     *
+     * Endpoints MUST NOT send a "record_size_limit" extension with a value
+     * smaller than 64.  An endpoint MUST treat receipt of a smaller value
+     * as a fatal error and generate an "illegal_parameter" alert.
+     */
+    if (record_size_limit < MBEDTLS_SSL_RECORD_SIZE_LIMIT_MIN) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("Invalid record size limit : %u Bytes",
+                                  record_size_limit));
+        MBEDTLS_SSL_PEND_FATAL_ALERT(
+            MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+            MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
+
+    ssl->session_negotiate->record_size_limit = record_size_limit;
+
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+int mbedtls_ssl_tls13_write_record_size_limit_ext(mbedtls_ssl_context *ssl,
+                                                  unsigned char *buf,
+                                                  const unsigned char *end,
+                                                  size_t *out_len)
+{
+    unsigned char *p = buf;
+    *out_len = 0;
+
+    MBEDTLS_STATIC_ASSERT(MBEDTLS_SSL_IN_CONTENT_LEN >= MBEDTLS_SSL_RECORD_SIZE_LIMIT_MIN,
+                          "MBEDTLS_SSL_IN_CONTENT_LEN is less than the "
+                          "minimum record size limit");
+
+    MBEDTLS_SSL_CHK_BUF_PTR(p, end, 6);
+
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_TLS_EXT_RECORD_SIZE_LIMIT, p, 0);
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_SSL_RECORD_SIZE_LIMIT_EXTENSION_DATA_LENGTH,
+                          p, 2);
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_SSL_IN_CONTENT_LEN, p, 4);
+
+    *out_len = 6;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("Sent RecordSizeLimit: %d Bytes",
+                              MBEDTLS_SSL_IN_CONTENT_LEN));
+
+    mbedtls_ssl_tls13_set_hs_sent_ext_mask(ssl, MBEDTLS_TLS_EXT_RECORD_SIZE_LIMIT);
+
+    return 0;
+}
+
+#endif /* MBEDTLS_SSL_RECORD_SIZE_LIMIT */
+
+#endif /* MBEDTLS_SSL_TLS_C && MBEDTLS_SSL_PROTO_TLS1_3 */
+
+/************** End of ssl_tls13_generic.c ***********************************/
+#pragma pop_macro("local_err_translation")
+#pragma pop_macro("SSL_VERIFY_STRUCT_MAX_SIZE")
+#pragma pop_macro("PSA_TO_MBEDTLS_ERR")
+#pragma push_macro("PSA_TO_MBEDTLS_ERR")
+#pragma push_macro("MBEDTLS_SSL_TLS1_3_LABEL")
+#pragma push_macro("SSL_TLS1_3_KEY_SCHEDULE_HKDF_LABEL_LEN")
+#pragma push_macro("SSL_TLS1_3_KEY_SCHEDULE_MAX_HKDF_LABEL_LEN")
+#pragma push_macro("local_err_translation")
+#define local_err_translation doltlite_mbedtls_tls13_keys_err_translation
+/************** Begin file ssl_tls13_keys.c **********************************/
+/*
+ *  TLS 1.3 key schedule
+ *
+ *  Copyright The Mbed TLS Contributors
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ */
+
+/* #include "common.h" */
+
+#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
+
+/* #include <stdint.h> */
+/* #include <string.h> */
+
+/************** Include mbedtls/hkdf.h in the middle of ssl_tls13_keys.c *****/
+/************** Begin file hkdf.h ********************************************/
+/**
+ * \file hkdf.h
+ *
+ * \brief   This file contains the HKDF interface.
+ *
+ *          The HMAC-based Extract-and-Expand Key Derivation Function (HKDF) is
+ *          specified by RFC 5869.
+ */
+/*
+ *  Copyright The Mbed TLS Contributors
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ */
+#ifndef MBEDTLS_HKDF_H
+#define MBEDTLS_HKDF_H
+
+/* #include "mbedtls/build_info.h" */
+
+/* #include "mbedtls/md.h" */
+
+/**
+ *  \name HKDF Error codes
+ *  \{
+ */
+/** Bad input parameters to function. */
+#define MBEDTLS_ERR_HKDF_BAD_INPUT_DATA  -0x5F80
+/** \} name */
+
+#if 0
+extern "C" {
+#endif
+
+/**
+ *  \brief  This is the HMAC-based Extract-and-Expand Key Derivation Function
+ *          (HKDF).
+ *
+ *  \param  md        A hash function; md.size denotes the length of the hash
+ *                    function output in bytes.
+ *  \param  salt      An optional salt value (a non-secret random value);
+ *                    if the salt is not provided, a string of all zeros of
+ *                    md.size length is used as the salt.
+ *  \param  salt_len  The length in bytes of the optional \p salt.
+ *  \param  ikm       The input keying material.
+ *  \param  ikm_len   The length in bytes of \p ikm.
+ *  \param  info      An optional context and application specific information
+ *                    string. This can be a zero-length string.
+ *  \param  info_len  The length of \p info in bytes.
+ *  \param  okm       The output keying material of \p okm_len bytes.
+ *  \param  okm_len   The length of the output keying material in bytes. This
+ *                    must be less than or equal to 255 * md.size bytes.
+ *
+ *  \return 0 on success.
+ *  \return #MBEDTLS_ERR_HKDF_BAD_INPUT_DATA when the parameters are invalid.
+ *  \return An MBEDTLS_ERR_MD_* error for errors returned from the underlying
+ *          MD layer.
+ */
+int mbedtls_hkdf(const mbedtls_md_info_t *md, const unsigned char *salt,
+                 size_t salt_len, const unsigned char *ikm, size_t ikm_len,
+                 const unsigned char *info, size_t info_len,
+                 unsigned char *okm, size_t okm_len);
+
+/**
+ *  \brief  Take the input keying material \p ikm and extract from it a
+ *          fixed-length pseudorandom key \p prk.
+ *
+ *  \warning    This function should only be used if the security of it has been
+ *              studied and established in that particular context (eg. TLS 1.3
+ *              key schedule). For standard HKDF security guarantees use
+ *              \c mbedtls_hkdf instead.
+ *
+ *  \param       md        A hash function; md.size denotes the length of the
+ *                         hash function output in bytes.
+ *  \param       salt      An optional salt value (a non-secret random value);
+ *                         if the salt is not provided, a string of all zeros
+ *                         of md.size length is used as the salt.
+ *  \param       salt_len  The length in bytes of the optional \p salt.
+ *  \param       ikm       The input keying material.
+ *  \param       ikm_len   The length in bytes of \p ikm.
+ *  \param[out]  prk       A pseudorandom key of at least md.size bytes.
+ *
+ *  \return 0 on success.
+ *  \return #MBEDTLS_ERR_HKDF_BAD_INPUT_DATA when the parameters are invalid.
+ *  \return An MBEDTLS_ERR_MD_* error for errors returned from the underlying
+ *          MD layer.
+ */
+int mbedtls_hkdf_extract(const mbedtls_md_info_t *md,
+                         const unsigned char *salt, size_t salt_len,
+                         const unsigned char *ikm, size_t ikm_len,
+                         unsigned char *prk);
+
+/**
+ *  \brief  Expand the supplied \p prk into several additional pseudorandom
+ *          keys, which is the output of the HKDF.
+ *
+ *  \warning    This function should only be used if the security of it has been
+ *              studied and established in that particular context (eg. TLS 1.3
+ *              key schedule). For standard HKDF security guarantees use
+ *              \c mbedtls_hkdf instead.
+ *
+ *  \param  md        A hash function; md.size denotes the length of the hash
+ *                    function output in bytes.
+ *  \param  prk       A pseudorandom key of at least md.size bytes. \p prk is
+ *                    usually the output from the HKDF extract step.
+ *  \param  prk_len   The length in bytes of \p prk.
+ *  \param  info      An optional context and application specific information
+ *                    string. This can be a zero-length string.
+ *  \param  info_len  The length of \p info in bytes.
+ *  \param  okm       The output keying material of \p okm_len bytes.
+ *  \param  okm_len   The length of the output keying material in bytes. This
+ *                    must be less than or equal to 255 * md.size bytes.
+ *
+ *  \return 0 on success.
+ *  \return #MBEDTLS_ERR_HKDF_BAD_INPUT_DATA when the parameters are invalid.
+ *  \return An MBEDTLS_ERR_MD_* error for errors returned from the underlying
+ *          MD layer.
+ */
+int mbedtls_hkdf_expand(const mbedtls_md_info_t *md, const unsigned char *prk,
+                        size_t prk_len, const unsigned char *info,
+                        size_t info_len, unsigned char *okm, size_t okm_len);
+
+#if 0
+}
+#endif
+
+#endif /* hkdf.h */
+
+/************** End of hkdf.h ************************************************/
+/************** Continuing where we left off in ssl_tls13_keys.c *************/
+/* #include "debug_internal.h" */
+/* #include "mbedtls/error.h" */
+/* #include "mbedtls/platform.h" */
+
+/* #include "ssl_misc.h" */
+/* #include "ssl_tls13_keys.h" */
+/* #include "ssl_tls13_invasive.h" */
+
+/* #include "psa/crypto.h" */
+/* #include "mbedtls/psa_util.h" */
+
+/* Define a local translating function to save code size by not using too many
+ * arguments in each translating place. */
+static int local_err_translation(psa_status_t status)
+{
+    return psa_status_to_mbedtls(status, psa_to_ssl_errors,
+                                 ARRAY_LENGTH(psa_to_ssl_errors),
+                                 psa_generic_status_to_mbedtls);
+}
+#define PSA_TO_MBEDTLS_ERR(status) local_err_translation(status)
+
+#define MBEDTLS_SSL_TLS1_3_LABEL(name, string)       \
+    .name = string,
+
+struct mbedtls_ssl_tls13_labels_struct const mbedtls_ssl_tls13_labels =
+{
+    /* This seems to work in C, despite the string literal being one
+     * character too long due to the 0-termination. */
+    MBEDTLS_SSL_TLS1_3_LABEL_LIST
+};
+
+#undef MBEDTLS_SSL_TLS1_3_LABEL
+
+/*
+ * This function creates a HkdfLabel structure used in the TLS 1.3 key schedule.
+ *
+ * The HkdfLabel is specified in RFC 8446 as follows:
+ *
+ * struct HkdfLabel {
+ *   uint16 length;            // Length of expanded key material
+ *   opaque label<7..255>;     // Always prefixed by "tls13 "
+ *   opaque context<0..255>;   // Usually a communication transcript hash
+ * };
+ *
+ * Parameters:
+ * - desired_length: Length of expanded key material.
+ *                   The length field can hold numbers up to 2**16, but HKDF
+ *                   can only generate outputs of up to 255 * HASH_LEN bytes.
+ *                   It is the caller's responsibility to ensure that this
+ *                   limit is not exceeded. In TLS 1.3, SHA256 is the hash
+ *                   function with the smallest block size, so a length
+ *                   <= 255 * 32 = 8160 is always safe.
+ * - (label, label_len): label + label length, without "tls13 " prefix
+ *                       The label length MUST be less than or equal to
+ *                       MBEDTLS_SSL_TLS1_3_HKDF_LABEL_MAX_LABEL_LEN.
+ *                       It is the caller's responsibility to ensure this.
+ *                       All (label, label length) pairs used in TLS 1.3
+ *                       can be obtained via MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN().
+ * - (ctx, ctx_len): context + context length
+ *                   The context length MUST be less than or equal to
+ *                   MBEDTLS_SSL_TLS1_3_KEY_SCHEDULE_MAX_CONTEXT_LEN
+ *                   It is the caller's responsibility to ensure this.
+ * - dst: Target buffer for HkdfLabel structure,
+ *        This MUST be a writable buffer of size
+ *        at least SSL_TLS1_3_KEY_SCHEDULE_MAX_HKDF_LABEL_LEN Bytes.
+ * - dst_len: Pointer at which to store the actual length of
+ *            the HkdfLabel structure on success.
+ */
+
+/* We need to tell the compiler that we meant to leave out the null character. */
+static const char tls13_label_prefix[6] MBEDTLS_ATTRIBUTE_UNTERMINATED_STRING = "tls13 ";
+
+#define SSL_TLS1_3_KEY_SCHEDULE_HKDF_LABEL_LEN(label_len, context_len) \
+    (2                     /* expansion length           */ \
+     + 1                   /* label length               */ \
+     + label_len                                           \
+     + 1                   /* context length             */ \
+     + context_len)
+
+#define SSL_TLS1_3_KEY_SCHEDULE_MAX_HKDF_LABEL_LEN                      \
+    SSL_TLS1_3_KEY_SCHEDULE_HKDF_LABEL_LEN(                             \
+        sizeof(tls13_label_prefix) +                       \
+        MBEDTLS_SSL_TLS1_3_HKDF_LABEL_MAX_LABEL_LEN,       \
+        MBEDTLS_SSL_TLS1_3_KEY_SCHEDULE_MAX_CONTEXT_LEN)
+
+static void ssl_tls13_hkdf_encode_label(
+    size_t desired_length,
+    const unsigned char *label, size_t label_len,
+    const unsigned char *ctx, size_t ctx_len,
+    unsigned char *dst, size_t *dst_len)
+{
+    size_t total_label_len =
+        sizeof(tls13_label_prefix) + label_len;
+    size_t total_hkdf_lbl_len =
+        SSL_TLS1_3_KEY_SCHEDULE_HKDF_LABEL_LEN(total_label_len, ctx_len);
+
+    unsigned char *p = dst;
+
+    /* Add the size of the expanded key material. */
+#if MBEDTLS_SSL_TLS1_3_KEY_SCHEDULE_MAX_EXPANSION_LEN > UINT16_MAX
+#error "The desired key length must fit into an uint16 but \
+    MBEDTLS_SSL_TLS1_3_KEY_SCHEDULE_MAX_EXPANSION_LEN is greater than UINT16_MAX"
+#endif
+
+    *p++ = MBEDTLS_BYTE_1(desired_length);
+    *p++ = MBEDTLS_BYTE_0(desired_length);
+
+    /* Add label incl. prefix */
+    *p++ = MBEDTLS_BYTE_0(total_label_len);
+    memcpy(p, tls13_label_prefix, sizeof(tls13_label_prefix));
+    p += sizeof(tls13_label_prefix);
+    memcpy(p, label, label_len);
+    p += label_len;
+
+    /* Add context value */
+    *p++ = MBEDTLS_BYTE_0(ctx_len);
+    if (ctx_len != 0) {
+        memcpy(p, ctx, ctx_len);
+    }
+
+    /* Return total length to the caller.  */
+    *dst_len = total_hkdf_lbl_len;
+}
+
+int mbedtls_ssl_tls13_hkdf_expand_label(
+    psa_algorithm_t hash_alg,
+    const unsigned char *secret, size_t secret_len,
+    const unsigned char *label, size_t label_len,
+    const unsigned char *ctx, size_t ctx_len,
+    unsigned char *buf, size_t buf_len)
+{
+    unsigned char hkdf_label[SSL_TLS1_3_KEY_SCHEDULE_MAX_HKDF_LABEL_LEN];
+    size_t hkdf_label_len = 0;
+    psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+    psa_status_t abort_status = PSA_ERROR_CORRUPTION_DETECTED;
+    psa_key_derivation_operation_t operation =
+        PSA_KEY_DERIVATION_OPERATION_INIT;
+
+    if (label_len > MBEDTLS_SSL_TLS1_3_HKDF_LABEL_MAX_LABEL_LEN) {
+        /* Should never happen since this is an internal
+         * function, and we know statically which labels
+         * are allowed. */
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    if (ctx_len > MBEDTLS_SSL_TLS1_3_KEY_SCHEDULE_MAX_CONTEXT_LEN) {
+        /* Should not happen, as above. */
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    if (buf_len > MBEDTLS_SSL_TLS1_3_KEY_SCHEDULE_MAX_EXPANSION_LEN) {
+        /* Should not happen, as above. */
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    if (!PSA_ALG_IS_HASH(hash_alg)) {
+        return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+    }
+
+    ssl_tls13_hkdf_encode_label(buf_len,
+                                label, label_len,
+                                ctx, ctx_len,
+                                hkdf_label,
+                                &hkdf_label_len);
+
+    status = psa_key_derivation_setup(&operation, PSA_ALG_HKDF_EXPAND(hash_alg));
+
+    if (status != PSA_SUCCESS) {
+        goto cleanup;
+    }
+
+    status = psa_key_derivation_input_bytes(&operation,
+                                            PSA_KEY_DERIVATION_INPUT_SECRET,
+                                            secret,
+                                            secret_len);
+
+    if (status != PSA_SUCCESS) {
+        goto cleanup;
+    }
+
+    status = psa_key_derivation_input_bytes(&operation,
+                                            PSA_KEY_DERIVATION_INPUT_INFO,
+                                            hkdf_label,
+                                            hkdf_label_len);
+
+    if (status != PSA_SUCCESS) {
+        goto cleanup;
+    }
+
+    status = psa_key_derivation_output_bytes(&operation,
+                                             buf,
+                                             buf_len);
+
+    if (status != PSA_SUCCESS) {
+        goto cleanup;
+    }
+
+cleanup:
+    abort_status = psa_key_derivation_abort(&operation);
+    status = (status == PSA_SUCCESS ? abort_status : status);
+    mbedtls_platform_zeroize(hkdf_label, hkdf_label_len);
+    return PSA_TO_MBEDTLS_ERR(status);
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_make_traffic_key(
+    psa_algorithm_t hash_alg,
+    const unsigned char *secret, size_t secret_len,
+    unsigned char *key, size_t key_len,
+    unsigned char *iv, size_t iv_len)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+
+    ret = mbedtls_ssl_tls13_hkdf_expand_label(
+        hash_alg,
+        secret, secret_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(key),
+        NULL, 0,
+        key, key_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = mbedtls_ssl_tls13_hkdf_expand_label(
+        hash_alg,
+        secret, secret_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(iv),
+        NULL, 0,
+        iv, iv_len);
+    return ret;
+}
+
+/*
+ * The traffic keying material is generated from the following inputs:
+ *
+ *  - One secret value per sender.
+ *  - A purpose value indicating the specific value being generated
+ *  - The desired lengths of key and IV.
+ *
+ * The expansion itself is based on HKDF:
+ *
+ *   [sender]_write_key = HKDF-Expand-Label( Secret, "key", "", key_length )
+ *   [sender]_write_iv  = HKDF-Expand-Label( Secret, "iv" , "", iv_length )
+ *
+ * [sender] denotes the sending side and the Secret value is provided
+ * by the function caller. Note that we generate server and client side
+ * keys in a single function call.
+ */
+int mbedtls_ssl_tls13_make_traffic_keys(
+    psa_algorithm_t hash_alg,
+    const unsigned char *client_secret,
+    const unsigned char *server_secret, size_t secret_len,
+    size_t key_len, size_t iv_len,
+    mbedtls_ssl_key_set *keys)
+{
+    int ret = 0;
+
+    ret = ssl_tls13_make_traffic_key(
+        hash_alg, client_secret, secret_len,
+        keys->client_write_key, key_len,
+        keys->client_write_iv, iv_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = ssl_tls13_make_traffic_key(
+        hash_alg, server_secret, secret_len,
+        keys->server_write_key, key_len,
+        keys->server_write_iv, iv_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    keys->key_len = key_len;
+    keys->iv_len = iv_len;
+
+    return 0;
+}
+
+int mbedtls_ssl_tls13_derive_secret(
+    psa_algorithm_t hash_alg,
+    const unsigned char *secret, size_t secret_len,
+    const unsigned char *label, size_t label_len,
+    const unsigned char *ctx, size_t ctx_len,
+    int ctx_hashed,
+    unsigned char *dstbuf, size_t dstbuf_len)
+{
+    int ret;
+    unsigned char hashed_context[PSA_HASH_MAX_SIZE];
+    if (ctx_hashed == MBEDTLS_SSL_TLS1_3_CONTEXT_UNHASHED) {
+        psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+
+        status = psa_hash_compute(hash_alg, ctx, ctx_len, hashed_context,
+                                  PSA_HASH_LENGTH(hash_alg), &ctx_len);
+        if (status != PSA_SUCCESS) {
+            ret = PSA_TO_MBEDTLS_ERR(status);
+            return ret;
+        }
+    } else {
+        if (ctx_len > sizeof(hashed_context)) {
+            /* This should never happen since this function is internal
+             * and the code sets `ctx_hashed` correctly.
+             * Let's double-check nonetheless to not run at the risk
+             * of getting a stack overflow. */
+            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        }
+
+        memcpy(hashed_context, ctx, ctx_len);
+    }
+
+    return mbedtls_ssl_tls13_hkdf_expand_label(hash_alg,
+                                               secret, secret_len,
+                                               label, label_len,
+                                               hashed_context, ctx_len,
+                                               dstbuf, dstbuf_len);
+
+}
+
+int mbedtls_ssl_tls13_evolve_secret(
+    psa_algorithm_t hash_alg,
+    const unsigned char *secret_old,
+    const unsigned char *input, size_t input_len,
+    unsigned char *secret_new)
+{
+    int ret = MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+    psa_status_t abort_status = PSA_ERROR_CORRUPTION_DETECTED;
+    size_t hlen;
+    unsigned char tmp_secret[PSA_MAC_MAX_SIZE] = { 0 };
+    const unsigned char all_zeroes_input[MBEDTLS_TLS1_3_MD_MAX_SIZE] = { 0 };
+    const unsigned char *l_input = NULL;
+    size_t l_input_len;
+
+    psa_key_derivation_operation_t operation =
+        PSA_KEY_DERIVATION_OPERATION_INIT;
+
+    if (!PSA_ALG_IS_HASH(hash_alg)) {
+        return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+    }
+
+    hlen = PSA_HASH_LENGTH(hash_alg);
+
+    /* For non-initial runs, call Derive-Secret( ., "derived", "")
+     * on the old secret. */
+    if (secret_old != NULL) {
+        ret = mbedtls_ssl_tls13_derive_secret(
+            hash_alg,
+            secret_old, hlen,
+            MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(derived),
+            NULL, 0,        /* context */
+            MBEDTLS_SSL_TLS1_3_CONTEXT_UNHASHED,
+            tmp_secret, hlen);
+        if (ret != 0) {
+            goto cleanup;
+        }
+    }
+
+    ret = 0;
+
+    if (input != NULL && input_len != 0) {
+        l_input = input;
+        l_input_len = input_len;
+    } else {
+        l_input = all_zeroes_input;
+        l_input_len = hlen;
+    }
+
+    status = psa_key_derivation_setup(&operation,
+                                      PSA_ALG_HKDF_EXTRACT(hash_alg));
+
+    if (status != PSA_SUCCESS) {
+        goto cleanup;
+    }
+
+    status = psa_key_derivation_input_bytes(&operation,
+                                            PSA_KEY_DERIVATION_INPUT_SALT,
+                                            tmp_secret,
+                                            hlen);
+
+    if (status != PSA_SUCCESS) {
+        goto cleanup;
+    }
+
+    status = psa_key_derivation_input_bytes(&operation,
+                                            PSA_KEY_DERIVATION_INPUT_SECRET,
+                                            l_input, l_input_len);
+
+    if (status != PSA_SUCCESS) {
+        goto cleanup;
+    }
+
+    status = psa_key_derivation_output_bytes(&operation,
+                                             secret_new,
+                                             PSA_HASH_LENGTH(hash_alg));
+
+    if (status != PSA_SUCCESS) {
+        goto cleanup;
+    }
+
+cleanup:
+    abort_status = psa_key_derivation_abort(&operation);
+    status = (status == PSA_SUCCESS ? abort_status : status);
+    ret = (ret == 0 ? PSA_TO_MBEDTLS_ERR(status) : ret);
+    mbedtls_platform_zeroize(tmp_secret, sizeof(tmp_secret));
+    return ret;
+}
+
+int mbedtls_ssl_tls13_derive_early_secrets(
+    psa_algorithm_t hash_alg,
+    unsigned char const *early_secret,
+    unsigned char const *transcript, size_t transcript_len,
+    mbedtls_ssl_tls13_early_secrets *derived)
+{
+    int ret;
+    size_t const hash_len = PSA_HASH_LENGTH(hash_alg);
+
+    /* We should never call this function with an unknown hash,
+     * but add an assertion anyway. */
+    if (!PSA_ALG_IS_HASH(hash_alg)) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    /*
+     *            0
+     *            |
+     *            v
+     *  PSK ->  HKDF-Extract = Early Secret
+     *            |
+     *            +-----> Derive-Secret(., "c e traffic", ClientHello)
+     *            |                     = client_early_traffic_secret
+     *            |
+     *            +-----> Derive-Secret(., "e exp master", ClientHello)
+     *            |                     = early_exporter_master_secret
+     *            v
+     */
+
+    /* Create client_early_traffic_secret */
+    ret = mbedtls_ssl_tls13_derive_secret(
+        hash_alg,
+        early_secret, hash_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(c_e_traffic),
+        transcript, transcript_len,
+        MBEDTLS_SSL_TLS1_3_CONTEXT_HASHED,
+        derived->client_early_traffic_secret,
+        hash_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    /* Create early exporter */
+    ret = mbedtls_ssl_tls13_derive_secret(
+        hash_alg,
+        early_secret, hash_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(e_exp_master),
+        transcript, transcript_len,
+        MBEDTLS_SSL_TLS1_3_CONTEXT_HASHED,
+        derived->early_exporter_master_secret,
+        hash_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    return 0;
+}
+
+int mbedtls_ssl_tls13_derive_handshake_secrets(
+    psa_algorithm_t hash_alg,
+    unsigned char const *handshake_secret,
+    unsigned char const *transcript, size_t transcript_len,
+    mbedtls_ssl_tls13_handshake_secrets *derived)
+{
+    int ret;
+    size_t const hash_len = PSA_HASH_LENGTH(hash_alg);
+
+    /* We should never call this function with an unknown hash,
+     * but add an assertion anyway. */
+    if (!PSA_ALG_IS_HASH(hash_alg)) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    /*
+     *
+     * Handshake Secret
+     * |
+     * +-----> Derive-Secret( ., "c hs traffic",
+     * |                     ClientHello...ServerHello )
+     * |                     = client_handshake_traffic_secret
+     * |
+     * +-----> Derive-Secret( ., "s hs traffic",
+     * |                     ClientHello...ServerHello )
+     * |                     = server_handshake_traffic_secret
+     *
+     */
+
+    /*
+     * Compute client_handshake_traffic_secret with
+     * Derive-Secret( ., "c hs traffic", ClientHello...ServerHello )
+     */
+
+    ret = mbedtls_ssl_tls13_derive_secret(
+        hash_alg,
+        handshake_secret, hash_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(c_hs_traffic),
+        transcript, transcript_len,
+        MBEDTLS_SSL_TLS1_3_CONTEXT_HASHED,
+        derived->client_handshake_traffic_secret,
+        hash_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    /*
+     * Compute server_handshake_traffic_secret with
+     * Derive-Secret( ., "s hs traffic", ClientHello...ServerHello )
+     */
+
+    ret = mbedtls_ssl_tls13_derive_secret(
+        hash_alg,
+        handshake_secret, hash_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(s_hs_traffic),
+        transcript, transcript_len,
+        MBEDTLS_SSL_TLS1_3_CONTEXT_HASHED,
+        derived->server_handshake_traffic_secret,
+        hash_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    return 0;
+}
+
+int mbedtls_ssl_tls13_derive_application_secrets(
+    psa_algorithm_t hash_alg,
+    unsigned char const *application_secret,
+    unsigned char const *transcript, size_t transcript_len,
+    mbedtls_ssl_tls13_application_secrets *derived)
+{
+    int ret;
+    size_t const hash_len = PSA_HASH_LENGTH(hash_alg);
+
+    /* We should never call this function with an unknown hash,
+     * but add an assertion anyway. */
+    if (!PSA_ALG_IS_HASH(hash_alg)) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    /* Generate {client,server}_application_traffic_secret_0
+     *
+     * Master Secret
+     * |
+     * +-----> Derive-Secret( ., "c ap traffic",
+     * |                      ClientHello...server Finished )
+     * |                      = client_application_traffic_secret_0
+     * |
+     * +-----> Derive-Secret( ., "s ap traffic",
+     * |                      ClientHello...Server Finished )
+     * |                      = server_application_traffic_secret_0
+     * |
+     * +-----> Derive-Secret( ., "exp master",
+     * |                      ClientHello...server Finished)
+     * |                      = exporter_master_secret
+     *
+     */
+
+    ret = mbedtls_ssl_tls13_derive_secret(
+        hash_alg,
+        application_secret, hash_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(c_ap_traffic),
+        transcript, transcript_len,
+        MBEDTLS_SSL_TLS1_3_CONTEXT_HASHED,
+        derived->client_application_traffic_secret_N,
+        hash_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = mbedtls_ssl_tls13_derive_secret(
+        hash_alg,
+        application_secret, hash_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(s_ap_traffic),
+        transcript, transcript_len,
+        MBEDTLS_SSL_TLS1_3_CONTEXT_HASHED,
+        derived->server_application_traffic_secret_N,
+        hash_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = mbedtls_ssl_tls13_derive_secret(
+        hash_alg,
+        application_secret, hash_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(exp_master),
+        transcript, transcript_len,
+        MBEDTLS_SSL_TLS1_3_CONTEXT_HASHED,
+        derived->exporter_master_secret,
+        hash_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    return 0;
+}
+
+/* Generate resumption_master_secret for use with the ticket exchange.
+ *
+ * This is not integrated with mbedtls_ssl_tls13_derive_application_secrets()
+ * because it uses the transcript hash up to and including ClientFinished. */
+int mbedtls_ssl_tls13_derive_resumption_master_secret(
+    psa_algorithm_t hash_alg,
+    unsigned char const *application_secret,
+    unsigned char const *transcript, size_t transcript_len,
+    mbedtls_ssl_tls13_application_secrets *derived)
+{
+    int ret;
+    size_t const hash_len = PSA_HASH_LENGTH(hash_alg);
+
+    /* We should never call this function with an unknown hash,
+     * but add an assertion anyway. */
+    if (!PSA_ALG_IS_HASH(hash_alg)) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    ret = mbedtls_ssl_tls13_derive_secret(
+        hash_alg,
+        application_secret, hash_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(res_master),
+        transcript, transcript_len,
+        MBEDTLS_SSL_TLS1_3_CONTEXT_HASHED,
+        derived->resumption_master_secret,
+        hash_len);
+
+    if (ret != 0) {
+        return ret;
+    }
+
+    return 0;
+}
+
+/**
+ * \brief Transition into application stage of TLS 1.3 key schedule.
+ *
+ *        The TLS 1.3 key schedule can be viewed as a simple state machine
+ *        with states Initial -> Early -> Handshake -> Application, and
+ *        this function represents the Handshake -> Application transition.
+ *
+ *        In the handshake stage, ssl_tls13_generate_application_keys()
+ *        can be used to derive the handshake traffic keys.
+ *
+ * \param ssl  The SSL context to operate on. This must be in key schedule
+ *             stage \c Handshake.
+ *
+ * \returns    \c 0 on success.
+ * \returns    A negative error code on failure.
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_key_schedule_stage_application(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+    psa_algorithm_t const hash_alg = mbedtls_md_psa_alg_from_type(
+        (mbedtls_md_type_t) handshake->ciphersuite_info->mac);
+
+    /*
+     * Compute MasterSecret
+     */
+    ret = mbedtls_ssl_tls13_evolve_secret(
+        hash_alg,
+        handshake->tls13_master_secrets.handshake,
+        NULL, 0,
+        handshake->tls13_master_secrets.app);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_evolve_secret", ret);
+        return ret;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(
+        4, "Master secret",
+        handshake->tls13_master_secrets.app, PSA_HASH_LENGTH(hash_alg));
+
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_calc_finished_core(psa_algorithm_t hash_alg,
+                                        unsigned char const *base_key,
+                                        unsigned char const *transcript,
+                                        unsigned char *dst,
+                                        size_t *dst_len)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+    size_t hash_len = PSA_HASH_LENGTH(hash_alg);
+    unsigned char finished_key[PSA_MAC_MAX_SIZE];
+    int ret;
+    psa_algorithm_t alg;
+
+    /* We should never call this function with an unknown hash,
+     * but add an assertion anyway. */
+    if (!PSA_ALG_IS_HASH(hash_alg)) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    /* TLS 1.3 Finished message
+     *
+     * struct {
+     *     opaque verify_data[Hash.length];
+     * } Finished;
+     *
+     * verify_data =
+     *     HMAC( finished_key,
+     *            Hash( Handshake Context +
+     *                  Certificate*      +
+     *                  CertificateVerify* )
+     *    )
+     *
+     * finished_key =
+     *    HKDF-Expand-Label( BaseKey, "finished", "", Hash.length )
+     */
+
+    ret = mbedtls_ssl_tls13_hkdf_expand_label(
+        hash_alg, base_key, hash_len,
+        MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(finished),
+        NULL, 0,
+        finished_key, hash_len);
+    if (ret != 0) {
+        goto exit;
+    }
+
+    alg = PSA_ALG_HMAC(hash_alg);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+
+    status = psa_import_key(&attributes, finished_key, hash_len, &key);
+    if (status != PSA_SUCCESS) {
+        ret = PSA_TO_MBEDTLS_ERR(status);
+        goto exit;
+    }
+
+    status = psa_mac_compute(key, alg, transcript, hash_len,
+                             dst, hash_len, dst_len);
+    ret = PSA_TO_MBEDTLS_ERR(status);
+
+exit:
+
+    status = psa_destroy_key(key);
+    if (ret == 0) {
+        ret = PSA_TO_MBEDTLS_ERR(status);
+    }
+
+    mbedtls_platform_zeroize(finished_key, sizeof(finished_key));
+
+    return ret;
+}
+
+int mbedtls_ssl_tls13_calculate_verify_data(mbedtls_ssl_context *ssl,
+                                            unsigned char *dst,
+                                            size_t dst_len,
+                                            size_t *actual_len,
+                                            int from)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+
+    unsigned char transcript[MBEDTLS_TLS1_3_MD_MAX_SIZE];
+    size_t transcript_len;
+
+    unsigned char *base_key = NULL;
+    size_t base_key_len = 0;
+    mbedtls_ssl_tls13_handshake_secrets *tls13_hs_secrets =
+        &ssl->handshake->tls13_hs_secrets;
+
+    mbedtls_md_type_t const md_type = (mbedtls_md_type_t) ssl->handshake->ciphersuite_info->mac;
+
+    psa_algorithm_t hash_alg = mbedtls_md_psa_alg_from_type(
+        (mbedtls_md_type_t) ssl->handshake->ciphersuite_info->mac);
+    size_t const hash_len = PSA_HASH_LENGTH(hash_alg);
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> mbedtls_ssl_tls13_calculate_verify_data"));
+
+    if (from == MBEDTLS_SSL_IS_CLIENT) {
+        base_key = tls13_hs_secrets->client_handshake_traffic_secret;
+        base_key_len = sizeof(tls13_hs_secrets->client_handshake_traffic_secret);
+    } else {
+        base_key = tls13_hs_secrets->server_handshake_traffic_secret;
+        base_key_len = sizeof(tls13_hs_secrets->server_handshake_traffic_secret);
+    }
+
+    if (dst_len < hash_len) {
+        ret = MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL;
+        goto exit;
+    }
+
+    ret = mbedtls_ssl_get_handshake_transcript(ssl, md_type,
+                                               transcript, sizeof(transcript),
+                                               &transcript_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_get_handshake_transcript", ret);
+        goto exit;
+    }
+    MBEDTLS_SSL_DEBUG_BUF(4, "handshake hash", transcript, transcript_len);
+
+    ret = ssl_tls13_calc_finished_core(hash_alg, base_key,
+                                       transcript, dst, actual_len);
+    if (ret != 0) {
+        goto exit;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "verify_data for finished message", dst, hash_len);
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= mbedtls_ssl_tls13_calculate_verify_data"));
+
+exit:
+    /* Erase handshake secrets */
+    mbedtls_platform_zeroize(base_key, base_key_len);
+    mbedtls_platform_zeroize(transcript, sizeof(transcript));
+    return ret;
+}
+
+int mbedtls_ssl_tls13_create_psk_binder(mbedtls_ssl_context *ssl,
+                                        const psa_algorithm_t hash_alg,
+                                        unsigned char const *psk, size_t psk_len,
+                                        int psk_type,
+                                        unsigned char const *transcript,
+                                        unsigned char *result)
+{
+    int ret = 0;
+    unsigned char binder_key[PSA_MAC_MAX_SIZE];
+    unsigned char early_secret[PSA_MAC_MAX_SIZE];
+    size_t const hash_len = PSA_HASH_LENGTH(hash_alg);
+    size_t actual_len;
+
+#if !defined(MBEDTLS_DEBUG_C)
+    ssl = NULL; /* make sure we don't use it except for debug */
+    ((void) ssl);
+#endif
+
+    /* We should never call this function with an unknown hash,
+     * but add an assertion anyway. */
+    if (!PSA_ALG_IS_HASH(hash_alg)) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    /*
+     *            0
+     *            |
+     *            v
+     *  PSK ->  HKDF-Extract = Early Secret
+     *            |
+     *            +-----> Derive-Secret(., "ext binder" | "res binder", "")
+     *            |                     = binder_key
+     *            v
+     */
+
+    ret = mbedtls_ssl_tls13_evolve_secret(hash_alg,
+                                          NULL,           /* Old secret */
+                                          psk, psk_len,   /* Input      */
+                                          early_secret);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_evolve_secret", ret);
+        goto exit;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "mbedtls_ssl_tls13_create_psk_binder",
+                          early_secret, hash_len);
+
+    if (psk_type == MBEDTLS_SSL_TLS1_3_PSK_RESUMPTION) {
+        ret = mbedtls_ssl_tls13_derive_secret(
+            hash_alg,
+            early_secret, hash_len,
+            MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(res_binder),
+            NULL, 0, MBEDTLS_SSL_TLS1_3_CONTEXT_UNHASHED,
+            binder_key, hash_len);
+        MBEDTLS_SSL_DEBUG_MSG(4, ("Derive Early Secret with 'res binder'"));
+    } else {
+        ret = mbedtls_ssl_tls13_derive_secret(
+            hash_alg,
+            early_secret, hash_len,
+            MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(ext_binder),
+            NULL, 0, MBEDTLS_SSL_TLS1_3_CONTEXT_UNHASHED,
+            binder_key, hash_len);
+        MBEDTLS_SSL_DEBUG_MSG(4, ("Derive Early Secret with 'ext binder'"));
+    }
+
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_derive_secret", ret);
+        goto exit;
+    }
+
+    /*
+     * The binding_value is computed in the same way as the Finished message
+     * but with the BaseKey being the binder_key.
+     */
+
+    ret = ssl_tls13_calc_finished_core(hash_alg, binder_key, transcript,
+                                       result, &actual_len);
+    if (ret != 0) {
+        goto exit;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(3, "psk binder", result, actual_len);
+
+exit:
+
+    mbedtls_platform_zeroize(early_secret, sizeof(early_secret));
+    mbedtls_platform_zeroize(binder_key,   sizeof(binder_key));
+    return ret;
+}
+
+int mbedtls_ssl_tls13_populate_transform(
+    mbedtls_ssl_transform *transform,
+    int endpoint, int ciphersuite,
+    mbedtls_ssl_key_set const *traffic_keys,
+    mbedtls_ssl_context *ssl /* DEBUG ONLY */)
+{
+#if !defined(MBEDTLS_USE_PSA_CRYPTO)
+    int ret;
+    mbedtls_cipher_info_t const *cipher_info;
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+    const mbedtls_ssl_ciphersuite_t *ciphersuite_info;
+    unsigned char const *key_enc;
+    unsigned char const *iv_enc;
+    unsigned char const *key_dec;
+    unsigned char const *iv_dec;
+
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+    psa_key_type_t key_type;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_algorithm_t alg;
+    size_t key_bits;
+    psa_status_t status = PSA_SUCCESS;
+#endif
+
+#if !defined(MBEDTLS_DEBUG_C)
+    ssl = NULL; /* make sure we don't use it except for those cases */
+    (void) ssl;
+#endif
+
+    ciphersuite_info = mbedtls_ssl_ciphersuite_from_id(ciphersuite);
+    if (ciphersuite_info == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("ciphersuite info for %d not found",
+                                  ciphersuite));
+        return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+    }
+
+#if !defined(MBEDTLS_USE_PSA_CRYPTO)
+    cipher_info = mbedtls_cipher_info_from_type(ciphersuite_info->cipher);
+    if (cipher_info == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("cipher info for %u not found",
+                                  ciphersuite_info->cipher));
+        return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+    }
+
+    /*
+     * Setup cipher contexts in target transform
+     */
+    if ((ret = mbedtls_cipher_setup(&transform->cipher_ctx_enc,
+                                    cipher_info)) != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_cipher_setup", ret);
+        return ret;
+    }
+
+    if ((ret = mbedtls_cipher_setup(&transform->cipher_ctx_dec,
+                                    cipher_info)) != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_cipher_setup", ret);
+        return ret;
+    }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+#if defined(MBEDTLS_SSL_SRV_C)
+    if (endpoint == MBEDTLS_SSL_IS_SERVER) {
+        key_enc = traffic_keys->server_write_key;
+        key_dec = traffic_keys->client_write_key;
+        iv_enc = traffic_keys->server_write_iv;
+        iv_dec = traffic_keys->client_write_iv;
+    } else
+#endif /* MBEDTLS_SSL_SRV_C */
+#if defined(MBEDTLS_SSL_CLI_C)
+    if (endpoint == MBEDTLS_SSL_IS_CLIENT) {
+        key_enc = traffic_keys->client_write_key;
+        key_dec = traffic_keys->server_write_key;
+        iv_enc = traffic_keys->client_write_iv;
+        iv_dec = traffic_keys->server_write_iv;
+    } else
+#endif /* MBEDTLS_SSL_CLI_C */
+    {
+        /* should not happen */
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    memcpy(transform->iv_enc, iv_enc, traffic_keys->iv_len);
+    memcpy(transform->iv_dec, iv_dec, traffic_keys->iv_len);
+
+#if !defined(MBEDTLS_USE_PSA_CRYPTO)
+    if ((ret = mbedtls_cipher_setkey(&transform->cipher_ctx_enc,
+                                     key_enc, (int) mbedtls_cipher_info_get_key_bitlen(cipher_info),
+                                     MBEDTLS_ENCRYPT)) != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_cipher_setkey", ret);
+        return ret;
+    }
+
+    if ((ret = mbedtls_cipher_setkey(&transform->cipher_ctx_dec,
+                                     key_dec, (int) mbedtls_cipher_info_get_key_bitlen(cipher_info),
+                                     MBEDTLS_DECRYPT)) != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_cipher_setkey", ret);
+        return ret;
+    }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+    /*
+     * Setup other fields in SSL transform
+     */
+
+    if ((ciphersuite_info->flags & MBEDTLS_CIPHERSUITE_SHORT_TAG) != 0) {
+        transform->taglen  = 8;
+    } else {
+        transform->taglen  = 16;
+    }
+
+    transform->ivlen       = traffic_keys->iv_len;
+    transform->maclen      = 0;
+    transform->fixed_ivlen = transform->ivlen;
+    transform->tls_version = MBEDTLS_SSL_VERSION_TLS1_3;
+
+    /* We add the true record content type (1 Byte) to the plaintext and
+     * then pad to the configured granularity. The minimum length of the
+     * type-extended and padded plaintext is therefore the padding
+     * granularity. */
+    transform->minlen =
+        transform->taglen + MBEDTLS_SSL_CID_TLS1_3_PADDING_GRANULARITY;
+
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+    /*
+     * Setup psa keys and alg
+     */
+    if ((status = mbedtls_ssl_cipher_to_psa((mbedtls_cipher_type_t) ciphersuite_info->cipher,
+                                            transform->taglen,
+                                            &alg,
+                                            &key_type,
+                                            &key_bits)) != PSA_SUCCESS) {
+        MBEDTLS_SSL_DEBUG_RET(
+            1, "mbedtls_ssl_cipher_to_psa", PSA_TO_MBEDTLS_ERR(status));
+        return PSA_TO_MBEDTLS_ERR(status);
+    }
+
+    transform->psa_alg = alg;
+
+    if (alg != MBEDTLS_SSL_NULL_CIPHER) {
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+        psa_set_key_algorithm(&attributes, alg);
+        psa_set_key_type(&attributes, key_type);
+
+        if ((status = psa_import_key(&attributes,
+                                     key_enc,
+                                     PSA_BITS_TO_BYTES(key_bits),
+                                     &transform->psa_key_enc)) != PSA_SUCCESS) {
+            MBEDTLS_SSL_DEBUG_RET(
+                1, "psa_import_key", PSA_TO_MBEDTLS_ERR(status));
+            return PSA_TO_MBEDTLS_ERR(status);
+        }
+
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DECRYPT);
+
+        if ((status = psa_import_key(&attributes,
+                                     key_dec,
+                                     PSA_BITS_TO_BYTES(key_bits),
+                                     &transform->psa_key_dec)) != PSA_SUCCESS) {
+            MBEDTLS_SSL_DEBUG_RET(
+                1, "psa_import_key", PSA_TO_MBEDTLS_ERR(status));
+            return PSA_TO_MBEDTLS_ERR(status);
+        }
+    }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+    return 0;
+}
+
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_get_cipher_key_info(
+    const mbedtls_ssl_ciphersuite_t *ciphersuite_info,
+    size_t *key_len, size_t *iv_len)
+{
+    psa_key_type_t key_type;
+    psa_algorithm_t alg;
+    size_t taglen;
+    size_t key_bits;
+    psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+
+    if (ciphersuite_info->flags & MBEDTLS_CIPHERSUITE_SHORT_TAG) {
+        taglen = 8;
+    } else {
+        taglen = 16;
+    }
+
+    status = mbedtls_ssl_cipher_to_psa((mbedtls_cipher_type_t) ciphersuite_info->cipher, taglen,
+                                       &alg, &key_type, &key_bits);
+    if (status != PSA_SUCCESS) {
+        return PSA_TO_MBEDTLS_ERR(status);
+    }
+
+    *key_len = PSA_BITS_TO_BYTES(key_bits);
+
+    /* TLS 1.3 only have AEAD ciphers, IV length is unconditionally 12 bytes */
+    *iv_len = 12;
+
+    return 0;
+}
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+/*
+ * ssl_tls13_generate_early_key() generates the key necessary for protecting
+ * the early application data and handshake messages as described in section 7
+ * of RFC 8446.
+ *
+ * NOTE: Only one key is generated, the key for the traffic from the client to
+ *       the server. The TLS 1.3 specification does not define a secret and thus
+ *       a key for server early traffic.
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_generate_early_key(mbedtls_ssl_context *ssl,
+                                        mbedtls_ssl_key_set *traffic_keys)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_md_type_t md_type;
+    psa_algorithm_t hash_alg;
+    size_t hash_len;
+    unsigned char transcript[MBEDTLS_TLS1_3_MD_MAX_SIZE];
+    size_t transcript_len;
+    size_t key_len = 0;
+    size_t iv_len = 0;
+    mbedtls_ssl_tls13_early_secrets tls13_early_secrets;
+
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+    const mbedtls_ssl_ciphersuite_t *ciphersuite_info =
+        handshake->ciphersuite_info;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> ssl_tls13_generate_early_key"));
+
+    ret = ssl_tls13_get_cipher_key_info(ciphersuite_info, &key_len, &iv_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "ssl_tls13_get_cipher_key_info", ret);
+        goto cleanup;
+    }
+
+    md_type = (mbedtls_md_type_t) ciphersuite_info->mac;
+
+    hash_alg = mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) ciphersuite_info->mac);
+    hash_len = PSA_HASH_LENGTH(hash_alg);
+
+    ret = mbedtls_ssl_get_handshake_transcript(ssl, md_type,
+                                               transcript,
+                                               sizeof(transcript),
+                                               &transcript_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1,
+                              "mbedtls_ssl_get_handshake_transcript",
+                              ret);
+        goto cleanup;
+    }
+
+    ret = mbedtls_ssl_tls13_derive_early_secrets(
+        hash_alg, handshake->tls13_master_secrets.early,
+        transcript, transcript_len, &tls13_early_secrets);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(
+            1, "mbedtls_ssl_tls13_derive_early_secrets", ret);
+        goto cleanup;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(
+        4, "Client early traffic secret",
+        tls13_early_secrets.client_early_traffic_secret, hash_len);
+
+    /*
+     * Export client handshake traffic secret
+     */
+    if (ssl->f_export_keys != NULL) {
+        ssl->f_export_keys(
+            ssl->p_export_keys,
+            MBEDTLS_SSL_KEY_EXPORT_TLS1_3_CLIENT_EARLY_SECRET,
+            tls13_early_secrets.client_early_traffic_secret,
+            hash_len,
+            handshake->randbytes,
+            handshake->randbytes + MBEDTLS_CLIENT_HELLO_RANDOM_LEN,
+            MBEDTLS_SSL_TLS_PRF_NONE /* TODO: FIX! */);
+    }
+
+    ret = ssl_tls13_make_traffic_key(
+        hash_alg,
+        tls13_early_secrets.client_early_traffic_secret,
+        hash_len, traffic_keys->client_write_key, key_len,
+        traffic_keys->client_write_iv, iv_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "ssl_tls13_make_traffic_key", ret);
+        goto cleanup;
+    }
+    traffic_keys->key_len = key_len;
+    traffic_keys->iv_len = iv_len;
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "client early write_key",
+                          traffic_keys->client_write_key,
+                          traffic_keys->key_len);
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "client early write_iv",
+                          traffic_keys->client_write_iv,
+                          traffic_keys->iv_len);
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= ssl_tls13_generate_early_key"));
+
+cleanup:
+    /* Erase early secrets and transcript */
+    mbedtls_platform_zeroize(
+        &tls13_early_secrets, sizeof(mbedtls_ssl_tls13_early_secrets));
+    mbedtls_platform_zeroize(transcript, sizeof(transcript));
+    return ret;
+}
+
+int mbedtls_ssl_tls13_compute_early_transform(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_ssl_key_set traffic_keys;
+    mbedtls_ssl_transform *transform_earlydata = NULL;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    /* Next evolution in key schedule: Establish early_data secret and
+     * key material. */
+    ret = ssl_tls13_generate_early_key(ssl, &traffic_keys);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "ssl_tls13_generate_early_key",
+                              ret);
+        goto cleanup;
+    }
+
+    transform_earlydata = mbedtls_calloc(1, sizeof(mbedtls_ssl_transform));
+    if (transform_earlydata == NULL) {
+        ret = MBEDTLS_ERR_SSL_ALLOC_FAILED;
+        goto cleanup;
+    }
+
+    ret = mbedtls_ssl_tls13_populate_transform(
+        transform_earlydata,
+        ssl->conf->endpoint,
+        handshake->ciphersuite_info->id,
+        &traffic_keys,
+        ssl);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_populate_transform", ret);
+        goto cleanup;
+    }
+    handshake->transform_earlydata = transform_earlydata;
+
+cleanup:
+    mbedtls_platform_zeroize(&traffic_keys, sizeof(traffic_keys));
+    if (ret != 0) {
+        mbedtls_free(transform_earlydata);
+    }
+
+    return ret;
+}
+#endif /* MBEDTLS_SSL_EARLY_DATA */
+
+int mbedtls_ssl_tls13_key_schedule_stage_early(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    psa_algorithm_t hash_alg;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+    unsigned char *psk = NULL;
+    size_t psk_len = 0;
+
+    if (handshake->ciphersuite_info == NULL) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("cipher suite info not found"));
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    hash_alg = mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) handshake->ciphersuite_info->mac);
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_PSK_ENABLED)
+    if (mbedtls_ssl_tls13_key_exchange_mode_with_psk(ssl)) {
+        ret = mbedtls_ssl_tls13_export_handshake_psk(ssl, &psk, &psk_len);
+        if (ret != 0) {
+            MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_export_handshake_psk",
+                                  ret);
+            return ret;
+        }
+    }
+#endif
+
+    ret = mbedtls_ssl_tls13_evolve_secret(hash_alg, NULL, psk, psk_len,
+                                          handshake->tls13_master_secrets.early);
+#if defined(MBEDTLS_USE_PSA_CRYPTO) && \
+    defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_PSK_ENABLED)
+    mbedtls_free((void *) psk);
+#endif
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_evolve_secret", ret);
+        return ret;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "mbedtls_ssl_tls13_key_schedule_stage_early",
+                          handshake->tls13_master_secrets.early,
+                          PSA_HASH_LENGTH(hash_alg));
+    return 0;
+}
+
+/**
+ * \brief Compute TLS 1.3 handshake traffic keys.
+ *
+ *        ssl_tls13_generate_handshake_keys() generates keys necessary for
+ *        protecting the handshake messages, as described in Section 7 of
+ *        RFC 8446.
+ *
+ * \param ssl  The SSL context to operate on. This must be in
+ *             key schedule stage \c Handshake, see
+ *             ssl_tls13_key_schedule_stage_handshake().
+ * \param traffic_keys The address at which to store the handshake traffic
+ *                     keys. This must be writable but may be uninitialized.
+ *
+ * \returns    \c 0 on success.
+ * \returns    A negative error code on failure.
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_generate_handshake_keys(mbedtls_ssl_context *ssl,
+                                             mbedtls_ssl_key_set *traffic_keys)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_md_type_t md_type;
+    psa_algorithm_t hash_alg;
+    size_t hash_len;
+    unsigned char transcript[MBEDTLS_TLS1_3_MD_MAX_SIZE];
+    size_t transcript_len;
+    size_t key_len = 0;
+    size_t iv_len = 0;
+
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+    const mbedtls_ssl_ciphersuite_t *ciphersuite_info =
+        handshake->ciphersuite_info;
+    mbedtls_ssl_tls13_handshake_secrets *tls13_hs_secrets =
+        &handshake->tls13_hs_secrets;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> ssl_tls13_generate_handshake_keys"));
+
+    ret = ssl_tls13_get_cipher_key_info(ciphersuite_info, &key_len, &iv_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "ssl_tls13_get_cipher_key_info", ret);
+        return ret;
+    }
+
+    md_type = (mbedtls_md_type_t) ciphersuite_info->mac;
+
+    hash_alg = mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) ciphersuite_info->mac);
+    hash_len = PSA_HASH_LENGTH(hash_alg);
+
+    ret = mbedtls_ssl_get_handshake_transcript(ssl, md_type,
+                                               transcript,
+                                               sizeof(transcript),
+                                               &transcript_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1,
+                              "mbedtls_ssl_get_handshake_transcript",
+                              ret);
+        return ret;
+    }
+
+    ret = mbedtls_ssl_tls13_derive_handshake_secrets(
+        hash_alg, handshake->tls13_master_secrets.handshake,
+        transcript, transcript_len, tls13_hs_secrets);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_derive_handshake_secrets",
+                              ret);
+        return ret;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "Client handshake traffic secret",
+                          tls13_hs_secrets->client_handshake_traffic_secret,
+                          hash_len);
+    MBEDTLS_SSL_DEBUG_BUF(4, "Server handshake traffic secret",
+                          tls13_hs_secrets->server_handshake_traffic_secret,
+                          hash_len);
+
+    /*
+     * Export client handshake traffic secret
+     */
+    if (ssl->f_export_keys != NULL) {
+        ssl->f_export_keys(
+            ssl->p_export_keys,
+            MBEDTLS_SSL_KEY_EXPORT_TLS1_3_CLIENT_HANDSHAKE_TRAFFIC_SECRET,
+            tls13_hs_secrets->client_handshake_traffic_secret,
+            hash_len,
+            handshake->randbytes,
+            handshake->randbytes + MBEDTLS_CLIENT_HELLO_RANDOM_LEN,
+            MBEDTLS_SSL_TLS_PRF_NONE /* TODO: FIX! */);
+
+        ssl->f_export_keys(
+            ssl->p_export_keys,
+            MBEDTLS_SSL_KEY_EXPORT_TLS1_3_SERVER_HANDSHAKE_TRAFFIC_SECRET,
+            tls13_hs_secrets->server_handshake_traffic_secret,
+            hash_len,
+            handshake->randbytes,
+            handshake->randbytes + MBEDTLS_CLIENT_HELLO_RANDOM_LEN,
+            MBEDTLS_SSL_TLS_PRF_NONE /* TODO: FIX! */);
+    }
+
+    ret = mbedtls_ssl_tls13_make_traffic_keys(
+        hash_alg,
+        tls13_hs_secrets->client_handshake_traffic_secret,
+        tls13_hs_secrets->server_handshake_traffic_secret,
+        hash_len, key_len, iv_len, traffic_keys);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_make_traffic_keys", ret);
+        goto exit;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "client_handshake write_key",
+                          traffic_keys->client_write_key,
+                          traffic_keys->key_len);
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "server_handshake write_key",
+                          traffic_keys->server_write_key,
+                          traffic_keys->key_len);
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "client_handshake write_iv",
+                          traffic_keys->client_write_iv,
+                          traffic_keys->iv_len);
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "server_handshake write_iv",
+                          traffic_keys->server_write_iv,
+                          traffic_keys->iv_len);
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= ssl_tls13_generate_handshake_keys"));
+
+exit:
+
+    return ret;
+}
+
+/**
+ * \brief Transition into handshake stage of TLS 1.3 key schedule.
+ *
+ *        The TLS 1.3 key schedule can be viewed as a simple state machine
+ *        with states Initial -> Early -> Handshake -> Application, and
+ *        this function represents the Early -> Handshake transition.
+ *
+ *        In the handshake stage, ssl_tls13_generate_handshake_keys()
+ *        can be used to derive the handshake traffic keys.
+ *
+ * \param ssl  The SSL context to operate on. This must be in key schedule
+ *             stage \c Early.
+ *
+ * \returns    \c 0 on success.
+ * \returns    A negative error code on failure.
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_key_schedule_stage_handshake(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+    psa_algorithm_t const hash_alg = mbedtls_md_psa_alg_from_type(
+        (mbedtls_md_type_t) handshake->ciphersuite_info->mac);
+    unsigned char *shared_secret = NULL;
+    size_t shared_secret_len = 0;
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+    /*
+     * Compute ECDHE secret used to compute the handshake secret from which
+     * client_handshake_traffic_secret and server_handshake_traffic_secret
+     * are derived in the handshake secret derivation stage.
+     */
+    if (mbedtls_ssl_tls13_key_exchange_mode_with_ephemeral(ssl)) {
+        if (mbedtls_ssl_tls13_named_group_is_ecdhe(handshake->offered_group_id) ||
+            mbedtls_ssl_tls13_named_group_is_ffdh(handshake->offered_group_id)) {
+#if defined(PSA_WANT_ALG_ECDH) || defined(PSA_WANT_ALG_FFDH)
+            psa_algorithm_t alg =
+                mbedtls_ssl_tls13_named_group_is_ecdhe(handshake->offered_group_id) ?
+                PSA_ALG_ECDH : PSA_ALG_FFDH;
+
+            /* Compute ECDH shared secret. */
+            psa_status_t status = PSA_ERROR_GENERIC_ERROR;
+            psa_key_attributes_t key_attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+            status = psa_get_key_attributes(handshake->xxdh_psa_privkey,
+                                            &key_attributes);
+            if (status != PSA_SUCCESS) {
+                ret = PSA_TO_MBEDTLS_ERR(status);
+            }
+
+            shared_secret_len = PSA_BITS_TO_BYTES(
+                psa_get_key_bits(&key_attributes));
+            shared_secret = mbedtls_calloc(1, shared_secret_len);
+            if (shared_secret == NULL) {
+                return MBEDTLS_ERR_SSL_ALLOC_FAILED;
+            }
+
+            status = psa_raw_key_agreement(
+                alg, handshake->xxdh_psa_privkey,
+                handshake->xxdh_psa_peerkey, handshake->xxdh_psa_peerkey_len,
+                shared_secret, shared_secret_len, &shared_secret_len);
+            if (status != PSA_SUCCESS) {
+                ret = PSA_TO_MBEDTLS_ERR(status);
+                MBEDTLS_SSL_DEBUG_RET(1, "psa_raw_key_agreement", ret);
+                goto cleanup;
+            }
+
+            status = psa_destroy_key(handshake->xxdh_psa_privkey);
+            if (status != PSA_SUCCESS) {
+                ret = PSA_TO_MBEDTLS_ERR(status);
+                MBEDTLS_SSL_DEBUG_RET(1, "psa_destroy_key", ret);
+                goto cleanup;
+            }
+
+            handshake->xxdh_psa_privkey = MBEDTLS_SVC_KEY_ID_INIT;
+#endif /* PSA_WANT_ALG_ECDH || PSA_WANT_ALG_FFDH */
+        } else {
+            MBEDTLS_SSL_DEBUG_MSG(1, ("Group not supported."));
+            return MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE;
+        }
+    }
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED */
+
+    /*
+     * Compute the Handshake Secret
+     */
+    ret = mbedtls_ssl_tls13_evolve_secret(
+        hash_alg, handshake->tls13_master_secrets.early,
+        shared_secret, shared_secret_len,
+        handshake->tls13_master_secrets.handshake);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_evolve_secret", ret);
+        goto cleanup;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "Handshake secret",
+                          handshake->tls13_master_secrets.handshake,
+                          PSA_HASH_LENGTH(hash_alg));
+
+cleanup:
+    if (shared_secret != NULL) {
+        mbedtls_zeroize_and_free(shared_secret, shared_secret_len);
+    }
+
+    return ret;
+}
+
+/**
+ * \brief Compute TLS 1.3 application traffic keys.
+ *
+ *        ssl_tls13_generate_application_keys() generates application traffic
+ *        keys, since any record following a 1-RTT Finished message MUST be
+ *        encrypted under the application traffic key.
+ *
+ * \param ssl  The SSL context to operate on. This must be in
+ *             key schedule stage \c Application, see
+ *             ssl_tls13_key_schedule_stage_application().
+ * \param traffic_keys The address at which to store the application traffic
+ *                     keys. This must be writable but may be uninitialized.
+ *
+ * \returns    \c 0 on success.
+ * \returns    A negative error code on failure.
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_generate_application_keys(
+    mbedtls_ssl_context *ssl,
+    mbedtls_ssl_key_set *traffic_keys)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    /* Address at which to store the application secrets */
+    mbedtls_ssl_tls13_application_secrets * const app_secrets =
+        &ssl->session_negotiate->app_secrets;
+
+    /* Holding the transcript up to and including the ServerFinished */
+    unsigned char transcript[MBEDTLS_TLS1_3_MD_MAX_SIZE];
+    size_t transcript_len;
+
+    /* Variables relating to the hash for the chosen ciphersuite. */
+    mbedtls_md_type_t md_type;
+
+    psa_algorithm_t hash_alg;
+    size_t hash_len;
+
+    /* Variables relating to the cipher for the chosen ciphersuite. */
+    size_t key_len = 0, iv_len = 0;
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> derive application traffic keys"));
+
+    /* Extract basic information about hash and ciphersuite */
+
+    ret = ssl_tls13_get_cipher_key_info(handshake->ciphersuite_info,
+                                        &key_len, &iv_len);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "ssl_tls13_get_cipher_key_info", ret);
+        goto cleanup;
+    }
+
+    md_type = (mbedtls_md_type_t) handshake->ciphersuite_info->mac;
+
+    hash_alg = mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) handshake->ciphersuite_info->mac);
+    hash_len = PSA_HASH_LENGTH(hash_alg);
+
+    /* Compute current handshake transcript. It's the caller's responsibility
+     * to call this at the right time, that is, after the ServerFinished. */
+
+    ret = mbedtls_ssl_get_handshake_transcript(ssl, md_type,
+                                               transcript, sizeof(transcript),
+                                               &transcript_len);
+    if (ret != 0) {
+        goto cleanup;
+    }
+
+    /* Compute application secrets from master secret and transcript hash. */
+
+    ret = mbedtls_ssl_tls13_derive_application_secrets(
+        hash_alg, handshake->tls13_master_secrets.app,
+        transcript, transcript_len, app_secrets);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(
+            1, "mbedtls_ssl_tls13_derive_application_secrets", ret);
+        goto cleanup;
+    }
+
+    /* Derive first epoch of IV + Key for application traffic. */
+
+    ret = mbedtls_ssl_tls13_make_traffic_keys(
+        hash_alg,
+        app_secrets->client_application_traffic_secret_N,
+        app_secrets->server_application_traffic_secret_N,
+        hash_len, key_len, iv_len, traffic_keys);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_make_traffic_keys", ret);
+        goto cleanup;
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "Client application traffic secret",
+                          app_secrets->client_application_traffic_secret_N,
+                          hash_len);
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "Server application traffic secret",
+                          app_secrets->server_application_traffic_secret_N,
+                          hash_len);
+
+    /*
+     * Export client/server application traffic secret 0
+     */
+    if (ssl->f_export_keys != NULL) {
+        ssl->f_export_keys(
+            ssl->p_export_keys,
+            MBEDTLS_SSL_KEY_EXPORT_TLS1_3_CLIENT_APPLICATION_TRAFFIC_SECRET,
+            app_secrets->client_application_traffic_secret_N, hash_len,
+            handshake->randbytes,
+            handshake->randbytes + MBEDTLS_CLIENT_HELLO_RANDOM_LEN,
+            MBEDTLS_SSL_TLS_PRF_NONE /* TODO: this should be replaced by
+                                        a new constant for TLS 1.3! */);
+
+        ssl->f_export_keys(
+            ssl->p_export_keys,
+            MBEDTLS_SSL_KEY_EXPORT_TLS1_3_SERVER_APPLICATION_TRAFFIC_SECRET,
+            app_secrets->server_application_traffic_secret_N, hash_len,
+            handshake->randbytes,
+            handshake->randbytes + MBEDTLS_CLIENT_HELLO_RANDOM_LEN,
+            MBEDTLS_SSL_TLS_PRF_NONE /* TODO: this should be replaced by
+                                        a new constant for TLS 1.3! */);
+    }
+
+    MBEDTLS_SSL_DEBUG_BUF(4, "client application_write_key:",
+                          traffic_keys->client_write_key, key_len);
+    MBEDTLS_SSL_DEBUG_BUF(4, "server application write key",
+                          traffic_keys->server_write_key, key_len);
+    MBEDTLS_SSL_DEBUG_BUF(4, "client application write IV",
+                          traffic_keys->client_write_iv, iv_len);
+    MBEDTLS_SSL_DEBUG_BUF(4, "server application write IV",
+                          traffic_keys->server_write_iv, iv_len);
+
+    MBEDTLS_SSL_DEBUG_MSG(2, ("<= derive application traffic keys"));
+
+cleanup:
+    /* randbytes is not used again */
+    mbedtls_platform_zeroize(ssl->handshake->randbytes,
+                             sizeof(ssl->handshake->randbytes));
+
+    mbedtls_platform_zeroize(transcript, sizeof(transcript));
+    return ret;
+}
+
+int mbedtls_ssl_tls13_compute_handshake_transform(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_ssl_key_set traffic_keys;
+    mbedtls_ssl_transform *transform_handshake = NULL;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+
+    /* Compute handshake secret */
+    ret = ssl_tls13_key_schedule_stage_handshake(ssl);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_derive_master_secret", ret);
+        goto cleanup;
+    }
+
+    /* Next evolution in key schedule: Establish handshake secret and
+     * key material. */
+    ret = ssl_tls13_generate_handshake_keys(ssl, &traffic_keys);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "ssl_tls13_generate_handshake_keys",
+                              ret);
+        goto cleanup;
+    }
+
+    transform_handshake = mbedtls_calloc(1, sizeof(mbedtls_ssl_transform));
+    if (transform_handshake == NULL) {
+        ret = MBEDTLS_ERR_SSL_ALLOC_FAILED;
+        goto cleanup;
+    }
+
+    ret = mbedtls_ssl_tls13_populate_transform(
+        transform_handshake,
+        ssl->conf->endpoint,
+        handshake->ciphersuite_info->id,
+        &traffic_keys,
+        ssl);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_populate_transform", ret);
+        goto cleanup;
+    }
+    handshake->transform_handshake = transform_handshake;
+
+cleanup:
+    mbedtls_platform_zeroize(&traffic_keys, sizeof(traffic_keys));
+    if (ret != 0) {
+        mbedtls_free(transform_handshake);
+    }
+
+    return ret;
+}
+
+int mbedtls_ssl_tls13_compute_resumption_master_secret(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_md_type_t md_type;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
+    unsigned char transcript[MBEDTLS_TLS1_3_MD_MAX_SIZE];
+    size_t transcript_len;
+
+    MBEDTLS_SSL_DEBUG_MSG(
+        2, ("=> mbedtls_ssl_tls13_compute_resumption_master_secret"));
+
+    md_type = (mbedtls_md_type_t) handshake->ciphersuite_info->mac;
+
+    ret = mbedtls_ssl_get_handshake_transcript(ssl, md_type,
+                                               transcript, sizeof(transcript),
+                                               &transcript_len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = mbedtls_ssl_tls13_derive_resumption_master_secret(
+        mbedtls_md_psa_alg_from_type(md_type),
+        handshake->tls13_master_secrets.app,
+        transcript, transcript_len,
+        &ssl->session_negotiate->app_secrets);
+    if (ret != 0) {
+        return ret;
+    }
+
+    /* Erase master secrets */
+    mbedtls_platform_zeroize(&handshake->tls13_master_secrets,
+                             sizeof(handshake->tls13_master_secrets));
+
+    MBEDTLS_SSL_DEBUG_BUF(
+        4, "Resumption master secret",
+        ssl->session_negotiate->app_secrets.resumption_master_secret,
+        PSA_HASH_LENGTH(mbedtls_md_psa_alg_from_type(md_type)));
+
+    MBEDTLS_SSL_DEBUG_MSG(
+        2, ("<= mbedtls_ssl_tls13_compute_resumption_master_secret"));
+    return 0;
+}
+
+int mbedtls_ssl_tls13_compute_application_transform(mbedtls_ssl_context *ssl)
+{
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    mbedtls_ssl_key_set traffic_keys;
+    mbedtls_ssl_transform *transform_application = NULL;
+
+    ret = ssl_tls13_key_schedule_stage_application(ssl);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1,
+                              "ssl_tls13_key_schedule_stage_application", ret);
+        goto cleanup;
+    }
+
+    ret = ssl_tls13_generate_application_keys(ssl, &traffic_keys);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1,
+                              "ssl_tls13_generate_application_keys", ret);
+        goto cleanup;
+    }
+
+    transform_application =
+        mbedtls_calloc(1, sizeof(mbedtls_ssl_transform));
+    if (transform_application == NULL) {
+        ret = MBEDTLS_ERR_SSL_ALLOC_FAILED;
+        goto cleanup;
+    }
+
+    ret = mbedtls_ssl_tls13_populate_transform(
+        transform_application,
+        ssl->conf->endpoint,
+        ssl->handshake->ciphersuite_info->id,
+        &traffic_keys,
+        ssl);
+    if (ret != 0) {
+        MBEDTLS_SSL_DEBUG_RET(1, "mbedtls_ssl_tls13_populate_transform", ret);
+        goto cleanup;
+    }
+
+    ssl->transform_application = transform_application;
+
+cleanup:
+
+    mbedtls_platform_zeroize(&traffic_keys, sizeof(traffic_keys));
+    if (ret != 0) {
+        mbedtls_free(transform_application);
+    }
+    return ret;
+}
+
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_PSK_ENABLED)
+int mbedtls_ssl_tls13_export_handshake_psk(mbedtls_ssl_context *ssl,
+                                           unsigned char **psk,
+                                           size_t *psk_len)
+{
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+    psa_key_attributes_t key_attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+
+    *psk_len = 0;
+    *psk = NULL;
+
+    if (mbedtls_svc_key_id_is_null(ssl->handshake->psk_opaque)) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+
+    status = psa_get_key_attributes(ssl->handshake->psk_opaque, &key_attributes);
+    if (status != PSA_SUCCESS) {
+        return PSA_TO_MBEDTLS_ERR(status);
+    }
+
+    *psk_len = PSA_BITS_TO_BYTES(psa_get_key_bits(&key_attributes));
+    *psk = mbedtls_calloc(1, *psk_len);
+    if (*psk == NULL) {
+        return MBEDTLS_ERR_SSL_ALLOC_FAILED;
+    }
+
+    status = psa_export_key(ssl->handshake->psk_opaque,
+                            (uint8_t *) *psk, *psk_len, psk_len);
+    if (status != PSA_SUCCESS) {
+        mbedtls_free((void *) *psk);
+        *psk = NULL;
+        return PSA_TO_MBEDTLS_ERR(status);
+    }
+    return 0;
+#else
+    *psk = ssl->handshake->psk;
+    *psk_len = ssl->handshake->psk_len;
+    if (*psk == NULL) {
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+    return 0;
+#endif /* !MBEDTLS_USE_PSA_CRYPTO */
+}
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_PSK_ENABLED */
+
+#if defined(MBEDTLS_SSL_KEYING_MATERIAL_EXPORT)
+int mbedtls_ssl_tls13_exporter(const psa_algorithm_t hash_alg,
+                               const unsigned char *secret, const size_t secret_len,
+                               const unsigned char *label, const size_t label_len,
+                               const unsigned char *context_value, const size_t context_len,
+                               unsigned char *out, const size_t out_len)
+{
+    size_t hash_len = PSA_HASH_LENGTH(hash_alg);
+    unsigned char hkdf_secret[MBEDTLS_TLS1_3_MD_MAX_SIZE];
+    int ret = 0;
+
+    ret = mbedtls_ssl_tls13_derive_secret(hash_alg, secret, secret_len, label, label_len, NULL, 0,
+                                          MBEDTLS_SSL_TLS1_3_CONTEXT_UNHASHED, hkdf_secret,
+                                          hash_len);
+    if (ret != 0) {
+        goto exit;
+    }
+    ret = mbedtls_ssl_tls13_derive_secret(hash_alg,
+                                          hkdf_secret,
+                                          hash_len,
+                                          MBEDTLS_SSL_TLS1_3_LBL_WITH_LEN(exporter),
+                                          context_value,
+                                          context_len,
+                                          MBEDTLS_SSL_TLS1_3_CONTEXT_UNHASHED,
+                                          out,
+                                          out_len);
+
+exit:
+    mbedtls_platform_zeroize(hkdf_secret, sizeof(hkdf_secret));
+    return ret;
+}
+#endif /* defined(MBEDTLS_SSL_KEYING_MATERIAL_EXPORT) */
+
+#endif /* MBEDTLS_SSL_PROTO_TLS1_3 */
+
+/************** End of ssl_tls13_keys.c **************************************/
+#pragma pop_macro("local_err_translation")
+#pragma pop_macro("SSL_TLS1_3_KEY_SCHEDULE_MAX_HKDF_LABEL_LEN")
+#pragma pop_macro("SSL_TLS1_3_KEY_SCHEDULE_HKDF_LABEL_LEN")
+#pragma pop_macro("MBEDTLS_SSL_TLS1_3_LABEL")
+#pragma pop_macro("PSA_TO_MBEDTLS_ERR")
 #pragma push_macro("CHECK")
 #pragma push_macro("CHECK_RANGE")
 #pragma push_macro("PRINT_ITEM")
@@ -462432,10 +469775,12 @@ int doltliteCredsBearerTokenAt(const DoltliteCreds *cred, const char *audience,
                                long iat, char **jwtOut);
 
 char *doltliteCredsToJwk(const DoltliteCreds *cred);
+char *doltliteCredsToPublicJwk(const DoltliteCreds *cred);
 int doltliteCredsFromJwk(const char *json, DoltliteCreds **out);
 
 char *doltliteCredsDir(void);
 int doltliteCredsSave(const DoltliteCreds *cred, const char *dir);
+int doltliteCredsSavePublic(const DoltliteCreds *cred, const char *dir);
 int doltliteCredsLoad(const char *dir, const char *kid, DoltliteCreds **out);
 int doltliteCredsLoadDefault(const char *dir, DoltliteCreds **out);
 
@@ -462446,6 +469791,7 @@ int doltliteCredsRemove(const char *dir, const char *kid);
 
 int doltliteCredsLoadPubKey(const char *dir, const char *kid,
                             unsigned char pub[DOLTLITE_PUBKEY_LEN]);
+int doltliteCredsValidateAuthDir(const char *dir);
 
 int doltliteCredsVerifyBearer(const char *authValue, const char *expectedAudience,
                               const char *authKeysDir, long now, char **kidOut);
@@ -462839,6 +470185,21 @@ char *doltliteCredsToJwk(const DoltliteCreds *c) {
   return json;
 }
 
+char *doltliteCredsToPublicJwk(const DoltliteCreds *c) {
+  char *x = doltliteBase64UrlEncode(c->pub, DOLTLITE_PUBKEY_LEN);
+  char *json = NULL;
+  if (x) {
+    size_t n = strlen(x) + 48;
+    json = (char *)sqlite3_malloc(n);
+    if (json) {
+      snprintf(json, n,
+               "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"%s\"}", x);
+    }
+  }
+  sqlite3_free(x);
+  return json;
+}
+
 static const char *jsonSkipWs(const char *p){
   while( p && (*p==' ' || *p=='\t' || *p=='\r' || *p=='\n') ) p++;
   return p;
@@ -463105,7 +470466,8 @@ static char *credsFilePath(const char *dir, const char *kid) {
   return path;
 }
 
-int doltliteCredsSave(const DoltliteCreds *c, const char *dir) {
+static int credsSaveJwk(const DoltliteCreds *c, const char *dir,
+                        int publicOnly) {
   char *owned = NULL;
   char *kid = NULL;
   char *path = NULL;
@@ -463123,13 +470485,22 @@ int doltliteCredsSave(const DoltliteCreds *c, const char *dir) {
   if (!kid) goto done;
   path = credsFilePath(dir, kid);
   if (!path) goto done;
-  json = doltliteCredsToJwk(c);
+  json = publicOnly ? doltliteCredsToPublicJwk(c) : doltliteCredsToJwk(c);
   if (!json) goto done;
 
   {
     size_t len = strlen(json);
 #ifdef _WIN32
-    FILE *f = fopen(path, "wb");
+    FILE *existing = NULL;
+    FILE *f;
+    if (publicOnly) {
+      existing = fopen(path, "rb");
+      if (existing) {
+        fclose(existing);
+        goto done;
+      }
+    }
+    f = fopen(path, "wb");
     if (!f) goto done;
     if (fwrite(json, 1, len, f) != len) {
       fclose(f);
@@ -463138,7 +470509,8 @@ int doltliteCredsSave(const DoltliteCreds *c, const char *dir) {
     if (fclose(f) != 0) goto done;
 #else
     size_t off = 0;
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int flags = O_WRONLY | O_CREAT | (publicOnly ? O_EXCL : O_TRUNC);
+    int fd = open(path, flags, 0600);
     if (fd < 0) goto done;
     (void)fchmod(fd, 0600);
     while (off < len) {
@@ -463161,6 +470533,14 @@ done:
   sqlite3_free(kid);
   sqlite3_free(owned);
   return rc;
+}
+
+int doltliteCredsSave(const DoltliteCreds *c, const char *dir) {
+  return credsSaveJwk(c, dir, 0);
+}
+
+int doltliteCredsSavePublic(const DoltliteCreds *c, const char *dir) {
+  return credsSaveJwk(c, dir, 1);
 }
 
 int doltliteCredsLoad(const char *dir, const char *kid, DoltliteCreds **out) {
@@ -463386,8 +470766,12 @@ int doltliteCredsLoadPubKey(const char *dir, const char *kid,
   char *path = NULL;
   FILE *f = NULL;
   char *json = NULL;
+  char *kty = NULL;
+  char *crv = NULL;
   char *xstr = NULL;
+  char *derivedKid = NULL;
   unsigned char *raw = NULL;
+  unsigned char kidRaw[DOLTLITE_KID_RAW_LEN];
   size_t rawlen = 0;
   long sz;
   int rc = 1;
@@ -463411,10 +470795,18 @@ int doltliteCredsLoadPubKey(const char *dir, const char *kid,
   if (fread(json, 1, (size_t)sz, f) != (size_t)sz) goto done;
   json[sz] = '\0';
 
+  if (credsJsonObjectValue(json, "d")) goto done;
+  kty = jsonFindString(json, "kty");
+  crv = jsonFindString(json, "crv");
+  if (!kty || strcmp(kty, "OKP") != 0) goto done;
+  if (!crv || strcmp(crv, "Ed25519") != 0) goto done;
   xstr = jsonFindString(json, "x");
   if (!xstr) goto done;
   if (doltliteBase64UrlDecode(xstr, &raw, &rawlen)) goto done;
   if (rawlen != DOLTLITE_PUBKEY_LEN) goto done;
+  doltliteSha512_224(raw, rawlen, kidRaw);
+  derivedKid = doltliteBase32Encode(kidRaw, sizeof(kidRaw));
+  if (!derivedKid || strcmp(derivedKid, kid) != 0) goto done;
   memcpy(pub, raw, DOLTLITE_PUBKEY_LEN);
   rc = 0;
 
@@ -463423,8 +470815,89 @@ done:
   sqlite3_free(json);
   sqlite3_free(path);
   sqlite3_free(owned);
+  sqlite3_free(kty);
+  sqlite3_free(crv);
   sqlite3_free(xstr);
+  sqlite3_free(derivedKid);
   sqlite3_free(raw);
+  return rc;
+}
+
+static int credsFileContainsPrivateJwk(const char *dir, const char *name) {
+  char *path = NULL;
+  FILE *f = NULL;
+  char *json = NULL;
+  size_t pathLen;
+  long sz;
+  int found = 0;
+#ifdef _WIN32
+  DWORD attrs;
+#else
+  struct stat st;
+#endif
+
+  pathLen = strlen(dir) + strlen(name) + 2;
+  path = (char *)sqlite3_malloc(pathLen);
+  if (!path) return 0;
+  snprintf(path, pathLen, "%s/%s", dir, name);
+#ifdef _WIN32
+  attrs = GetFileAttributesA(path);
+  if (attrs == INVALID_FILE_ATTRIBUTES ||
+      (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) goto done;
+#else
+  if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) goto done;
+#endif
+  f = fopen(path, "rb");
+  if (!f) goto done;
+  if (fseek(f, 0, SEEK_END) != 0) goto done;
+  sz = ftell(f);
+  if (sz < 0 || sz > 1 << 20) goto done;
+  if (fseek(f, 0, SEEK_SET) != 0) goto done;
+  json = (char *)sqlite3_malloc((size_t)sz + 1);
+  if (!json) goto done;
+  if (fread(json, 1, (size_t)sz, f) != (size_t)sz) goto done;
+  json[sz] = '\0';
+  found = credsJsonObjectValue(json, "d") != NULL;
+
+done:
+  if (f) fclose(f);
+  sqlite3_free(json);
+  sqlite3_free(path);
+  return found;
+}
+
+int doltliteCredsValidateAuthDir(const char *dir) {
+  DirIter it;
+  const char *name;
+  int rc = 0;
+
+  if (!dir || dirOpen(&it, dir)) return 1;
+  while ((name = dirNext(&it)) != NULL) {
+    size_t n = strlen(name);
+    char *kid;
+    unsigned char pub[DOLTLITE_PUBKEY_LEN];
+    if (!(n > 4 && strcmp(name + n - 4, ".jwk") == 0)) {
+      if (credsFileContainsPrivateJwk(dir, name)) {
+        rc = 1;
+        break;
+      }
+      continue;
+    }
+    kid = (char *)sqlite3_malloc(n - 4 + 1);
+    if (!kid) {
+      rc = 1;
+      break;
+    }
+    memcpy(kid, name, n - 4);
+    kid[n - 4] = '\0';
+    if (!credsKidValid(kid) || doltliteCredsLoadPubKey(dir, kid, pub) != 0) {
+      rc = 1;
+      sqlite3_free(kid);
+      break;
+    }
+    sqlite3_free(kid);
+  }
+  dirClose(&it);
   return rc;
 }
 
@@ -467202,6 +474675,8 @@ int csSyncFile(ChunkStore *cs);
 void csFillChunkHdr(u8 *p, const ProllyHash *pHash, u32 size);
 void csSerializeManifest(const ChunkStore *cs, u8 *aBuf);
 int csManifestHashStateOffsetless(const u8 *aBuf);
+int csValidateWalRootManifest(const ChunkStore *cs, const u8 *aBuf,
+                              i64 iRootOffset);
 int csReadDiskRefsHash(ChunkStore *cs, ProllyHash *pOut);
 
 #endif /* CHUNK_STORE_INT_H */
@@ -467428,6 +474903,54 @@ int csManifestHashStateOffsetless(const u8 *aBuf){
   return csManifestHashStateImpl(aBuf, 0, 0);
 }
 
+int csValidateWalRootManifest(
+  const ChunkStore *cs,
+  const u8 *aBuf,
+  i64 iRootOffset
+){
+  u32 nChunks = CS_READ_U32(aBuf + CS_MANIFEST_CHUNK_COUNT_OFF);
+  u32 nIndexSize = CS_READ_U32(aBuf + CS_MANIFEST_INDEX_SIZE_OFF);
+  i64 iIndexOffset = CS_READ_I64(aBuf + CS_MANIFEST_INDEX_OFFSET_OFF);
+  i64 iWalOffset = CS_READ_I64(aBuf + CS_MANIFEST_WAL_OFFSET_OFF);
+  i64 durableTo = CS_READ_I64(aBuf + CS_MANIFEST_DURABLE_TO_OFF);
+  i64 batchStart = CS_READ_I64(aBuf + CS_MANIFEST_BATCH_START_OFF);
+  i64 rootEnd;
+  i64 nextOff = CS_READ_I64(aBuf + CS_MANIFEST_NEXT_OFF_OFF);
+
+  if( CS_READ_U32(aBuf + CS_MANIFEST_MAGIC_OFF)!=CHUNK_STORE_MAGIC
+   || CS_READ_U32(aBuf + CS_MANIFEST_VERSION_OFF)!=CHUNK_STORE_VERSION
+   || nChunks>(u32)INT_MAX || nIndexSize>(u32)INT_MAX
+   || nIndexSize%CHUNK_INDEX_ENTRY_SIZE!=0
+   || nIndexSize/CHUNK_INDEX_ENTRY_SIZE>nChunks
+   || iIndexOffset<0 || iWalOffset<CHUNK_MANIFEST_SIZE
+   || (nIndexSize>0 && iIndexOffset<CHUNK_MANIFEST_SIZE) ){
+    return SQLITE_CORRUPT;
+  }
+  if( iIndexOffset>0
+   && (iWalOffset<iIndexOffset
+       || iWalOffset-iIndexOffset<(i64)nIndexSize) ){
+    return SQLITE_CORRUPT;
+  }
+  if( cs
+   && (iWalOffset!=cs->wal.iWalOffset
+       || iIndexOffset!=cs->index.iIndexOffset
+       || (i64)nIndexSize!=cs->index.nIndexSize) ){
+    return SQLITE_CORRUPT;
+  }
+  if( iRootOffset<iWalOffset
+   || iRootOffset>LARGEST_INT64-(1+CHUNK_MANIFEST_SIZE) ){
+    return SQLITE_CORRUPT;
+  }
+  rootEnd = iRootOffset + 1 + CHUNK_MANIFEST_SIZE;
+  /* Both gaps are sector-alignment padding; writers cap sectors at 64KiB. */
+  if( durableTo<iWalOffset || durableTo>batchStart
+   || batchStart>iRootOffset || batchStart-durableTo>=65536
+   || nextOff<rootEnd || nextOff-rootEnd>=65536 ){
+    return SQLITE_CORRUPT;
+  }
+  return SQLITE_OK;
+}
+
 static int csReadManifest(ChunkStore *cs){
   u8 aBuf[CHUNK_MANIFEST_SIZE];
   u32 magic, version;
@@ -467508,6 +475031,10 @@ static int csScanForCommittedRoot(ChunkStore *cs, int *pEverCommitted,
         if( rc != SQLITE_OK ) return rc;
         state = csManifestHashState(m, q + i);
         if( state==CS_MANIFEST_HASH_OK ){
+          if( csValidateWalRootManifest(0, m, q+i)!=SQLITE_OK ){
+            *pEverCommitted = 1;
+            return SQLITE_OK;
+          }
           if( CS_READ_I64(m + CS_MANIFEST_DURABLE_TO_OFF) > CHUNK_MANIFEST_SIZE ){
             *pEverCommitted = 1;
             return SQLITE_OK;
@@ -467538,6 +475065,7 @@ int chunkStoreOpen(
     if( !pVfs ) return SQLITE_CANTOPEN;
   }
   cs->file.pVfs = pVfs;
+  cs->isBuffer = sqlite3IsDoltliteMemdb(pVfs);
   CS_GRAPH_LOCK(cs) = CS_FILE_LOCK_INIT;
   cs->pGraphLockName = 0;
   cs->pLockMutex = sqlite3_mutex_alloc(SQLITE_MUTEX_RECURSIVE);
@@ -467682,13 +475210,17 @@ int chunkStoreOpen(
       return rc;
     }
 
-    rc = csReadIndex(cs);
-    if( rc != SQLITE_OK ){
-      chunkStoreClose(cs);
-      return rc;
+    {
+      int loadedCheckpoint = 0;
+      i64 iSkipStart = 0;
+      i64 iSkipEnd = 0;
+      rc = csTryLoadWalCheckpoint(cs, &loadedCheckpoint,
+                                  &iSkipStart, &iSkipEnd);
+      if( rc==SQLITE_OK && !loadedCheckpoint ) rc = csReadIndex(cs);
+      if( rc==SQLITE_OK && !loadedCheckpoint ){
+        rc = csReplayWalSkipping(cs, iSkipStart, iSkipEnd);
+      }
     }
-
-    rc = csReplayWal(cs);
     if( rc != SQLITE_OK ){
       chunkStoreClose(cs);
       return rc;
@@ -467813,10 +475345,10 @@ static void csWriteCleanCloseMarker(ChunkStore *cs){
   char *lockName = 0;
   int lockHeld;
 
-  if( cs->isMemory || cs->readOnly || cs->corruptMidStream ){
+  if( cs->isMemory || cs->isBuffer || cs->readOnly || cs->corruptMidStream ){
     return;
   }
-  if( !cs->file.pFile || !cs->file.zFilename || cs->wal.cleanCloseMarker ){
+  if( !cs->file.pFile || !cs->file.zFilename ){
     return;
   }
   if( cs->wal.iWalOffset<=0 || cs->wal.nWalData<=0 ){
@@ -467828,6 +475360,7 @@ static void csWriteCleanCloseMarker(ChunkStore *cs){
   if( prollyHashCompare(&cs->refs.refsHash, &cs->refs.committedRefsHash)!=0 ){
     return;
   }
+  if( cs->wal.cleanCloseMarker && !csWalCheckpointDue(cs) ) return;
 
   lockHeld = cs->lockDepth>0;
   if( !lockHeld ){
@@ -467849,6 +475382,16 @@ static void csWriteCleanCloseMarker(ChunkStore *cs){
     if( sectorSize > 65536 ) sectorSize = 65536;
   }
 
+  if( csWalCheckpointDue(cs) ){
+    int wroteCheckpoint = 0;
+    rc = csWriteWalCheckpoint(cs, sectorSize, &wroteCheckpoint);
+    if( rc!=SQLITE_OK ){
+      sqlite3_log(SQLITE_NOTICE,
+        "doltlite: unable to checkpoint chunk WAL on close: %d", rc);
+    }
+    if( wroteCheckpoint ) goto done;
+  }
+
   markerStart = cs->file.iFileSize;
   if( markerStart <= 0 ) goto done;
   markerEnd = markerStart + (i64)sizeof(rootRec);
@@ -467860,6 +475403,7 @@ static void csWriteCleanCloseMarker(ChunkStore *cs){
 
   rootRec[0] = CS_WAL_TAG_ROOT;
   csSerializeManifest(cs, rootRec + 1);
+  csStampWalCheckpoint(cs, rootRec + 1);
   CS_WRITE_I64(rootRec + 1 + CS_MANIFEST_DURABLE_TO_OFF, markerStart);
   CS_WRITE_I64(rootRec + 1 + CS_MANIFEST_NEXT_OFF_OFF, markerNext);
   CS_WRITE_I64(rootRec + 1 + CS_MANIFEST_BATCH_START_OFF, markerStart);
@@ -467895,6 +475439,10 @@ int chunkStoreClose(ChunkStore *cs){
   if( cs->file.pFile ){
     csCloseFile(cs->file.pFile);
     cs->file.pFile = 0;
+  }
+  if( cs->pOwnedVfs ){
+    sqlite3MemdbDestroyPrivateVfs(cs->pOwnedVfs);
+    cs->pOwnedVfs = 0;
   }
   sqlite3_free(cs->file.zFilename);
   csReleaseIndexBuf(cs->index.aIndex, cs->index.aIndexMmapBase, cs->index.aIndexMmapSize);
@@ -467937,10 +475485,12 @@ int chunkStoreHasMany(ChunkStore *cs, const ProllyHash *aHash, int nHash, u8 *aR
 int chunkStoreHas(ChunkStore *cs, const ProllyHash *hash, int *pHas){
   int idx = -1;
   int rc;
+  ChunkIndexEntry entry;
   *pHas = 0;
   if( cs->notADatabase ) return SQLITE_NOTADB;
-  if( csSearchIndex(cs->index.aIndex, cs->index.nIndex, hash) >= 0 ){
-    *pHas = 1;
+  rc = csIndexLookup(cs, hash, &entry, pHas);
+  if( rc!=SQLITE_OK ) return rc;
+  if( *pHas ){
     return SQLITE_OK;
   }
   rc = csSearchRecent(cs, hash, &idx);
@@ -467999,16 +475549,19 @@ int chunkStoreGet(
 
   {
     ChunkIndexEntry *e;
+    ChunkIndexEntry indexEntry;
+    int found = 0;
     rc = csSearchRecent(cs, hash, &idx);
     if( rc!=SQLITE_OK ) return rc;
     if( idx >= 0 ){
       e = &cs->staging.aRecent[idx];
     }else{
-      idx = csSearchIndex(cs->index.aIndex, cs->index.nIndex, hash);
-      if( idx < 0 ){
+      rc = csIndexLookup(cs, hash, &indexEntry, &found);
+      if( rc!=SQLITE_OK ) return rc;
+      if( !found ){
         return SQLITE_NOTFOUND;
       }
-      e = &cs->index.aIndex[idx];
+      e = &indexEntry;
     }
 
     if( cs->file.pFile == 0 ){
@@ -468185,7 +475738,7 @@ static int csDrainPendingToWal(ChunkStore *cs){
   if( cs->staging.nPending==0 ){
     return SQLITE_OK;
   }
-  if( cs->lockDepth<=0 ){
+  if( cs->lockDepth<=0 && !cs->isBuffer ){
     return SQLITE_OK;
   }
 
@@ -468410,6 +475963,60 @@ int chunkStorePutSparse(
   }
 
   return SQLITE_OK;
+}
+
+static int csCopyEntries(
+  ChunkStore *pSrc,
+  ChunkStore *pDest,
+  const ChunkIndexEntry *aEntry,
+  int nEntry
+){
+  int i;
+  for(i=0; i<nEntry; i++){
+    u8 *pData = 0;
+    int nData = 0;
+    int nPhys = 0;
+    int rc = chunkStoreGetSparse(pSrc, &aEntry[i].hash,
+                                 &pData, &nData, &nPhys);
+    if( rc==SQLITE_OK ){
+      rc = chunkStorePutSparse(pDest, pData, nPhys,
+                               (i64)nData - nPhys, 0);
+    }
+    sqlite3_free(pData);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  return SQLITE_OK;
+}
+
+int chunkStoreCopyIntoEmpty(ChunkStore *pSrc, ChunkStore *pDest){
+  const ChunkIndexEntry *aEntry = 0;
+  u8 *pRefs = 0;
+  int nEntry = 0;
+  int nRefs = 0;
+  int rc;
+
+  assert( chunkStoreIsEmpty(pDest) );
+  rc = csMaterializeIndex(pSrc);
+  if( rc!=SQLITE_OK ) return rc;
+  chunkIndexGetEntries(&pSrc->index, &nEntry, &aEntry);
+  rc = csCopyEntries(pSrc, pDest, aEntry, nEntry);
+  if( rc!=SQLITE_OK ) return rc;
+
+  chunkStagingGetRecent(&pSrc->staging, &nEntry, &aEntry);
+  rc = csCopyEntries(pSrc, pDest, aEntry, nEntry);
+  if( rc!=SQLITE_OK ) return rc;
+
+  chunkStagingGetPending(&pSrc->staging, &nEntry, &aEntry);
+  rc = csCopyEntries(pSrc, pDest, aEntry, nEntry);
+  if( rc!=SQLITE_OK ) return rc;
+
+  rc = chunkStoreSerializeRefsToBlob(pSrc, &pRefs, &nRefs);
+  if( rc==SQLITE_OK ){
+    rc = chunkStoreInstallRefsBlob(pDest, pRefs, nRefs);
+  }
+  sqlite3_free(pRefs);
+  if( rc!=SQLITE_OK ) return rc;
+  return chunkStoreCommit(pDest);
 }
 
 int chunkStoreIsEmpty(ChunkStore *cs){
@@ -468729,7 +476336,7 @@ int chunkStoreLockAndRefreshChanged(ChunkStore *cs, int *pChanged){
   int changed = 0;
   int rc;
   if( pChanged ) *pChanged = 0;
-  if( cs->isMemory ) return SQLITE_OK;
+  if( cs->isMemory || cs->isBuffer ) return SQLITE_OK;
   if( cs->pLockMutex && sqlite3_mutex_try(cs->pLockMutex)!=SQLITE_OK ){
     return SQLITE_BUSY;
   }
@@ -468817,7 +476424,7 @@ static int csMovedFileIsOurs(ChunkStore *cs, int *pIsOurs){
   int rc;
 
   *pIsOurs = 0;
-  if( cs->isMemory || cs->file.pFile==0 ) return SQLITE_OK;
+  if( cs->isMemory || cs->isBuffer || cs->file.pFile==0 ) return SQLITE_OK;
   if( cs->file.zFilename==0 || cs->file.zFilename[0]==0 ) return SQLITE_OK;
   if( cs->file.iFileSize<=0 ){
     *pIsOurs = 1;
@@ -468846,7 +476453,7 @@ static int csDetectExternalChanges(ChunkStore *cs, int *pChanged){
   int rc;
 
   *pChanged = 0;
-  if( cs->isMemory ) return SQLITE_OK;
+  if( cs->isMemory || cs->isBuffer ) return SQLITE_OK;
 
   if( cs->file.pFile==0 ){
     int exists = 0;
@@ -468912,7 +476519,7 @@ int chunkStoreHasExternalChanges(ChunkStore *cs, int *pChanged){
 int chunkStoreRefreshIfChanged(ChunkStore *cs, int *pChanged){
   int rc;
   int bChanged = 0;
-  if( cs->isMemory ){
+  if( cs->isMemory || cs->isBuffer ){
     *pChanged = 0;
     return SQLITE_OK;
   }
@@ -468942,7 +476549,7 @@ int chunkStoreRefreshIfChanged(ChunkStore *cs, int *pChanged){
 int chunkStoreForceRefresh(ChunkStore *cs){
   int rc;
   int wasPinned;
-  if( cs->isMemory ) return SQLITE_OK;
+  if( cs->isMemory || cs->isBuffer ) return SQLITE_OK;
   /* The refresh the moved-file check declined, refused for the reason it
   ** declined it: reloading by path here would adopt the foreign store while the
   ** caller's catalog stays ours, and every caller is on a write path. A peer's
@@ -469119,6 +476726,8 @@ int csDiskStateMatchesMemory(ChunkStore *cs){
   }
   return aRoot[0]==CS_WAL_TAG_ROOT
       && hashState==CS_MANIFEST_HASH_OK
+      && csValidateWalRootManifest(
+           cs, aRoot+1, contentEnd-(i64)sizeof(aRoot))==SQLITE_OK
       && memcmp(aRoot + 1 + CS_MANIFEST_REFS_HASH_OFF,
                 cs->refs.refsHash.data, PROLLY_HASH_SIZE)==0;
 }
@@ -469132,6 +476741,7 @@ int csDiskStateMatchesMemory(ChunkStore *cs){
 int csReadDiskRefsHash(ChunkStore *cs, ProllyHash *pOut){
   i64 physSize = 0;
   u8 aRoot[1 + CHUNK_MANIFEST_SIZE];
+  int hashState;
 
   memset(pOut, 0, sizeof(*pOut));
   if( cs->file.pFile==0 ) return 0;
@@ -469148,6 +476758,15 @@ int csReadDiskRefsHash(ChunkStore *cs, ProllyHash *pOut){
   ** write) is not a published state; report "cannot prove" and let the
   ** caller fall back to its in-memory comparison. */
   if( aRoot[0]!=CS_WAL_TAG_ROOT ) return 0;
+  hashState = csManifestHashState(aRoot+1, physSize-(i64)sizeof(aRoot));
+  if( hashState==CS_MANIFEST_HASH_BAD ){
+    hashState = csManifestHashStateOffsetless(aRoot+1);
+  }
+  if( hashState!=CS_MANIFEST_HASH_OK
+   || csValidateWalRootManifest(
+        cs, aRoot+1, physSize-(i64)sizeof(aRoot))!=SQLITE_OK ){
+    return 0;
+  }
   memcpy(pOut->data, aRoot + 1 + CS_MANIFEST_REFS_HASH_OFF, PROLLY_HASH_SIZE);
   return 1;
 }
@@ -469166,7 +476785,7 @@ int chunkStoreReadDiskBranchTip(ChunkStore *cs, const char *zName,
   int rc;
 
   *pFound = 0;
-  if( cs->isMemory || !cs->file.zFilename ){
+  if( cs->isMemory || cs->isBuffer || !cs->file.zFilename ){
     if( chunkStoreFindBranch(cs, zName, pTip)==SQLITE_OK ) *pFound = 1;
     return SQLITE_OK;
   }
@@ -469884,6 +477503,11 @@ static int csCommitPlanPendingIndex(
     return csGrowRecent(cs, cs->staging.nPending);
   }
 
+  {
+    int rc = csMaterializeIndex(cs);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+
   if( cs->staging.nRecent > 0 ){
     *paMergePending = (ChunkIndexEntry*)sqlite3_malloc(
       (cs->staging.nRecent + cs->staging.nPending) * (int)sizeof(ChunkIndexEntry)
@@ -469967,7 +477591,7 @@ static int csCommitToFile(ChunkStore *cs){
   CsFileLock lockFd = CS_FILE_LOCK_INIT;
   char *lockName = 0;
   int hadFile = (cs->file.pFile != 0);
-  int lockHeld = cs->lockDepth>0;
+  int lockHeld = cs->lockDepth>0 || cs->isBuffer;
   ChunkIndexEntry *aCommittedPending = 0;
   ChunkIndexEntry aSmallCommittedPending[32];
   ChunkIndexEntry *aMergePending = 0;
@@ -470107,6 +477731,7 @@ static int csCommitToFile(ChunkStore *cs){
     }
     rootRec[0] = CS_WAL_TAG_ROOT;
     csSerializeManifest(cs, rootRec + 1);
+    csStampWalCheckpoint(cs, rootRec + 1);
     CS_WRITE_I64(rootRec + 1 + CS_MANIFEST_DURABLE_TO_OFF, durableTo);
     CS_WRITE_I64(rootRec + 1 + CS_MANIFEST_NEXT_OFF_OFF, nextOff);
     CS_WRITE_I64(rootRec + 1 + CS_MANIFEST_BATCH_START_OFF, batchStart);
@@ -470133,28 +477758,39 @@ static int csCommitToFile(ChunkStore *cs){
   cs->wal.nWalData = contentEnd - cs->wal.iWalOffset;
   cs->wal.cleanCloseMarker = 0;
 
-commit_done:
-  csFileUnlock(lockFd, &lockName);
-
-  if( rc != SQLITE_OK ){
-    if( cs->file.pFile && writeOff > origFileSize ){
-      (void)csRollbackFailedAppend(cs, origFileSize);
-    }
-    (void)csRestoreCommittedRefsState(cs);
-    if( aCommittedPending!=aSmallCommittedPending ){
-      sqlite3_free(aCommittedPending);
-    }
-    sqlite3_free(aMergePending);
-    sqlite3_free(aMerged);
-    return rc;
-  }
-
   csCommitPublishStaging(cs, useRecent, aCommittedPending, aMerged, nMerged);
   if( aCommittedPending!=aSmallCommittedPending ){
     sqlite3_free(aCommittedPending);
   }
   sqlite3_free(aMergePending);
+  if( csWalCheckpointDue(cs) ){
+    int wroteCheckpoint = 0;
+    int checkpointRc;
+    sqlite3BeginBenignMalloc();
+    checkpointRc = csWriteWalCheckpoint(cs, sectorSize, &wroteCheckpoint);
+    sqlite3EndBenignMalloc();
+    if( checkpointRc!=SQLITE_OK ){
+      sqlite3_log(SQLITE_NOTICE,
+        "doltlite: unable to checkpoint chunk WAL after commit: %d",
+        checkpointRc);
+    }
+  }
+  csFileUnlock(lockFd, &lockName);
   return SQLITE_OK;
+
+commit_done:
+  csFileUnlock(lockFd, &lockName);
+
+  if( cs->file.pFile && writeOff > origFileSize ){
+    (void)csRollbackFailedAppend(cs, origFileSize);
+  }
+  (void)csRestoreCommittedRefsState(cs);
+  if( aCommittedPending!=aSmallCommittedPending ){
+    sqlite3_free(aCommittedPending);
+  }
+  sqlite3_free(aMergePending);
+  sqlite3_free(aMerged);
+  return rc;
 }
 
 int chunkStoreCommit(ChunkStore *cs){
@@ -470169,7 +477805,7 @@ int chunkStoreCommit(ChunkStore *cs){
   if( cs->corruptMidStream ) return SQLITE_CORRUPT;
   if( cs->readOnly || cs->movedReadOnly ) return SQLITE_READONLY;
   if( cs->isMemory ) return csCommitToMemory(cs);
-  if( cs->lockDepth<=0 && cs->file.zFilename ){
+  if( !cs->isBuffer && cs->lockDepth<=0 && cs->file.zFilename ){
     ProllyHash baseRefsHash;
     preserveRefs = cs->staging.nPending > 0
                 && prollyHashCompare(&cs->refs.refsHash,
@@ -470197,7 +477833,8 @@ int chunkStoreCommit(ChunkStore *cs){
     }
     acquiredLock = 1;
   }
-  if( cs->movedReadOnly || (!acquiredLock && csFileHasMovedNoFault(cs)) ){
+  if( cs->movedReadOnly
+   || (!cs->isBuffer && !acquiredLock && csFileHasMovedNoFault(cs)) ){
     if( acquiredLock ) chunkStoreUnlock(cs);
     return SQLITE_READONLY;
   }
@@ -470262,12 +477899,415 @@ void walStateSetOffset(WalState *w, i64 iOffset){
   assert( w!=0 );
   assert( iOffset>=0 );
   w->iWalOffset = iOffset;
+  w->iCheckpointOffset = 0;
+  w->nCheckpointIndex = 0;
+  w->iCheckpointReplay = 0;
+  w->iCheckpointDataEnd = 0;
+  w->nCheckpointEntries = 0;
+  memset(&w->checkpointHash, 0, sizeof(w->checkpointHash));
+  w->checkpointMagic = 0;
 }
 
 void walStateSetDataSize(WalState *w, i64 nData){
   assert( w!=0 );
   assert( nData>=0 );
   w->nWalData = nData;
+}
+
+static int csReadCheckpointStamp(
+  const u8 *aManifest,
+  i64 iRootOffset,
+  WalState *pWal
+){
+  i64 iOffset;
+  i64 nIndex;
+  i64 iReplay;
+  i64 iCheckpointRoot;
+  i64 iDataEnd = 0;
+  int nEntries = 0;
+  u32 magic;
+
+  magic = CS_READ_U32(aManifest + CS_MANIFEST_CHECKPOINT_MAGIC_OFF);
+  if( magic!=CS_WAL_CHECKPOINT_MAGIC_V1
+   && magic!=CS_WAL_CHECKPOINT_MAGIC_V2 ){
+    return 0;
+  }
+  iOffset = CS_READ_I64(aManifest + CS_MANIFEST_CHECKPOINT_OFFSET_OFF);
+  nIndex = (i64)CS_READ_U32(
+      aManifest + CS_MANIFEST_CHECKPOINT_SIZE_OFF);
+  iReplay = CS_READ_I64(
+      aManifest + CS_MANIFEST_CHECKPOINT_REPLAY_OFF);
+  if( iOffset<pWal->iWalOffset || nIndex<=0 || nIndex>INT_MAX
+   || iOffset>LARGEST_INT64-CS_WAL_CHUNK_HDR_SIZE-nIndex ){
+    return 0;
+  }
+  if( magic==CS_WAL_CHECKPOINT_MAGIC_V1 ){
+    if( nIndex%CHUNK_INDEX_ENTRY_SIZE!=0 ) return 0;
+    nEntries = (int)(nIndex/CHUNK_INDEX_ENTRY_SIZE);
+    iDataEnd = iOffset;
+  }else{
+    iDataEnd = CS_READ_I64(
+        aManifest + CS_MANIFEST_CHECKPOINT_DATA_END_OFF);
+    nEntries = (int)CS_READ_U32(
+        aManifest + CS_MANIFEST_CHECKPOINT_COUNT_OFF);
+    if( nIndex<CS_INDEX_PAGE_HEADER_SIZE || nIndex>CS_INDEX_PAGE_SIZE
+     || iDataEnd<pWal->iWalOffset || iDataEnd>iOffset || nEntries<=0 ){
+      return 0;
+    }
+  }
+  iCheckpointRoot = iOffset + CS_WAL_CHUNK_HDR_SIZE + nIndex;
+  if( iCheckpointRoot>iRootOffset
+   || iCheckpointRoot>LARGEST_INT64-(1+CHUNK_MANIFEST_SIZE)
+   || iReplay<iCheckpointRoot+1+CHUNK_MANIFEST_SIZE
+   || iReplay-(iCheckpointRoot+1+CHUNK_MANIFEST_SIZE)>=65536 ){
+    return 0;
+  }
+  pWal->iCheckpointOffset = iOffset;
+  pWal->nCheckpointIndex = nIndex;
+  pWal->iCheckpointReplay = iReplay;
+  pWal->iCheckpointDataEnd = iDataEnd;
+  pWal->nCheckpointEntries = nEntries;
+  pWal->checkpointMagic = magic;
+  if( magic==CS_WAL_CHECKPOINT_MAGIC_V2 ){
+    memcpy(pWal->checkpointHash.data,
+           aManifest + CS_MANIFEST_CHECKPOINT_HASH_OFF,
+           PROLLY_HASH_SIZE);
+  }else{
+    memset(&pWal->checkpointHash, 0, sizeof(pWal->checkpointHash));
+  }
+  return 1;
+}
+
+void csStampWalCheckpoint(const ChunkStore *cs, u8 *aManifest){
+  if( cs->wal.iCheckpointOffset<=0 || cs->wal.nCheckpointIndex<=0
+   || cs->wal.iCheckpointReplay<=0
+   || (cs->wal.checkpointMagic!=CS_WAL_CHECKPOINT_MAGIC_V1
+       && cs->wal.checkpointMagic!=CS_WAL_CHECKPOINT_MAGIC_V2) ){
+    return;
+  }
+  assert( cs->wal.nCheckpointIndex<=0xffffffffu );
+  CS_WRITE_U32(aManifest + CS_MANIFEST_CHECKPOINT_MAGIC_OFF,
+               cs->wal.checkpointMagic);
+  CS_WRITE_I64(aManifest + CS_MANIFEST_CHECKPOINT_OFFSET_OFF,
+               cs->wal.iCheckpointOffset);
+  CS_WRITE_U32(aManifest + CS_MANIFEST_CHECKPOINT_SIZE_OFF,
+               (u32)cs->wal.nCheckpointIndex);
+  CS_WRITE_I64(aManifest + CS_MANIFEST_CHECKPOINT_REPLAY_OFF,
+               cs->wal.iCheckpointReplay);
+  if( cs->wal.checkpointMagic==CS_WAL_CHECKPOINT_MAGIC_V2 ){
+    CS_WRITE_I64(aManifest + CS_MANIFEST_CHECKPOINT_DATA_END_OFF,
+                 cs->wal.iCheckpointDataEnd);
+    memcpy(aManifest + CS_MANIFEST_CHECKPOINT_HASH_OFF,
+           cs->wal.checkpointHash.data, PROLLY_HASH_SIZE);
+    CS_WRITE_U32(aManifest + CS_MANIFEST_CHECKPOINT_COUNT_OFF,
+                 (u32)cs->wal.nCheckpointEntries);
+  }
+}
+
+static i64 csWalCheckpointThreshold(void){
+  i64 n = 64*1024*1024;
+  const char *z = getenv("DOLTLITE_WAL_CHECKPOINT_THRESHOLD");
+  if( z && z[0] ){
+    i64 v = (i64)strtoll(z, 0, 10);
+    if( v>0 ) n = v;
+  }
+  return n;
+}
+
+int csWalCheckpointDue(const ChunkStore *cs){
+  i64 iBase = cs->wal.iCheckpointReplay>0
+            ? cs->wal.iCheckpointReplay : cs->wal.iWalOffset;
+  /* Ref-less raw stores retain eager verification of every WAL chunk. */
+  return !prollyHashIsEmpty(&cs->refs.refsHash)
+      && iBase>0 && cs->file.iFileSize>=iBase
+      && cs->file.iFileSize-iBase>=csWalCheckpointThreshold();
+}
+
+static void csSerializeCheckpointEntry(u8 *aBuf, const ChunkIndexEntry *pEntry){
+  memcpy(aBuf, pEntry->hash.data, PROLLY_HASH_SIZE);
+  CS_WRITE_I64(aBuf + PROLLY_HASH_SIZE, pEntry->offset);
+  CS_WRITE_U32(aBuf + PROLLY_HASH_SIZE + 8, (u32)pEntry->size);
+}
+
+static int csDeserializeCheckpointEntry(
+  const u8 *aBuf,
+  ChunkIndexEntry *pEntry
+){
+  u32 n = CS_READ_U32(aBuf + PROLLY_HASH_SIZE + 8);
+  if( n>0x7fffffffu ) return SQLITE_CORRUPT;
+  memcpy(pEntry->hash.data, aBuf, PROLLY_HASH_SIZE);
+  pEntry->offset = CS_READ_I64(aBuf + PROLLY_HASH_SIZE);
+  pEntry->size = (int)n;
+  return SQLITE_OK;
+}
+
+static int csBuildCheckpointIndex(
+  ChunkStore *cs,
+  ChunkIndexEntry **ppIndex,
+  int *pnIndex
+){
+  i64 nAlloc;
+  ChunkIndexEntry *aIndex;
+  int i;
+  int nOut = 0;
+  int rc;
+
+  *ppIndex = 0;
+  *pnIndex = 0;
+  rc = csMaterializeIndex(cs);
+  if( rc!=SQLITE_OK ) return rc;
+  nAlloc = (i64)cs->index.nIndex + cs->staging.nRecent;
+  if( nAlloc<=0 || nAlloc>INT_MAX/(int)sizeof(ChunkIndexEntry) ){
+    return nAlloc<=0 ? SQLITE_OK : SQLITE_TOOBIG;
+  }
+  aIndex = sqlite3_malloc64(
+      (sqlite3_uint64)nAlloc * sizeof(ChunkIndexEntry));
+  if( !aIndex ) return SQLITE_NOMEM;
+  if( cs->index.nIndex>0 ){
+    memcpy(aIndex, cs->index.aIndex,
+           cs->index.nIndex * sizeof(ChunkIndexEntry));
+  }
+  if( cs->staging.nRecent>0 ){
+    memcpy(aIndex + cs->index.nIndex, cs->staging.aRecent,
+           cs->staging.nRecent * sizeof(ChunkIndexEntry));
+  }
+  qsort(aIndex, (size_t)nAlloc, sizeof(ChunkIndexEntry), csIndexEntryCmp);
+  for(i=0; i<(int)nAlloc; i++){
+    if( nOut==0
+     || prollyHashCompare(&aIndex[nOut-1].hash, &aIndex[i].hash)!=0 ){
+      aIndex[nOut++] = aIndex[i];
+    }
+  }
+  *ppIndex = aIndex;
+  *pnIndex = nOut;
+  return SQLITE_OK;
+}
+
+typedef struct CsCheckpointPageRef CsCheckpointPageRef;
+struct CsCheckpointPageRef {
+  ProllyHash maxHash;
+  ProllyHash bodyHash;
+  i64 offset;
+  int size;
+};
+
+static int csWriteCheckpointPage(
+  ChunkStore *cs,
+  const u8 *aBody,
+  int nBody,
+  const ProllyHash *pMaxHash,
+  i64 *pOffset,
+  CsCheckpointPageRef *pRef
+){
+  u8 aHeader[CS_WAL_CHUNK_HDR_SIZE];
+  int rc;
+  if( nBody<CS_INDEX_PAGE_HEADER_SIZE || nBody>CS_INDEX_PAGE_SIZE
+   || *pOffset>LARGEST_INT64-CS_WAL_CHUNK_HDR_SIZE-nBody ){
+    return SQLITE_TOOBIG;
+  }
+  prollyHashCompute(aBody, nBody, &pRef->bodyHash);
+  csFillChunkHdr(aHeader, &pRef->bodyHash, (u32)nBody);
+  rc = sqlite3OsWrite(cs->file.pFile, aHeader, sizeof(aHeader), *pOffset);
+  if( rc==SQLITE_OK ){
+    rc = sqlite3OsWrite(cs->file.pFile, aBody, nBody,
+                        *pOffset+CS_WAL_CHUNK_HDR_SIZE);
+  }
+  if( rc!=SQLITE_OK ) return rc;
+  pRef->maxHash = *pMaxHash;
+  pRef->offset = *pOffset;
+  pRef->size = nBody;
+  *pOffset += CS_WAL_CHUNK_HDR_SIZE+nBody;
+  return SQLITE_OK;
+}
+
+static int csWriteCheckpointLeaves(
+  ChunkStore *cs,
+  const ChunkIndexEntry *aIndex,
+  int nIndex,
+  i64 *pOffset,
+  CsCheckpointPageRef **ppRef,
+  int *pnRef
+){
+  const int nPerPage =
+      (CS_INDEX_PAGE_SIZE-CS_INDEX_PAGE_HEADER_SIZE)/CHUNK_INDEX_ENTRY_SIZE;
+  int nRef = (nIndex+nPerPage-1)/nPerPage;
+  CsCheckpointPageRef *aRef;
+  u8 aBody[CS_INDEX_PAGE_SIZE];
+  int i;
+  int rc = SQLITE_OK;
+
+  if( nRef<=0 || nRef>INT_MAX/(int)sizeof(CsCheckpointPageRef) ){
+    return SQLITE_TOOBIG;
+  }
+  aRef = sqlite3_malloc64(
+      (sqlite3_uint64)nRef*sizeof(CsCheckpointPageRef));
+  if( !aRef ) return SQLITE_NOMEM;
+  for(i=0; i<nRef; i++){
+    int iFirst = i*nPerPage;
+    int nCell = nIndex-iFirst;
+    int j;
+    int nBody;
+    if( nCell>nPerPage ) nCell = nPerPage;
+    CS_WRITE_U32(aBody, CS_INDEX_PAGE_LEAF_MAGIC);
+    CS_WRITE_U32(aBody+4, (u32)nCell);
+    for(j=0; j<nCell; j++){
+      csSerializeCheckpointEntry(
+          aBody+CS_INDEX_PAGE_HEADER_SIZE+j*CHUNK_INDEX_ENTRY_SIZE,
+          &aIndex[iFirst+j]);
+    }
+    nBody = CS_INDEX_PAGE_HEADER_SIZE+nCell*CHUNK_INDEX_ENTRY_SIZE;
+    rc = csWriteCheckpointPage(cs, aBody, nBody,
+                               &aIndex[iFirst+nCell-1].hash,
+                               pOffset, &aRef[i]);
+    if( rc!=SQLITE_OK ) break;
+  }
+  if( rc!=SQLITE_OK ){
+    sqlite3_free(aRef);
+    return rc;
+  }
+  *ppRef = aRef;
+  *pnRef = nRef;
+  return SQLITE_OK;
+}
+
+static int csWriteCheckpointParents(
+  ChunkStore *cs,
+  CsCheckpointPageRef *aChild,
+  int nChild,
+  i64 *pOffset,
+  CsCheckpointPageRef **ppParent,
+  int *pnParent
+){
+  const int nPerPage =
+      (CS_INDEX_PAGE_SIZE-CS_INDEX_PAGE_HEADER_SIZE)/CS_INDEX_CHILD_SIZE;
+  int nParent = (nChild+nPerPage-1)/nPerPage;
+  CsCheckpointPageRef *aParent;
+  u8 aBody[CS_INDEX_PAGE_SIZE];
+  int i;
+  int rc = SQLITE_OK;
+
+  aParent = sqlite3_malloc64(
+      (sqlite3_uint64)nParent*sizeof(CsCheckpointPageRef));
+  if( !aParent ) return SQLITE_NOMEM;
+  for(i=0; i<nParent; i++){
+    int iFirst = i*nPerPage;
+    int nCell = nChild-iFirst;
+    int j;
+    int nBody;
+    if( nCell>nPerPage ) nCell = nPerPage;
+    CS_WRITE_U32(aBody, CS_INDEX_PAGE_INTERNAL_MAGIC);
+    CS_WRITE_U32(aBody+4, (u32)nCell);
+    for(j=0; j<nCell; j++){
+      const CsCheckpointPageRef *pChild = &aChild[iFirst+j];
+      u8 *p = aBody+CS_INDEX_PAGE_HEADER_SIZE+j*CS_INDEX_CHILD_SIZE;
+      memcpy(p, pChild->maxHash.data, PROLLY_HASH_SIZE);
+      p += PROLLY_HASH_SIZE;
+      CS_WRITE_I64(p, pChild->offset);
+      p += 8;
+      CS_WRITE_U32(p, (u32)pChild->size);
+      p += 4;
+      memcpy(p, pChild->bodyHash.data, PROLLY_HASH_SIZE);
+    }
+    nBody = CS_INDEX_PAGE_HEADER_SIZE+nCell*CS_INDEX_CHILD_SIZE;
+    rc = csWriteCheckpointPage(cs, aBody, nBody,
+                               &aChild[iFirst+nCell-1].maxHash,
+                               pOffset, &aParent[i]);
+    if( rc!=SQLITE_OK ) break;
+  }
+  if( rc!=SQLITE_OK ){
+    sqlite3_free(aParent);
+    return rc;
+  }
+  *ppParent = aParent;
+  *pnParent = nParent;
+  return SQLITE_OK;
+}
+
+int csWriteWalCheckpoint(ChunkStore *cs, int sectorSize, int *pWritten){
+  ChunkIndexEntry *aIndex = 0;
+  CsCheckpointPageRef *aRef = 0;
+  int nIndex = 0;
+  i64 iCheckpoint;
+  i64 iDataEnd;
+  i64 iWrite;
+  i64 iRoot;
+  i64 iRootEnd;
+  i64 iNext;
+  u8 aRoot[1 + CHUNK_MANIFEST_SIZE];
+  int nRef = 0;
+  int rc;
+
+  *pWritten = 0;
+  rc = csBuildCheckpointIndex(cs, &aIndex, &nIndex);
+  if( rc!=SQLITE_OK || nIndex==0 ) goto checkpoint_done;
+  iDataEnd = cs->file.iFileSize;
+  iWrite = iDataEnd;
+  rc = csWriteCheckpointLeaves(cs, aIndex, nIndex, &iWrite, &aRef, &nRef);
+  if( rc!=SQLITE_OK ) goto checkpoint_rollback;
+  while( nRef>1 ){
+    CsCheckpointPageRef *aParent = 0;
+    int nParent = 0;
+    rc = csWriteCheckpointParents(cs, aRef, nRef, &iWrite,
+                                  &aParent, &nParent);
+    sqlite3_free(aRef);
+    aRef = aParent;
+    nRef = nParent;
+    if( rc!=SQLITE_OK ) goto checkpoint_rollback;
+  }
+  rc = csSyncFile(cs);
+  if( rc!=SQLITE_OK ) goto checkpoint_rollback;
+
+  iCheckpoint = aRef[0].offset;
+  iRoot = iWrite;
+  iRootEnd = iRoot + (i64)sizeof(aRoot);
+  iNext = iRootEnd;
+  if( sectorSize>1 ){
+    iNext += sectorSize - 1;
+    iNext -= iNext % sectorSize;
+  }
+  aRoot[0] = CS_WAL_TAG_ROOT;
+  csSerializeManifest(cs, aRoot + 1);
+  CS_WRITE_I64(aRoot + 1 + CS_MANIFEST_DURABLE_TO_OFF, iDataEnd);
+  CS_WRITE_I64(aRoot + 1 + CS_MANIFEST_NEXT_OFF_OFF, iNext);
+  CS_WRITE_I64(aRoot + 1 + CS_MANIFEST_BATCH_START_OFF, iDataEnd);
+  CS_WRITE_U32(aRoot + 1 + CS_MANIFEST_CHECKPOINT_MAGIC_OFF,
+               CS_WAL_CHECKPOINT_MAGIC_V2);
+  CS_WRITE_I64(aRoot + 1 + CS_MANIFEST_CHECKPOINT_OFFSET_OFF, iCheckpoint);
+  CS_WRITE_U32(aRoot + 1 + CS_MANIFEST_CHECKPOINT_SIZE_OFF,
+               (u32)aRef[0].size);
+  CS_WRITE_I64(aRoot + 1 + CS_MANIFEST_CHECKPOINT_REPLAY_OFF, iNext);
+  CS_WRITE_I64(aRoot + 1 + CS_MANIFEST_CHECKPOINT_DATA_END_OFF, iDataEnd);
+  memcpy(aRoot + 1 + CS_MANIFEST_CHECKPOINT_HASH_OFF,
+         aRef[0].bodyHash.data, PROLLY_HASH_SIZE);
+  CS_WRITE_U32(aRoot + 1 + CS_MANIFEST_CHECKPOINT_COUNT_OFF, (u32)nIndex);
+  csManifestSeal(aRoot + 1, iRoot);
+  rc = sqlite3OsWrite(cs->file.pFile, aRoot, sizeof(aRoot), iRoot);
+  if( rc!=SQLITE_OK ) goto checkpoint_rollback;
+  rc = csSyncFile(cs);
+  if( rc!=SQLITE_OK ) goto checkpoint_rollback;
+
+  cs->wal.iCheckpointOffset = iCheckpoint;
+  cs->wal.nCheckpointIndex = aRef[0].size;
+  cs->wal.iCheckpointReplay = iNext;
+  cs->wal.iCheckpointDataEnd = iDataEnd;
+  cs->wal.nCheckpointEntries = nIndex;
+  cs->wal.checkpointHash = aRef[0].bodyHash;
+  cs->wal.checkpointMagic = CS_WAL_CHECKPOINT_MAGIC_V2;
+  cs->file.iFileSize = iNext;
+  cs->wal.nWalData = iRootEnd - cs->wal.iWalOffset;
+  cs->wal.cleanCloseMarker = 1;
+  *pWritten = 1;
+  rc = SQLITE_OK;
+  goto checkpoint_done;
+
+checkpoint_rollback:
+  (void)sqlite3OsTruncate(cs->file.pFile, iDataEnd);
+  (void)csSyncFile(cs);
+
+checkpoint_done:
+  sqlite3_free(aRef);
+  sqlite3_free(aIndex);
+  return rc;
 }
 
 static void csCaptureReplayState(ChunkStore *cs, ChunkStoreReplayState *pSaved){
@@ -470277,6 +478317,7 @@ static void csCaptureReplayState(ChunkStore *cs, ChunkStoreReplayState *pSaved){
   pSaved->nIndex = cs->index.nIndex;
   pSaved->aIndexMmapBase = cs->index.aIndexMmapBase;
   pSaved->aIndexMmapSize = cs->index.aIndexMmapSize;
+  pSaved->lazy = cs->index.lazy;
   csCaptureSavedRefsState(cs, &pSaved->refs);
 }
 
@@ -470285,6 +478326,7 @@ static void csRestoreReplayState(ChunkStore *cs, const ChunkStoreReplayState *pS
   cs->index.nIndex = pSaved->nIndex;
   cs->index.aIndexMmapBase = pSaved->aIndexMmapBase;
   cs->index.aIndexMmapSize = pSaved->aIndexMmapSize;
+  cs->index.lazy = pSaved->lazy;
   csRestoreSavedRefsState(cs, &pSaved->refs);
 }
 
@@ -470344,7 +478386,15 @@ void csAdoptOpenedStoreState(ChunkStore *pDst, ChunkStore *pSrc){
   pDst->index.nIndex = pSrc->index.nIndex;
   pDst->index.aIndexMmapBase = pSrc->index.aIndexMmapBase;
   pDst->index.aIndexMmapSize = pSrc->index.aIndexMmapSize;
+  pDst->index.lazy = pSrc->index.lazy;
   pDst->wal.nWalData = pSrc->wal.nWalData;
+  pDst->wal.iCheckpointOffset = pSrc->wal.iCheckpointOffset;
+  pDst->wal.nCheckpointIndex = pSrc->wal.nCheckpointIndex;
+  pDst->wal.iCheckpointReplay = pSrc->wal.iCheckpointReplay;
+  pDst->wal.iCheckpointDataEnd = pSrc->wal.iCheckpointDataEnd;
+  pDst->wal.nCheckpointEntries = pSrc->wal.nCheckpointEntries;
+  pDst->wal.checkpointHash = pSrc->wal.checkpointHash;
+  pDst->wal.checkpointMagic = pSrc->wal.checkpointMagic;
   pDst->wal.recoveredMidStream = pSrc->wal.recoveredMidStream;
   pDst->wal.cleanCloseMarker = pSrc->wal.cleanCloseMarker;
   pDst->corruptMidStream = pSrc->corruptMidStream;
@@ -470356,7 +478406,15 @@ void csAdoptOpenedStoreState(ChunkStore *pDst, ChunkStore *pSrc){
   pSrc->index.nIndex = 0;
   pSrc->index.aIndexMmapBase = 0;
   pSrc->index.aIndexMmapSize = 0;
+  memset(&pSrc->index.lazy, 0, sizeof(pSrc->index.lazy));
   pSrc->wal.nWalData = 0;
+  pSrc->wal.iCheckpointOffset = 0;
+  pSrc->wal.nCheckpointIndex = 0;
+  pSrc->wal.iCheckpointReplay = 0;
+  pSrc->wal.iCheckpointDataEnd = 0;
+  pSrc->wal.nCheckpointEntries = 0;
+  memset(&pSrc->wal.checkpointHash, 0, sizeof(pSrc->wal.checkpointHash));
+  pSrc->wal.checkpointMagic = 0;
   pSrc->wal.cleanCloseMarker = 0;
   REFS_OWNED_CLEAR(pSrc->refs);
 }
@@ -470431,7 +478489,9 @@ static int csWalResolveDamage(
                            cs->wal.iWalOffset + cand + 1);
         if( rc != SQLITE_OK ) return rc;
         state = csManifestHashState(m, cs->wal.iWalOffset + cand);
-        if( state==CS_MANIFEST_HASH_OK ){
+        if( state==CS_MANIFEST_HASH_OK
+         && csValidateWalRootManifest(
+              cs, m, cs->wal.iWalOffset+cand)==SQLITE_OK ){
           i64 durableTo = CS_READ_I64(m + CS_MANIFEST_DURABLE_TO_OFF);
           i64 batchStart = CS_READ_I64(m + CS_MANIFEST_BATCH_START_OFF);
           if( durableTo > damageAbs ){
@@ -470454,11 +478514,16 @@ static int csWalResolveDamage(
   return SQLITE_OK;
 }
 
-int csReplayWal(ChunkStore *cs){
+static int csReplayWalFrom(
+  ChunkStore *cs,
+  i64 iStart,
+  i64 iSkipStart,
+  i64 iSkipEnd
+){
   i64 walSize;
   ChunkStoreReplayState saved;
   i64 pos;
-  i64 lastBoundary = 0;
+  i64 lastBoundary;
   i64 resumePos = 0;
   int damageAction = 0;
   int sawMidStream = 0;
@@ -470476,6 +478541,7 @@ int csReplayWal(ChunkStore *cs){
   memset(&tmpRefs, 0, sizeof(tmpRefs));
 
   if( cs->wal.iWalOffset <= 0 || !cs->file.pFile ) return SQLITE_OK;
+  if( iStart<cs->wal.iWalOffset ) return SQLITE_CORRUPT;
 
   {
     i64 fileSize = 0;
@@ -470486,10 +478552,11 @@ int csReplayWal(ChunkStore *cs){
   }
   if( walSize <= 0 ){
     /* Without a WAL tail, chunk_count must describe the compacted index. */
-    if( cs->index.nIndex > 0 && cs->index.nChunks != cs->index.nIndex ){
+    if( chunkIndexCount(&cs->index)>0
+     && cs->index.nChunks!=chunkIndexCount(&cs->index) ){
       return SQLITE_CORRUPT;
     }
-    if( cs->index.nIndex==0 && cs->index.nChunks==0
+    if( chunkIndexCount(&cs->index)==0 && cs->index.nChunks==0
      && !prollyHashIsEmpty(&cs->refs.refsHash) ){
       memset(cs->refs.refsHash.data, 0, PROLLY_HASH_SIZE);
     }
@@ -470499,14 +478566,21 @@ int csReplayWal(ChunkStore *cs){
   csCaptureReplayState(cs, &saved);
 
   cs->wal.nWalData = walSize;
-  cs->wal.cleanCloseMarker = 0;
+  lastBoundary = iStart - cs->wal.iWalOffset;
+  cs->wal.cleanCloseMarker = lastBoundary>=walSize;
 
-  pos = 0;
+  pos = lastBoundary;
   while( pos < walSize ){
     u8 aPrefix[CS_WAL_CHUNK_HDR_SIZE];
     u8 tag = 0;
     i64 recPos = pos;
     int havePrefix = 0;
+    if( iSkipStart>0
+     && cs->wal.iWalOffset+pos>=iSkipStart
+     && cs->wal.iWalOffset+pos<iSkipEnd ){
+      pos = iSkipEnd-cs->wal.iWalOffset;
+      continue;
+    }
     if( walSize - pos < CS_WAL_CHUNK_HDR_SIZE ){
       rc = sqlite3OsRead(cs->file.pFile, &tag, 1, cs->wal.iWalOffset + pos);
       if( rc != SQLITE_OK ) goto replay_error;
@@ -470584,9 +478658,12 @@ int csReplayWal(ChunkStore *cs){
         }
       }
       {
-        int existing = csSearchIndex(cs->index.aIndex, cs->index.nIndex, &hash);
+        ChunkIndexEntry existingEntry;
+        int existing = 0;
         ChunkIndexEntry *e = 0;
-        if( existing < 0 ){
+        rc = csIndexLookup(cs, &hash, &existingEntry, &existing);
+        if( rc!=SQLITE_OK ) goto replay_error;
+        if( !existing ){
           rc = csGrowPending(cs);
           if( rc != SQLITE_OK ) goto replay_error;
           e = &cs->staging.aPending[cs->staging.nPending];
@@ -470638,6 +478715,16 @@ int csReplayWal(ChunkStore *cs){
         sawMidStream = (damageAction==CS_DAMAGE_MIDSTREAM);
         break;
       }
+      if( hashState==CS_MANIFEST_HASH_OK
+       && csValidateWalRootManifest(
+            cs, m, cs->wal.iWalOffset+recPos)!=SQLITE_OK ){
+        sqlite3_log(SQLITE_CORRUPT,
+          "doltlite: invalid sealed WAL root manifest at offset %lld",
+          (long long)(cs->wal.iWalOffset + recPos));
+        cs->corruptMidStream = 1;
+        rc = SQLITE_CORRUPT;
+        goto replay_error;
+      }
 
       cs->index.nChunks = (int)CS_READ_U32(m + CS_MANIFEST_CHUNK_COUNT_OFF);
       memcpy(cs->refs.refsHash.data, m + CS_MANIFEST_REFS_HASH_OFF, PROLLY_HASH_SIZE);
@@ -470651,6 +478738,9 @@ int csReplayWal(ChunkStore *cs){
         cs->wal.cleanCloseMarker = durableTo >= recAbs && batchStart == recAbs;
         if( nextOff > cs->wal.iWalOffset + pos ){
           pos = nextOff - cs->wal.iWalOffset;
+        }
+        if( iSkipStart==0 ){
+          (void)csReadCheckpointStamp(m, recAbs, &cs->wal);
         }
       }else{
         cs->wal.cleanCloseMarker = 0;
@@ -470690,7 +478780,7 @@ int csReplayWal(ChunkStore *cs){
   ** if no root manifest can be replayed. */
   if( sawDamage
    && nRootRecordsSeen == 0
-   && nPendingBefore == 0 && cs->index.nIndex == 0 ){
+   && nPendingBefore == 0 && chunkIndexCount(&cs->index)==0 ){
     memset(cs->refs.refsHash.data, 0, PROLLY_HASH_SIZE);
     cs->index.nChunks = 0;
     cs->wal.recoveredMidStream = 1;
@@ -470706,7 +478796,7 @@ int csReplayWal(ChunkStore *cs){
   cs->staging.nPending = nRootedPending;
 
   if( nRootRecordsSeen == 0
-   && nPendingBefore == 0 && cs->index.nIndex == 0
+   && nPendingBefore == 0 && chunkIndexCount(&cs->index)==0
    && !sawMidStream && !cs->wal.recoveredMidStream ){
     memset(cs->refs.refsHash.data, 0, PROLLY_HASH_SIZE);
     cs->index.nChunks = 0;
@@ -470757,6 +478847,356 @@ replay_error:
   if( haveTmpRefs ) csFreeRefsState(&tmpRefs);
   csRollbackReplayState(cs, &saved, nPendingBefore);
   return rc;
+}
+
+int csReplayWal(ChunkStore *cs){
+  return csReplayWalSkipping(cs, 0, 0);
+}
+
+int csReplayWalSkipping(ChunkStore *cs, i64 iSkipStart, i64 iSkipEnd){
+  cs->wal.iCheckpointOffset = 0;
+  cs->wal.nCheckpointIndex = 0;
+  cs->wal.iCheckpointReplay = 0;
+  cs->wal.iCheckpointDataEnd = 0;
+  cs->wal.nCheckpointEntries = 0;
+  memset(&cs->wal.checkpointHash, 0, sizeof(cs->wal.checkpointHash));
+  cs->wal.checkpointMagic = 0;
+  if( (iSkipStart==0)!=(iSkipEnd==0)
+   || (iSkipStart>0
+       && (iSkipStart<cs->wal.iWalOffset || iSkipEnd<=iSkipStart)) ){
+    return SQLITE_CORRUPT;
+  }
+  return csReplayWalFrom(cs, cs->wal.iWalOffset, iSkipStart, iSkipEnd);
+}
+
+static int csCheckpointIndexInsert(
+  ChunkIndexEntry *aIndex,
+  int nIndex,
+  const ChunkIndexEntry *pEntry
+){
+  int lo = 0;
+  int hi = nIndex;
+  while( lo<hi ){
+    int mid = lo + (hi-lo)/2;
+    int cmp = prollyHashCompare(&aIndex[mid].hash, &pEntry->hash);
+    if( cmp<0 ) lo = mid + 1;
+    else hi = mid;
+  }
+  if( lo<nIndex
+   && prollyHashCompare(&aIndex[lo].hash, &pEntry->hash)==0 ){
+    return nIndex;
+  }
+  memmove(aIndex + lo + 1, aIndex + lo,
+          (nIndex-lo) * sizeof(ChunkIndexEntry));
+  aIndex[lo] = *pEntry;
+  return nIndex + 1;
+}
+
+static int csFindLastCheckpointRoot(
+  ChunkStore *cs,
+  i64 nFile,
+  u8 *aRoot,
+  i64 *pRootOffset,
+  WalState *pStamp,
+  int *pFound
+){
+  u8 aBuf[65540];
+  i64 iEnd = nFile;
+  i64 nZeroRun = 0;
+
+  *pFound = 0;
+  while( iEnd>cs->wal.iWalOffset ){
+    i64 iStart = iEnd-(i64)sizeof(aBuf);
+    int n;
+    int i;
+    int iFirst;
+    int rc;
+    if( iStart<cs->wal.iWalOffset ) iStart = cs->wal.iWalOffset;
+    n = (int)(iEnd-iStart);
+    rc = sqlite3OsRead(cs->file.pFile, aBuf, n, iStart);
+    if( rc!=SQLITE_OK ) return rc;
+    iFirst = iEnd==nFile ? n-1 : n-5;
+    for(i=iFirst; i>=0; i--){
+      i64 iRoot;
+      WalState stamp;
+      if( aBuf[i]==0 ){
+        nZeroRun++;
+        if( nZeroRun>=CS_WAL_SCAN_MAX ) return SQLITE_OK;
+      }else{
+        nZeroRun = 0;
+      }
+      if( i>n-5 ) continue;
+      if( aBuf[i]!=CS_WAL_TAG_ROOT
+       || CS_READ_U32(aBuf+i+1)!=CHUNK_STORE_MAGIC ){
+        continue;
+      }
+      iRoot = iStart+i;
+      if( iRoot>nFile-(i64)(1+CHUNK_MANIFEST_SIZE) ) continue;
+      rc = sqlite3OsRead(cs->file.pFile, aRoot,
+                         1+CHUNK_MANIFEST_SIZE, iRoot);
+      if( rc!=SQLITE_OK ) return rc;
+      stamp = *pStamp;
+      if( aRoot[0]==CS_WAL_TAG_ROOT
+       && csManifestHashState(aRoot+1, iRoot)==CS_MANIFEST_HASH_OK
+       && csValidateWalRootManifest(cs, aRoot+1, iRoot)==SQLITE_OK ){
+        if( csReadCheckpointStamp(aRoot+1, iRoot, &stamp) ){
+          *pRootOffset = iRoot;
+          *pStamp = stamp;
+          *pFound = 1;
+          return SQLITE_OK;
+        }
+        if( CS_READ_I64(aRoot+1+CS_MANIFEST_DURABLE_TO_OFF)==iRoot
+         && CS_READ_I64(aRoot+1+CS_MANIFEST_BATCH_START_OFF)==iRoot ){
+          return SQLITE_OK;
+        }
+      }
+    }
+    if( iStart==cs->wal.iWalOffset ) break;
+    iEnd = iStart+4;
+  }
+  return SQLITE_OK;
+}
+
+static void csCheckpointSkipRange(
+  const WalState *pStamp,
+  i64 *pSkipStart,
+  i64 *pSkipEnd
+){
+  *pSkipStart = pStamp->checkpointMagic==CS_WAL_CHECKPOINT_MAGIC_V2
+              ? pStamp->iCheckpointDataEnd : pStamp->iCheckpointOffset;
+  *pSkipEnd = pStamp->iCheckpointReplay;
+}
+
+int csTryLoadWalCheckpoint(
+  ChunkStore *cs,
+  int *pLoaded,
+  i64 *pSkipStart,
+  i64 *pSkipEnd
+){
+  u8 aTail[1 + CHUNK_MANIFEST_SIZE];
+  u8 aRoot[1 + CHUNK_MANIFEST_SIZE];
+  u8 aHeader[CS_WAL_CHUNK_HDR_SIZE];
+  u8 aBuf[65536];
+  i64 nFile = 0;
+  i64 iTail;
+  i64 iRoot;
+  i64 iRead;
+  i64 nRemain;
+  WalState stamp;
+  WalState rootStamp;
+  ChunkIndexEntry *aIndex = 0;
+  ChunkIndexEntry snapshotEntry;
+  ProllyHash bodyHash;
+  blake3_hasher hasher;
+  int nIndex;
+  int iEntry = 0;
+  int found = 0;
+  int rc;
+
+  *pLoaded = 0;
+  *pSkipStart = 0;
+  *pSkipEnd = 0;
+  if( cs->wal.iWalOffset<=0 || !cs->file.pFile ) return SQLITE_OK;
+  rc = sqlite3OsFileSize(cs->file.pFile, &nFile);
+  if( rc!=SQLITE_OK ) return rc;
+  stamp = cs->wal;
+  rc = csFindLastCheckpointRoot(cs, nFile, aTail, &iTail, &stamp, &found);
+  if( rc!=SQLITE_OK || !found ) return rc;
+
+  iRoot = stamp.iCheckpointOffset + CS_WAL_CHUNK_HDR_SIZE
+        + stamp.nCheckpointIndex;
+  if( iRoot<0 || iRoot+(i64)sizeof(aRoot)>nFile ) return SQLITE_OK;
+  rc = sqlite3OsRead(cs->file.pFile, aRoot, sizeof(aRoot), iRoot);
+  if( rc!=SQLITE_OK ) return rc;
+  rootStamp = cs->wal;
+  if( aRoot[0]!=CS_WAL_TAG_ROOT
+   || csManifestHashState(aRoot+1, iRoot)!=CS_MANIFEST_HASH_OK
+   || csValidateWalRootManifest(cs, aRoot+1, iRoot)!=SQLITE_OK
+   || !csReadCheckpointStamp(aRoot+1, iRoot, &rootStamp)
+   || rootStamp.iCheckpointOffset!=stamp.iCheckpointOffset
+   || rootStamp.nCheckpointIndex!=stamp.nCheckpointIndex
+   || rootStamp.iCheckpointReplay!=stamp.iCheckpointReplay
+   || rootStamp.checkpointMagic!=stamp.checkpointMagic
+   || (stamp.checkpointMagic==CS_WAL_CHECKPOINT_MAGIC_V2
+       && (rootStamp.iCheckpointDataEnd!=stamp.iCheckpointDataEnd
+           || rootStamp.nCheckpointEntries!=stamp.nCheckpointEntries
+           || prollyHashCompare(&rootStamp.checkpointHash,
+                                &stamp.checkpointHash)!=0))
+   || (stamp.checkpointMagic==CS_WAL_CHECKPOINT_MAGIC_V2
+       ? (CS_READ_I64(aRoot+1+CS_MANIFEST_DURABLE_TO_OFF)
+              !=stamp.iCheckpointDataEnd
+          || CS_READ_I64(aRoot+1+CS_MANIFEST_BATCH_START_OFF)
+              !=stamp.iCheckpointDataEnd)
+       : (CS_READ_I64(aRoot+1+CS_MANIFEST_DURABLE_TO_OFF)<iRoot
+          || CS_READ_I64(aRoot+1+CS_MANIFEST_BATCH_START_OFF)!=iRoot))
+   || CS_READ_I64(aRoot+1+CS_MANIFEST_NEXT_OFF_OFF)
+        !=stamp.iCheckpointReplay ){
+    return SQLITE_OK;
+  }
+
+  rc = sqlite3OsRead(cs->file.pFile, aHeader, sizeof(aHeader),
+                     stamp.iCheckpointOffset);
+  if( rc!=SQLITE_OK ) return rc;
+  if( aHeader[0]!=CS_WAL_TAG_CHUNK
+   || (i64)CS_READ_U32(aHeader+CS_WAL_CHUNK_LEN_OFF)
+        !=stamp.nCheckpointIndex ){
+    csCheckpointSkipRange(&stamp, pSkipStart, pSkipEnd);
+    return SQLITE_OK;
+  }
+  if( stamp.checkpointMagic==CS_WAL_CHECKPOINT_MAGIC_V2 ){
+    u8 *aPage = 0;
+    u32 pageMagic;
+    u32 nCell;
+    int nCellSize;
+    if( memcmp(aHeader+CS_WAL_CHUNK_HASH_OFF,
+               stamp.checkpointHash.data, PROLLY_HASH_SIZE)!=0 ){
+      csCheckpointSkipRange(&stamp, pSkipStart, pSkipEnd);
+      return SQLITE_OK;
+    }
+    aPage = sqlite3_malloc((int)stamp.nCheckpointIndex);
+    if( !aPage ) return SQLITE_NOMEM;
+    rc = sqlite3OsRead(cs->file.pFile, aPage, (int)stamp.nCheckpointIndex,
+                       stamp.iCheckpointOffset+CS_WAL_CHUNK_HDR_SIZE);
+    if( rc==SQLITE_OK ){
+      prollyHashCompute(aPage, (int)stamp.nCheckpointIndex, &bodyHash);
+      if( prollyHashCompare(&bodyHash, &stamp.checkpointHash)!=0 ){
+        rc = SQLITE_CORRUPT;
+      }
+    }
+    if( rc==SQLITE_OK ){
+      pageMagic = CS_READ_U32(aPage);
+      nCell = CS_READ_U32(aPage+4);
+      nCellSize = pageMagic==CS_INDEX_PAGE_LEAF_MAGIC
+                ? CHUNK_INDEX_ENTRY_SIZE
+                : pageMagic==CS_INDEX_PAGE_INTERNAL_MAGIC
+                  ? CS_INDEX_CHILD_SIZE : 0;
+      if( nCellSize==0 || nCell==0
+       || (i64)CS_INDEX_PAGE_HEADER_SIZE+(i64)nCell*nCellSize
+            !=stamp.nCheckpointIndex ){
+        rc = SQLITE_CORRUPT;
+      }
+    }
+    sqlite3_free(aPage);
+    if( rc!=SQLITE_OK ){
+      if( rc!=SQLITE_NOMEM ){
+        csCheckpointSkipRange(&stamp, pSkipStart, pSkipEnd);
+      }
+      return rc==SQLITE_NOMEM ? rc : SQLITE_OK;
+    }
+
+    csReleaseIndexBuf(cs->index.aIndex, cs->index.aIndexMmapBase,
+                      cs->index.aIndexMmapSize);
+    cs->index.aIndex = 0;
+    cs->index.nIndex = 0;
+    cs->index.aIndexMmapBase = 0;
+    cs->index.aIndexMmapSize = 0;
+    cs->index.lazy.iRootOffset = stamp.iCheckpointOffset;
+    cs->index.lazy.iDataEnd = stamp.iCheckpointDataEnd;
+    cs->index.lazy.nRootSize = (int)stamp.nCheckpointIndex;
+    cs->index.lazy.nEntries = stamp.nCheckpointEntries;
+    cs->index.lazy.rootHash = stamp.checkpointHash;
+    cs->index.lazy.active = 1;
+    cs->index.nChunks = (int)CS_READ_U32(
+        aRoot+1+CS_MANIFEST_CHUNK_COUNT_OFF);
+    memcpy(cs->refs.refsHash.data,
+           aRoot+1+CS_MANIFEST_REFS_HASH_OFF, PROLLY_HASH_SIZE);
+    cs->wal.iCheckpointOffset = stamp.iCheckpointOffset;
+    cs->wal.nCheckpointIndex = stamp.nCheckpointIndex;
+    cs->wal.iCheckpointReplay = stamp.iCheckpointReplay;
+    cs->wal.iCheckpointDataEnd = stamp.iCheckpointDataEnd;
+    cs->wal.nCheckpointEntries = stamp.nCheckpointEntries;
+    cs->wal.checkpointHash = stamp.checkpointHash;
+    cs->wal.checkpointMagic = stamp.checkpointMagic;
+    rc = csReplayWalFrom(cs, stamp.iCheckpointReplay, 0, 0);
+    if( rc!=SQLITE_OK ){
+      memset(&cs->index.lazy, 0, sizeof(cs->index.lazy));
+      cs->wal.iCheckpointOffset = 0;
+      cs->wal.nCheckpointIndex = 0;
+      cs->wal.iCheckpointReplay = 0;
+      cs->wal.iCheckpointDataEnd = 0;
+      cs->wal.nCheckpointEntries = 0;
+      memset(&cs->wal.checkpointHash, 0, sizeof(cs->wal.checkpointHash));
+      cs->wal.checkpointMagic = 0;
+      if( rc!=SQLITE_NOMEM ){
+        csCheckpointSkipRange(&stamp, pSkipStart, pSkipEnd);
+      }
+      return rc==SQLITE_NOMEM ? rc : SQLITE_OK;
+    }
+    *pLoaded = 1;
+    return SQLITE_OK;
+  }
+  nIndex = (int)(stamp.nCheckpointIndex / CHUNK_INDEX_ENTRY_SIZE);
+  if( nIndex>=(INT_MAX/(int)sizeof(ChunkIndexEntry)) ) return SQLITE_TOOBIG;
+  aIndex = sqlite3_malloc64(
+      (sqlite3_uint64)(nIndex+1) * sizeof(ChunkIndexEntry));
+  if( !aIndex ) return SQLITE_NOMEM;
+
+  blake3_hasher_init(&hasher);
+  iRead = stamp.iCheckpointOffset + CS_WAL_CHUNK_HDR_SIZE;
+  nRemain = stamp.nCheckpointIndex;
+  while( nRemain>0 ){
+    int n = nRemain>(i64)sizeof(aBuf) ? (int)sizeof(aBuf) : (int)nRemain;
+    int i;
+    rc = sqlite3OsRead(cs->file.pFile, aBuf, n, iRead);
+    if( rc!=SQLITE_OK ) goto checkpoint_invalid;
+    blake3_hasher_update(&hasher, aBuf, (size_t)n);
+    for(i=0; i<n; i+=CHUNK_INDEX_ENTRY_SIZE){
+      rc = csDeserializeCheckpointEntry(aBuf+i, &aIndex[iEntry]);
+      if( rc!=SQLITE_OK ) goto checkpoint_invalid;
+      if( aIndex[iEntry].offset<CHUNK_MANIFEST_SIZE
+       || aIndex[iEntry].offset>stamp.iCheckpointOffset-4
+       || (i64)aIndex[iEntry].size
+            > stamp.iCheckpointOffset-aIndex[iEntry].offset-4
+       || (iEntry>0
+           && prollyHashCompare(&aIndex[iEntry-1].hash,
+                                &aIndex[iEntry].hash)>=0) ){
+        goto checkpoint_invalid;
+      }
+      iEntry++;
+    }
+    iRead += n;
+    nRemain -= n;
+  }
+  blake3_hasher_finalize(&hasher, bodyHash.data, PROLLY_HASH_SIZE);
+  if( memcmp(bodyHash.data, aHeader+CS_WAL_CHUNK_HASH_OFF,
+             PROLLY_HASH_SIZE)!=0 ){
+    goto checkpoint_invalid;
+  }
+
+  memcpy(snapshotEntry.hash.data, aHeader+CS_WAL_CHUNK_HASH_OFF,
+         PROLLY_HASH_SIZE);
+  snapshotEntry.offset = stamp.iCheckpointOffset + CS_WAL_CHUNK_LEN_OFF;
+  snapshotEntry.size = (int)stamp.nCheckpointIndex;
+  nIndex = csCheckpointIndexInsert(aIndex, nIndex, &snapshotEntry);
+  csReleaseIndexBuf(cs->index.aIndex, cs->index.aIndexMmapBase,
+                    cs->index.aIndexMmapSize);
+  cs->index.aIndex = aIndex;
+  cs->index.nIndex = nIndex;
+  cs->index.aIndexMmapBase = 0;
+  cs->index.aIndexMmapSize = 0;
+  cs->index.nChunks = (int)CS_READ_U32(
+      aRoot+1+CS_MANIFEST_CHUNK_COUNT_OFF);
+  memcpy(cs->refs.refsHash.data,
+         aRoot+1+CS_MANIFEST_REFS_HASH_OFF, PROLLY_HASH_SIZE);
+  cs->wal.iCheckpointOffset = stamp.iCheckpointOffset;
+  cs->wal.nCheckpointIndex = stamp.nCheckpointIndex;
+  cs->wal.iCheckpointReplay = stamp.iCheckpointReplay;
+  cs->wal.iCheckpointDataEnd = stamp.iCheckpointDataEnd;
+  cs->wal.nCheckpointEntries = stamp.nCheckpointEntries;
+  cs->wal.checkpointHash = stamp.checkpointHash;
+  cs->wal.checkpointMagic = stamp.checkpointMagic;
+  aIndex = 0;
+  rc = csReplayWalFrom(cs, stamp.iCheckpointReplay, 0, 0);
+  if( rc!=SQLITE_OK ) return rc;
+  *pLoaded = 1;
+  return SQLITE_OK;
+
+checkpoint_invalid:
+  sqlite3_free(aIndex);
+  if( rc!=SQLITE_NOMEM ){
+    csCheckpointSkipRange(&stamp, pSkipStart, pSkipEnd);
+  }
+  return rc==SQLITE_NOMEM ? rc : SQLITE_OK;
 }
 
 #endif
@@ -471672,9 +480112,11 @@ void chunkIndexGetEntries(const ChunkIndex *idx, int *pn, const ChunkIndexEntry 
 }
 
 int chunkIndexCount(const ChunkIndex *idx){
+  i64 n;
   assert( idx!=0 );
   assert( idx->nIndex>=0 );
-  return idx->nIndex;
+  n = (i64)idx->nIndex + idx->lazy.nEntries;
+  return n>INT_MAX ? INT_MAX : (int)n;
 }
 
 void chunkIndexSetMetadata(ChunkIndex *idx, int nChunks, i64 iOffset, i64 nSize){
@@ -471695,6 +480137,7 @@ void chunkIndexReplaceEntries(ChunkIndex *idx, ChunkIndexEntry *aNew, int nNew){
   idx->nIndex = nNew;
   idx->aIndexMmapBase = 0;
   idx->aIndexMmapSize = 0;
+  memset(&idx->lazy, 0, sizeof(idx->lazy));
 }
 
 void csReleaseIndexBuf(ChunkIndexEntry *aIndex,
@@ -471769,6 +480212,372 @@ static int csDeserializeIndexEntry(const u8 *aBuf, ChunkIndexEntry *e){
   return SQLITE_OK;
 }
 
+static int csReadLazyPage(
+  ChunkStore *cs,
+  i64 iOffset,
+  int nBody,
+  const ProllyHash *pHash,
+  i64 iLimit,
+  u8 **ppBody
+){
+  u8 aHeader[CS_WAL_CHUNK_HDR_SIZE];
+  ProllyHash actual;
+  u8 *aBody;
+  int rc;
+
+  *ppBody = 0;
+  if( nBody<CS_INDEX_PAGE_HEADER_SIZE || nBody>CS_INDEX_PAGE_SIZE
+   || iOffset<cs->index.lazy.iDataEnd
+   || iLimit<CS_WAL_CHUNK_HDR_SIZE+nBody
+   || iOffset>iLimit-CS_WAL_CHUNK_HDR_SIZE-nBody ){
+    return SQLITE_CORRUPT;
+  }
+  rc = sqlite3OsRead(cs->file.pFile, aHeader, sizeof(aHeader), iOffset);
+  if( rc!=SQLITE_OK ) return rc;
+  if( aHeader[0]!=CS_WAL_TAG_CHUNK
+   || CS_READ_U32(aHeader+CS_WAL_CHUNK_LEN_OFF)!=(u32)nBody
+   || memcmp(aHeader+CS_WAL_CHUNK_HASH_OFF, pHash->data,
+             PROLLY_HASH_SIZE)!=0 ){
+    return SQLITE_CORRUPT;
+  }
+  aBody = sqlite3_malloc(nBody);
+  if( !aBody ) return SQLITE_NOMEM;
+  rc = sqlite3OsRead(cs->file.pFile, aBody, nBody,
+                     iOffset+CS_WAL_CHUNK_HDR_SIZE);
+  if( rc==SQLITE_OK ){
+    prollyHashCompute(aBody, nBody, &actual);
+    if( prollyHashCompare(&actual, pHash)!=0 ) rc = SQLITE_CORRUPT;
+  }
+  if( rc!=SQLITE_OK ){
+    sqlite3_free(aBody);
+    return rc;
+  }
+  *ppBody = aBody;
+  return SQLITE_OK;
+}
+
+static int csLazyPageShape(
+  const u8 *aBody,
+  int nBody,
+  u32 *pMagic,
+  int *pnCell,
+  int *pnCellSize
+){
+  u32 magic;
+  u32 nCell;
+  int nCellSize;
+  if( nBody<CS_INDEX_PAGE_HEADER_SIZE ) return SQLITE_CORRUPT;
+  magic = CS_READ_U32(aBody);
+  nCell = CS_READ_U32(aBody+4);
+  nCellSize = magic==CS_INDEX_PAGE_LEAF_MAGIC
+            ? CHUNK_INDEX_ENTRY_SIZE
+            : magic==CS_INDEX_PAGE_INTERNAL_MAGIC ? CS_INDEX_CHILD_SIZE : 0;
+  if( nCellSize==0 || nCell==0 || nCell>(u32)INT_MAX
+   || (i64)CS_INDEX_PAGE_HEADER_SIZE+(i64)nCell*nCellSize!=nBody ){
+    return SQLITE_CORRUPT;
+  }
+  *pMagic = magic;
+  *pnCell = (int)nCell;
+  *pnCellSize = nCellSize;
+  return SQLITE_OK;
+}
+
+static int csLazyPageMaxHash(
+  const u8 *aBody,
+  u32 magic,
+  int nCell,
+  ProllyHash *pMax
+){
+  const u8 *p;
+  if( magic==CS_INDEX_PAGE_LEAF_MAGIC ){
+    p = aBody+CS_INDEX_PAGE_HEADER_SIZE
+      +(nCell-1)*CHUNK_INDEX_ENTRY_SIZE;
+  }else{
+    p = aBody+CS_INDEX_PAGE_HEADER_SIZE+(nCell-1)*CS_INDEX_CHILD_SIZE;
+  }
+  memcpy(pMax->data, p, PROLLY_HASH_SIZE);
+  return SQLITE_OK;
+}
+
+int csIndexLookup(
+  ChunkStore *cs,
+  const ProllyHash *pHash,
+  ChunkIndexEntry *pEntry,
+  int *pFound
+){
+  ChunkIndexLazy *pLazy = &cs->index.lazy;
+  ProllyHash pageHash;
+  ProllyHash expectedMax;
+  i64 iOffset;
+  i64 iLimit;
+  int nBody;
+  int haveExpectedMax = 0;
+  int depth;
+  int idx;
+
+  *pFound = 0;
+  idx = csSearchIndex(cs->index.aIndex, cs->index.nIndex, pHash);
+  if( idx>=0 ){
+    *pEntry = cs->index.aIndex[idx];
+    *pFound = 1;
+    return SQLITE_OK;
+  }
+  if( !pLazy->active ) return SQLITE_OK;
+  iOffset = pLazy->iRootOffset;
+  nBody = pLazy->nRootSize;
+  pageHash = pLazy->rootHash;
+  iLimit = iOffset+CS_WAL_CHUNK_HDR_SIZE+nBody;
+
+  for(depth=0; depth<32; depth++){
+    u8 *aBody = 0;
+    u32 magic;
+    int nCell;
+    int nCellSize;
+    ProllyHash pageMax;
+    int rc = csReadLazyPage(cs, iOffset, nBody, &pageHash, iLimit, &aBody);
+    if( rc!=SQLITE_OK ) return rc;
+    rc = csLazyPageShape(aBody, nBody, &magic, &nCell, &nCellSize);
+    if( rc==SQLITE_OK ){
+      csLazyPageMaxHash(aBody, magic, nCell, &pageMax);
+      if( haveExpectedMax
+       && prollyHashCompare(&pageMax, &expectedMax)!=0 ){
+        rc = SQLITE_CORRUPT;
+      }
+    }
+    if( rc!=SQLITE_OK ){
+      sqlite3_free(aBody);
+      return rc;
+    }
+
+    if( magic==CS_INDEX_PAGE_LEAF_MAGIC ){
+      int lo = 0;
+      int hi = nCell-1;
+      int i;
+      ProllyHash previous;
+      for(i=0; i<nCell; i++){
+        const u8 *p = aBody+CS_INDEX_PAGE_HEADER_SIZE
+                    +i*CHUNK_INDEX_ENTRY_SIZE;
+        ChunkIndexEntry e;
+        rc = csDeserializeIndexEntry(p, &e);
+        if( rc!=SQLITE_OK
+         || e.offset<CHUNK_MANIFEST_SIZE
+         || e.offset>pLazy->iDataEnd-4
+         || (i64)e.size>pLazy->iDataEnd-e.offset-4
+         || (i>0 && prollyHashCompare(&previous, &e.hash)>=0) ){
+          sqlite3_free(aBody);
+          return SQLITE_CORRUPT;
+        }
+        previous = e.hash;
+      }
+      while( lo<=hi ){
+        int mid = lo+(hi-lo)/2;
+        const u8 *p = aBody+CS_INDEX_PAGE_HEADER_SIZE
+                    +mid*CHUNK_INDEX_ENTRY_SIZE;
+        ProllyHash h;
+        int cmp;
+        memcpy(h.data, p, PROLLY_HASH_SIZE);
+        cmp = prollyHashCompare(&h, pHash);
+        if( cmp<0 ) lo = mid+1;
+        else if( cmp>0 ) hi = mid-1;
+        else{
+          rc = csDeserializeIndexEntry(p, pEntry);
+          if( rc==SQLITE_OK
+           && (pEntry->offset<CHUNK_MANIFEST_SIZE
+               || pEntry->offset>pLazy->iDataEnd-4
+               || (i64)pEntry->size
+                    >pLazy->iDataEnd-pEntry->offset-4) ){
+            rc = SQLITE_CORRUPT;
+          }
+          sqlite3_free(aBody);
+          if( rc==SQLITE_OK ) *pFound = 1;
+          return rc;
+        }
+      }
+      sqlite3_free(aBody);
+      return SQLITE_OK;
+    }else{
+      int lo = 0;
+      int hi = nCell;
+      const u8 *p;
+      int i;
+      ProllyHash previous;
+      for(i=0; i<nCell; i++){
+        const u8 *q = aBody+CS_INDEX_PAGE_HEADER_SIZE
+                    +i*CS_INDEX_CHILD_SIZE;
+        ProllyHash h;
+        i64 childOffset;
+        u32 childSize;
+        memcpy(h.data, q, PROLLY_HASH_SIZE);
+        q += PROLLY_HASH_SIZE;
+        childOffset = CS_READ_I64(q);
+        q += 8;
+        childSize = CS_READ_U32(q);
+        if( (i>0 && prollyHashCompare(&previous, &h)>=0)
+         || childSize<CS_INDEX_PAGE_HEADER_SIZE
+         || childSize>CS_INDEX_PAGE_SIZE
+         || childOffset<pLazy->iDataEnd
+         || iOffset<CS_WAL_CHUNK_HDR_SIZE+(i64)childSize
+         || childOffset>iOffset-CS_WAL_CHUNK_HDR_SIZE-childSize ){
+          sqlite3_free(aBody);
+          return SQLITE_CORRUPT;
+        }
+        previous = h;
+      }
+      while( lo<hi ){
+        int mid = lo+(hi-lo)/2;
+        const u8 *q = aBody+CS_INDEX_PAGE_HEADER_SIZE
+                    +mid*CS_INDEX_CHILD_SIZE;
+        ProllyHash h;
+        memcpy(h.data, q, PROLLY_HASH_SIZE);
+        if( prollyHashCompare(&h, pHash)<0 ) lo = mid+1;
+        else hi = mid;
+      }
+      if( lo==nCell ){
+        sqlite3_free(aBody);
+        return SQLITE_OK;
+      }
+      p = aBody+CS_INDEX_PAGE_HEADER_SIZE+lo*CS_INDEX_CHILD_SIZE;
+      memcpy(expectedMax.data, p, PROLLY_HASH_SIZE);
+      p += PROLLY_HASH_SIZE;
+      iLimit = iOffset;
+      iOffset = CS_READ_I64(p);
+      p += 8;
+      nBody = (int)CS_READ_U32(p);
+      p += 4;
+      memcpy(pageHash.data, p, PROLLY_HASH_SIZE);
+      haveExpectedMax = 1;
+      sqlite3_free(aBody);
+    }
+  }
+  return SQLITE_CORRUPT;
+}
+
+static int csCollectLazyPage(
+  ChunkStore *cs,
+  i64 iOffset,
+  int nBody,
+  const ProllyHash *pHash,
+  i64 iLimit,
+  const ProllyHash *pExpectedMax,
+  ChunkIndexEntry *aOut,
+  int nOut,
+  int *pPos,
+  int depth
+){
+  u8 *aBody = 0;
+  u32 magic;
+  int nCell;
+  int nCellSize;
+  ProllyHash pageMax;
+  int i;
+  int rc;
+
+  if( depth>=32 ) return SQLITE_CORRUPT;
+  rc = csReadLazyPage(cs, iOffset, nBody, pHash, iLimit, &aBody);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = csLazyPageShape(aBody, nBody, &magic, &nCell, &nCellSize);
+  if( rc!=SQLITE_OK ) goto collect_done;
+  csLazyPageMaxHash(aBody, magic, nCell, &pageMax);
+  if( pExpectedMax && prollyHashCompare(&pageMax, pExpectedMax)!=0 ){
+    rc = SQLITE_CORRUPT;
+    goto collect_done;
+  }
+
+  if( magic==CS_INDEX_PAGE_LEAF_MAGIC ){
+    for(i=0; i<nCell; i++){
+      ChunkIndexEntry e;
+      const u8 *p = aBody+CS_INDEX_PAGE_HEADER_SIZE
+                  +i*CHUNK_INDEX_ENTRY_SIZE;
+      rc = csDeserializeIndexEntry(p, &e);
+      if( rc!=SQLITE_OK ) goto collect_done;
+      if( e.offset<CHUNK_MANIFEST_SIZE || e.offset>cs->index.lazy.iDataEnd-4
+       || (i64)e.size>cs->index.lazy.iDataEnd-e.offset-4
+       || *pPos>=nOut
+       || (*pPos>0
+           && prollyHashCompare(&aOut[*pPos-1].hash, &e.hash)>=0) ){
+        rc = SQLITE_CORRUPT;
+        goto collect_done;
+      }
+      aOut[(*pPos)++] = e;
+    }
+  }else{
+    ProllyHash previousMax;
+    for(i=0; i<nCell; i++){
+      const u8 *p = aBody+CS_INDEX_PAGE_HEADER_SIZE+i*CS_INDEX_CHILD_SIZE;
+      ProllyHash childMax;
+      ProllyHash childHash;
+      i64 childOffset;
+      int childSize;
+      memcpy(childMax.data, p, PROLLY_HASH_SIZE);
+      p += PROLLY_HASH_SIZE;
+      childOffset = CS_READ_I64(p);
+      p += 8;
+      childSize = (int)CS_READ_U32(p);
+      p += 4;
+      memcpy(childHash.data, p, PROLLY_HASH_SIZE);
+      if( i>0 && prollyHashCompare(&previousMax, &childMax)>=0 ){
+        rc = SQLITE_CORRUPT;
+        goto collect_done;
+      }
+      previousMax = childMax;
+      rc = csCollectLazyPage(cs, childOffset, childSize, &childHash,
+                             iOffset, &childMax, aOut, nOut, pPos, depth+1);
+      if( rc!=SQLITE_OK ) goto collect_done;
+    }
+  }
+
+collect_done:
+  sqlite3_free(aBody);
+  return rc;
+}
+
+int csMaterializeIndex(ChunkStore *cs){
+  ChunkIndexLazy lazy = cs->index.lazy;
+  ChunkIndexEntry *aLazy = 0;
+  ChunkIndexEntry *aMerged = 0;
+  int nTotal;
+  int i = 0;
+  int j = 0;
+  int k = 0;
+  int rc;
+
+  if( !lazy.active ) return SQLITE_OK;
+  if( lazy.nEntries<=0
+   || lazy.nEntries>INT_MAX/(int)sizeof(ChunkIndexEntry)
+   || cs->index.nIndex>INT_MAX-lazy.nEntries ){
+    return SQLITE_CORRUPT;
+  }
+  aLazy = sqlite3_malloc64(
+      (sqlite3_uint64)lazy.nEntries*sizeof(ChunkIndexEntry));
+  if( !aLazy ) return SQLITE_NOMEM;
+  rc = csCollectLazyPage(cs, lazy.iRootOffset, lazy.nRootSize,
+                         &lazy.rootHash,
+                         lazy.iRootOffset+CS_WAL_CHUNK_HDR_SIZE+lazy.nRootSize,
+                         0, aLazy, lazy.nEntries, &i, 0);
+  if( rc!=SQLITE_OK || i!=lazy.nEntries ){
+    sqlite3_free(aLazy);
+    return rc==SQLITE_OK ? SQLITE_CORRUPT : rc;
+  }
+  nTotal = lazy.nEntries+cs->index.nIndex;
+  aMerged = sqlite3_malloc64((sqlite3_uint64)nTotal*sizeof(ChunkIndexEntry));
+  if( !aMerged ){
+    sqlite3_free(aLazy);
+    return SQLITE_NOMEM;
+  }
+  i = 0;
+  while( i<lazy.nEntries && j<cs->index.nIndex ){
+    int cmp = prollyHashCompare(&aLazy[i].hash, &cs->index.aIndex[j].hash);
+    if( cmp<0 ) aMerged[k++] = aLazy[i++];
+    else if( cmp>0 ) aMerged[k++] = cs->index.aIndex[j++];
+    else{ aMerged[k++] = cs->index.aIndex[j++]; i++; }
+  }
+  while( i<lazy.nEntries ) aMerged[k++] = aLazy[i++];
+  while( j<cs->index.nIndex ) aMerged[k++] = cs->index.aIndex[j++];
+  sqlite3_free(aLazy);
+  chunkIndexReplaceEntries(&cs->index, aMerged, k);
+  return SQLITE_OK;
+}
+
 static int csValidateIndexEntries(
   const ChunkIndexEntry *aIndex,
   int nIndex,
@@ -471798,6 +480607,7 @@ int csReadIndex(ChunkStore *cs){
   int i;
   i64 fileSize = 0;
 
+  memset(&cs->index.lazy, 0, sizeof(cs->index.lazy));
   if( cs->index.nIndexSize == 0 ){
     cs->index.nIndex = 0;
     return SQLITE_OK;
@@ -479328,6 +488138,7 @@ struct BtCursorOps {
 typedef struct DoltVcState {
   ProllyHash stagedCatalog;
   u8 isMerging;
+  u8 pendingReplayCommit;
   ProllyHash mergeCommitHash;
   ProllyHash conflictsCatalogHash;
   ProllyHash constraintViolationsHash;
@@ -479341,6 +488152,7 @@ struct Btree {
   u32 iLoadedWorkingStateVersion;
   Btree *pNext;
   u64 nSeek;
+  int nBackup;
 
   Catalog cat;
 
@@ -479775,6 +488587,10 @@ int btreeStoreWorkingSetBlob(ChunkStore*, const char*, const ProllyHash*,
                              const ProllyHash*, const ProllyHash*, u8,
                              const ProllyHash*, const ProllyHash*, const char*,
                              const char*, const ProllyHash*);
+int btreePutRebaseMetadataOnBranch(ChunkStore*, const char*, u8,
+                                   const ProllyHash*, const ProllyHash*,
+                                   const char*, const char*);
+int btreeClearRebaseMetadataOnBranch(ChunkStore*, const char*);
 int btreeReadWorkingCatalog(ChunkStore*, const char*, ProllyHash*, ProllyHash*);
 int btreeWriteWorkingState(ChunkStore*, const char*, const ProllyHash*,
                            const ProllyHash*);
@@ -479822,6 +488638,9 @@ int sortKeyFromUnpackedIntRecordBuffer(UnpackedRecord*, int, u8**, int*, int*);
 int prollyInvokeBusyHandler(BtShared*);
 ChunkStore *doltliteGetChunkStore(sqlite3*);
 ChunkStore *doltliteBtreeChunkStore(Btree*);
+void doltliteBtreeBackupStart(Btree*);
+void doltliteBtreeBackupFinish(Btree*);
+void doltliteInvalidateBtreeWorkingState(Btree*);
 BtShared *doltliteGetBtShared(sqlite3*);
 ProllyCache *doltliteGetCache(sqlite3*);
 int doltliteRegister(sqlite3*);
@@ -480673,6 +489492,7 @@ SQLITE_PRIVATE int sqlite3BtreeOpen(
     p->headCommit = state.headCommit;
     p->vc.stagedCatalog = state.stagedCatalog;
     p->vc.isMerging = state.isMerging;
+    p->vc.pendingReplayCommit = 0;
     p->vc.mergeCommitHash = state.mergeCommit;
     p->vc.conflictsCatalogHash = state.conflictsCatalog;
     p->isRebasing = state.isRebasing;
@@ -481923,8 +490743,9 @@ SQLITE_PRIVATE int sqlite3BtreeCopyFile(Btree *pTo, Btree *pFrom){
 }
 
 SQLITE_PRIVATE int sqlite3BtreeIsInBackup(Btree *p){
-  (void)p;
-  return 0;
+  assert( p );
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  return p->nBackup!=0;
 }
 
 #ifndef SQLITE_OMIT_WAL
@@ -481966,6 +490787,101 @@ ChunkStore *doltliteBtreeChunkStore(Btree *p){
   return &p->pBt->store;
 }
 
+int doltliteBtreeSerialize(
+  Btree *p,
+  unsigned char **ppData,
+  sqlite3_int64 *pnData
+){
+  ChunkStore *pSrc = doltliteBtreeChunkStore(p);
+  ChunkStore dest;
+  sqlite3_vfs *pVfs;
+  int rc;
+  int locked = 0;
+
+  *ppData = 0;
+  *pnData = -1;
+  if( pSrc==0 ) return SQLITE_ERROR;
+  pVfs = sqlite3MemdbCreatePrivateVfs(
+      0, 0, 0,
+      SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE);
+  if( pVfs==0 ) return SQLITE_NOMEM;
+  rc = chunkStoreOpen(&dest, pVfs, "x\0",
+      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_DB);
+  if( rc!=SQLITE_OK ){
+    sqlite3MemdbDestroyPrivateVfs(pVfs);
+    return rc;
+  }
+  dest.pOwnedVfs = pVfs;
+  rc = chunkStoreLockAndRefresh(pSrc);
+  if( rc==SQLITE_OK ){
+    locked = 1;
+    rc = chunkStoreCopyIntoEmpty(pSrc, &dest);
+  }
+  if( locked ) chunkStoreUnlock(pSrc);
+  if( rc==SQLITE_OK ){
+    rc = sqlite3MemdbPrivateVfsData(pVfs, ppData, pnData, 1);
+  }
+  chunkStoreClose(&dest);
+  return rc;
+}
+
+int doltliteBtreeDeserialize(
+  sqlite3 *db,
+  unsigned char *pData,
+  sqlite3_int64 szDb,
+  sqlite3_int64 szBuf,
+  unsigned mFlags,
+  Btree **ppBt
+){
+  sqlite3_vfs *pVfs;
+  ChunkStore *pStore;
+  int openFlags;
+  int rc;
+
+  *ppBt = 0;
+  pVfs = sqlite3MemdbCreatePrivateVfs(pData, szDb, szBuf, mFlags);
+  if( pVfs==0 ){
+    if( mFlags & SQLITE_DESERIALIZE_FREEONCLOSE ) sqlite3_free(pData);
+    return SQLITE_NOMEM;
+  }
+  openFlags = 0;
+  if( mFlags & SQLITE_DESERIALIZE_READONLY ){
+    openFlags |= SQLITE_OPEN_READONLY;
+  }else{
+    openFlags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+  }
+  rc = sqlite3BtreeOpen(pVfs, "x\0", db, ppBt, 0, openFlags);
+  if( rc==SQLITE_OK && !sqlite3BtreeIsDoltliteFormat(*ppBt) ){
+    sqlite3BtreeClose(*ppBt);
+    *ppBt = 0;
+    rc = SQLITE_NOTADB;
+  }
+  if( rc!=SQLITE_OK ){
+    sqlite3MemdbDestroyPrivateVfs(pVfs);
+    return rc;
+  }
+  pStore = doltliteBtreeChunkStore(*ppBt);
+  assert( pStore && pStore->isBuffer && pStore->pOwnedVfs==0 );
+  pStore->pOwnedVfs = pVfs;
+  return SQLITE_OK;
+}
+
+void doltliteBtreeBackupStart(Btree *p){
+  if( p ) p->nBackup++;
+}
+
+void doltliteBtreeBackupFinish(Btree *p){
+  assert( p && p->nBackup>0 );
+  p->nBackup--;
+}
+
+void doltliteInvalidateBtreeWorkingState(Btree *p){
+  BtShared *pBt = p ? p->pBt : 0;
+  if( !pBt ) return;
+  pBt->iWorkingStateVersion++;
+  if( pBt->iWorkingStateVersion==0 ) pBt->iWorkingStateVersion = 1;
+}
+
 ChunkStore *doltliteGetChunkStore(sqlite3 *db){
   if( db && db->nDb>0 && db->aDb[0].pBt ){
     Btree *pBt = db->aDb[0].pBt;
@@ -481986,13 +490902,6 @@ BtShared *doltliteGetBtShared(sqlite3 *db){
 int doltliteIsStockSqliteDb(sqlite3 *db){
   return db && db->nDb>0 && db->aDb[0].pBt
       && sqlite3BtreeUsesOrig(db->aDb[0].pBt);
-}
-
-void doltliteInvalidateWorkingState(sqlite3 *db){
-  BtShared *pBt = doltliteGetBtShared(db);
-  if( !pBt ) return;
-  pBt->iWorkingStateVersion++;
-  if( pBt->iWorkingStateVersion==0 ) pBt->iWorkingStateVersion = 1;
 }
 
 ProllyCache *doltliteGetCache(sqlite3 *db){
@@ -483717,7 +492626,17 @@ static int serializeCatalogPatchRoots(Btree *pBtree, u8 **ppOut, int *pnOut){
     if( iTable!=1 || pBtree->bMasterRootChangedTxn ){
       memcpy(q, pTE->root.data, PROLLY_HASH_SIZE);
     }
-    q += PROLLY_HASH_SIZE + PROLLY_HASH_SIZE;
+    q += PROLLY_HASH_SIZE;
+    /* Only roots are patched, so every object the baseline names is published
+    ** as it stands there. Matching entry counts and table numbers do not make
+    ** it this catalog -- a connection that switched branches has a baseline
+    ** describing the branch it left -- and its schema hash is what tells the
+    ** two apart. */
+    if( iTable!=1 && memcmp(q, pTE->schemaHash.data, PROLLY_HASH_SIZE)!=0 ){
+      sqlite3_free(buf);
+      return SQLITE_NOTFOUND;
+    }
+    q += PROLLY_HASH_SIZE;
     nPatched++;
 
     if( iFormat!=CATALOG_FORMAT_V3 ){
@@ -486356,7 +495275,8 @@ static int indexMovetoScanTreeLeaf(
   int nSortKey,
   int nSeekKeyField,
   int *pTreeFound,
-  int *pTreeCmp
+  int *pTreeCmp,
+  int *pTreeEqSeen
 ){
   int rc = SQLITE_OK;
   int iLevel;
@@ -486365,10 +495285,12 @@ static int indexMovetoScanTreeLeaf(
   int nItems;
   int bestIdx = -1;
   int bestCmp = 0;
+  int eqLanding = 0;
   u8 *pRecBuf;
   int nRecBufAlloc;
   int i;
 
+  *pTreeEqSeen = 0;
   if( pCur->pCur.eState!=PROLLY_CURSOR_VALID ) return SQLITE_OK;
 
   iLevel = pCur->pCur.iLevel;
@@ -486404,6 +495326,7 @@ static int indexMovetoScanTreeLeaf(
             if( nSeekKeyField>0 ){
               pIdxKey->eqSeen = 0;
               bestCmp = 1;
+              eqLanding = 0;
             }else{
               const u8 *pVal2; int nVal2;
               prollyNodeValue(&pLeaf->node, i, &pVal2, &nVal2);
@@ -486416,6 +495339,7 @@ static int indexMovetoScanTreeLeaf(
               }
               pIdxKey->eqSeen = 0;
               bestCmp = sqlite3VdbeRecordCompare(nVal2, pVal2, pIdxKey);
+              eqLanding = (bestCmp==0 || pIdxKey->eqSeen);
             }
           }
           break;
@@ -486433,6 +495357,7 @@ static int indexMovetoScanTreeLeaf(
           pIdxKey->eqSeen = 1;
           bestIdx = i;
           bestCmp = pIdxKey->default_rc;
+          eqLanding = 1;
           *pTreeFound = 1;
           *pTreeCmp = bestCmp;
           if( pIdxKey->default_rc < 0 ){
@@ -486462,6 +495387,7 @@ static int indexMovetoScanTreeLeaf(
         }
         bestIdx = i;
         bestCmp = recCmp;
+        eqLanding = 1;
         *pTreeFound = 1;
         *pTreeCmp = recCmp;
         break;
@@ -486477,6 +495403,7 @@ static int indexMovetoScanTreeLeaf(
         if( bestIdx < 0 ){
           bestIdx = i;
           bestCmp = recCmp;
+          eqLanding = 0;
         }
       }
     }
@@ -486499,10 +495426,12 @@ static int indexMovetoScanTreeLeaf(
 
   if( *pTreeFound ){
     pCur->pCur.aLevel[iLevel].idx = bestIdx;
+    *pTreeEqSeen = eqLanding;
   }else if( bestIdx >= 0 ){
     pCur->pCur.aLevel[iLevel].idx = bestIdx;
     *pTreeCmp = bestCmp;
     *pTreeFound = 1;
+    *pTreeEqSeen = eqLanding;
   }
   return SQLITE_OK;
 }
@@ -486565,7 +495494,7 @@ int prollyBtCursorIndexMoveto(
   refreshCursorRoot(pCur);
 
   {
-    int treeFound = 0, mutFound = 0, mutEqSeen = 0;
+    int treeFound = 0, mutFound = 0, mutEqSeen = 0, treeEqSeen = 0;
     int treeCmp = 0, mutCmp = 0;
     const u8 *mutKey = 0;
     int mutNKey = 0;
@@ -486596,7 +495525,7 @@ int prollyBtCursorIndexMoveto(
     ** an I/O or allocation failure. */
     rc = indexMovetoScanTreeLeaf(
         pCur, pIdxKey, pSortKey, nSortKey, nSeekKeyField,
-        &treeFound, &treeCmp);
+        &treeFound, &treeCmp, &treeEqSeen);
     if( rc!=SQLITE_OK ) return rc;
 
     {
@@ -486679,11 +495608,14 @@ int prollyBtCursorIndexMoveto(
         /* Only if the row actually compared equal. A landing above the key is
         ** still a landing, but an equality seek must not read it as a hit. */
         if( mutEqSeen ) pIdxKey->eqSeen = 1;
+        assert( pIdxKey->default_rc>=0 || mutCmp!=-1 || pIdxKey->eqSeen );
         return SQLITE_OK;
       }
     }
     if( treeFound ){
       *pRes = treeCmp;
+      if( treeEqSeen ) pIdxKey->eqSeen = 1;
+      assert( pIdxKey->default_rc>=0 || treeCmp!=-1 || pIdxKey->eqSeen );
       /* A prefix seek can land on a tree row whose value was overwritten in
       ** this transaction (full-key seeks catch this in the exact-match fast
       ** path above). Serve the row from the mut map, or the caller reads the
@@ -487543,6 +496475,25 @@ static int blobPrefixSuccessor(const u8 *pKey, int nKey, u8 **ppOut, int *pnOut)
   return SQLITE_OK;
 }
 
+/* Exclusive end after a complete first-field encoding. A 9-byte exact
+** numeric is a byte prefix of the 18-byte neighbor that shares its IEEE
+** base; a raw prefix successor sits above that neighbor and would count
+** it as still inside the range. Extra composite columns start with a
+** field tag below 0x80, so appending the continuation marker keeps them
+** inside and leaves the neighbor out. */
+static int blobFieldSuccessor(const u8 *pKey, int nKey, u8 **ppOut, int *pnOut){
+  if( nKey==9 && pKey[0]==SORTKEY_NUM ){
+    u8 *pOut = sqlite3_malloc(10);
+    if( !pOut ) return SQLITE_NOMEM;
+    memcpy(pOut, pKey, 9);
+    pOut[9] = 0x80;
+    *ppOut = pOut;
+    *pnOut = 10;
+    return SQLITE_OK;
+  }
+  return blobPrefixSuccessor(pKey, nKey, ppOut, pnOut);
+}
+
 static int countBlobKeysBefore(
   Btree *pBtree,
   const ProllyHash *pRoot,
@@ -487607,7 +496558,7 @@ static int countTreeBlobPrefixRange(
   rc = sortKeyFromUnpackedForCount(
       pCur, pUpper, &pUpperKey, &nUpperAlloc, &nUpperKey);
   if( rc!=SQLITE_OK ) goto done;
-  rc = blobPrefixSuccessor(pUpperKey, nUpperKey, &pUpperNext, &nUpperNext);
+  rc = blobFieldSuccessor(pUpperKey, nUpperKey, &pUpperNext, &nUpperNext);
   if( rc!=SQLITE_OK ) goto done;
 
   rc = countBlobKeysBefore(pCur->pBtree, &pTE->root, pTE->flags,
@@ -490276,6 +499227,66 @@ int btreeStoreWorkingSetBlob(
   return rc;
 }
 
+int btreePutRebaseMetadataOnBranch(
+  ChunkStore *cs,
+  const char *zBranch,
+  u8 rebaseFlags,
+  const ProllyHash *pPreRebaseCat,
+  const ProllyHash *pRebaseOnto,
+  const char *zOrig,
+  const char *zReturn
+){
+  ProllyHash cat, commit, staged, mergeC, conflicts, cvs;
+  char *zIgnoreOrig = 0;
+  char *zIgnoreReturn = 0;
+  u8 merging = 0;
+  u8 oldFlags = 0;
+  int rc;
+
+  if( !cs || !zBranch || !zBranch[0] ) return SQLITE_OK;
+  rc = btreeLoadWorkingSetBlob(cs, zBranch, &cat, &commit, &staged, &merging,
+                               &mergeC, &conflicts, &oldFlags, 0, 0,
+                               &zIgnoreOrig, &zIgnoreReturn, &cvs);
+  sqlite3_free(zIgnoreOrig);
+  sqlite3_free(zIgnoreReturn);
+  if( rc==SQLITE_NOTFOUND ){
+    rc = btreeLoadBranchHeadCatalog(cs, zBranch, &cat, &commit);
+    if( rc!=SQLITE_OK ) return rc;
+    memset(&staged, 0, sizeof(staged));
+    memset(&mergeC, 0, sizeof(mergeC));
+    memset(&conflicts, 0, sizeof(conflicts));
+    memset(&cvs, 0, sizeof(cvs));
+    merging = 0;
+  }else if( rc!=SQLITE_OK ){
+    return rc;
+  }
+  return btreeStoreWorkingSetBlob(cs, zBranch, &cat, &commit, &staged, merging,
+                                  &mergeC, &conflicts, rebaseFlags,
+                                  pPreRebaseCat, pRebaseOnto, zOrig, zReturn,
+                                  &cvs);
+}
+
+int btreeClearRebaseMetadataOnBranch(ChunkStore *cs, const char *zBranch){
+  ProllyHash cat, commit, staged, mergeC, conflicts, cvs;
+  char *zIgnoreOrig = 0;
+  char *zIgnoreReturn = 0;
+  u8 merging = 0;
+  u8 oldFlags = 0;
+  int rc;
+
+  if( !cs || !zBranch || !zBranch[0] ) return SQLITE_OK;
+  rc = btreeLoadWorkingSetBlob(cs, zBranch, &cat, &commit, &staged, &merging,
+                               &mergeC, &conflicts, &oldFlags, 0, 0,
+                               &zIgnoreOrig, &zIgnoreReturn, &cvs);
+  sqlite3_free(zIgnoreOrig);
+  sqlite3_free(zIgnoreReturn);
+  if( rc==SQLITE_NOTFOUND ) return SQLITE_OK;
+  if( rc!=SQLITE_OK ) return rc;
+  if( (oldFlags & WS_REBASE_FLAG_META_MIRROR)==0 ) return SQLITE_OK;
+  return btreeStoreWorkingSetBlob(cs, zBranch, &cat, &commit, &staged, merging,
+                                  &mergeC, &conflicts, 0, 0, 0, 0, 0, &cvs);
+}
+
 int btreeReadWorkingCatalog(
   ChunkStore *cs,
   const char *zBranch,
@@ -490402,6 +499413,7 @@ int btreeReloadBranchWorkingStateInto(
 
   p->vc.stagedCatalog = state.stagedCatalog;
   p->vc.isMerging = state.isMerging;
+  p->vc.pendingReplayCommit = 0;
   p->vc.mergeCommitHash = state.mergeCommit;
   p->vc.conflictsCatalogHash = state.conflictsCatalog;
   p->isRebasing = state.isRebasing;
@@ -490704,14 +499716,19 @@ int doltliteClearSessionMergeState(sqlite3 *db){
   return doltliteSetSessionMergeState(db, 0, 0, 0);
 }
 
-/* Record a new conflicts catalog without disturbing the source commit already
-** on the session. Reaching for doltliteSetSessionMergeState with a null
-** pMergeCommit zeroes it, which drops the second parent commit owes the merged
-** branch and blanks dolt_merge_status.source. */
-int doltliteSetSessionMergeConflicts(sqlite3 *db, const ProllyHash *pConflicts){
-  ProllyHash mergeCommit;
-  doltliteGetSessionMergeState(db, 0, &mergeCommit, 0);
-  return doltliteSetSessionMergeState(db, 1, &mergeCommit, pConflicts);
+int doltliteSetSessionPendingReplayCommit(sqlite3 *db, u8 pending){
+  if( db && db->nDb>0 && db->aDb[0].pBt ){
+    Btree *p = db->aDb[0].pBt;
+    int rc = sessionStateSyncSavepoints(p);
+    if( rc!=SQLITE_OK ) return rc;
+    p->vc.pendingReplayCommit = pending ? 1 : 0;
+  }
+  return SQLITE_OK;
+}
+
+int doltliteSessionHasPendingReplayCommit(sqlite3 *db){
+  if( !db || db->nDb<=0 || !db->aDb[0].pBt ) return 0;
+  return db->aDb[0].pBt->vc.pendingReplayCommit!=0;
 }
 
 int doltliteSetSessionMergeSourceSpec(sqlite3 *db, const char *zSpec,
@@ -490751,7 +499768,8 @@ void doltliteGetSessionRebaseState(sqlite3 *db, u8 *pIsRebasing,
                                     const char **pzReturnBranch){
   if( db && db->nDb>0 && db->aDb[0].pBt ){
     Btree *p = db->aDb[0].pBt;
-    if( pIsRebasing ) *pIsRebasing = p->isRebasing;
+    /* Callers treat this as a boolean; META_MIRROR is persist-mode only. */
+    if( pIsRebasing ) *pIsRebasing = p->isRebasing & WS_REBASE_FLAG_ACTIVE;
     if( pPreRebaseCat ) memcpy(pPreRebaseCat, &p->preRebaseWorkingCat, sizeof(ProllyHash));
     if( pRebaseOnto ) memcpy(pRebaseOnto, &p->rebaseOntoCommit, sizeof(ProllyHash));
     if( pzOrigBranch ) *pzOrigBranch = p->zRebaseOrigBranch;
@@ -490763,6 +499781,11 @@ void doltliteGetSessionRebaseState(sqlite3 *db, u8 *pIsRebasing,
     if( pzOrigBranch ) *pzOrigBranch = 0;
     if( pzReturnBranch ) *pzReturnBranch = 0;
   }
+}
+
+u8 doltliteGetSessionRebaseFlags(sqlite3 *db){
+  if( db && db->nDb>0 && db->aDb[0].pBt ) return db->aDb[0].pBt->isRebasing;
+  return 0;
 }
 
 int doltliteSetSessionRebaseState(sqlite3 *db, u8 isRebasing,
@@ -490813,6 +499836,31 @@ int doltliteClearSessionRebaseState(sqlite3 *db){
   return doltliteSetSessionRebaseState(db, 0, 0, 0, 0, 0);
 }
 
+int doltliteBranchWorkingSetRebaseFlags(
+  sqlite3 *db,
+  const char *zBranch,
+  u8 *pFlags
+){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  int rc;
+
+  if( pFlags ) *pFlags = 0;
+  if( !cs || !zBranch || !zBranch[0] ) return SQLITE_OK;
+  rc = btreeLoadWorkingSetBlob(cs, zBranch, 0, 0, 0, 0, 0, 0,
+                               pFlags, 0, 0, 0, 0, 0);
+  if( rc==SQLITE_NOTFOUND ){
+    if( pFlags ) *pFlags = 0;
+    return SQLITE_OK;
+  }
+  return rc;
+}
+
+int doltliteClearBranchRebaseMetadata(sqlite3 *db, const char *zBranch){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  if( !cs ) return SQLITE_ERROR;
+  return btreeClearRebaseMetadataOnBranch(cs, zBranch);
+}
+
 int doltliteSessionHasUnresolvedConflicts(sqlite3 *db){
   Btree *p;
   if( !db || db->nDb<=0 || !db->aDb[0].pBt ) return 0;
@@ -490827,9 +499875,8 @@ void doltliteGetSessionConflictsCatalog(sqlite3 *db, ProllyHash *pHash){
   {
     Btree *p = db->aDb[0].pBt;
     if( !db->autoCommit || sqlite3_txn_state(db, "main")!=SQLITE_TXN_NONE || db->pSavepoint ){
-      if( p->vc.isMerging ){
-        memcpy(pHash, &p->vc.conflictsCatalogHash, sizeof(*pHash));
-      }
+      /* Cherry-pick and revert record conflicts without isMerging. */
+      memcpy(pHash, &p->vc.conflictsCatalogHash, sizeof(*pHash));
       return;
     }
   }
@@ -490991,13 +500038,33 @@ int doltliteSaveWorkingSetWithHash(sqlite3 *db, const ProllyHash *pWorkingCatHas
                                 &pBtree->vc.constraintViolationsHash);
   if( rc!=SQLITE_OK ) return rc;
 
-  if( pBtree->isRebasing
+  if( (pBtree->isRebasing & WS_REBASE_FLAG_ACTIVE)
    && pBtree->zRebaseReturnBranch
    && pBtree->zRebaseReturnBranch[0]
    && sqlite3_stricmp(zBranch, pBtree->zRebaseReturnBranch)!=0 ){
-    rc = chunkStoreGetBranchWorkingSet(cs, zBranch, &wsHash);
-    if( rc!=SQLITE_OK ) return rc;
-    rc = chunkStoreSetBranchWorkingSet(cs, pBtree->zRebaseReturnBranch, &wsHash);
+    int metaMirror = (pBtree->isRebasing & WS_REBASE_FLAG_META_MIRROR)!=0;
+    if( !metaMirror ){
+      ProllyHash returnHead;
+      memset(&returnHead, 0, sizeof(returnHead));
+      if( chunkStoreFindBranch(cs, pBtree->zRebaseReturnBranch, &returnHead)
+            ==SQLITE_OK
+       && prollyHashCompare(&pBtree->headCommit, &returnHead)!=0 ){
+        metaMirror = 1;
+      }
+    }
+    if( metaMirror ){
+      pBtree->isRebasing = (u8)(pBtree->isRebasing | WS_REBASE_FLAG_META_MIRROR);
+      rc = btreePutRebaseMetadataOnBranch(
+          cs, pBtree->zRebaseReturnBranch,
+          (u8)(WS_REBASE_FLAG_ACTIVE | WS_REBASE_FLAG_META_MIRROR),
+          &pBtree->preRebaseWorkingCat, &pBtree->rebaseOntoCommit,
+          pBtree->zRebaseOrigBranch, pBtree->zRebaseReturnBranch);
+    }else{
+      rc = chunkStoreGetBranchWorkingSet(cs, zBranch, &wsHash);
+      if( rc!=SQLITE_OK ) return rc;
+      rc = chunkStoreSetBranchWorkingSet(cs, pBtree->zRebaseReturnBranch,
+                                         &wsHash);
+    }
     if( rc!=SQLITE_OK ) return rc;
   }
 
@@ -491100,6 +500167,7 @@ int doltliteLoadWorkingSet(sqlite3 *db, const char *zBranch){
   if( rc == SQLITE_NOTFOUND ){
     memset(&pBtree->vc.stagedCatalog, 0, sizeof(ProllyHash));
     pBtree->vc.isMerging = 0;
+    pBtree->vc.pendingReplayCommit = 0;
     memset(&pBtree->vc.mergeCommitHash, 0, sizeof(ProllyHash));
     memset(&pBtree->vc.conflictsCatalogHash, 0, sizeof(ProllyHash));
     pBtree->isRebasing = 0;
@@ -491113,6 +500181,7 @@ int doltliteLoadWorkingSet(sqlite3 *db, const char *zBranch){
     return SQLITE_OK;
   }
   if( rc==SQLITE_OK ){
+    pBtree->vc.pendingReplayCommit = 0;
     sqlite3_free(pBtree->zRebaseOrigBranch);
     pBtree->zRebaseOrigBranch = zNewRebaseOrigBranch;
     sqlite3_free(pBtree->zRebaseReturnBranch);
@@ -493228,6 +502297,13 @@ static int shimPagerCheckpoint(Pager *p, sqlite3 *db, int eMode,
 #endif
   if( rc==SQLITE_OK && db && pCs ){
     rc = doltliteGcCompactStore(db, pCs);
+    /* Compacting here is opportunistic -- stock does not compact on checkpoint
+    ** at all, and answers a checkpoint on a database it may not write with
+    ** success, so a read-only store just stays uncompacted. A store whose file
+    ** was replaced is not that: stock has no such state to be consistent with,
+    ** and the caller is checkpointing a path that no longer holds the database
+    ** it opened, which it can only learn if we say so. */
+    if( rc==SQLITE_READONLY && !pCs->movedReadOnly ) rc = SQLITE_OK;
   }
   if( pCs ) pCs->checkpointActive = 0;
   if( rc!=SQLITE_OK ) return rc;
@@ -493360,8 +502436,7 @@ static inline const PagerOps *getPagerOps(const Pager *p){
 
 /* True when pPager is doltlite's chunk-store pager shim rather than a real
 ** SQLite pager. The shim only services the handful of pager calls the prolly
-** btree facade makes; it has no page image, so callers that need real pages
-** (e.g. sqlite3_serialize's page dump) must treat a shim as unsupported. */
+** btree facade makes and has no page image. */
 int pagerShimIsShim(const Pager *p){
   return p && ((const PagerShim*)p)->magic == PAGER_SHIM_MAGIC;
 }
@@ -493737,8 +502812,10 @@ void disable_simulated_io_errors(void){
 void enable_simulated_io_errors(void){
 }
 
-ChunkStore *doltliteGetChunkStore(sqlite3 *db);
-void doltliteInvalidateWorkingState(sqlite3 *db);
+ChunkStore *doltliteBtreeChunkStore(Btree *p);
+void doltliteBtreeBackupStart(Btree *p);
+void doltliteBtreeBackupFinish(Btree *p);
+void doltliteInvalidateBtreeWorkingState(Btree *p);
 
 static int doltliteBackupSameFile(
   sqlite3_vfs *pSrcVfs,
@@ -493791,9 +502868,12 @@ struct DoltliteBackup {
   sqlite3_backup *pOrig;
   sqlite3 *pSrcDb;
   sqlite3 *pDestDb;
+  Btree *pSrcBt;
+  Btree *pDestBt;
+  char *zDestDb;
   char *zSrcFile;
   char *zDestFile;
-  sqlite3_vfs *pVfs;
+  sqlite3_vfs *pSrcVfs;
   sqlite3_vfs *pDestVfs;
   int done;
   int rc;
@@ -493869,13 +502949,6 @@ static sqlite3_backup *backupInitLocked(sqlite3 *pDest, const char *zDestDb,
     return (sqlite3_backup*)p;
   }
 
-  if( iSrc != 0 || iDest != 0 ){
-    sqlite3ErrorWithMsg(pDest, SQLITE_ERROR,
-        "backup of non-main databases is not supported on doltlite-format "
-        "databases");
-    return 0;
-  }
-
   /* Only one side is doltlite-format: the page copier cannot write a chunk
   ** store, and the raw copy would leave the other side's handle pointing at a
   ** file of the wrong format. */
@@ -493888,18 +502961,30 @@ static sqlite3_backup *backupInitLocked(sqlite3 *pDest, const char *zDestDb,
     return 0;
   }
 
-  srcCs = doltliteGetChunkStore(pSrc);
-  destCs = doltliteGetChunkStore(pDest);
-  if( !srcCs || !chunkFileGetFilename(&srcCs->file) ){
+  srcCs = doltliteBtreeChunkStore(pSrc->aDb[iSrc].pBt);
+  destCs = doltliteBtreeChunkStore(pDest->aDb[iDest].pBt);
+  if( !srcCs ){
     sqlite3ErrorWithMsg(pDest, SQLITE_ERROR, "source database is not backed by a file");
     return 0;
   }
-  if( srcCs->isMemory ){
-    sqlite3ErrorWithMsg(pDest, SQLITE_ERROR, "cannot backup in-memory doltlite database");
+  if( !srcCs->isMemory && !chunkFileGetFilename(&srcCs->file) ){
+    sqlite3ErrorWithMsg(pDest, SQLITE_ERROR, "source database is not backed by a file");
     return 0;
   }
-  if( !destCs || !chunkFileGetFilename(&destCs->file) ){
+  if( !destCs ){
     sqlite3ErrorWithMsg(pDest, SQLITE_ERROR, "destination database is not backed by a file");
+    return 0;
+  }
+  if( !destCs->isMemory && !chunkFileGetFilename(&destCs->file) ){
+    sqlite3ErrorWithMsg(pDest, SQLITE_ERROR, "destination database is not backed by a file");
+    return 0;
+  }
+  if( destCs->readOnly ){
+    sqlite3Error(pDest, SQLITE_READONLY);
+    return 0;
+  }
+  if( sqlite3BtreeTxnState(pDest->aDb[iDest].pBt)!=SQLITE_TXN_NONE ){
+    sqlite3ErrorWithMsg(pDest, SQLITE_ERROR, "destination database is in use");
     return 0;
   }
   /* Do not raw-copy over (or from) a short/garbage file that stock would
@@ -493908,7 +502993,7 @@ static sqlite3_backup *backupInitLocked(sqlite3 *pDest, const char *zDestDb,
     sqlite3ErrorWithMsg(pDest, SQLITE_NOTADB, "file is not a database");
     return 0;
   }
-  {
+  if( !srcCs->isMemory && !destCs->isMemory ){
     int sameRc = SQLITE_OK;
     int same = doltliteBackupSameFile(chunkFileGetVfs(&srcCs->file),
                                       chunkFileGetFilename(&srcCs->file),
@@ -493938,33 +503023,48 @@ static sqlite3_backup *backupInitLocked(sqlite3 *pDest, const char *zDestDb,
 
   p->pSrcDb = pSrc;
   p->pDestDb = pDest;
-  p->pVfs = chunkFileGetVfs(&srcCs->file);
+  p->pSrcBt = pSrc->aDb[iSrc].pBt;
+  p->pDestBt = pDest->aDb[iDest].pBt;
+  p->pSrcVfs = chunkFileGetVfs(&srcCs->file);
   p->pDestVfs = chunkFileGetVfs(&destCs->file);
+  p->zDestDb = sqlite3_mprintf("%s", zDestDb);
+  if( !p->zDestDb ){
+    sqlite3_free(p);
+    sqlite3Error(pDest, SQLITE_NOMEM);
+    return 0;
+  }
   /* zSrcFile is opened with SQLITE_OPEN_MAIN_DB below, so it needs the VFS's
   ** double-nul terminator (a plain "%s" copy keeps only the first nul). */
   p->zSrcFile = 0;
-  if( chunkStoreDupFilenameDoubleNul(chunkFileGetFilename(&srcCs->file),
+  if( !srcCs->isMemory
+   && chunkStoreDupFilenameDoubleNul(chunkFileGetFilename(&srcCs->file),
                                      &p->zSrcFile)!=SQLITE_OK ){
+    sqlite3_free(p->zDestDb);
     sqlite3_free(p);
     sqlite3Error(pDest, SQLITE_NOMEM);
     return 0;
   }
-  p->zDestFile = sqlite3_mprintf("%s", chunkFileGetFilename(&destCs->file));
-  if( !p->zSrcFile || !p->zDestFile ){
+  if( !destCs->isMemory
+   && chunkStoreDupFilenameDoubleNul(chunkFileGetFilename(&destCs->file),
+                                     &p->zDestFile)!=SQLITE_OK ){
     sqlite3_free(p->zSrcFile);
-    sqlite3_free(p->zDestFile);
+    sqlite3_free(p->zDestDb);
     sqlite3_free(p);
     sqlite3Error(pDest, SQLITE_NOMEM);
     return 0;
   }
-
+  doltliteBtreeBackupStart(p->pSrcBt);
   return (sqlite3_backup*)p;
 }
 
 SQLITE_API int sqlite3_backup_step(sqlite3_backup *pBackup, int nPage){
   DoltliteBackup *p = (DoltliteBackup*)pBackup;
-  ChunkStore *srcCs;
-  ChunkStore *destCs;
+  ChunkStore *srcCs = 0;
+  ChunkStore *destCs = 0;
+  ChunkStore tmpStore;
+  Btree *pDestBt = 0;
+  sqlite3_vfs *pDestVfs = 0;
+  const char *zDestFile = 0;
   sqlite3_file *pSrc = 0;
   sqlite3_file *pTmp = 0;
   char *zTmpFile = 0;
@@ -493974,24 +503074,114 @@ SQLITE_API int sqlite3_backup_step(sqlite3_backup *pBackup, int nPage){
   int openFlags;
   int srcLocked = 0;
   int destLocked = 0;
+  int tmpStoreOpen = 0;
+  int memoryAdopted = 0;
+  int iDest;
   (void)nPage;
+
+  memset(&tmpStore, 0, sizeof(tmpStore));
 
   if( p && p->pOrig ) return orig_sqlite3_backup_step(p->pOrig, nPage);
   if( !p ) return SQLITE_DONE;
   if( p->done ) return SQLITE_DONE;
   if( p->rc!=SQLITE_OK ) return p->rc;
 
-  srcCs = doltliteGetChunkStore(p->pSrcDb);
-  destCs = doltliteGetChunkStore(p->pDestDb);
+  sqlite3_mutex_enter(p->pSrcDb->mutex);
+  sqlite3BtreeEnter(p->pSrcBt);
+  sqlite3_mutex_enter(p->pDestDb->mutex);
+
+  srcCs = doltliteBtreeChunkStore(p->pSrcBt);
+  iDest = sqlite3FindDbName(p->pDestDb, p->zDestDb);
+  if( iDest<0 ){
+    sqlite3ErrorWithMsg(p->pDestDb, SQLITE_ERROR,
+                        "unknown database %s", p->zDestDb);
+    rc = SQLITE_ERROR;
+    goto backup_step_done;
+  }
+  pDestBt = p->pDestDb->aDb[iDest].pBt;
+  if( pDestBt!=p->pDestBt ){
+    sqlite3ErrorWithMsg(p->pDestDb, SQLITE_ERROR,
+                        "unknown database %s", p->zDestDb);
+    rc = SQLITE_ERROR;
+    goto backup_step_done;
+  }
+  destCs = doltliteBtreeChunkStore(pDestBt);
   if( !srcCs || !destCs ){
-    p->rc = SQLITE_ERROR;
-    return p->rc;
+    sqlite3ErrorWithMsg(p->pDestDb, SQLITE_ERROR,
+        "cannot backup between a legacy SQLite database and a doltlite "
+        "database");
+    rc = SQLITE_ERROR;
+    goto backup_step_done;
+  }
+  if( !destCs->isMemory && !chunkFileGetFilename(&destCs->file) ){
+    sqlite3ErrorWithMsg(p->pDestDb, SQLITE_ERROR,
+                        "destination database is not backed by a file");
+    rc = SQLITE_ERROR;
+    goto backup_step_done;
+  }
+  if( destCs->readOnly ){
+    rc = SQLITE_READONLY;
+    sqlite3Error(p->pDestDb, rc);
+    goto backup_step_done;
+  }
+  if( p->zDestFile ){
+    int sameRc = SQLITE_OK;
+    int same = !destCs->isMemory
+            && doltliteBackupSameFile(p->pDestVfs, p->zDestFile,
+                                      chunkFileGetVfs(&destCs->file),
+                                      chunkFileGetFilename(&destCs->file),
+                                      &sameRc);
+    if( sameRc!=SQLITE_OK ){
+      rc = sameRc==SQLITE_IOERR_NOMEM ? SQLITE_NOMEM : sameRc;
+      sqlite3Error(p->pDestDb, rc);
+      goto backup_step_done;
+    }
+    if( !same ){
+      sqlite3ErrorWithMsg(p->pDestDb, SQLITE_ERROR,
+                          "unknown database %s", p->zDestDb);
+      rc = SQLITE_ERROR;
+      goto backup_step_done;
+    }
+  }else if( !destCs->isMemory ){
+    sqlite3ErrorWithMsg(p->pDestDb, SQLITE_ERROR,
+                        "unknown database %s", p->zDestDb);
+    rc = SQLITE_ERROR;
+    goto backup_step_done;
+  }
+  if( sqlite3BtreeTxnState(pDestBt)!=SQLITE_TXN_NONE ){
+    sqlite3ErrorWithMsg(p->pDestDb, SQLITE_ERROR,
+                        "destination database is in use");
+    rc = SQLITE_ERROR;
+    goto backup_step_done;
+  }
+  zDestFile = destCs->isMemory ? 0 : chunkFileGetFilename(&destCs->file);
+  pDestVfs = chunkFileGetVfs(&destCs->file);
+  if( srcCs==destCs ){
+    sqlite3ErrorWithMsg(p->pDestDb, SQLITE_ERROR,
+                        "source and destination are the same database");
+    rc = SQLITE_ERROR;
+    goto backup_step_done;
+  }
+  if( !srcCs->isMemory && !destCs->isMemory ){
+    int sameRc = SQLITE_OK;
+    int same = doltliteBackupSameFile(p->pSrcVfs, p->zSrcFile,
+                                      pDestVfs, zDestFile, &sameRc);
+    if( sameRc!=SQLITE_OK ){
+      rc = sameRc==SQLITE_IOERR_NOMEM ? SQLITE_NOMEM : sameRc;
+      sqlite3Error(p->pDestDb, rc);
+      goto backup_step_done;
+    }
+    if( same ){
+      sqlite3ErrorWithMsg(p->pDestDb, SQLITE_ERROR,
+                          "source and destination are the same database");
+      rc = SQLITE_ERROR;
+      goto backup_step_done;
+    }
   }
 
   rc = chunkStoreLockAndRefresh(srcCs);
   if( rc!=SQLITE_OK ){
-    if( rc!=SQLITE_BUSY && rc!=SQLITE_LOCKED ) p->rc = rc;
-    return rc;
+    goto backup_step_done;
   }
   srcLocked = 1;
 
@@ -494002,18 +503192,38 @@ SQLITE_API int sqlite3_backup_step(sqlite3_backup *pBackup, int nPage){
   }
   destLocked = 1;
 
-  openFlags = SQLITE_OPEN_READONLY | SQLITE_OPEN_MAIN_DB;
-  rc = sqlite3OsOpenMalloc(p->pVfs, p->zSrcFile, &pSrc, openFlags, 0);
-  if( rc != SQLITE_OK ) goto backup_step_done;
+  /* The refresh above is what learns the destination file was replaced. The
+  ** path now names a database this handle never opened, and finishing would
+  ** rename our copy over it. */
+  if( destCs->movedReadOnly ){
+    rc = SQLITE_READONLY;
+    p->rc = rc;
+    sqlite3Error(p->pDestDb, rc);
+    goto backup_step_done;
+  }
 
-  rc = sqlite3OsFileSize(pSrc, &fileSize);
-  if( rc != SQLITE_OK ){
+  if( destCs->isMemory ){
+    openFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+              | SQLITE_OPEN_MEMORY | SQLITE_OPEN_MAIN_DB;
+    rc = chunkStoreOpen(&tmpStore, pDestVfs, ":memory:", openFlags);
+    if( rc!=SQLITE_OK ) goto backup_step_done;
+    tmpStoreOpen = 1;
+    rc = chunkStoreCopyIntoEmpty(srcCs, &tmpStore);
+    if( rc!=SQLITE_OK ) goto backup_step_done;
+
+    chunkStoreUnlock(destCs);
+    destLocked = 0;
+    chunkStoreClose(destCs);
+    *destCs = tmpStore;
+    memset(&tmpStore, 0, sizeof(tmpStore));
+    tmpStoreOpen = 0;
+    memoryAdopted = 1;
+    doltliteInvalidateBtreeWorkingState(pDestBt);
     goto backup_step_done;
   }
 
   {
-    /* Opened with SQLITE_OPEN_MAIN_DB below; needs the VFS double-nul name. */
-    char *zTmpRaw = sqlite3_mprintf("%s-backup-%p", p->zDestFile, (void*)p);
+    char *zTmpRaw = sqlite3_mprintf("%s-backup-%p", zDestFile, (void*)p);
     if( !zTmpRaw ){
       rc = SQLITE_NOMEM;
       goto backup_step_done;
@@ -494022,58 +503232,77 @@ SQLITE_API int sqlite3_backup_step(sqlite3_backup *pBackup, int nPage){
     sqlite3_free(zTmpRaw);
     if( rc!=SQLITE_OK ) goto backup_step_done;
   }
-  /* Clearing a stale tmp file may legitimately find nothing to delete, but
-  ** any other failure would surface as a confusing EXCLUSIVE-open error (or
-  ** silently consume an injected fault), so propagate it here. */
-  rc = sqlite3OsDelete(p->pDestVfs, zTmpFile, 0);
+  rc = sqlite3OsDelete(pDestVfs, zTmpFile, 0);
   if( rc==SQLITE_IOERR_DELETE_NOENT ) rc = SQLITE_OK;
   if( rc!=SQLITE_OK ) goto backup_step_done;
 
-  openFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_EXCLUSIVE
-            | SQLITE_OPEN_MAIN_DB;
-  rc = sqlite3OsOpenMalloc(p->pDestVfs, zTmpFile, &pTmp, openFlags, 0);
-  if( rc != SQLITE_OK ) goto backup_step_done;
+  if( srcCs->isMemory ){
+    openFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+              | SQLITE_OPEN_EXCLUSIVE | SQLITE_OPEN_MAIN_DB;
+    rc = chunkStoreOpen(&tmpStore, pDestVfs, zTmpFile, openFlags);
+    if( rc!=SQLITE_OK ) goto backup_step_done;
+    tmpStoreOpen = 1;
+    rc = chunkStoreCopyIntoEmpty(srcCs, &tmpStore);
+    if( rc!=SQLITE_OK ) goto backup_step_done;
+    chunkStoreClose(&tmpStore);
+    tmpStoreOpen = 0;
+  }else{
+    openFlags = SQLITE_OPEN_READONLY | SQLITE_OPEN_MAIN_DB;
+    rc = sqlite3OsOpenMalloc(p->pSrcVfs, p->zSrcFile, &pSrc, openFlags, 0);
+    if( rc != SQLITE_OK ) goto backup_step_done;
 
-  {
-    u8 *buf = (u8*)sqlite3_malloc(65536);
-    i64 off = 0;
-    if( !buf ){
-      rc = SQLITE_NOMEM;
+    rc = sqlite3OsFileSize(pSrc, &fileSize);
+    if( rc != SQLITE_OK ){
       goto backup_step_done;
     }
-    while( off < fileSize ){
-      int toRead = (fileSize - off) > 65536 ? 65536 : (int)(fileSize - off);
-      rc = sqlite3OsRead(pSrc, buf, toRead, off);
-      if( rc != SQLITE_OK ) break;
-      rc = sqlite3OsWrite(pTmp, buf, toRead, off);
-      if( rc != SQLITE_OK ) break;
-      off += toRead;
-    }
-    sqlite3_free(buf);
-  }
 
-  if( rc == SQLITE_OK ){
-    rc = sqlite3OsTruncate(pTmp, fileSize);
+    openFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+              | SQLITE_OPEN_EXCLUSIVE | SQLITE_OPEN_MAIN_DB;
+    rc = sqlite3OsOpenMalloc(pDestVfs, zTmpFile, &pTmp, openFlags, 0);
+    if( rc != SQLITE_OK ) goto backup_step_done;
+
+    {
+      u8 *buf = (u8*)sqlite3_malloc(65536);
+      i64 off = 0;
+      if( !buf ){
+        rc = SQLITE_NOMEM;
+        goto backup_step_done;
+      }
+      while( off < fileSize ){
+        int toRead = (fileSize - off) > 65536 ? 65536 : (int)(fileSize - off);
+        rc = sqlite3OsRead(pSrc, buf, toRead, off);
+        if( rc != SQLITE_OK ) break;
+        rc = sqlite3OsWrite(pTmp, buf, toRead, off);
+        if( rc != SQLITE_OK ) break;
+        off += toRead;
+      }
+      sqlite3_free(buf);
+    }
+
+    if( rc == SQLITE_OK ){
+      rc = sqlite3OsTruncate(pTmp, fileSize);
+    }
+    if( rc == SQLITE_OK ){
+      rc = sqlite3OsSync(pTmp, SQLITE_SYNC_NORMAL);
+    }
+    if( pTmp ){
+      sqlite3OsClose(pTmp);
+      sqlite3_free(pTmp);
+      pTmp = 0;
+    }
   }
   if( rc == SQLITE_OK ){
-    rc = sqlite3OsSync(pTmp, SQLITE_SYNC_NORMAL);
-  }
-  if( pTmp ){
-    sqlite3OsClose(pTmp);
-    sqlite3_free(pTmp);
-    pTmp = 0;
-  }
-  if( rc == SQLITE_OK ){
-    rc = sqlite3OsReplaceFile(p->pDestVfs, zTmpFile, p->zDestFile,
+    rc = sqlite3OsReplaceFile(pDestVfs, zTmpFile, zDestFile,
                               &retainTmp);
   }
 
 backup_step_done:
   if( pSrc ) sqlite3OsCloseFree(pSrc);
   if( pTmp ) sqlite3OsCloseFree(pTmp);
+  if( tmpStoreOpen ) chunkStoreClose(&tmpStore);
   if( zTmpFile ){
     if( rc!=SQLITE_OK && !retainTmp ){
-      (void)sqlite3OsDelete(p->pDestVfs, zTmpFile, 0);
+      (void)sqlite3OsDelete(pDestVfs, zTmpFile, 0);
     }
     sqlite3_free(zTmpFile);
   }
@@ -494083,19 +503312,23 @@ backup_step_done:
     destLocked = 0;
   }
 
-  if( rc == SQLITE_OK ){
+  if( rc == SQLITE_OK && !memoryAdopted ){
     destCs->adoptReplacement = 1;
     rc = chunkStoreLockAndRefresh(destCs);
     if( rc==SQLITE_OK ){
       /* The chunk store now reflects the renamed file. Force the
       ** destination's Btree handles to reload their catalog (and
       ** schema cookie) on the next transaction. */
-      doltliteInvalidateWorkingState(p->pDestDb);
+      doltliteInvalidateBtreeWorkingState(pDestBt);
       chunkStoreUnlock(destCs);
     }
   }
 
   if( srcLocked ) chunkStoreUnlock(srcCs);
+
+  sqlite3_mutex_leave(p->pDestDb->mutex);
+  sqlite3BtreeLeave(p->pSrcBt);
+  sqlite3_mutex_leave(p->pSrcDb->mutex);
 
   if( rc == SQLITE_OK ){
     p->done = 1;
@@ -494114,11 +503347,20 @@ SQLITE_API int sqlite3_backup_finish(sqlite3_backup *pBackup){
     sqlite3_free(p);
     return rc;
   }
-  rc = p->rc;
+  sqlite3_mutex_enter(p->pSrcDb->mutex);
+  sqlite3BtreeEnter(p->pSrcBt);
+  doltliteBtreeBackupFinish(p->pSrcBt);
+  sqlite3BtreeLeave(p->pSrcBt);
+  sqlite3_mutex_leave(p->pSrcDb->mutex);
+  rc = p->rc==SQLITE_DONE ? SQLITE_OK : p->rc;
+  sqlite3_mutex_enter(p->pDestDb->mutex);
+  sqlite3Error(p->pDestDb, rc);
+  sqlite3_mutex_leave(p->pDestDb->mutex);
   sqlite3_free(p->zSrcFile);
   sqlite3_free(p->zDestFile);
+  sqlite3_free(p->zDestDb);
   sqlite3_free(p);
-  return rc==SQLITE_DONE ? SQLITE_OK : rc;
+  return rc;
 }
 
 SQLITE_API int sqlite3_backup_remaining(sqlite3_backup *pBackup){
@@ -496487,7 +505729,6 @@ int doltliteGcCompactStore(sqlite3 *db, ChunkStore *cs);
 int doltliteGcCompactDbWithPhase(sqlite3 *db, int iDb, const char **pzPhase);
 BtShared *doltliteGetBtShared(sqlite3 *db);
 int doltliteIsStockSqliteDb(sqlite3 *db);
-void doltliteInvalidateWorkingState(sqlite3 *db);
 ProllyCache *doltliteGetCache(sqlite3 *db);
 int doltliteSerializeCatalogEntries(sqlite3 *db, struct TableEntry *aTables,
                                     int nTables, u8 **ppOut, int *pnOut);
@@ -496545,15 +505786,41 @@ int doltliteCompareAndAdvanceBranch(
   const ProllyHash *pWorkingCatHash
 );
 int doltlitePersistOrSaveWorkingSet(sqlite3 *db);
+#define DOLTLITE_CMD_OPTION_FLAG 0
+#define DOLTLITE_CMD_OPTION_VALUE 1
+#define DOLTLITE_CMD_PARSE_SHORT_GROUPS 0x01
+
+typedef struct DoltliteCmdOption DoltliteCmdOption;
+struct DoltliteCmdOption {
+  const char *zLong;
+  char shortName;
+  u8 eType;
+  int *pSeen;
+  const char **pzValue;
+};
+
+typedef struct DoltliteCmdArgs DoltliteCmdArgs;
+struct DoltliteCmdArgs {
+  sqlite3_value **apPositional;
+  const char **azPositional;
+  int nPositional;
+};
+
 /* Shared dolt_* command scaffolding (doltlite_cmd.c). */
+int doltliteCmdParseArgs(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv,
+  DoltliteCmdOption *aOption, int nOption, int flags,
+  DoltliteCmdArgs *pArgs
+);
+void doltliteCmdArgsClear(DoltliteCmdArgs *pArgs);
 int doltliteCmdRejectDetached(sqlite3_context *ctx);
 void doltliteCmdResultUnknownOption(sqlite3_context *ctx, const char *zOpt);
 void doltliteCmdResultMissingOptionValue(
   sqlite3_context *ctx, const char *zOptName
 );
-const char *doltliteCmdTakeValueArg(
-  sqlite3_context *ctx, int argc, sqlite3_value **argv, int *pI,
-  const char *zOptName
+int doltliteCmdParseAuthor(
+  sqlite3_context *ctx, const char *zAuthor,
+  char **pzName, char **pzEmail
 );
 void doltliteCmdResultPeerBranchBusy(sqlite3_context *ctx, const char *zOp);
 int doltliteCmdFinishWithConflicts(
@@ -496856,7 +506123,8 @@ int doltliteSetSessionMergeState(sqlite3 *db, u8 isMerging,
                                  const ProllyHash *pMergeCommit,
                                  const ProllyHash *pConflictsCatalog);
 int doltliteClearSessionMergeState(sqlite3 *db);
-int doltliteSetSessionMergeConflicts(sqlite3 *db, const ProllyHash *pConflicts);
+int doltliteSetSessionPendingReplayCommit(sqlite3 *db, u8 pending);
+int doltliteSessionHasPendingReplayCommit(sqlite3 *db);
 int doltliteSetSessionMergeSourceSpec(sqlite3 *db, const char *zSpec,
                                       const ProllyHash *pMergeCommit);
 const char *doltliteGetSessionMergeSourceSpec(sqlite3 *db,
@@ -496866,12 +506134,15 @@ void doltliteGetSessionRebaseState(sqlite3 *db, u8 *pIsRebasing,
                                    ProllyHash *pRebaseOnto,
                                    const char **pzOrigBranch,
                                    const char **pzReturnBranch);
+u8 doltliteGetSessionRebaseFlags(sqlite3 *db);
 int doltliteSetSessionRebaseState(sqlite3 *db, u8 isRebasing,
                                   const ProllyHash *pPreRebaseCat,
                                   const ProllyHash *pRebaseOnto,
                                   const char *zOrigBranch,
                                   const char *zReturnBranch);
 int doltliteClearSessionRebaseState(sqlite3 *db);
+int doltliteBranchWorkingSetRebaseFlags(sqlite3 *db, const char *zBranch, u8 *pFlags);
+int doltliteClearBranchRebaseMetadata(sqlite3 *db, const char *zBranch);
 void doltliteGetSessionConflictsCatalog(sqlite3 *db, ProllyHash *pHash);
 int doltliteSessionHasUnresolvedConflicts(sqlite3 *db);
 int doltliteSetSessionConflictsCatalog(sqlite3 *db, const ProllyHash *pHash);
@@ -496951,6 +506222,11 @@ struct SchemaMergeAction {
   char *zTableName;
   char **azAddColumns;
   int nAddColumns;
+  char **azDropColumns;
+  int nDropColumns;
+  /* Flat old,new pairs: a rename the merged layout still has to be told about. */
+  char **azRenameColumns;
+  int nRenameColumns;
 };
 
 void freeSchemaMergeActions(SchemaMergeAction *a, int n);
@@ -496961,6 +506237,7 @@ int doltliteMergeCatalogs(sqlite3 *db,
     int *pnConflicts, char **pzErrMsg,
     SchemaMergeAction **ppActions, int *pnActions,
     int bPreferOurMaster,
+    int bBranchMerge,
     char ***pazReindex, int *pnReindex,
     char ***pazRebuildVtabs, int *pnRebuildVtabs);
 void doltliteFreeNameList(char **az, int n);
@@ -497051,6 +506328,7 @@ extern int doltliteConstraintViolationsRegister(sqlite3 *db);
 extern int doltliteVerifyConstraintsRegister(sqlite3 *db);
 extern int doltliteDocsRegister(sqlite3 *db);
 extern int doltliteTestsRegister(sqlite3 *db);
+extern int doltliteIgnoreRegister(sqlite3 *db);
 
 int doltliteRegister(sqlite3 *db){
   int rc;
@@ -497085,6 +506363,7 @@ int doltliteRegister(sqlite3 *db){
   if( (rc = doltliteVerifyConstraintsRegister(db))!=SQLITE_OK ) return rc;
   if( (rc = doltliteDocsRegister(db))!=SQLITE_OK ) return rc;
   if( (rc = doltliteTestsRegister(db))!=SQLITE_OK ) return rc;
+  if( (rc = doltliteIgnoreRegister(db))!=SQLITE_OK ) return rc;
   return doltliteMaybeSeedRepo(db);
 }
 
@@ -497128,6 +506407,7 @@ typedef struct sqlite3 sqlite3;
 
 int doltliteCheckIgnore(sqlite3 *db, const char *zTable,
                         int *pIgnored, char **pzErr);
+int doltliteIgnoreRegister(sqlite3 *db);
 
 #endif
 
@@ -497611,6 +506891,14 @@ void freeSchemaMergeActions(SchemaMergeAction *a, int n){
       sqlite3_free(a[i].azAddColumns[j]);
     }
     sqlite3_free(a[i].azAddColumns);
+    for(j=0; j<a[i].nDropColumns; j++){
+      sqlite3_free(a[i].azDropColumns[j]);
+    }
+    sqlite3_free(a[i].azDropColumns);
+    for(j=0; j<a[i].nRenameColumns; j++){
+      sqlite3_free(a[i].azRenameColumns[j]);
+    }
+    sqlite3_free(a[i].azRenameColumns);
     sqlite3_free(a[i].zTableName);
   }
   sqlite3_free(a);
@@ -498108,7 +507396,13 @@ int doltliteVcSealBranchStyleTxn(sqlite3 *db){
   int rc;
   if( db->autoCommit ) return SQLITE_OK;
   if( db->pSavepoint ){
-    return doltliteVcSealActiveSavepoints(db);
+    rc = doltliteVcSealActiveSavepoints(db);
+    if( rc!=SQLITE_OK ) return rc;
+    /* Releasing the savepoints leaves any enclosing BEGIN open, and a later
+    ** ROLLBACK would then revert the working set to the branch we left while
+    ** the ref already names the one we switched to. Seal that too. A top-level
+    ** SAVEPOINT was the transaction, so releasing it ended everything. */
+    if( db->autoCommit ) return SQLITE_OK;
   }
   rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   if( rc!=SQLITE_OK ) return rc;
@@ -498139,11 +507433,154 @@ int doltlitePrimeSchemaCache(sqlite3 *db){
 
 /* #include <string.h> */
 
-/*
-** Shared scaffolding for dolt_* SQL command functions: argv option errors,
-** peer-branch BUSY messages, and the three-way VC txn outcome switch for
-** merge conflicts / constraint violations.
-*/
+static DoltliteCmdOption *cmdFindLongOption(
+  DoltliteCmdOption *aOption,
+  int nOption,
+  const char *zName
+){
+  int i;
+  for(i=0; i<nOption; i++){
+    if( aOption[i].zLong && strcmp(aOption[i].zLong, zName)==0 ){
+      return &aOption[i];
+    }
+  }
+  return 0;
+}
+
+static DoltliteCmdOption *cmdFindShortOption(
+  DoltliteCmdOption *aOption,
+  int nOption,
+  char name
+){
+  int i;
+  for(i=0; i<nOption; i++){
+    if( aOption[i].shortName==name ) return &aOption[i];
+  }
+  return 0;
+}
+
+static int cmdSetOption(
+  sqlite3_context *ctx,
+  DoltliteCmdOption *pOption,
+  const char *zOpt,
+  const char *zAttached,
+  int argc,
+  sqlite3_value **argv,
+  int *pI
+){
+  const char *zValue;
+  if( pOption->eType==DOLTLITE_CMD_OPTION_FLAG ){
+    if( pOption->pSeen ) *pOption->pSeen = 1;
+    return SQLITE_OK;
+  }
+  if( zAttached && zAttached[0] ){
+    zValue = zAttached;
+  }else if( *pI+1<argc ){
+    zValue = (const char*)sqlite3_value_text(argv[++*pI]);
+  }else{
+    doltliteCmdResultMissingOptionValue(ctx, zOpt);
+    return SQLITE_ERROR;
+  }
+  if( !zValue ){
+    doltliteCmdResultMissingOptionValue(ctx, zOpt);
+    return SQLITE_ERROR;
+  }
+  if( pOption->pSeen ) *pOption->pSeen = 1;
+  if( pOption->pzValue ) *pOption->pzValue = zValue;
+  return SQLITE_OK;
+}
+
+void doltliteCmdArgsClear(DoltliteCmdArgs *pArgs){
+  if( !pArgs ) return;
+  sqlite3_free(pArgs->apPositional);
+  sqlite3_free((void*)pArgs->azPositional);
+  memset(pArgs, 0, sizeof(*pArgs));
+}
+
+int doltliteCmdParseArgs(
+  sqlite3_context *ctx,
+  int argc,
+  sqlite3_value **argv,
+  DoltliteCmdOption *aOption,
+  int nOption,
+  int flags,
+  DoltliteCmdArgs *pArgs
+){
+  int endOptions = 0;
+  int i;
+  memset(pArgs, 0, sizeof(*pArgs));
+  for(i=0; i<nOption; i++){
+    if( aOption[i].pSeen ) *aOption[i].pSeen = 0;
+    if( aOption[i].pzValue ) *aOption[i].pzValue = 0;
+  }
+  if( argc>0 ){
+    pArgs->apPositional = sqlite3_malloc64((sqlite3_uint64)argc * sizeof(*argv));
+    pArgs->azPositional = sqlite3_malloc64(
+        (sqlite3_uint64)argc * sizeof(*pArgs->azPositional));
+    if( !pArgs->apPositional || !pArgs->azPositional ){
+      doltliteCmdArgsClear(pArgs);
+      sqlite3_result_error_nomem(ctx);
+      return SQLITE_NOMEM;
+    }
+  }
+  for(i=0; i<argc; i++){
+    const char *zArg = (const char*)sqlite3_value_text(argv[i]);
+    DoltliteCmdOption *pOption = 0;
+    int rc;
+    if( !zArg ) continue;
+    if( !endOptions && strcmp(zArg, "--")==0 ){
+      endOptions = 1;
+      continue;
+    }
+    if( !endOptions && zArg[0]=='-' && zArg[1]=='-' && zArg[2] ){
+      pOption = cmdFindLongOption(aOption, nOption, zArg+2);
+      if( !pOption ){
+        doltliteCmdResultUnknownOption(ctx, zArg);
+        doltliteCmdArgsClear(pArgs);
+        return SQLITE_ERROR;
+      }
+      rc = cmdSetOption(ctx, pOption, pOption->zLong, 0, argc, argv, &i);
+      if( rc!=SQLITE_OK ){
+        doltliteCmdArgsClear(pArgs);
+        return rc;
+      }
+      continue;
+    }
+    if( !endOptions && zArg[0]=='-' && zArg[1] && zArg[1]!='-' ){
+      int j;
+      int nShort = (flags & DOLTLITE_CMD_PARSE_SHORT_GROUPS)
+                 ? sqlite3Strlen30(zArg)-1 : 1;
+      if( !(flags & DOLTLITE_CMD_PARSE_SHORT_GROUPS) && zArg[2] ){
+        doltliteCmdResultUnknownOption(ctx, zArg);
+        doltliteCmdArgsClear(pArgs);
+        return SQLITE_ERROR;
+      }
+      for(j=1; j<=nShort; j++){
+        char zOpt[2] = { zArg[j], 0 };
+        pOption = cmdFindShortOption(aOption, nOption, zArg[j]);
+        if( !pOption ){
+          char zUnknown[3] = { '-', zArg[j], 0 };
+          doltliteCmdResultUnknownOption(ctx, zUnknown);
+          doltliteCmdArgsClear(pArgs);
+          return SQLITE_ERROR;
+        }
+        rc = cmdSetOption(ctx, pOption,
+            pOption->zLong ? pOption->zLong : zOpt,
+            pOption->eType==DOLTLITE_CMD_OPTION_VALUE ? zArg+j+1 : 0,
+            argc, argv, &i);
+        if( rc!=SQLITE_OK ){
+          doltliteCmdArgsClear(pArgs);
+          return rc;
+        }
+        if( pOption->eType==DOLTLITE_CMD_OPTION_VALUE ) break;
+      }
+      continue;
+    }
+    pArgs->apPositional[pArgs->nPositional] = argv[i];
+    pArgs->azPositional[pArgs->nPositional++] = zArg;
+  }
+  return SQLITE_OK;
+}
 
 int doltliteCmdRejectDetached(sqlite3_context *ctx){
   sqlite3 *db = sqlite3_context_db_handle(ctx);
@@ -498177,20 +507614,58 @@ void doltliteCmdResultMissingOptionValue(
   }
 }
 
-const char *doltliteCmdTakeValueArg(
+int doltliteCmdParseAuthor(
   sqlite3_context *ctx,
-  int argc,
-  sqlite3_value **argv,
-  int *pI,
-  const char *zOptName
+  const char *zAuthor,
+  char **pzName,
+  char **pzEmail
 ){
-  int i = *pI;
-  if( i+1>=argc ){
-    doltliteCmdResultMissingOptionValue(ctx, zOptName);
-    return 0;
+  const char *z = zAuthor;
+  if( pzName ) *pzName = 0;
+  if( pzEmail ) *pzEmail = 0;
+  if( !z || !z[0] ){
+    sqlite3_result_error(ctx, "Option 'author' requires a value", -1);
+    return SQLITE_ERROR;
   }
-  *pI = i+1;
-  return (const char*)sqlite3_value_text(argv[i+1]);
+  while( 1 ){
+    const char *zEnd = strchr(z, ')');
+    const char *zSep = 0;
+    const char *p;
+    char *zName;
+    char *zEmail;
+    int nEmail;
+    int i;
+    int j;
+    if( !zEnd ) zEnd = z + strlen(z);
+    for(p=z+1; p+2<zEnd; p++){
+      if( p[0]==' ' && p[1]=='<' ) zSep = p;
+    }
+    if( zSep ){
+      if( !pzName || !pzEmail ) return SQLITE_OK;
+      zName = sqlite3_mprintf("%.*s", (int)(zSep-z), z);
+      nEmail = (int)(zEnd-zSep-2);
+      zEmail = sqlite3_malloc64((sqlite3_uint64)nEmail+1);
+      if( !zName || !zEmail ){
+        sqlite3_free(zName);
+        sqlite3_free(zEmail);
+        sqlite3_result_error_nomem(ctx);
+        return SQLITE_NOMEM;
+      }
+      for(i=0, j=0; i<nEmail; i++){
+        if( zSep[i+2]!='>' ) zEmail[j++] = zSep[i+2];
+      }
+      zEmail[j] = 0;
+      *pzName = zName;
+      *pzEmail = zEmail;
+      return SQLITE_OK;
+    }
+    if( !zEnd[0] ) break;
+    z = zEnd + 1;
+  }
+  sqlite3_result_error(ctx,
+    "Author not formatted correctly. Use 'Name <author@example.com>' format",
+    -1);
+  return SQLITE_ERROR;
 }
 
 void doltliteCmdResultPeerBranchBusy(sqlite3_context *ctx, const char *zOp){
@@ -498206,6 +507681,13 @@ void doltliteCmdResultPeerBranchBusy(sqlite3_context *ctx, const char *zOp){
   }
 }
 
+static int markPendingReplayIfNotMerging(sqlite3 *db){
+  u8 isMerging = 0;
+  doltliteGetSessionMergeState(db, &isMerging, 0, 0);
+  if( isMerging ) return SQLITE_OK;
+  return doltliteSetSessionPendingReplayCommit(db, 1);
+}
+
 int doltliteReportConflicts(
   sqlite3 *db,
   sqlite3_context *ctx,
@@ -498217,6 +507699,8 @@ int doltliteReportConflicts(
   rc = doltliteRegisterConflictTables(db);
   if( rc!=SQLITE_OK ) return rc;
   rc = doltlitePersistOrSaveWorkingSet(db);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = markPendingReplayIfNotMerging(db);
   if( rc!=SQLITE_OK ) return rc;
   sqlite3_snprintf(sizeof(msg), msg,
     "%s has %d conflict(s). Resolve and then commit with dolt_commit.",
@@ -498233,6 +507717,8 @@ int doltliteReportConstraintViolations(
   char msg[256];
   int rc;
   rc = doltlitePersistOrSaveWorkingSet(db);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = markPendingReplayIfNotMerging(db);
   if( rc!=SQLITE_OK ) return rc;
   sqlite3_snprintf(sizeof(msg), msg,
     "%s resulted in constraint violations. Resolve the rows in "
@@ -498253,6 +507739,8 @@ int doltliteReportConflictsAndConstraintViolations(
   rc = doltliteRegisterConflictTables(db);
   if( rc!=SQLITE_OK ) return rc;
   rc = doltlitePersistOrSaveWorkingSet(db);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = markPendingReplayIfNotMerging(db);
   if( rc!=SQLITE_OK ) return rc;
   sqlite3_snprintf(sizeof(msg), msg,
     "%s has %d conflict(s) and constraint violations. Resolve "
@@ -499197,7 +508685,7 @@ int doltliteStageNamedTables(
     const char *zTable = (const char*)sqlite3_value_text(argv[i]);
     Pgno iTable = 0;
     int j;
-    if( !zTable || zTable[0]=='-' || strcmp(zTable, ".")==0 ) continue;
+    if( !zTable || strcmp(zTable, ".")==0 ) continue;
 
     {
       int ignored = 0;
@@ -499515,10 +509003,18 @@ static void doltliteAddFunc(
   sqlite3 *db = sqlite3_context_db_handle(context);
   ChunkStore *cs = doltliteGetChunkStore(db);
   int sealTopLevel = doltliteSavepointIsTopLevelTxn(db);
+  int stageAll = 0;
+  DoltliteCmdArgs args;
+  DoltliteCmdOption aOption[] = {
+    { "all", 'A', DOLTLITE_CMD_OPTION_FLAG, &stageAll, 0 }
+  };
   int rc;
   int i;
-  int stageAll = 0;
+  int nTables = 0;
+  int parsed = 0;
   int opRc = SQLITE_OK;
+
+  memset(&args, 0, sizeof(args));
 
   if( doltliteCmdRejectDetached(context) ) return;
   if( !cs ){
@@ -499529,21 +509025,25 @@ static void doltliteAddFunc(
     sqlite3_result_error(context, "dolt_add requires table name or '-A'", -1);
     goto add_cleanup;
   }
-
-  for(i=0; i<argc; i++){
-    const char *arg = (const char*)sqlite3_value_text(argv[i]);
-    if( !arg ) continue;
-    if( strcmp(arg, "-A")==0
-     || strcmp(arg, "--all")==0
-     || strcmp(arg, ".")==0 ){
+  rc = doltliteCmdParseArgs(context, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ) goto add_cleanup;
+  for(i=0; i<args.nPositional; i++){
+    if( strcmp(args.azPositional[i], ".")==0 ){
       stageAll = 1;
-    }else if( arg[0]=='-' ){
-      doltliteCmdResultUnknownOption(context, arg);
-      goto add_cleanup;
+    }else{
+      args.apPositional[nTables] = args.apPositional[i];
+      args.azPositional[nTables++] = args.azPositional[i];
     }
   }
+  if( !stageAll && nTables==0 ){
+    sqlite3_result_error(context, "dolt_add requires table name or '-A'", -1);
+    goto add_cleanup;
+  }
 
-  opRc = doltliteStageArgsAndPersist(db, context, cs, argc, argv, stageAll);
+  parsed = 1;
+  opRc = doltliteStageArgsAndPersist(
+      db, context, cs, nTables, args.apPositional, stageAll);
   if( opRc!=SQLITE_OK ) goto add_cleanup;
 
   sqlite3_result_int(context, 0);
@@ -499551,8 +509051,9 @@ static void doltliteAddFunc(
 add_cleanup:
   if( sealTopLevel ){
     rc = doltliteVcSealTopLevelSavepointTxn(db);
-    if( rc==SQLITE_OK && opRc==SQLITE_OK ){
-      rc = doltliteStageArgsAndPersist(db, context, cs, argc, argv, stageAll);
+    if( rc==SQLITE_OK && parsed && opRc==SQLITE_OK ){
+      rc = doltliteStageArgsAndPersist(
+          db, context, cs, nTables, args.apPositional, stageAll);
       if( rc!=SQLITE_OK ){
         opRc = rc;
       }
@@ -499565,6 +509066,7 @@ add_cleanup:
   }else if( opRc!=SQLITE_OK ){
     sqlite3_result_error_code(context, opRc);
   }
+  doltliteCmdArgsClear(&args);
 }
 
 
@@ -499661,80 +509163,55 @@ static int doltliteCommitParseOptions(
   sqlite3_value **argv,
   DoltliteCommitOptions *opts
 ){
-  int i;
+  DoltliteCmdArgs args;
+  DoltliteCmdOption aOption[] = {
+    { 0, 'A', DOLTLITE_CMD_OPTION_FLAG, &opts->addAll, 0 },
+    { "all", 'a', DOLTLITE_CMD_OPTION_FLAG, &opts->addModifiedOnly, 0 },
+    { "force", 'f', DOLTLITE_CMD_OPTION_FLAG, &opts->force, 0 },
+    { "message", 'm', DOLTLITE_CMD_OPTION_VALUE, 0, &opts->zMessage },
+    { "author", 0, DOLTLITE_CMD_OPTION_VALUE, 0, &opts->zAuthor },
+    { "date", 0, DOLTLITE_CMD_OPTION_VALUE, 0, &opts->zDate },
+    { "amend", 0, DOLTLITE_CMD_OPTION_FLAG, &opts->amend, 0 },
+    { "allow-empty", 0, DOLTLITE_CMD_OPTION_FLAG, &opts->allowEmpty, 0 },
+    { "skip-empty", 0, DOLTLITE_CMD_OPTION_FLAG, &opts->skipEmpty, 0 }
+  };
+  int rc;
   memset(opts, 0, sizeof(*opts));
-  for(i=0; i<argc; i++){
-    const char *arg = (const char*)sqlite3_value_text(argv[i]);
-    if( !arg ) continue;
-    if( arg[0]=='-' && arg[1]!='-' && arg[1]!=0 && arg[2]!=0 ){
-      int j;
-      for(j=1; arg[j]; j++){
-        if( arg[j]=='A' ){
-          opts->addAll = 1;
-        }else if( arg[j]=='a' ){
-          opts->addModifiedOnly = 1;
-        }else if( arg[j]=='f' ){
-          opts->force = 1;
-        }else if( arg[j]=='m' ){
-          if( arg[j+1]!=0 ){
-            opts->zMessage = &arg[j+1];
-          }else if( i+1<argc ){
-            opts->zMessage = (const char*)sqlite3_value_text(argv[++i]);
-          }else{
-            doltliteCmdResultMissingOptionValue(context, "message");
-            return SQLITE_ERROR;
-          }
-          break;
-        }else{
-          char opt[3] = { '-', (char)arg[j], 0 };
-          doltliteCmdResultUnknownOption(context, opt);
-          return SQLITE_ERROR;
-        }
-      }
-    }else if( strcmp(arg, "-m")==0 ){
-      opts->zMessage = doltliteCmdTakeValueArg(
-          context, argc, argv, &i, "message");
-      if( !opts->zMessage ) return SQLITE_ERROR;
-    }else if( strcmp(arg, "--message")==0 ){
-      opts->zMessage = doltliteCmdTakeValueArg(
-          context, argc, argv, &i, "message");
-      if( !opts->zMessage ) return SQLITE_ERROR;
-    }else if( strcmp(arg, "--author")==0 ){
-      opts->zAuthor = doltliteCmdTakeValueArg(
-          context, argc, argv, &i, "author");
-      if( !opts->zAuthor ) return SQLITE_ERROR;
-    }else if( strcmp(arg, "--date")==0 ){
-      opts->zDate = doltliteCmdTakeValueArg(
-          context, argc, argv, &i, "date");
-      if( !opts->zDate ) return SQLITE_ERROR;
-    }else if( strcmp(arg, "--amend")==0 ){
-      opts->amend = 1;
-    }else if( strcmp(arg, "--allow-empty")==0 ){
-      opts->allowEmpty = 1;
-    }else if( strcmp(arg, "--skip-empty")==0 ){
-      opts->skipEmpty = 1;
-    }else if( strcmp(arg, "-f")==0 || strcmp(arg, "--force")==0 ){
-      opts->force = 1;
-    }else if( strcmp(arg, "-A")==0 ){
-      opts->addAll = 1;
-    }else if( strcmp(arg, "-a")==0 || strcmp(arg, "--all")==0 ){
-      opts->addModifiedOnly = 1;
-    }else if( arg[0]=='-' ){
-      doltliteCmdResultUnknownOption(context, arg);
-      return SQLITE_ERROR;
+  rc = doltliteCmdParseArgs(context, argc, argv, aOption, ArraySize(aOption),
+                            DOLTLITE_CMD_PARSE_SHORT_GROUPS, &args);
+  if( rc!=SQLITE_OK ) return rc;
+  if( args.nPositional>0 ){
+    const char *arg = args.azPositional[0];
+    char *zErr = sqlite3_mprintf(
+        "commit does not take positional arguments, but found 1: %s", arg);
+    if( zErr ){
+      sqlite3_result_error(context, zErr, -1);
+      sqlite3_free(zErr);
     }else{
-      char *zErr = sqlite3_mprintf(
-          "commit does not take positional arguments, but found 1: %s", arg);
-      if( zErr ){
-        sqlite3_result_error(context, zErr, -1);
-        sqlite3_free(zErr);
-      }else{
-        sqlite3_result_error_nomem(context);
-      }
-      return SQLITE_ERROR;
+      sqlite3_result_error_nomem(context);
     }
+    doltliteCmdArgsClear(&args);
+    return SQLITE_ERROR;
   }
+  doltliteCmdArgsClear(&args);
   return SQLITE_OK;
+}
+
+static int doltliteCommitValidateAuthor(
+  sqlite3_context *context,
+  const char *zAuthor
+){
+  char *zName = 0;
+  char *zEmail = 0;
+  int rc = doltliteCmdParseAuthor(context, zAuthor, &zName, &zEmail);
+  if( rc==SQLITE_OK && zEmail[0]==0 ){
+    sqlite3_result_error(context,
+      "Aborting commit due to empty author email. Is your config set?", -1);
+    rc = SQLITE_ERROR;
+  }
+  sqlite3_free(zName);
+  sqlite3_free(zEmail);
+  return rc;
 }
 
 /* Rebuild the staged catalog for `dolt_commit -a`, overlaying working-tree
@@ -500191,17 +509668,9 @@ static int doltliteCommitCreateObject(
   }
 
   if( zAuthor ){
-    const char *lt = strchr(zAuthor, '<');
-    const char *gt = lt ? strchr(lt, '>') : 0;
-    if( lt && gt ){
-      int nameLen = (int)(lt - zAuthor);
-      while( nameLen>0 && zAuthor[nameLen-1]==' ' ) nameLen--;
-      zParsedName = sqlite3_mprintf("%.*s", nameLen, zAuthor);
-      zParsedEmail = sqlite3_mprintf("%.*s", (int)(gt-lt-1), lt+1);
-    }else{
-      zParsedName = sqlite3_mprintf("%s", zAuthor);
-      zParsedEmail = sqlite3_mprintf("");
-    }
+    rc = doltliteCmdParseAuthor(context, zAuthor,
+                                &zParsedName, &zParsedEmail);
+    if( rc!=SQLITE_OK ) return rc;
   }
 
   {
@@ -500266,6 +509735,10 @@ static void doltliteCommitFunc(
   }
 
   if( doltliteCommitParseOptions(context, argc, argv, &opts)!=SQLITE_OK ){
+    return;
+  }
+  if( opts.zAuthor
+   && doltliteCommitValidateAuthor(context, opts.zAuthor)!=SQLITE_OK ){
     return;
   }
   zMessage = opts.zMessage;
@@ -500415,7 +509888,7 @@ static void doltliteCommitFunc(
   {
     u8 isMerging = 0;
     doltliteGetSessionMergeState(db, &isMerging, 0, 0);
-    if( !isMerging && !amend ){
+    if( !isMerging && !amend && !doltliteSessionHasPendingReplayCommit(db) ){
       ProllyHash headCatHash;
       rc = doltliteGetHeadCatalogHash(db, &headCatHash);
       if( rc==SQLITE_OK && !prollyHashIsEmpty(&headCatHash)
@@ -500484,6 +509957,7 @@ static void doltliteCommitFunc(
     return;
   }
   doltliteTxnStateClear(&mutationState);
+  (void)doltliteSetSessionPendingReplayCommit(db, 0);
 
   doltliteHashToHex(&commitHash, hexBuf);
 
@@ -500543,7 +510017,7 @@ int doltliteCommitCmdRegister(sqlite3 *db){
 /* #include <time.h> */
 
 static int resetPathMatchesName(const struct TableEntry *pEntry, const char *zName){
-  return pEntry->zName && strcmp(pEntry->zName, zName)==0;
+  return pEntry->zName && sqlite3_stricmp(pEntry->zName, zName)==0;
 }
 
 static int resetFindTableIndex(struct TableEntry *aTables, int nTables,
@@ -500629,9 +510103,11 @@ static int resetStageNamedPaths(
   }
 
   for(p=0; p<nPaths; p++){
-    const char *zTable = azPaths[p];
-    int iH = resetFindTableIndex(aHead, nHead, zTable);
-    int iS = resetFindTableIndex(aStaged, nStaged, zTable);
+    const char *zPath = azPaths[p];
+    int iH = resetFindTableIndex(aHead, nHead, zPath);
+    int iS = resetFindTableIndex(aStaged, nStaged, zPath);
+    const char *zHeadTable = iH>=0 ? aHead[iH].zName : 0;
+    const char *zStagedTable = iS>=0 ? aStaged[iS].zName : 0;
     char *zDup;
     if( iH<0 && iS<0 ){
       rc = SQLITE_NOTFOUND;
@@ -500649,8 +510125,8 @@ static int resetStageNamedPaths(
       if( rc!=SQLITE_OK ) goto done;
       if( pMate ) continue;
       addRemoveIndexEntriesOfTable(aStaged, &nStaged,
-                                   aStagedSchema, nStagedSchema, zTable);
-      iS = resetFindTableIndex(aStaged, nStaged, zTable);
+                                   aStagedSchema, nStagedSchema, zStagedTable);
+      iS = resetFindTableIndex(aStaged, nStaged, zStagedTable);
       sqlite3_free(aStaged[iS].zName);
       if( iS+1<nStaged ){
         memmove(&aStaged[iS], &aStaged[iS+1],
@@ -500698,7 +510174,7 @@ static int resetStageNamedPaths(
       }
       aStaged = aNew;
       addRemoveIndexEntriesOfTable(aStaged, &nStaged,
-                                   aStagedSchema, nStagedSchema, zTable);
+                                   aStagedSchema, nStagedSchema, zHeadTable);
       zDup = aHead[iH].zName ? sqlite3_mprintf("%s", aHead[iH].zName) : 0;
       if( aHead[iH].zName && !zDup ){
         rc = SQLITE_NOMEM;
@@ -500711,14 +510187,19 @@ static int resetStageNamedPaths(
       rc = addAppendIndexEntriesOfTable(0, &aStaged, &nStaged,
                                         aHead, nHead,
                                         aHeadSchema, nHeadSchema,
-                                        zTable);
+                                        zHeadTable);
       if( rc!=SQLITE_OK ) goto done;
     }else{
       /* Take HEAD's content under the STAGED entry's number so the entry
       ** keeps pairing with the staged catalog's schema row. The table's
       ** index set resets with it: replace whatever index entries staging
       ** carried for this table with HEAD's. */
-      Pgno iKeep = aStaged[iS].iTable;
+      Pgno iKeep;
+      addRemoveIndexEntriesOfTable(aStaged, &nStaged,
+                                   aStagedSchema, nStagedSchema,
+                                   zStagedTable);
+      iS = resetFindTableIndex(aStaged, nStaged, zStagedTable);
+      iKeep = aStaged[iS].iTable;
       zDup = aHead[iH].zName ? sqlite3_mprintf("%s", aHead[iH].zName) : 0;
       if( aHead[iH].zName && !zDup ){
         rc = SQLITE_NOMEM;
@@ -500728,12 +510209,10 @@ static int resetStageNamedPaths(
       aStaged[iS] = aHead[iH];
       aStaged[iS].zName = zDup;
       aStaged[iS].iTable = iKeep;
-      addRemoveIndexEntriesOfTable(aStaged, &nStaged,
-                                   aStagedSchema, nStagedSchema, zTable);
       rc = addAppendIndexEntriesOfTable(0, &aStaged, &nStaged,
                                         aHead, nHead,
                                         aHeadSchema, nHeadSchema,
-                                        zTable);
+                                        zHeadTable);
       if( rc!=SQLITE_OK ) goto done;
     }
   }
@@ -500972,6 +510451,11 @@ static void doltliteResetFunc(
   int havePreResetHead = 0;
   int isHard = 0;
   int isSoft = 0;
+  DoltliteCmdArgs args;
+  DoltliteCmdOption aOption[] = {
+    { "hard", 0, DOLTLITE_CMD_OPTION_FLAG, &isHard, 0 },
+    { "soft", 0, DOLTLITE_CMD_OPTION_FLAG, &isSoft, 0 }
+  };
   const char *zRef = 0;
   const char **azPaths = 0;
   int nPaths = 0;
@@ -500980,6 +510464,8 @@ static void doltliteResetFunc(
   int graphLocked = 0;
   u8 isMerging = 0;
   int bSucceeded = 0;
+
+  memset(&args, 0, sizeof(args));
 
   assert( context!=0 );
   assert( argc>=0 );
@@ -500994,20 +510480,15 @@ static void doltliteResetFunc(
     havePreResetHead = 1;
   }
 
-  azPaths = (const char**)sqlite3_malloc(sizeof(char*) * (argc>0?argc:1));
+  rc = doltliteCmdParseArgs(context, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ) goto reset_cleanup;
+  azPaths = (const char**)sqlite3_malloc(
+      sizeof(char*) * (args.nPositional>0 ? args.nPositional : 1));
   if( !azPaths ){ sqlite3_result_error_nomem(context); goto reset_cleanup; }
-  for(i=0; i<argc; i++){
-    const char *arg = (const char*)sqlite3_value_text(argv[i]);
-    if( !arg ) continue;
-    if( strcmp(arg, "--hard")==0 ){ isHard = 1; }
-    else if( strcmp(arg, "--soft")==0 ){ isSoft = 1; }
-    else if( arg[0]=='-' ){
-      doltliteCmdResultUnknownOption(context, arg);
-      sqlite3_free(azPaths);
-      azPaths = 0;
-      goto reset_cleanup;
-    }
-    else if( !zRef ){
+  for(i=0; i<args.nPositional; i++){
+    const char *arg = args.azPositional[i];
+    if( !zRef ){
 
       if( isHard || isSoft ){
         zRef = arg;
@@ -501216,6 +510697,7 @@ static void doltliteResetFunc(
   bSucceeded = 1;
 reset_cleanup:
   sqlite3_free(azPaths);
+  doltliteCmdArgsClear(&args);
   if( graphLocked ){
     chunkStoreUnlock(cs);
   }
@@ -501335,6 +510817,28 @@ int mergeFastForward(
   return SQLITE_OK;
 }
 
+/* SQLite keeps whatever quoting the rename statement used, so a name quoted
+** here lands quoted in the stored schema while the same rename typed by hand
+** lands bare -- and the two then read as different column definitions, which
+** turns a later merge of two identical schemas into a conflict. Quote only
+** what cannot be written bare. */
+static char *mergeQuotedIfNeeded(const char *zName){
+  int i;
+  int bPlain = zName[0]!=0
+            && (sqlite3Isalpha(zName[0]) || zName[0]=='_');
+  for(i=0; bPlain && zName[i]; i++){
+    if( !sqlite3Isalnum(zName[i]) && zName[i]!='_' && zName[i]!='$' ){
+      bPlain = 0;
+    }
+  }
+  if( bPlain
+   && sqlite3KeywordCode((const u8*)zName, (int)strlen(zName))!=TK_ID ){
+    bPlain = 0;
+  }
+  return bPlain ? sqlite3_mprintf("%s", zName)
+                : sqlite3_mprintf("\"%w\"", zName);
+}
+
 static int doltliteApplyMergeSchemaActions(
   sqlite3 *db,
   const ProllyHash *pAncCatHash,
@@ -501356,6 +510860,30 @@ static int doltliteApplyMergeSchemaActions(
       rc = sqlite3_exec(db, zAlter, 0, 0, 0);
       sqlite3_free(zAlter);
       if( rc!=SQLITE_OK ) break;
+    }
+    /* A rename the other side made. The adopted schema still calls the column
+    ** by its old name, and renaming rewrites no rows, so this only has to tell
+    ** the merged catalog the new name -- which also carries the dependent
+    ** index and view definitions across for free. */
+    for(sj=0; rc==SQLITE_OK && sj+1<aSchemaActions[si].nRenameColumns; sj+=2){
+      char *zNew = mergeQuotedIfNeeded(aSchemaActions[si].azRenameColumns[sj+1]);
+      char *zAlter = zNew ? sqlite3_mprintf(
+          "ALTER TABLE \"%w\" RENAME COLUMN \"%w\" TO %s",
+          aSchemaActions[si].zTableName,
+          aSchemaActions[si].azRenameColumns[sj], zNew) : 0;
+      sqlite3_free(zNew);
+      if( !zAlter ) return SQLITE_NOMEM;
+      rc = sqlite3_exec(db, zAlter, 0, 0, 0);
+      sqlite3_free(zAlter);
+    }
+    /* Deletions the side whose schema was not adopted had already made. */
+    for(sj=0; rc==SQLITE_OK && sj<aSchemaActions[si].nDropColumns; sj++){
+      char *zAlter = sqlite3_mprintf("ALTER TABLE \"%w\" DROP COLUMN \"%w\"",
+                                      aSchemaActions[si].zTableName,
+                                      aSchemaActions[si].azDropColumns[sj]);
+      if( !zAlter ) return SQLITE_NOMEM;
+      rc = sqlite3_exec(db, zAlter, 0, 0, 0);
+      sqlite3_free(zAlter);
     }
   }
 
@@ -501452,11 +510980,24 @@ static int mergeRefInstallMergedCatalog(
   ** filter proved otherwise conflict-free. */
   if( *pnRebuildVtabs>0 && nMergeConflicts==0 ){
     int ri;
+    /* The owners live in the just-switched catalog, which sqlite3FindTable
+    ** cannot see until the schema is reloaded. */
+    (void)sqlite3_exec(db, "SELECT 1 FROM sqlite_master LIMIT 1", 0, 0, 0);
     for(ri=0; ri<*pnRebuildVtabs && rc==SQLITE_OK; ri++){
-      char *zSql = sqlite3_mprintf(
-          "INSERT INTO \"%w\"(cmd, arg) VALUES('rebuild',"
-          " (SELECT val FROM \"%w_model\" WHERE id=1))",
-          (*pazRebuildVtabs)[ri], (*pazRebuildVtabs)[ri]);
+      const char *zOwner = (*pazRebuildVtabs)[ri];
+      Table *pTab = sqlite3FindTable(db, zOwner, "main");
+      char *zSql;
+      /* Each module spells its rebuild differently: vec1 takes the stored
+      ** model as an argument, fts names itself in its own hidden column. */
+      if( pTab && IsVirtual(pTab) && pTab->u.vtab.nArg>0
+       && sqlite3_stricmp(pTab->u.vtab.azArg[0], "vec1")!=0 ){
+        zSql = sqlite3_mprintf(
+            "INSERT INTO \"%w\"(\"%w\") VALUES('rebuild')", zOwner, zOwner);
+      }else{
+        zSql = sqlite3_mprintf(
+            "INSERT INTO \"%w\"(cmd, arg) VALUES('rebuild',"
+            " (SELECT val FROM \"%w_model\" WHERE id=1))", zOwner, zOwner);
+      }
       if( !zSql ){
         rc = SQLITE_NOMEM;
         break;
@@ -501720,7 +511261,7 @@ int doltliteMergeRef(
 
   rc = doltliteMergeCatalogs(db, &ancCatHash, &ourCatHash, &theirCatHash,
                               &mergedCatHash, &nMergeConflicts, &zOwnedErr,
-                              &aSchemaActions, &nSchemaActions, 0,
+                              &aSchemaActions, &nSchemaActions, 0, 1,
                               &azReindex, &nReindex,
                               &azRebuildVtabs, &nRebuildVtabs);
   if( rc!=SQLITE_OK ){
@@ -501865,10 +511406,16 @@ static void doltliteMergeFunc(
   sqlite3 *db = sqlite3_context_db_handle(context);
   const char *zBranch = 0;
   const char *zMessage = 0;
+  DoltliteCmdArgs args;
   int isAbort = 0;
   int noFastForward = 0;
+  DoltliteCmdOption aOption[] = {
+    { "abort", 0, DOLTLITE_CMD_OPTION_FLAG, &isAbort, 0 },
+    { "no-ff", 0, DOLTLITE_CMD_OPTION_FLAG, &noFastForward, 0 },
+    { "message", 'm', DOLTLITE_CMD_OPTION_VALUE, 0, &zMessage }
+  };
   u8 isMerging = 0;
-  int rc, i;
+  int rc;
 
   if( doltliteCmdRejectDetached(context) ) return;
   if( !doltliteGetChunkStore(db) ){
@@ -501880,48 +511427,42 @@ static void doltliteMergeFunc(
     return;
   }
 
-  for(i=0; i<argc; i++){
-    const char *arg = (const char*)sqlite3_value_text(argv[i]);
-    if( !arg ) continue;
-    if( strcmp(arg, "--abort")==0 ){
-      isAbort = 1;
-    }else if( strcmp(arg, "--no-ff")==0 ){
-      noFastForward = 1;
-    }else if( strcmp(arg, "-m")==0 || strcmp(arg, "--message")==0 ){
-      zMessage = doltliteCmdTakeValueArg(context, argc, argv, &i, "message");
-      if( !zMessage ) return;
-    }else if( arg[0]=='-' ){
-      doltliteCmdResultUnknownOption(context, arg);
-      return;
-    }else if( !zBranch ){
-      zBranch = arg;
-    }else{
-      sqlite3_result_error(context, "too many positional arguments to dolt_merge", -1);
-      return;
-    }
+  rc = doltliteCmdParseArgs(context, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ) return;
+  if( args.nPositional>1 ){
+    doltliteCmdArgsClear(&args);
+    sqlite3_result_error(context, "too many positional arguments to dolt_merge", -1);
+    return;
   }
+  if( args.nPositional==1 ) zBranch = args.azPositional[0];
 
   if( isAbort ){
     if( zBranch || zMessage || noFastForward ){
       sqlite3_result_error(context,
         "--abort does not take other arguments", -1);
+      doltliteCmdArgsClear(&args);
       return;
     }
     doltliteGetSessionMergeState(db, &isMerging, 0, 0);
     if( !isMerging ){
       sqlite3_result_error(context, "no merge in progress", -1);
+      doltliteCmdArgsClear(&args);
       return;
     }
     rc = mergeAbortInPlace(db);
     if( rc!=SQLITE_OK ){
       sqlite3_result_error_code(context, rc);
+      doltliteCmdArgsClear(&args);
       return;
     }
     sqlite3_result_int(context, 0);
+    doltliteCmdArgsClear(&args);
     return;
   }
 
   (void)doltliteMergeRef(db, context, zBranch, zMessage, noFastForward);
+  doltliteCmdArgsClear(&args);
 }
 
 
@@ -502085,7 +511626,8 @@ int applyMergedCatalogAndCommit(
     int nReindex = 0;
     rc = doltliteMergeCatalogs(db, ancCatHash, ourCatHash, theirCatHash,
                                 &mergedCatHash, pnConflicts, &zMergeErr, 0, 0,
-                                bPreferOurMaster, &azReindex, &nReindex, 0, 0);
+                                bPreferOurMaster, 0,
+                                &azReindex, &nReindex, 0, 0);
     if( rc!=SQLITE_OK ){
       sqlite3_free(zMergeErr);
       doltliteTxnStateClear(&savedState);
@@ -502222,7 +511764,7 @@ int applyMergedCatalogAndCommit(
     char *zCErr = 0;
     rc = doltliteMergeCatalogs(db, ourCatHash, &liveMergedCatHash,
                                pCommitOurCatHash, &commitCatHash,
-                               &nCommitConflicts, &zCErr, 0, 0, 0,
+                               &nCommitConflicts, &zCErr, 0, 0, 0, 0,
                                &azReindexC, &nReindexC, 0, 0);
     sqlite3_free(zCErr);
     doltliteFreeNameList(azReindexC, nReindexC);
@@ -502817,9 +512359,16 @@ static int rebaseRestoreReturnBranchWorkingState(
   ChunkStore *cs = doltliteGetChunkStore(db);
   DoltliteCommit c;
   ProllyHash headHash;
+  u8 flags = 0;
   int rc;
 
   if( !cs || !zBranch || !zBranch[0] ) return SQLITE_OK;
+  rc = doltliteBranchWorkingSetRebaseFlags(db, zBranch, &flags);
+  if( rc!=SQLITE_OK ) return rc;
+  if( flags & WS_REBASE_FLAG_META_MIRROR ){
+    return doltliteClearBranchRebaseMetadata(db, zBranch);
+  }
+  if( (flags & WS_REBASE_FLAG_ACTIVE)==0 ) return SQLITE_OK;
   rc = chunkStoreFindBranch(cs, zBranch, &headHash);
   if( rc!=SQLITE_OK ) return rc;
   memset(&c, 0, sizeof(c));
@@ -502831,11 +512380,13 @@ static int rebaseRestoreReturnBranchWorkingState(
   return rc;
 }
 /* True if zBranch holds working-set changes its head commit does not. An
-** interactive rebase mirrors its working set onto the return branch so a
-** reopen can resume, and clears that branch at the end -- both of which
-** destroy uncommitted work, so a dirty branch must not be adopted as the
-** mirror target. Rebase already refuses to start with a dirty current branch;
-** the return branch is a different one and has no such guarantee. */
+** interactive rebase mirrors onto the return branch so a reopen can resume.
+** The whole-blob mirror is only loadable when workingCommit equals that
+** branch's HEAD, so a dirty return branch -- or one whose HEAD is not the
+** rebase upstream -- keeps its catalog and only receives rebase metadata.
+** Restore undoes the same choice. Rebase already refuses to start with a
+** dirty current branch; the return branch is a different one and has no
+** such guarantee. */
 static int rebaseBranchHasUncommittedWork(
   sqlite3 *db,
   const char *zBranch,
@@ -503619,7 +513170,12 @@ static int rebaseRestoreInProgress(
   do {
     rc = rebaseWritePlanRows(db, aPlan, nPlan);
     if( rc==SQLITE_OK ){
-      rc = doltliteSetSessionRebaseState(db, 1, pPreRebaseCat, pExpectedOrigHead,
+      /* Claim already cleared session flags. Persist remirrors the working
+      ** catalog onto the return branch unless META_MIRROR is set, which
+      ** would replace uncommitted work on a dirty default. Restore is not
+      ** a finish, so overlay metadata only. */
+      u8 flags = (u8)(WS_REBASE_FLAG_ACTIVE | WS_REBASE_FLAG_META_MIRROR);
+      rc = doltliteSetSessionRebaseState(db, flags, pPreRebaseCat, pExpectedOrigHead,
                                          zOrigBranch, zReturnBranch);
     }
     if( rc==SQLITE_OK ) rc = doltlitePersistWorkingSet(db);
@@ -503708,7 +513264,7 @@ static int rebaseApplyPlanRowCatalog(
     int nReindex = 0;
     rc = doltliteMergeCatalogs(db, &parentC.catalogHash, pCurCat,
                                &replayC.catalogHash, pMergedCat,
-                               &nConflicts, 0, 0, 0, 0,
+                               &nConflicts, 0, 0, 0, 0, 0,
                                &azReindex, &nReindex, 0, 0);
     if( rc==SQLITE_OK && nConflicts==0 ){
       rc = doltliteSwitchCatalog(db, pMergedCat);
@@ -503939,11 +513495,36 @@ static int rebaseReadActiveRetry(
   return rc;
 }
 
+/* Put cleared claim ownership back so a later abort/continue can retry.
+** The rollback persist must not share the claim-commit fault point. */
+static int rebaseUnclaimActiveEnd(
+  sqlite3 *db,
+  u8 flags,
+  const ProllyHash *pPreRebaseCat,
+  const ProllyHash *pRebaseOnto,
+  const char *zOrigBranch,
+  const char *zReturnBranch
+){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  int rc;
+
+  if( !cs ) return SQLITE_ERROR;
+  rc = doltliteSetSessionRebaseState(db, flags, pPreRebaseCat, pRebaseOnto,
+                                     zOrigBranch, zReturnBranch);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = doltliteSaveWorkingSet(db);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = chunkStoreSerializeRefs(cs);
+  if( rc!=SQLITE_OK ) return rc;
+  return chunkStoreCommit(cs);
+}
+
 /* Claim exclusive ownership of ending the active rebase.
 **
 ** Returns SQLITE_DONE if durable isRebasing is already clear (peer won).
 ** Returns SQLITE_OK after this connection clears isRebasing. Storage failures
-** return an error without reporting "no rebase in progress".
+** after mutation restore ownership so a retry can still abort or continue,
+** and return an error without reporting "no rebase in progress".
 ** Callers must copy branch names out of session state before claiming. */
 static int rebaseClaimActiveEnd(
   sqlite3 *db,
@@ -503952,11 +513533,19 @@ static int rebaseClaimActiveEnd(
   ChunkStore *cs = doltliteGetChunkStore(db);
   const char *zBranch;
   const char *zReturnBranchConst = 0;
+  const char *zOrigBranchConst = 0;
   char *zReturnBranch = 0;
+  char *zSavedOrig = 0;
+  ProllyHash savedPre;
+  ProllyHash savedOnto;
   u8 isRebasing = 0;
+  u8 savedFlags = 0;
   int rc;
   int locked = 0;
+  int mutated = 0;
 
+  memset(&savedPre, 0, sizeof(savedPre));
+  memset(&savedOnto, 0, sizeof(savedOnto));
   if( !cs || !db || !zWorkingBranch || !zWorkingBranch[0] ){
     return SQLITE_ERROR;
   }
@@ -503972,23 +513561,26 @@ static int rebaseClaimActiveEnd(
   ** working branch is canonical for terminal-operation ownership. */
   rc = doltliteLoadWorkingSet(db, zWorkingBranch);
   if( rc!=SQLITE_OK ) goto claim_done;
-  doltliteGetSessionRebaseState(db, &isRebasing, 0, 0,
-                                0, &zReturnBranchConst);
+  savedFlags = doltliteGetSessionRebaseFlags(db);
+  doltliteGetSessionRebaseState(db, &isRebasing, &savedPre, &savedOnto,
+                                &zOrigBranchConst, &zReturnBranchConst);
   if( !isRebasing ){
     rc = SQLITE_DONE;
     goto claim_done;
   }
-  zReturnBranch = sqlite3_mprintf("%s", zReturnBranchConst);
-  if( !zReturnBranch ){
+  zReturnBranch = sqlite3_mprintf("%s", zReturnBranchConst ? zReturnBranchConst : "");
+  zSavedOrig = sqlite3_mprintf("%s", zOrigBranchConst ? zOrigBranchConst : "");
+  if( !zReturnBranch || !zSavedOrig ){
     rc = SQLITE_NOMEM;
     goto claim_done;
   }
 
   rc = doltliteClearSessionRebaseState(db);
   if( rc!=SQLITE_OK ) goto claim_done;
+  mutated = 1;
   rc = doltliteSaveWorkingSet(db);
   if( rc!=SQLITE_OK ) goto claim_done;
-  if( zReturnBranch && zReturnBranch[0]
+  if( zReturnBranch[0]
    && sqlite3_stricmp(zBranch, zReturnBranch)!=0 ){
     rc = rebaseRestoreReturnBranchWorkingState(db, zReturnBranch);
     if( rc!=SQLITE_OK ) goto claim_done;
@@ -503998,12 +513590,17 @@ static int rebaseClaimActiveEnd(
     if( rc!=SQLITE_OK ) goto claim_done;
   }
   rc = chunkStoreSerializeRefs(cs);
-  if( rc!=SQLITE_OK ) goto claim_done;
-  rc = chunkStoreCommit(cs);
+  if( rc==SQLITE_OK && sqlite3FaultSim(961) ) rc = SQLITE_IOERR;
+  if( rc==SQLITE_OK ) rc = chunkStoreCommit(cs);
 
 claim_done:
+  if( mutated && rc!=SQLITE_OK ){
+    (void)rebaseUnclaimActiveEnd(db, savedFlags, &savedPre, &savedOnto,
+                                 zSavedOrig, zReturnBranch);
+  }
   if( locked ) chunkStoreUnlock(cs);
   sqlite3_free(zReturnBranch);
+  sqlite3_free(zSavedOrig);
   return rc;
 }
 
@@ -504142,6 +513739,7 @@ static void doltliteRebaseInteractiveStart(
   int rc;
   int dirty = 0;
   u8 curIsRebasing = 0;
+  u8 rebaseFlags = WS_REBASE_FLAG_ACTIVE;
   int bWorkingBranchCreated = 0;
   const char *zFailMsg = 0;
 
@@ -504233,12 +513831,15 @@ static void doltliteRebaseInteractiveStart(
 
   {
     int dirty = 0;
+    ProllyHash returnHead;
     rc = rebaseBranchHasUncommittedWork(db, zReturnBranch, &dirty);
     if( rc!=SQLITE_OK ) goto fail;
-    if( dirty ){
-      /* Empty disables both the mirror and the end-of-rebase clear. The rebase
-      ** still runs; only resuming it after a reopen is given up. */
-      zReturnBranch[0] = 0;
+    memset(&returnHead, 0, sizeof(returnHead));
+    rc = chunkStoreFindBranch(cs, zReturnBranch, &returnHead);
+    if( rc==SQLITE_NOTFOUND ) rc = SQLITE_OK;
+    if( rc!=SQLITE_OK ) goto fail;
+    if( dirty || prollyHashCompare(&returnHead, &upstreamHash)!=0 ){
+      rebaseFlags = (u8)(WS_REBASE_FLAG_ACTIVE | WS_REBASE_FLAG_META_MIRROR);
     }
   }
   if( strlen(zReturnBranch)>=WS_REBASE_BRANCH_LEN ){
@@ -504278,7 +513879,7 @@ static void doltliteRebaseInteractiveStart(
     goto fail;
   }
 
-  rc = doltliteSetSessionRebaseState(db, 1, &preRebaseCat, &headHash,
+  rc = doltliteSetSessionRebaseState(db, rebaseFlags, &preRebaseCat, &headHash,
                                      zOrig, zReturnBranch);
   if( rc==SQLITE_OK ) rc = doltlitePersistWorkingSet(db);
   if( rc!=SQLITE_OK ) goto fail;
@@ -504756,9 +514357,19 @@ static void doltliteRebaseFunc(
 ){
   sqlite3 *db = sqlite3_context_db_handle(context);
   ChunkStore *cs = doltliteGetChunkStore(db);
-  const char *zArg0;
+  DoltliteCmdArgs args;
+  const char *zArg0 = 0;
+  int isAbort = 0, isContinue = 0, isInteractive = 0;
+  DoltliteCmdOption aOption[] = {
+    { "abort", 0, DOLTLITE_CMD_OPTION_FLAG, &isAbort, 0 },
+    { "continue", 0, DOLTLITE_CMD_OPTION_FLAG, &isContinue, 0 },
+    { "interactive", 'i', DOLTLITE_CMD_OPTION_FLAG, &isInteractive, 0 }
+  };
   int sealTopLevel = db->pSavepoint!=0 && db->nSavepoint==0;
   int keepTopLevelSavepoint = 0;
+  int rc;
+
+  memset(&args, 0, sizeof(args));
 
   if( doltliteCmdRejectDetached(context) ) return;
   if( !cs ){ sqlite3_result_error(context, "no database", -1); goto rebase_cleanup; }
@@ -504767,49 +514378,56 @@ static void doltliteRebaseFunc(
     goto rebase_cleanup;
   }
 
-  zArg0 = (const char*)sqlite3_value_text(argv[0]);
-  if( !zArg0 ){
-    sqlite3_result_error(context, "upstream ref required", -1);
+  rc = doltliteCmdParseArgs(context, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ) goto rebase_cleanup;
+  if( isAbort + isContinue + isInteractive > 1 ){
+    sqlite3_result_error(context, "conflicting flags", -1);
     goto rebase_cleanup;
   }
+  if( args.nPositional>0 ) zArg0 = args.azPositional[0];
 
-  if( strcmp(zArg0, "--abort")==0 ){
+  if( isAbort ){
+    if( args.nPositional!=0 ){
+      sqlite3_result_error(context, "--abort does not take other arguments", -1);
+      goto rebase_cleanup;
+    }
     doltliteRebaseInteractiveAbort(context, db);
     goto rebase_cleanup;
   }
-  if( strcmp(zArg0, "--continue")==0 ){
+  if( isContinue ){
+    if( args.nPositional!=0 ){
+      sqlite3_result_error(context, "--continue does not take other arguments", -1);
+      goto rebase_cleanup;
+    }
     keepTopLevelSavepoint = 1;
     doltliteRebaseInteractiveContinue(context, db);
     goto rebase_cleanup;
   }
-  if( strcmp(zArg0, "-i")==0 || strcmp(zArg0, "--interactive")==0 ){
+  if( isInteractive ){
     const char *zUpstream;
     keepTopLevelSavepoint = 1;
-    if( argc<2 ){
+    if( args.nPositional<1 ){
       sqlite3_result_error(context,
         "interactive rebase requires upstream branch: "
         "dolt_rebase('-i', 'upstream')", -1);
       goto rebase_cleanup;
     }
-    if( argc!=2 ){
+    if( args.nPositional!=1 ){
       sqlite3_result_error(context,
         "interactive rebase takes exactly one upstream branch", -1);
       goto rebase_cleanup;
     }
-    zUpstream = (const char*)sqlite3_value_text(argv[1]);
-    if( !zUpstream ){
-      sqlite3_result_error(context, "upstream ref required", -1);
-      goto rebase_cleanup;
-    }
+    zUpstream = args.azPositional[0];
     doltliteRebaseInteractiveStart(context, db, zUpstream);
     goto rebase_cleanup;
   }
 
-  if( zArg0[0]=='-' ){
-    doltliteCmdResultUnknownOption(context, zArg0);
+  if( !zArg0 ){
+    sqlite3_result_error(context, "upstream ref required", -1);
     goto rebase_cleanup;
   }
-  if( argc!=1 ){
+  if( args.nPositional!=1 ){
     sqlite3_result_error(context,
       "too many positional arguments to dolt_rebase", -1);
     goto rebase_cleanup;
@@ -504824,6 +514442,7 @@ static void doltliteRebaseFunc(
   }
 
 rebase_cleanup:
+  doltliteCmdArgsClear(&args);
   if( sealTopLevel && !keepTopLevelSavepoint ){
     (void)doltliteVcSealTopLevelSavepointTxn(db);
   }
@@ -508032,6 +517651,7 @@ int doltliteMergeStatusRegister(sqlite3 *db){
 /* #include "sqliteInt.h" */
 /* #include "prolly_hash.h" */
 /* #include "prolly_diff.h" */
+/* #include "prolly_cursor.h" */
 /* #include "prolly_cache.h" */
 /* #include "chunk_store.h" */
 /* #include "doltlite_commit.h" */
@@ -508276,6 +517896,19 @@ static int loadIndexSchemaRows(
                                ppRows, pnRows);
 }
 
+static int diffRootHasRows(sqlite3 *db, const ProllyHash *pRoot, u8 *pHasRows){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  ProllyCache *pCache = doltliteGetCache(db);
+  u64 n = 0;
+  int rc;
+  *pHasRows = 0;
+  if( !cs || !pCache ) return SQLITE_ERROR;
+  if( prollyHashIsEmpty(pRoot) ) return SQLITE_OK;
+  rc = prollySubtreeCount(cs, pCache, pRoot, &n);
+  if( rc==SQLITE_OK ) *pHasRows = n>0;
+  return rc;
+}
+
 static int diffFilteredTableRoots(
   DoltliteDiffCursor *pCur,
   sqlite3 *db,
@@ -508316,7 +517949,12 @@ static int diffFilteredTableRoots(
   if( !childFound && !parentFound ) return SQLITE_OK;
 
   if( !childFound || !parentFound ){
-    return batchAppend(pCur, zHex, pCur->zFilterTable, pCommit, 1, 1);
+    u8 dataChange;
+    rc = diffRootHasRows(db, childFound ? &childRoot : &parentRoot,
+                         &dataChange);
+    if( rc!=SQLITE_OK ) return rc;
+    return batchAppend(pCur, zHex, pCur->zFilterTable, pCommit,
+                       dataChange, 1);
   }
   {
     u8 dataChange = prollyHashCompare(&childRoot, &parentRoot)!=0;
@@ -508355,6 +517993,7 @@ static int diffCatalogPairOne(
   struct TableEntry *p;
   u8 dataChange;
   u8 schemaChange;
+  int rc;
 
   if( !pCur->zFilterTable ) return SQLITE_OK;
 
@@ -508365,7 +518004,6 @@ static int diffCatalogPairOne(
     struct TableEntry *pOldMaster;
     int hasDiff;
     int oldHas;
-    int rc;
 
     memset(&emptyRoot, 0, sizeof(emptyRoot));
     pNewMaster = doltliteFindTableByNumber(aChild, nChild, 1);
@@ -508390,7 +518028,8 @@ static int diffCatalogPairOne(
   if( !e && !p ) return SQLITE_OK;
 
   if( !p || !e ){
-    dataChange = 1;
+    rc = diffRootHasRows(db, e ? &e->root : &p->root, &dataChange);
+    if( rc!=SQLITE_OK ) return rc;
     schemaChange = 1;
   }else{
     dataChange   = (prollyHashCompare(&e->root, &p->root) != 0) ? 1 : 0;
@@ -508460,7 +518099,8 @@ static int diffCatalogPair(
     }
     p = diffNameIndexFind(&parentIdx, e->zName);
     if( !p ){
-      dataChange = 1;
+      rc = diffRootHasRows(db, &e->root, &dataChange);
+      if( rc!=SQLITE_OK ) goto diff_done;
       schemaChange = 1;
     }else{
       dataChange   = (prollyHashCompare(&e->root, &p->root) != 0) ? 1 : 0;
@@ -508477,9 +518117,12 @@ static int diffCatalogPair(
   }
   for(i=0; i<nParent; i++){
     struct TableEntry *p = &aParent[i];
+    u8 dataChange;
     if( !p->zName ) continue;
     if( diffNameIndexFind(&childIdx, p->zName) ) continue;
-    rc = batchAppend(pCur, zHex, p->zName, pCommit, 1, 1);
+    rc = diffRootHasRows(db, &p->root, &dataChange);
+    if( rc!=SQLITE_OK ) goto diff_done;
+    rc = batchAppend(pCur, zHex, p->zName, pCommit, dataChange, 1);
     if( rc!=SQLITE_OK ) goto diff_done;
   }
 diff_done:
@@ -511248,64 +520891,24 @@ static int mutateBranchMove(sqlite3 *db, ChunkStore *cs, void *pArg){
   return rc;
 }
 
-static void doltBranchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+enum DoltliteBranchMode {
+  MODE_CREATE, MODE_DELETE, MODE_COPY, MODE_MOVE
+};
+
+static void doltBranchParsedFunc(
+  sqlite3_context *ctx,
+  enum DoltliteBranchMode mode,
+  int force,
+  int nPositional,
+  const char **aPositional
+){
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   ChunkStore *cs = doltliteGetChunkStore(db);
-  enum { MODE_CREATE, MODE_DELETE, MODE_COPY, MODE_MOVE } mode = MODE_CREATE;
-  int force = 0;
-  const char *aPositional[3] = {0, 0, 0};
-  int nPositional = 0;
   int hadExplicitTxn = !db->autoCommit;
   int hadSavepoint = db->pSavepoint!=0;
-  int i, rc;
+  int rc;
 
-  if( doltliteCmdRejectDetached(ctx) ) return;
   if( !cs ){ branchError(ctx, hadSavepoint, doltliteVcUnavailableMessage(db)); return; }
-  if( argc<1 ){ branchError(ctx, hadSavepoint, "dolt_branch requires arguments"); return; }
-
-  for(i=0; i<argc; i++){
-    const char *arg = (const char*)sqlite3_value_text(argv[i]);
-    if( !arg ) continue;
-    if( strcmp(arg, "-d")==0 || strcmp(arg, "--delete")==0 ){
-      if( mode!=MODE_CREATE ){
-        branchError(ctx, hadSavepoint, "conflicting flags"); return;
-      }
-      mode = MODE_DELETE;
-    }else if( strcmp(arg, "-D")==0 ){
-
-      if( mode!=MODE_CREATE ){
-        branchError(ctx, hadSavepoint, "conflicting flags"); return;
-      }
-      mode = MODE_DELETE;
-      force = 1;
-    }else if( strcmp(arg, "-c")==0 || strcmp(arg, "--copy")==0 ){
-      if( mode!=MODE_CREATE ){
-        branchError(ctx, hadSavepoint, "conflicting flags"); return;
-      }
-      mode = MODE_COPY;
-    }else if( strcmp(arg, "-m")==0 || strcmp(arg, "--move")==0 ){
-      if( mode!=MODE_CREATE ){
-        branchError(ctx, hadSavepoint, "conflicting flags"); return;
-      }
-      mode = MODE_MOVE;
-    }else if( strcmp(arg, "-f")==0 || strcmp(arg, "--force")==0 ){
-      force = 1;
-    }else if( arg[0]=='-' ){
-      char *zErr = sqlite3_mprintf("unknown option `%s`", arg);
-      if( zErr ){
-        branchError(ctx, hadSavepoint, zErr);
-        sqlite3_free(zErr);
-      }else{
-        sqlite3_result_error_nomem(ctx);
-      }
-      return;
-    }else{
-      if( nPositional >= 3 ){
-        branchError(ctx, hadSavepoint, "too many arguments"); return;
-      }
-      aPositional[nPositional++] = arg;
-    }
-  }
 
   switch( mode ){
     case MODE_DELETE: {
@@ -511509,6 +521112,51 @@ static void doltBranchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv)
     }
   }
   sqlite3_result_int(ctx, 0);
+}
+
+static void doltBranchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+  DoltliteCmdArgs args;
+  enum DoltliteBranchMode mode = MODE_CREATE;
+  int isDelete = 0, isForceDelete = 0, isCopy = 0, isMove = 0, force = 0;
+  int hadSavepoint = db->pSavepoint!=0;
+  DoltliteCmdOption aOption[] = {
+    { "delete", 'd', DOLTLITE_CMD_OPTION_FLAG, &isDelete, 0 },
+    { 0, 'D', DOLTLITE_CMD_OPTION_FLAG, &isForceDelete, 0 },
+    { "copy", 'c', DOLTLITE_CMD_OPTION_FLAG, &isCopy, 0 },
+    { "move", 'm', DOLTLITE_CMD_OPTION_FLAG, &isMove, 0 },
+    { "force", 'f', DOLTLITE_CMD_OPTION_FLAG, &force, 0 }
+  };
+  int rc;
+
+  if( doltliteCmdRejectDetached(ctx) ) return;
+  if( argc<1 ){
+    branchError(ctx, hadSavepoint, "dolt_branch requires arguments");
+    return;
+  }
+  rc = doltliteCmdParseArgs(ctx, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ){
+    (void)doltliteVcSealSavepointError(db);
+    return;
+  }
+  if( isDelete + isForceDelete + isCopy + isMove > 1 ){
+    doltliteCmdArgsClear(&args);
+    branchError(ctx, hadSavepoint, "conflicting flags");
+    return;
+  }
+  if( isDelete || isForceDelete ) mode = MODE_DELETE;
+  else if( isCopy ) mode = MODE_COPY;
+  else if( isMove ) mode = MODE_MOVE;
+  if( isForceDelete ) force = 1;
+  if( args.nPositional>3 ){
+    doltliteCmdArgsClear(&args);
+    branchError(ctx, hadSavepoint, "too many arguments");
+    return;
+  }
+  doltBranchParsedFunc(ctx, mode, force, args.nPositional,
+                       args.azPositional);
+  doltliteCmdArgsClear(&args);
 }
 
 
@@ -512164,7 +521812,8 @@ static void checkoutSaveSession(sqlite3 *db, CheckoutMutationCtx *p){
   doltliteGetSessionMergeState(db, &p->savedIsMerging,
                                &p->savedMergeCommit,
                                &p->savedConflictsCatalog);
-  doltliteGetSessionRebaseState(db, &p->savedIsRebasing,
+  p->savedIsRebasing = doltliteGetSessionRebaseFlags(db);
+  doltliteGetSessionRebaseState(db, 0,
                                 &p->savedPreRebaseCat,
                                 &p->savedRebaseOnto,
                                 &p->zSavedRebaseOrigBranch,
@@ -512263,6 +521912,10 @@ static int checkoutMutateRefs(sqlite3 *db, ChunkStore *cs, void *pArg){
   if( !bSavepoint || p->bPersistUnderSavepoint ){
     rc = doltlitePersistWorkingSetWithHash(db, &p->targetCatHash);
     if( rc!=SQLITE_OK ) return rc;
+    /* The target branch is durable now, so it is what a rollback returns to.
+    ** Keeping the branch we left as the baseline reinstates its catalog --
+    ** its tables, under this branch. */
+    doltliteAdoptRollbackBaseline(db, &p->targetCatHash);
   }
 
   if( p->haveOldState && !p->savedWasDetached ){
@@ -513032,7 +522685,12 @@ static int doltliteCheckoutTables(
   return rc;
 }
 
-void doltCheckoutFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+static void doltCheckoutParsedFunc(
+  sqlite3_context *ctx,
+  int argc,
+  sqlite3_value **argv,
+  int createBranch
+){
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   ChunkStore *cs = doltliteGetChunkStore(db);
   CheckoutMutationCtx m;
@@ -513053,7 +522711,7 @@ void doltCheckoutFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
 
   if( doltliteIsDetached(db) ){
     ProllyHash probe;
-    if( strcmp(zBranch, "-b")==0 ){
+    if( createBranch ){
       doltliteVcResultError(ctx, db,
           "unable to create new branch in a read-only database");
       return;
@@ -513083,20 +522741,25 @@ void doltCheckoutFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
       doltliteVcResultError(ctx, db, "unresolved merge conflicts \xe2\x80\x94 commit or abort first");
       return;
     }
+    if( doltliteSessionHasUnresolvedConflicts(db) ){
+      doltliteVcResultError(ctx, db,
+        "unresolved conflicts \xe2\x80\x94 resolve them or roll back first");
+      return;
+    }
   }
 
-  if( strcmp(zBranch, "-b")==0 ){
-    if( argc<2 ){ doltliteVcResultError(ctx, db, "branch name required after -b"); return; }
-    if( argc>3 ){ doltliteVcResultError(ctx, db, "too many arguments"); return; }
-    zBranch = (const char*)sqlite3_value_text(argv[1]);
+  if( createBranch ){
+    if( argc<1 ){ doltliteVcResultError(ctx, db, "branch name required after -b"); return; }
+    if( argc>2 ){ doltliteVcResultError(ctx, db, "too many arguments"); return; }
+    zBranch = (const char*)sqlite3_value_text(argv[0]);
     if( branchNameEmpty(zBranch) ){ doltliteVcResultError(ctx, db, "branch name required after -b"); return; }
     if( !doltliteUserRefNameIsValid(zBranch) ){
       doltliteVcResultError(ctx, db, "invalid branch name");
       return;
     }
 
-    if( argc>=3 ){
-      const char *zStart = (const char*)sqlite3_value_text(argv[2]);
+    if( argc>=2 ){
+      const char *zStart = (const char*)sqlite3_value_text(argv[1]);
       if( !zStart ){
         doltliteVcResultError(ctx, db, "start point not found");
         return;
@@ -513283,6 +522946,29 @@ checkout_done:
   sqlite3_result_int(ctx, 0);
 }
 
+void doltCheckoutFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  DoltliteCmdArgs args;
+  int createBranch = 0;
+  DoltliteCmdOption aOption[] = {
+    { 0, 'b', DOLTLITE_CMD_OPTION_FLAG, &createBranch, 0 }
+  };
+  int rc;
+
+  if( argc==0 ){
+    doltCheckoutParsedFunc(ctx, argc, argv, createBranch);
+    return;
+  }
+  rc = doltliteCmdParseArgs(ctx, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ){
+    (void)doltliteVcSealSavepointError(sqlite3_context_db_handle(ctx));
+    return;
+  }
+  doltCheckoutParsedFunc(ctx, args.nPositional, args.apPositional,
+                         createBranch);
+  doltliteCmdArgsClear(&args);
+}
+
 #endif
 
 /************** End of doltlite_checkout.c ***********************************/
@@ -513324,38 +523010,34 @@ static int mutateTagRef(sqlite3 *db, ChunkStore *cs, void *pArg){
                               p->timestamp, p->zMessage);
 }
 
-static void doltTagFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+static void doltTagParsedFunc(
+  sqlite3_context *ctx,
+  int isDelete,
+  int nPositional,
+  const char **azPositional,
+  const char *zMessage,
+  const char *zAuthor
+){
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   ChunkStore *cs = doltliteGetChunkStore(db);
   TagMutationCtx m;
-  const char *arg0;
-  const char *zMessage = 0;
-  const char *zAuthor = 0;
-  const char *zCommitRef = 0;
+  const char *arg0 = nPositional>0 ? azPositional[0] : 0;
+  const char *zCommitRef = nPositional>1 ? azPositional[1] : 0;
   char *zParsedTagger = 0;
   char *zParsedEmail = 0;
-  int rc, i;
+  int rc;
 
-  if( doltliteCmdRejectDetached(ctx) ) return;
   if( !cs ){ doltliteVcResultError(ctx, db, "no database"); return; }
-  if( argc<1 ){ doltliteVcResultError(ctx, db, "tag name required"); return; }
+  if( nPositional<1 ){ doltliteVcResultError(ctx, db, "tag name required"); return; }
 
   memset(&m, 0, sizeof(m));
 
-  arg0 = (const char*)sqlite3_value_text(argv[0]);
-  if( !arg0 ){ doltliteVcResultError(ctx, db, "tag name required"); return; }
-
-
-  if( strcmp(arg0, "-d")==0 || strcmp(arg0, "--delete")==0 ){
-    const char *zName;
-    if( argc<2 ){ doltliteVcResultError(ctx, db, "tag name required for delete"); return; }
-    if( argc!=2 ){
+  if( isDelete ){
+    if( nPositional!=1 ){
       doltliteVcResultError(ctx, db, "too many positional arguments to dolt_tag");
       return;
     }
-    zName = (const char*)sqlite3_value_text(argv[1]);
-    if( !zName ){ doltliteVcResultError(ctx, db, "tag name required"); return; }
-    m.zName = zName;
+    m.zName = arg0;
     m.isDelete = 1;
     rc = doltliteMutateRefs(db, mutateTagRef, &m);
     if( rc==SQLITE_CONSTRAINT && doltliteSessionHasUnresolvedConflicts(db) ){
@@ -513383,25 +523065,9 @@ static void doltTagFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   }
 
 
-  for(i=1; i<argc; i++){
-    const char *arg = (const char*)sqlite3_value_text(argv[i]);
-    if( !arg ) continue;
-    if( strcmp(arg, "-m")==0 || strcmp(arg, "--message")==0 ){
-      zMessage = doltliteCmdTakeValueArg(ctx, argc, argv, &i, "message");
-      if( !zMessage ){ tagSealSavepointError(ctx); return; }
-    }else if( strcmp(arg, "--author")==0 ){
-      zAuthor = doltliteCmdTakeValueArg(ctx, argc, argv, &i, "author");
-      if( !zAuthor ){ tagSealSavepointError(ctx); return; }
-    }else if( arg[0]=='-' ){
-      tagSealSavepointError(ctx);
-      doltliteCmdResultUnknownOption(ctx, arg);
-      return;
-    }else if( !zCommitRef ){
-      zCommitRef = arg;
-    }else{
-      doltliteVcResultError(ctx, db, "too many positional arguments to dolt_tag");
-      return;
-    }
+  if( nPositional>2 ){
+    doltliteVcResultError(ctx, db, "too many positional arguments to dolt_tag");
+    return;
   }
 
   if( zCommitRef ){
@@ -513419,22 +523085,10 @@ static void doltTagFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   }
 
   if( zAuthor ){
-    const char *lt = strchr(zAuthor, '<');
-    const char *gt = lt ? strchr(lt, '>') : 0;
-    if( lt && gt ){
-      int nameLen = (int)(lt - zAuthor);
-      while( nameLen>0 && zAuthor[nameLen-1]==' ' ) nameLen--;
-      zParsedTagger = sqlite3_mprintf("%.*s", nameLen, zAuthor);
-      zParsedEmail  = sqlite3_mprintf("%.*s", (int)(gt-lt-1), lt+1);
-    }else{
-      zParsedTagger = sqlite3_mprintf("%s", zAuthor);
-      zParsedEmail  = sqlite3_mprintf("");
-    }
-    if( !zParsedTagger || !zParsedEmail ){
-      sqlite3_free(zParsedTagger);
-      sqlite3_free(zParsedEmail);
+    rc = doltliteCmdParseAuthor(ctx, zAuthor,
+                                &zParsedTagger, &zParsedEmail);
+    if( rc!=SQLITE_OK ){
       tagSealSavepointError(ctx);
-      sqlite3_result_error_nomem(ctx);
       return;
     }
     m.zTagger = zParsedTagger;
@@ -513466,6 +523120,41 @@ static void doltTagFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
     return;
   }
   sqlite3_result_int(ctx, 0);
+}
+
+static void doltTagFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  DoltliteCmdArgs args;
+  int isDelete = 0;
+  const char *zMessage = 0;
+  const char *zAuthor = 0;
+  DoltliteCmdOption aOption[] = {
+    { "delete", 'd', DOLTLITE_CMD_OPTION_FLAG, &isDelete, 0 },
+    { "message", 'm', DOLTLITE_CMD_OPTION_VALUE, 0, &zMessage },
+    { "author", 0, DOLTLITE_CMD_OPTION_VALUE, 0, &zAuthor }
+  };
+  int rc;
+
+  if( doltliteCmdRejectDetached(ctx) ) return;
+  if( argc<1 ){
+    doltliteVcResultError(ctx, sqlite3_context_db_handle(ctx),
+                          "tag name required");
+    return;
+  }
+  rc = doltliteCmdParseArgs(ctx, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ){
+    tagSealSavepointError(ctx);
+    return;
+  }
+  if( isDelete && (zMessage || zAuthor) ){
+    doltliteCmdArgsClear(&args);
+    doltliteVcResultError(ctx, sqlite3_context_db_handle(ctx),
+                          "too many positional arguments to dolt_tag");
+    return;
+  }
+  doltTagParsedFunc(ctx, isDelete, args.nPositional, args.azPositional,
+                    zMessage, zAuthor);
+  doltliteCmdArgsClear(&args);
 }
 
 typedef struct TagVtab TagVtab;
@@ -514104,6 +523793,59 @@ struct SchemaRootpageRemap {
 
 /* ── rows (doltlite_merge_rows.c) ─────────────────────────────────────── */
 
+/* Shared with the pre-detection module, which reads the same pass-1 state. */
+typedef struct IndexMergePatch IndexMergePatch;
+struct IndexMergePatch {
+  Pgno iTable;
+  ProllyHash mergedRoot;
+};
+
+/* Shared state for pass-1 catalog merge. Keeps the long parameter list off
+** the leaf helpers and makes the patch list a single ownership root. */
+typedef struct MergePass1Ctx MergePass1Ctx;
+struct MergePass1Ctx {
+  sqlite3 *db;
+  struct TableEntry *aAnc; int nAnc;
+  struct TableEntry *aOurs; int nOurs;
+  struct TableEntry *aTheirs; int nTheirs;
+  SchemaEntry *aAncSchema; int nAncSchema;
+  SchemaEntry *aOursSchema; int nOursSchema;
+  SchemaEntry *aTheirsSchema; int nTheirsSchema;
+  struct TableEntry *aMerged; int *pnMerged;
+  MergeConflictTable **ppConflictTables; int *pnConflictTables;
+  int *pTotalConflicts;
+  char **pzErrMsg;
+  const ProllyHash *pCatAnc;
+  const ProllyHash *pCatOurs;
+  const ProllyHash *pCatTheirs;
+  SchemaMergeAction **ppSchemaActions; int *pnSchemaActions;
+  int bDisjointSchemaChanges;
+  int bPreferOurMaster;
+  /* A merge of two branches, as opposed to a replay of one commit onto
+  ** another (revert, cherry-pick, rebase). Refusals that encode Dolt's
+  ** judgement about a merge only apply to the former. */
+  int bBranchMerge;
+  char ***pazReindex; int *pnReindex;
+  IndexMergePatch *aPatches;
+  int nPatches;
+  int nPatchesAlloc;
+};
+
+int mergePass1CheckIndexOverRenamedColumn(MergePass1Ctx *c);
+int mergePass1CheckTriggerOverRenamedTable(MergePass1Ctx *c);
+int mergePass1CheckRowEditOfDroppedColumn(MergePass1Ctx *c);
+int mergePass1CheckDuplicateIndexColumns(MergePass1Ctx *c);
+
+int mergeRowEditsColumn(
+  sqlite3 *db,
+  const ProllyHash *pAncRoot,
+  const ProllyHash *pOtherRoot,
+  u8 ancFlags,
+  u8 otherFlags,
+  int iField,
+  int *pbEdited
+);
+
 int canFastMerge(
   sqlite3 *db,
   const char *zName,
@@ -514171,6 +523913,8 @@ int trySchemaColumnMerge(
   const char *zOursSql,
   const char *zTheirsSql,
   char ***ppAddCols, int *pnAddCols,
+  char ***ppDropCols, int *pnDropCols,
+  char ***ppRenameCols, int *pnRenameCols,
   int *pSchemaChoice,
   int *pResolvedDivergence,
   char **pzErrDetail
@@ -514195,6 +523939,18 @@ int appendSchemaConflict(
   const char *zTable,
   const char *zObject,
   int *pAddedTable
+);
+
+int recordSchemaColumnChanges(
+  SchemaMergeAction **ppSchemaActions,
+  int *pnSchemaActions,
+  const char *zName,
+  char **azAddCols,
+  int nAddCols,
+  char **azDropCols,
+  int nDropCols,
+  char **azRenameCols,
+  int nRenameCols
 );
 
 int recordSchemaAddColumns(
@@ -514226,6 +523982,31 @@ int hasSchemaConflictTable(
 int hasAnySchemaConflict(
   MergeConflictTable *aConflictTables,
   int nConflictTables
+);
+
+int mergeIndexColumnsOverlap(const char *zSqlA, const char *zSqlB);
+
+int mergePreDetectDualIndexOverlap(
+  SchemaEntry *aAnc, int nAnc,
+  SchemaEntry *aOurs, int nOurs,
+  SchemaEntry *aTheirs, int nTheirs,
+  MergeConflictTable **ppConflictTables,
+  int *pnConflictTables,
+  int *pTotalConflicts
+);
+
+int mergeIndexColumnRenamedAway(
+  const char *zIndexSql,
+  const char *zAncTableSql,
+  const char *zSideTableSql,
+  char **pzColumn
+);
+
+int mergeIndexColumnGoneFrom(
+  const char *zIndexSql,
+  const char *zAncTableSql,
+  const char *zSideTableSql,
+  char **pzColumn
 );
 
 int mergeIndexFollowsDualRename(
@@ -514279,7 +524060,7 @@ void mergeColDefaultsFree(MergeColDefaults *p);
 int mergeColDefaultsLoad(const char *zSql, const char *zTable,
                          MergeColDefaults *pOut);
 
-int normalizeTheirsToMergedLayout(
+int normalizeSideToMergedLayout(
   sqlite3 *db,
   const char *zTable,
   const ProllyHash *pOursRoot,
@@ -514309,7 +524090,8 @@ int tryResolveSchemaDivergence(
 int mergeAppendReindexName(char ***paz, int *pn, const char *zName);
 int mergeFilterDerivedShadowConflicts(sqlite3 *db,
     MergeConflictTable *aConflictTables, int *pnConflictTables,
-    int *pTotalConflicts, char ***pazRebuild, int *pnRebuild);
+    int *pTotalConflicts, char ***pazRebuild, int *pnRebuild,
+    char **pzRefuse);
 
 int mergeCatalogPass1(
   sqlite3 *db,
@@ -514329,6 +524111,7 @@ int mergeCatalogPass1(
   SchemaMergeAction **ppSchemaActions, int *pnSchemaActions,
   int bDisjointSchemaChanges,
   int bPreferOurMaster,
+  int bBranchMerge,
   char ***pazReindex, int *pnReindex
 );
 
@@ -514724,12 +524507,16 @@ static int preDetectIndexSchemaConflicts(
   return SQLITE_OK;
 }
 
-int recordSchemaAddColumns(
+int recordSchemaColumnChanges(
   SchemaMergeAction **ppSchemaActions,
   int *pnSchemaActions,
   const char *zName,
   char **azAddCols,
-  int nAddCols
+  int nAddCols,
+  char **azDropCols,
+  int nDropCols,
+  char **azRenameCols,
+  int nRenameCols
 ){
   SchemaMergeAction *aNew;
   aNew = sqlite3_realloc(*ppSchemaActions,
@@ -514740,8 +524527,23 @@ int recordSchemaAddColumns(
   if( !aNew[*pnSchemaActions].zTableName ) return SQLITE_NOMEM;
   aNew[*pnSchemaActions].azAddColumns = azAddCols;
   aNew[*pnSchemaActions].nAddColumns = nAddCols;
+  aNew[*pnSchemaActions].azDropColumns = azDropCols;
+  aNew[*pnSchemaActions].nDropColumns = nDropCols;
+  aNew[*pnSchemaActions].azRenameColumns = azRenameCols;
+  aNew[*pnSchemaActions].nRenameColumns = nRenameCols;
   (*pnSchemaActions)++;
   return SQLITE_OK;
+}
+
+int recordSchemaAddColumns(
+  SchemaMergeAction **ppSchemaActions,
+  int *pnSchemaActions,
+  const char *zName,
+  char **azAddCols,
+  int nAddCols
+){
+  return recordSchemaColumnChanges(ppSchemaActions, pnSchemaActions, zName,
+                                   azAddCols, nAddCols, 0, 0, 0, 0);
 }
 
 int schemaEntryChangedByName(
@@ -515278,6 +525080,22 @@ static int rebuildDisjointSchemaRows(
                                  pSe->zName) ){
       continue;
     }
+    /* Pass 2 declines to adopt an index of theirs over a column we dropped,
+    ** because a catalog naming a column its table does not have cannot be
+    ** loaded. Writing the row here anyway puts that index back, and at a
+    ** number one of our own indexes already occupies, so ours is displaced by
+    ** an index that cannot resolve. */
+    {
+      SchemaEntry *pAncTbl = findSchemaEntry(aAncSchema, nAncSchema,
+                                             pSe->zTblName);
+      SchemaEntry *pOurTbl = findSchemaEntry(aOursSchema, nOursSchema,
+                                             pSe->zTblName);
+      if( pAncTbl && pOurTbl
+       && mergeIndexColumnGoneFrom(pSe->zSql, pAncTbl->zSql,
+                                   pOurTbl->zSql, 0) ){
+        continue;
+      }
+    }
     iRootpage = remapSchemaRootpage(aRemap, nRemap, pSe->iRootpage);
     rc = appendMergedSchemaCatalogRecord(db, &root, pMaster->flags, iNextRowid++,
                                          pSe, iRootpage);
@@ -515381,6 +525199,10 @@ int tryResolveSchemaDivergence(
   SchemaEntry *theirSchEntry;
   char **azAddCols = 0;
   int nAddCols = 0;
+  char **azDropCols = 0;
+  int nDropCols = 0;
+  char **azRenameCols = 0;
+  int nRenameCols = 0;
   int schemaChoice = SCHEMA_MERGE_DEFAULT;
   int resolvedDivergence = 0;
   char *zSchemaErr = 0;
@@ -515403,7 +525225,8 @@ int tryResolveSchemaDivergence(
    && theirSchEntry && theirSchEntry->zSql ){
     rc = trySchemaColumnMerge(
       ancSchEntry->zSql, ourSchEntry->zSql, theirSchEntry->zSql,
-      &azAddCols, &nAddCols, &schemaChoice,
+      &azAddCols, &nAddCols, &azDropCols, &nDropCols,
+      &azRenameCols, &nRenameCols, &schemaChoice,
       &resolvedDivergence, &zSchemaErr);
   }else{
     rc = SQLITE_ERROR;
@@ -515428,23 +525251,34 @@ int tryResolveSchemaDivergence(
     }
     sqlite3_free(zSchemaErr);
     freeAddedColumns(azAddCols, nAddCols);
+    freeAddedColumns(azDropCols, nDropCols);
     return SQLITE_ERROR;
   }
   sqlite3_free(zSchemaErr);
 
   if( schemaChoice!=SCHEMA_MERGE_DEFAULT ){
     if( ppSchemaActions && pnSchemaActions ){
-      rc = recordSchemaAddColumns(ppSchemaActions, pnSchemaActions, zName,
-                                  azAddCols, nAddCols);
+      rc = recordSchemaColumnChanges(ppSchemaActions, pnSchemaActions, zName,
+                                     azAddCols, nAddCols,
+                                     azDropCols, nDropCols,
+                                     azRenameCols, nRenameCols);
       if( rc!=SQLITE_OK ){
         freeAddedColumns(azAddCols, nAddCols);
+        freeAddedColumns(azDropCols, nDropCols);
+        freeAddedColumns(azRenameCols, nRenameCols);
         return rc;
       }
       azAddCols = 0;
       nAddCols = 0;
+      azDropCols = 0;
+      nDropCols = 0;
+      azRenameCols = 0;
+      nRenameCols = 0;
     }
     *pSchemaChoice = schemaChoice;
     freeAddedColumns(azAddCols, nAddCols);
+    freeAddedColumns(azDropCols, nDropCols);
+    freeAddedColumns(azRenameCols, nRenameCols);
     return SQLITE_OK;
   }
 
@@ -515454,23 +525288,38 @@ int tryResolveSchemaDivergence(
     if( rc!=SQLITE_OK ) return rc;
   }
 
-  if( nAddCols>0 ){
+  /* Their deletions are as much a schema change as their additions: with no
+  ** action recorded for them the merge has nothing to apply, and the two
+  ** sqlite_master rows go on to conflict over a table that merges cleanly. */
+  if( nAddCols>0 || nDropCols>0 || nRenameCols>0 ){
     if( ppSchemaActions && pnSchemaActions ){
-      rc = recordSchemaAddColumns(ppSchemaActions, pnSchemaActions, zName,
-                                  azAddCols, nAddCols);
+      rc = recordSchemaColumnChanges(ppSchemaActions, pnSchemaActions, zName,
+                                     azAddCols, nAddCols,
+                                     azDropCols, nDropCols,
+                                     azRenameCols, nRenameCols);
       if( rc!=SQLITE_OK ){
         freeAddedColumns(azAddCols, nAddCols);
+        freeAddedColumns(azDropCols, nDropCols);
+        freeAddedColumns(azRenameCols, nRenameCols);
         return rc;
       }
       azAddCols = 0;
       nAddCols = 0;
+      azDropCols = 0;
+      nDropCols = 0;
+      azRenameCols = 0;
+      nRenameCols = 0;
     }
     freeAddedColumns(azAddCols, nAddCols);
+    freeAddedColumns(azDropCols, nDropCols);
+    freeAddedColumns(azRenameCols, nRenameCols);
     *pSkipRowMerge = 1;
     return SQLITE_OK;
   }
 
   freeAddedColumns(azAddCols, nAddCols);
+  freeAddedColumns(azDropCols, nDropCols);
+  freeAddedColumns(azRenameCols, nRenameCols);
   return SQLITE_OK;
 }
 
@@ -515533,9 +525382,7 @@ static int recordMergeConflicts(
       aConflictTables, nConflictTables,
       &conflictsHash);
   if( rc!=SQLITE_OK ) return rc;
-  rc = doltliteSetSessionConflictsCatalog(db, &conflictsHash);
-  if( rc!=SQLITE_OK ) return rc;
-  return doltliteSetSessionMergeConflicts(db, &conflictsHash);
+  return doltliteSetSessionConflictsCatalog(db, &conflictsHash);
 }
 
 int doltliteMergeCatalogs(
@@ -515549,6 +525396,7 @@ int doltliteMergeCatalogs(
   SchemaMergeAction **ppActions,
   int *pnActions,
   int bPreferOurMaster,
+  int bBranchMerge,
   char ***pazReindex,
   int *pnReindex,
   char ***pazRebuildVtabs,
@@ -515593,6 +525441,12 @@ int doltliteMergeCatalogs(
   iNextMerged = iNextOurs > iNextTheirs ? iNextOurs : iNextTheirs;
   bDisjointSchemaChanges = catalogHasDisjointSchemaChanges(db, ancestor, ours, theirs);
 
+  rc = mergePreDetectDualIndexOverlap(
+      aAncSchema, nAncSchema, aOursSchema, nOursSchema,
+      aTheirsSchema, nTheirsSchema,
+      &aConflictTables, &nConflictTables, &totalConflicts);
+  if( rc!=SQLITE_OK ) goto merge_cleanup;
+
   rc = preDetectIndexSchemaConflicts(
       aAncSchema, nAncSchema, aOursSchema, nOursSchema,
       aTheirsSchema, nTheirsSchema,
@@ -515610,6 +525464,7 @@ int doltliteMergeCatalogs(
                           ppActions, pnActions,
                           bDisjointSchemaChanges,
                           bPreferOurMaster,
+                          bBranchMerge,
                           pazReindex, pnReindex);
   if( rc!=SQLITE_OK ){
     int k;
@@ -515655,14 +525510,57 @@ int doltliteMergeCatalogs(
   if( rc!=SQLITE_OK ) goto merge_cleanup;
 
   if( rc==SQLITE_OK && nConflictTables>0 && pazRebuildVtabs ){
+    char *zRefuse = 0;
     rc = mergeFilterDerivedShadowConflicts(db,
         aConflictTables, &nConflictTables, &totalConflicts,
-        pazRebuildVtabs, pnRebuildVtabs);
+        pazRebuildVtabs, pnRebuildVtabs, &zRefuse);
+    if( rc==SQLITE_OK && zRefuse ){
+      if( pzErrMsg ){
+        sqlite3_free(*pzErrMsg);
+        *pzErrMsg = zRefuse;
+      }else{
+        sqlite3_free(zRefuse);
+      }
+      rc = SQLITE_ERROR;
+    }
   }
   if( rc!=SQLITE_OK ) goto merge_cleanup;
 
-  rc = serializeMergedCatalog(db, ours, aMerged, nMerged, iNextMerged,
-                              aTheirsSchema, nTheirsSchema, pMergedHash);
+  /* Their schema supplies anything the merged rows do not carry, and an
+  ** object we deleted is exactly that, so the fallback would reinstate it --
+  ** and a reinstated trigger fires on the next write. Drop the ones we
+  ** deleted while their side left them alone. Tables and indexes are already
+  ** excluded by the serializer, and a deletion racing a change on their side
+  ** keeps today's behaviour rather than growing a new conflict here. */
+  {
+    SchemaEntry *aFallback = aTheirsSchema;
+    int nFallback = nTheirsSchema;
+    SchemaEntry *aKept = 0;
+    int k;
+    if( nTheirsSchema>0 ){
+      aKept = sqlite3_malloc(nTheirsSchema*(int)sizeof(SchemaEntry));
+      if( !aKept ){ rc = SQLITE_NOMEM; goto merge_cleanup; }
+      nFallback = 0;
+      for(k=0; k<nTheirsSchema; k++){
+        SchemaEntry *pT = &aTheirsSchema[k];
+        SchemaEntry *pAnc;
+        if( pT->zType && pT->zName
+         && strcmp(pT->zType, "table")!=0 && strcmp(pT->zType, "index")!=0
+         && findSchemaEntry(aOursSchema, nOursSchema, pT->zName)==0
+         && (pAnc = findSchemaEntry(aAncSchema, nAncSchema, pT->zName))!=0
+         && pAnc->zType && strcmp(pAnc->zType, pT->zType)==0
+         && (pAnc->zSql==0)==(pT->zSql==0)
+         && (pAnc->zSql==0 || strcmp(pAnc->zSql, pT->zSql)==0) ){
+          continue;
+        }
+        aKept[nFallback++] = *pT;
+      }
+      aFallback = aKept;
+    }
+    rc = serializeMergedCatalog(db, ours, aMerged, nMerged, iNextMerged,
+                                aFallback, nFallback, pMergedHash);
+    sqlite3_free(aKept);
+  }
 
   if( totalConflicts>0 && nConflictTables>0 && rc==SQLITE_OK ){
     rc = recordMergeConflicts(db, aConflictTables, nConflictTables);
@@ -515748,39 +525646,6 @@ int mergeAppendReindexName(char ***paz, int *pn, const char *zName){
   (*paz)[(*pn)++] = zDup;
   return SQLITE_OK;
 }
-
-typedef struct IndexMergePatch IndexMergePatch;
-struct IndexMergePatch {
-  Pgno iTable;
-  ProllyHash mergedRoot;
-};
-
-/* Shared state for pass-1 catalog merge. Keeps the long parameter list off
-** the leaf helpers and makes the patch list a single ownership root. */
-typedef struct MergePass1Ctx MergePass1Ctx;
-struct MergePass1Ctx {
-  sqlite3 *db;
-  struct TableEntry *aAnc; int nAnc;
-  struct TableEntry *aOurs; int nOurs;
-  struct TableEntry *aTheirs; int nTheirs;
-  SchemaEntry *aAncSchema; int nAncSchema;
-  SchemaEntry *aOursSchema; int nOursSchema;
-  SchemaEntry *aTheirsSchema; int nTheirsSchema;
-  struct TableEntry *aMerged; int *pnMerged;
-  MergeConflictTable **ppConflictTables; int *pnConflictTables;
-  int *pTotalConflicts;
-  char **pzErrMsg;
-  const ProllyHash *pCatAnc;
-  const ProllyHash *pCatOurs;
-  const ProllyHash *pCatTheirs;
-  SchemaMergeAction **ppSchemaActions; int *pnSchemaActions;
-  int bDisjointSchemaChanges;
-  int bPreferOurMaster;
-  char ***pazReindex; int *pnReindex;
-  IndexMergePatch *aPatches;
-  int nPatches;
-  int nPatchesAlloc;
-};
 
 static void mergePass1Free(MergePass1Ctx *c){
   sqlite3_free(c->aPatches);
@@ -516054,6 +525919,27 @@ static int mergePass1OursAdded(
   struct TableEntry *theirsEntry
 ){
   int rc;
+
+  /* An index we added over a column their side dropped cannot survive: the
+  ** merged table has no such column, so the catalog it would produce cannot
+  ** be loaded. Dolt drops the index with the column. */
+  if( !zName && zSchemaMergeName && zSchemaConflictTable ){
+    SchemaEntry *pOurIdx = findSchemaEntry(
+        c->aOursSchema, c->nOursSchema, zSchemaMergeName);
+    SchemaEntry *pAncTbl = findSchemaEntry(
+        c->aAncSchema, c->nAncSchema, zSchemaConflictTable);
+    SchemaEntry *pTheirTbl = findSchemaEntry(
+        c->aTheirsSchema, c->nTheirsSchema, zSchemaConflictTable);
+    char *zGone = 0;
+    if( pOurIdx && pAncTbl && pTheirTbl
+     && mergeIndexColumnGoneFrom(pOurIdx->zSql, pAncTbl->zSql,
+                                 pTheirTbl->zSql, &zGone) ){
+      sqlite3_free(zGone);
+      return SQLITE_OK;
+    }
+    sqlite3_free(zGone);
+  }
+
   if( theirsEntry ){
     if( !zName && c->bDisjointSchemaChanges ){
       c->aMerged[(*c->pnMerged)++] = c->aOurs[iOurs];
@@ -516309,6 +526195,73 @@ static int mergePass1CheckPrimaryKeysMatch(
   return SQLITE_ERROR;
 }
 
+/* The row merge addresses every side by merged column position, so a side
+** still holding the old layout has to be re-laid out first: otherwise a
+** column the merged layout no longer has shifts every later value one slot
+** left, and an ancestor read at the wrong positions reports cells as changed
+** that neither side touched. zOtherSql is the layout of the side that did not
+** supply the merged one, which is not always what the schema arrays hold —
+** adopting theirs overwrites our entry's SQL. */
+static int mergePass1RelayoutToMergedSchema(
+  MergePass1Ctx *c,
+  const char *zName,
+  const char *zAncSql,
+  const char *zMergedSql,
+  const char *zOtherSql,
+  u8 flags,
+  const ProllyHash *pMergedRoot,
+  const ProllyHash *pOtherRoot,
+  const ProllyHash *pAncRoot,
+  ProllyHash *pOtherOut,
+  ProllyHash *pAncOut,
+  int *pbRelaid
+){
+  int rc;
+
+  *pbRelaid = 0;
+  if( !zAncSql || !zMergedSql || !zOtherSql ) return SQLITE_OK;
+
+  rc = normalizeSideToMergedLayout(c->db, zName, pMergedRoot, pOtherRoot,
+                                   flags, zAncSql,
+                                   zMergedSql, zOtherSql, pOtherOut);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = normalizeSideToMergedLayout(c->db, zName, pMergedRoot, pAncRoot,
+                                   flags, zAncSql,
+                                   zMergedSql, zAncSql, pAncOut);
+  if( rc!=SQLITE_OK ) return rc;
+  *pbRelaid = 1;
+  return SQLITE_OK;
+}
+
+/* Exactly one side changed the table's columns, so the merged layout is
+** that side's and the other side plus the ancestor have to move onto it. */
+static int mergePass1RelayoutOneSidedSchema(
+  MergePass1Ctx *c,
+  const char *zName,
+  int bMergedIsOurs,
+  struct TableEntry *pOurs,
+  struct TableEntry *pAnc,
+  struct TableEntry *pTheirs,
+  ProllyHash *pOtherOut,
+  ProllyHash *pAncOut,
+  int *pbRelaid
+){
+  SchemaEntry *ourSE = findSchemaEntry(c->aOursSchema, c->nOursSchema, zName);
+  SchemaEntry *theirSE = findSchemaEntry(c->aTheirsSchema, c->nTheirsSchema, zName);
+  SchemaEntry *ancSE = findSchemaEntry(c->aAncSchema, c->nAncSchema, zName);
+
+  *pbRelaid = 0;
+  if( !ancSE || !ourSE || !theirSE ) return SQLITE_OK;
+
+  return mergePass1RelayoutToMergedSchema(c, zName, ancSE->zSql,
+      bMergedIsOurs ? ourSE->zSql : theirSE->zSql,
+      bMergedIsOurs ? theirSE->zSql : ourSE->zSql,
+      pOurs->flags,
+      bMergedIsOurs ? &pOurs->root : &pTheirs->root,
+      bMergedIsOurs ? &pTheirs->root : &pOurs->root,
+      &pAnc->root, pOtherOut, pAncOut, pbRelaid);
+}
+
 /* Both sides still have the object. */
 static int mergePass1BothSides(
   MergePass1Ctx *c,
@@ -516334,6 +526287,13 @@ static int mergePass1BothSides(
   int bDualAddColMerge = 0;
   int bSchemaConflict = 0;
   ProllyHash theirsNormRoot;
+  ProllyHash otherNormRoot;
+  ProllyHash ancNormRoot;
+  char *zOursPrevSql = 0;
+  struct TableEntry oursAdj;
+  struct TableEntry ancAdj;
+  struct TableEntry *pMergeOurs = &c->aOurs[iOurs];
+  struct TableEntry *pMergeAnc = ancEntry;
   const ProllyHash *pMergeTheirsRoot = &theirsEntry->root;
   int rc = SQLITE_OK;
 
@@ -516385,7 +526345,9 @@ static int mergePass1BothSides(
         sqlite3_free(zSql);
         return pOurSe ? SQLITE_NOMEM : SQLITE_CORRUPT;
       }
-      sqlite3_free(pOurSe->zSql);
+      /* Our rows still follow the layout being replaced here; keep it so the
+      ** relayout below can move them onto the adopted one. */
+      zOursPrevSql = pOurSe->zSql;
       pOurSe->zSql = zSql;
     }
     if( !bSchemaConflict && skipRowMerge && zName ){
@@ -516395,13 +526357,23 @@ static int mergePass1BothSides(
       SchemaEntry *ancSE = findSchemaEntry(c->aAncSchema, c->nAncSchema, zName);
       if( ancSE && ancSE->zSql && ourSE && ourSE->zSql
        && theirSE && theirSE->zSql ){
-        rc = normalizeTheirsToMergedLayout(c->db, zName,
+        rc = normalizeSideToMergedLayout(c->db, zName,
                                            &c->aOurs[iOurs].root,
                                            &theirsEntry->root,
                                            c->aOurs[iOurs].flags, ancSE->zSql,
                                            ourSE->zSql, theirSE->zSql,
                                            &theirsNormRoot);
         if( rc!=SQLITE_OK ) return rc;
+        rc = normalizeSideToMergedLayout(c->db, zName,
+                                           &c->aOurs[iOurs].root,
+                                           &ancEntry->root,
+                                           c->aOurs[iOurs].flags, ancSE->zSql,
+                                           ourSE->zSql, ancSE->zSql,
+                                           &ancNormRoot);
+        if( rc!=SQLITE_OK ) return rc;
+        ancAdj = *ancEntry;
+        memcpy(&ancAdj.root, &ancNormRoot, sizeof(ProllyHash));
+        pMergeAnc = &ancAdj;
         pMergeTheirsRoot = &theirsNormRoot;
         bDualAddColMerge = 1;
         skipRowMerge = 0;
@@ -516428,22 +526400,98 @@ static int mergePass1BothSides(
     skipRowMerge = 1;
   }
 
-  if( skipRowMerge ) return SQLITE_OK;
+  if( skipRowMerge ){
+    sqlite3_free(zOursPrevSql);
+    return SQLITE_OK;
+  }
+
+  /* Their schema was adopted whole for a rename, so the merged layout is
+  ** theirs and our rows are the ones left behind. A rename rewrites no rows,
+  ** so their root can be unchanged while the layout still moved: the move has
+  ** to be judged on the schema, never on whether either side wrote rows. */
+  if( zName && zOursPrevSql ){
+    SchemaEntry *ancSE = findSchemaEntry(c->aAncSchema, c->nAncSchema, zName);
+    SchemaEntry *mergedSE = findSchemaEntry(c->aOursSchema, c->nOursSchema, zName);
+    int bRelaid = 0;
+    if( ancSE && mergedSE ){
+      rc = mergePass1RelayoutToMergedSchema(c, zName, ancSE->zSql,
+          mergedSE->zSql, zOursPrevSql, c->aOurs[iOurs].flags,
+          &theirsEntry->root, &c->aOurs[iOurs].root, &ancEntry->root,
+          &otherNormRoot, &ancNormRoot, &bRelaid);
+      if( rc!=SQLITE_OK ){
+        sqlite3_free(zOursPrevSql);
+        return rc;
+      }
+    }
+    if( bRelaid ){
+      ancAdj = *ancEntry;
+      memcpy(&ancAdj.root, &ancNormRoot, sizeof(ProllyHash));
+      pMergeAnc = &ancAdj;
+      oursAdj = c->aOurs[iOurs];
+      memcpy(&oursAdj.root, &otherNormRoot, sizeof(ProllyHash));
+      pMergeOurs = &oursAdj;
+    }
+  }
+  sqlite3_free(zOursPrevSql);
+  zOursPrevSql = 0;
+
+  /* The mirror: our schema was kept for a rename on our side, so theirs is
+  ** the layout left behind. Judged on the schema for the same reason. */
+  if( zName && !bSchemaConflict && schemaChoice==SCHEMA_MERGE_OURS ){
+    SchemaEntry *ancSE = findSchemaEntry(c->aAncSchema, c->nAncSchema, zName);
+    SchemaEntry *ourSE = findSchemaEntry(c->aOursSchema, c->nOursSchema, zName);
+    SchemaEntry *theirSE = findSchemaEntry(c->aTheirsSchema, c->nTheirsSchema, zName);
+    int bRelaid = 0;
+    if( ancSE && ourSE && theirSE ){
+      rc = mergePass1RelayoutToMergedSchema(c, zName, ancSE->zSql,
+          ourSE->zSql, theirSE->zSql, c->aOurs[iOurs].flags,
+          &c->aOurs[iOurs].root, &theirsEntry->root, &ancEntry->root,
+          &otherNormRoot, &ancNormRoot, &bRelaid);
+      if( rc!=SQLITE_OK ) return rc;
+    }
+    if( bRelaid ){
+      ancAdj = *ancEntry;
+      memcpy(&ancAdj.root, &ancNormRoot, sizeof(ProllyHash));
+      pMergeAnc = &ancAdj;
+      pMergeTheirsRoot = &otherNormRoot;
+    }
+  }
+
+  if( zName && oursChanged && theirsChanged
+   && ourSchemaChanged!=theirSchemaChanged ){
+    int bRelaid = 0;
+    rc = mergePass1RelayoutOneSidedSchema(
+        c, zName, ourSchemaChanged, &c->aOurs[iOurs], ancEntry, theirsEntry,
+        &otherNormRoot, &ancNormRoot, &bRelaid);
+    if( rc!=SQLITE_OK ) return rc;
+    if( bRelaid ){
+      ancAdj = *ancEntry;
+      memcpy(&ancAdj.root, &ancNormRoot, sizeof(ProllyHash));
+      pMergeAnc = &ancAdj;
+      if( ourSchemaChanged ){
+        pMergeTheirsRoot = &otherNormRoot;
+      }else{
+        oursAdj = c->aOurs[iOurs];
+        memcpy(&oursAdj.root, &otherNormRoot, sizeof(ProllyHash));
+        pMergeOurs = &oursAdj;
+      }
+    }
+  }
 
   if( bDualAddColMerge || (oursChanged && theirsChanged) ){
     return mergePass1MergeTableData(
-        c, zName, zLogicalName, &c->aOurs[iOurs], ancEntry,
+        c, zName, zLogicalName, pMergeOurs, pMergeAnc,
         pMergeTheirsRoot, ourSchemaChanged, theirSchemaChanged,
         schemaChoice, theirsEntry);
   }
   if( theirsChanged ){
-    struct TableEntry merged = c->aOurs[iOurs];
+    struct TableEntry merged = *pMergeOurs;
     memcpy(&merged.root, &theirsEntry->root, sizeof(ProllyHash));
     memcpy(&merged.schemaHash, &theirsEntry->schemaHash, sizeof(ProllyHash));
     merged.flags = theirsEntry->flags;
     c->aMerged[(*c->pnMerged)++] = merged;
   }else{
-    c->aMerged[(*c->pnMerged)++] = c->aOurs[iOurs];
+    c->aMerged[(*c->pnMerged)++] = *pMergeOurs;
   }
   return SQLITE_OK;
 }
@@ -516829,6 +526877,7 @@ int mergeCatalogPass1(
   SchemaMergeAction **ppSchemaActions, int *pnSchemaActions,
   int bDisjointSchemaChanges,
   int bPreferOurMaster,
+  int bBranchMerge,
   char ***pazReindex, int *pnReindex
 ){
   MergePass1Ctx c;
@@ -516852,7 +526901,17 @@ int mergeCatalogPass1(
   c.ppSchemaActions = ppSchemaActions; c.pnSchemaActions = pnSchemaActions;
   c.bDisjointSchemaChanges = bDisjointSchemaChanges;
   c.bPreferOurMaster = bPreferOurMaster;
+  c.bBranchMerge = bBranchMerge;
   c.pazReindex = pazReindex; c.pnReindex = pnReindex;
+
+  rc = mergePass1CheckIndexOverRenamedColumn(&c);
+  if( rc==SQLITE_OK ) rc = mergePass1CheckTriggerOverRenamedTable(&c);
+  if( rc==SQLITE_OK ) rc = mergePass1CheckRowEditOfDroppedColumn(&c);
+  if( rc==SQLITE_OK ) rc = mergePass1CheckDuplicateIndexColumns(&c);
+  if( rc!=SQLITE_OK ){
+    mergePass1Free(&c);
+    return rc;
+  }
 
   for(i=0; i<nOurs; i++){
     if( aOurs[i].iTable==1 ){
@@ -516900,6 +526959,313 @@ int mergeCatalogPass1(
 /* #include "doltlite_merge_int.h" */
 
 /* Catalog merge pass 2: adopt theirs-only tables/indexes, rootpage remap. */
+
+static const char *mergeIndexSkipQuoted(const char *z, char q){
+  char qEnd = (q=='[') ? ']' : q;
+  z++;
+  while( *z ){
+    if( q!='[' && *z==q && z[1]==q ){ z += 2; continue; }
+    if( *z==qEnd ) return z+1;
+    z++;
+  }
+  return z;
+}
+
+static const char *mergeIndexSkipName(const char *z, const char *zEnd){
+  while( z<zEnd && sqlite3Isspace(*z) ) z++;
+  if( z>=zEnd ) return z;
+  if( *z=='\'' || *z=='"' || *z=='`' || *z=='[' ) return mergeIndexSkipQuoted(z, *z);
+  if( sqlite3Isalnum(*z) || *z=='_' || *z=='$' ){
+    z++;
+    while( z<zEnd && (sqlite3Isalnum(*z) || *z=='_' || *z=='$') ) z++;
+  }
+  return z;
+}
+
+static int mergeIndexIsSortKeyword(const char *z, int n){
+  static const char *const azKw[] = {
+    "ASC", "COLLATE", "DESC", "FIRST", "LAST", "NULLS"
+  };
+  int i;
+  for(i=0; i<(int)(sizeof(azKw)/sizeof(azKw[0])); i++){
+    if( sqlite3_strnicmp(z, azKw[i], n)==0 && azKw[i][n]==0 ) return 1;
+  }
+  return 0;
+}
+
+static char *mergeIndexDupIdent(const char *z, int n){
+  char *zOut = n>0 ? sqlite3_malloc(n+1) : 0;
+  if( zOut ){ memcpy(zOut, z, n); zOut[n] = 0; }
+  return zOut;
+}
+
+/* Walk CREATE INDEX column-list and WHERE identifiers. Skip function names,
+** sort keywords, the ident after COLLATE, and single-quoted literals. */
+static int mergeIndexEachColumn(
+  const char *zIndexSql,
+  int (*xEach)(void*, const char*),
+  void *pCtx
+){
+  const char *zOpen = zIndexSql ? strchr(zIndexSql, '(') : 0;
+  const char *zEnd, *z, *zIdent, *zLook;
+  char *zCol;
+  int depth, nIdent, rc = SQLITE_OK;
+
+  if( !zOpen ) return SQLITE_OK;
+  depth = 1;
+  zEnd = zOpen + 1;
+  while( *zEnd && depth>0 ){
+    if( *zEnd=='\'' || *zEnd=='"' || *zEnd=='`' || *zEnd=='[' ){
+      zEnd = mergeIndexSkipQuoted(zEnd, *zEnd);
+      continue;
+    }
+    if( *zEnd=='(' ) depth++;
+    else if( *zEnd==')' ) depth--;
+    if( depth>0 ) zEnd++;
+  }
+  if( depth!=0 ) return SQLITE_OK;
+
+  z = zOpen + 1;
+  zEnd = zIndexSql + strlen(zIndexSql);
+  while( z<zEnd && rc==SQLITE_OK ){
+    if( *z=='\'' ){ z = mergeIndexSkipQuoted(z, '\''); continue; }
+    if( *z=='"' || *z=='`' || *z=='[' ){
+      zIdent = z;
+      z = mergeIndexSkipQuoted(z, *z);
+      zCol = mergeIndexDupIdent(zIdent, (int)(z-zIdent));
+      if( !zCol ) return SQLITE_NOMEM;
+      sqlite3Dequote(zCol);
+      if( zCol[0] ) rc = xEach(pCtx, zCol);
+      sqlite3_free(zCol);
+      continue;
+    }
+    if( !(sqlite3Isalnum(*z) || *z=='_' || *z=='$') ){ z++; continue; }
+    zIdent = z++;
+    while( z<zEnd && (sqlite3Isalnum(*z) || *z=='_' || *z=='$') ) z++;
+    nIdent = (int)(z-zIdent);
+    zLook = z;
+    while( zLook<zEnd && sqlite3Isspace(*zLook) ) zLook++;
+    if( zLook<zEnd && *zLook=='(' ) continue;
+    if( mergeIndexIsSortKeyword(zIdent, nIdent) ){
+      if( nIdent==7 && sqlite3_strnicmp(zIdent, "COLLATE", 7)==0 ){
+        z = mergeIndexSkipName(z, zEnd);
+      }
+      continue;
+    }
+    zCol = mergeIndexDupIdent(zIdent, nIdent);
+    if( !zCol ) return SQLITE_NOMEM;
+    rc = xEach(pCtx, zCol);
+    sqlite3_free(zCol);
+  }
+  return rc;
+}
+
+typedef struct MergeIndexColCtx MergeIndexColCtx;
+struct MergeIndexColCtx {
+  ParsedColumn *aAnc; int nAnc;
+  ParsedColumn *aSide; int nSide;
+  char *zMissing;
+};
+
+static int mergeIndexColSurvives(void *pCtx, const char *zCol){
+  MergeIndexColCtx *p = (MergeIndexColCtx*)pCtx;
+  int iAnc;
+  if( p->zMissing ) return SQLITE_OK;
+  if( parsedColumnIndexByName(p->aSide, p->nSide, zCol)>=0 ) return SQLITE_OK;
+  /* Absent from this side and never in the ancestor means the other side added
+  ** it, and the merge carries additions over. */
+  iAnc = parsedColumnIndexByName(p->aAnc, p->nAnc, zCol);
+  if( iAnc<0 ) return SQLITE_OK;
+  /* A column of this side sitting at the vanished one's position, carrying its
+  ** definition, is a rename, not a drop: the indexed column still exists under
+  ** the new name and the index has to follow it there rather than disappear.
+  ** Retargeting the index is not expressible here yet, so leave those alone. */
+  if( iAnc<p->nSide
+   && parsedColumnIndexByName(p->aAnc, p->nAnc, p->aSide[iAnc].zName)<0
+   && parsedColumnDefinitionsMatch(&p->aSide[iAnc], &p->aAnc[iAnc]) ){
+    return SQLITE_OK;
+  }
+  p->zMissing = sqlite3_mprintf("%s", zCol);
+  return p->zMissing ? SQLITE_OK : SQLITE_NOMEM;
+}
+
+static int mergeIndexColRenamed(void *pCtx, const char *zCol){
+  MergeIndexColCtx *p = (MergeIndexColCtx*)pCtx;
+  int iAnc;
+  if( p->zMissing ) return SQLITE_OK;
+  if( parsedColumnIndexByName(p->aSide, p->nSide, zCol)>=0 ) return SQLITE_OK;
+  iAnc = parsedColumnIndexByName(p->aAnc, p->nAnc, zCol);
+  if( iAnc<0 ) return SQLITE_OK;
+  if( iAnc<p->nSide
+   && parsedColumnIndexByName(p->aAnc, p->nAnc, p->aSide[iAnc].zName)<0
+   && parsedColumnDefinitionsMatch(&p->aSide[iAnc], &p->aAnc[iAnc]) ){
+    p->zMissing = sqlite3_mprintf("%s", zCol);
+    return p->zMissing ? SQLITE_OK : SQLITE_NOMEM;
+  }
+  return SQLITE_OK;
+}
+
+/* Shared body: walk the index's columns with xEach and report the first one it
+** flagged. */
+static int mergeIndexColumnScan(
+  const char *zIndexSql,
+  const char *zAncTableSql,
+  const char *zSideTableSql,
+  int (*xEach)(void*, const char*),
+  char **pzColumn
+){
+  MergeIndexColCtx ctx;
+  int rc;
+
+  if( pzColumn ) *pzColumn = 0;
+  if( !zIndexSql || !zAncTableSql || !zSideTableSql ) return 0;
+  memset(&ctx, 0, sizeof(ctx));
+  if( parseColumns(zAncTableSql, &ctx.aAnc, &ctx.nAnc)!=SQLITE_OK ) return 0;
+  if( parseColumns(zSideTableSql, &ctx.aSide, &ctx.nSide)!=SQLITE_OK ){
+    freeColumns(ctx.aAnc, ctx.nAnc);
+    return 0;
+  }
+  rc = mergeIndexEachColumn(zIndexSql, xEach, &ctx);
+  freeColumns(ctx.aAnc, ctx.nAnc);
+  freeColumns(ctx.aSide, ctx.nSide);
+  if( rc!=SQLITE_OK || !ctx.zMissing ){
+    sqlite3_free(ctx.zMissing);
+    return 0;
+  }
+  if( pzColumn ){
+    *pzColumn = ctx.zMissing;
+  }else{
+    sqlite3_free(ctx.zMissing);
+  }
+  return 1;
+}
+
+/* The index names a column this side renamed rather than dropped. The indexed
+** column still exists under the new name, but nothing here retargets the index
+** to it, and a merged catalog naming a column the table does not have cannot be
+** loaded -- so the merge has to refuse instead of producing one. */
+typedef struct MergeIndexNameList MergeIndexNameList;
+struct MergeIndexNameList { char **az; int n; };
+
+static int mergeIndexCollectName(void *pCtx, const char *zCol){
+  MergeIndexNameList *p = (MergeIndexNameList*)pCtx;
+  char **azNew = sqlite3_realloc(p->az, (p->n+1)*(int)sizeof(char*));
+  if( !azNew ) return SQLITE_NOMEM;
+  p->az = azNew;
+  p->az[p->n] = sqlite3_mprintf("%s", zCol);
+  if( !p->az[p->n] ) return SQLITE_NOMEM;
+  p->n++;
+  return SQLITE_OK;
+}
+
+static void mergeIndexNameListFree(MergeIndexNameList *p){
+  int i;
+  for(i=0; i<p->n; i++) sqlite3_free(p->az[i]);
+  sqlite3_free(p->az);
+}
+
+/* Two index definitions that name a column in common. */
+int mergeIndexColumnsOverlap(const char *zSqlA, const char *zSqlB){
+  MergeIndexNameList a;
+  MergeIndexNameList b;
+  int i, j, bOverlap = 0;
+
+  if( !zSqlA || !zSqlB ) return 0;
+  memset(&a, 0, sizeof(a));
+  memset(&b, 0, sizeof(b));
+  if( mergeIndexEachColumn(zSqlA, mergeIndexCollectName, &a)==SQLITE_OK
+   && mergeIndexEachColumn(zSqlB, mergeIndexCollectName, &b)==SQLITE_OK ){
+    for(i=0; i<a.n && !bOverlap; i++){
+      for(j=0; j<b.n && !bOverlap; j++){
+        if( sqlite3_stricmp(a.az[i], b.az[j])==0 ) bOverlap = 1;
+      }
+    }
+  }
+  mergeIndexNameListFree(&a);
+  mergeIndexNameListFree(&b);
+  return bOverlap;
+}
+
+/* Each side added its own index, under its own name, over a column they share.
+** That is a disagreement about how the column is indexed rather than two
+** independent additions -- keeping both would also impose one side's
+** uniqueness on the other -- and Dolt reports it as a conflict. */
+int mergePreDetectDualIndexOverlap(
+  SchemaEntry *aAnc, int nAnc,
+  SchemaEntry *aOurs, int nOurs,
+  SchemaEntry *aTheirs, int nTheirs,
+  MergeConflictTable **ppConflictTables,
+  int *pnConflictTables,
+  int *pTotalConflicts
+){
+  int i, j, rc;
+
+  for(i=0; i<nOurs; i++){
+    if( !aOurs[i].zType || strcmp(aOurs[i].zType, "index")!=0 ) continue;
+    if( !aOurs[i].zName || !aOurs[i].zSql || !aOurs[i].zTblName ) continue;
+    if( findSchemaEntry(aAnc, nAnc, aOurs[i].zName) ) continue;
+    for(j=0; j<nTheirs; j++){
+      int added = 0;
+      if( !aTheirs[j].zType || strcmp(aTheirs[j].zType, "index")!=0 ) continue;
+      if( !aTheirs[j].zName || !aTheirs[j].zSql || !aTheirs[j].zTblName ) continue;
+      if( findSchemaEntry(aAnc, nAnc, aTheirs[j].zName) ) continue;
+      if( sqlite3_stricmp(aOurs[i].zName, aTheirs[j].zName)==0 ) continue;
+      if( sqlite3_stricmp(aOurs[i].zTblName, aTheirs[j].zTblName)!=0 ) continue;
+      if( !mergeIndexColumnsOverlap(aOurs[i].zSql, aTheirs[j].zSql) ) continue;
+      rc = appendSchemaConflict(ppConflictTables, pnConflictTables,
+                                aOurs[i].zTblName, aOurs[i].zName, &added);
+      if( rc!=SQLITE_OK ) return rc;
+      if( pTotalConflicts ) *pTotalConflicts += added;
+      break;
+    }
+  }
+  return SQLITE_OK;
+}
+
+int mergeIndexColumnRenamedAway(
+  const char *zIndexSql,
+  const char *zAncTableSql,
+  const char *zSideTableSql,
+  char **pzColumn
+){
+  return mergeIndexColumnScan(zIndexSql, zAncTableSql, zSideTableSql,
+                              mergeIndexColRenamed, pzColumn);
+}
+
+int mergeIndexColumnGoneFrom(
+  const char *zIndexSql,
+  const char *zAncTableSql,
+  const char *zSideTableSql,
+  char **pzColumn
+){
+  MergeIndexColCtx ctx;
+  int rc;
+
+  if( pzColumn ) *pzColumn = 0;
+  if( !zIndexSql || !zAncTableSql || !zSideTableSql ) return 0;
+
+  memset(&ctx, 0, sizeof(ctx));
+  if( parseColumns(zAncTableSql, &ctx.aAnc, &ctx.nAnc)!=SQLITE_OK ) return 0;
+  if( parseColumns(zSideTableSql, &ctx.aSide, &ctx.nSide)!=SQLITE_OK ){
+    freeColumns(ctx.aAnc, ctx.nAnc);
+    return 0;
+  }
+
+  rc = mergeIndexEachColumn(zIndexSql, mergeIndexColSurvives, &ctx);
+  freeColumns(ctx.aAnc, ctx.nAnc);
+  freeColumns(ctx.aSide, ctx.nSide);
+  if( rc!=SQLITE_OK || !ctx.zMissing ){
+    sqlite3_free(ctx.zMissing);
+    return 0;
+  }
+  if( pzColumn ){
+    *pzColumn = ctx.zMissing;
+  }else{
+    sqlite3_free(ctx.zMissing);
+  }
+  return 1;
+}
+
 
 int mergeCatalogPass2(
   struct TableEntry *aAnc, int nAnc,
@@ -516953,6 +527319,24 @@ int mergeCatalogPass2(
               aAncSchema, nAncSchema, aOursSchema, nOursSchema,
               aTheirsSchema, nTheirsSchema, pAncSe, pOurSe, pTheirSe) ){
           continue;
+        }
+        /* An index of theirs over a column we dropped or renamed away cannot
+        ** be adopted: the merged table has no such column, so the catalog it
+        ** would produce cannot be loaded at all. Dolt drops the index with
+        ** the column, so leave it behind. */
+        {
+          SchemaEntry *pAncTbl = findSchemaEntry(
+              aAncSchema, nAncSchema, pTheirSe->zTblName);
+          SchemaEntry *pOurTbl = findSchemaEntry(
+              aOursSchema, nOursSchema, pTheirSe->zTblName);
+          char *zGone = 0;
+          if( pAncTbl && pOurTbl
+           && mergeIndexColumnGoneFrom(pTheirSe->zSql, pAncTbl->zSql,
+                                           pOurTbl->zSql, &zGone) ){
+            sqlite3_free(zGone);
+            continue;
+          }
+          sqlite3_free(zGone);
         }
         oursEntry = findCatalogEntryBySchemaObject(
             aOurs, nOurs, aOursSchema, nOursSchema,
@@ -517119,19 +527503,56 @@ int mergeCatalogPass2(
   return SQLITE_OK;
 }
 
-/* If zTable is a derived shadow (%_idx, %_meta, %_model, %_config) of a
-** vec1 virtual table whose %_base still holds raw vectors, return the
-** malloc'd owner name; else NULL. Uncompressed builds store bucket
-** numbers in %_base instead of vectors, so auto-resolving their index
-** conflicts would silently lose the discarded side's vectors — those
-** stay loud. %_base itself is authoritative and is never derived. */
-static char *mergeVec1DerivedShadowOwner(sqlite3 *db, const char *zTable){
-  static const char *azSuffix[] = { "_idx", "_meta", "_model", "_config" };
+/* Is this fts table contentless? Such a table has no authoritative copy of
+** the indexed text -- the index IS the data -- so nothing can regenerate a
+** discarded side, and fts5 refuses 'rebuild' on one outright. */
+static int mergeFtsIsContentless(Table *pTab){
+  int i;
+  for(i=3; i<pTab->u.vtab.nArg; i++){
+    const char *z = pTab->u.vtab.azArg[i];
+    const char *zEq;
+    if( !z ) continue;
+    while( *z==' ' ) z++;
+    if( sqlite3_strnicmp(z, "content", 7)!=0 ) continue;
+    zEq = &z[7];
+    while( *zEq==' ' ) zEq++;
+    if( *zEq!='=' ) continue;
+    zEq++;
+    while( *zEq==' ' ) zEq++;
+    /* content='' names no table; content='x' names an authoritative one. */
+    if( (zEq[0]=='\'' && zEq[1]=='\'') || (zEq[0]=='"' && zEq[1]=='"')
+     || zEq[0]==0 ){
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* Classify zTable as a derived shadow of a virtual table: a shadow holding
+** state that is regenerated from data living elsewhere. Returns the malloc'd
+** owner name and sets *pbRebuildable to whether that regeneration is actually
+** possible. A shadow that is itself authoritative (%_content, %_base) is not
+** derived and is never reported here -- a conflict there is a conflict in the
+** data, which stays loud. */
+static char *mergeDerivedShadowOwner(
+  sqlite3 *db,
+  const char *zTable,
+  int *pbRebuildable
+){
+  static const char *azSuffix[] = {
+    /* vec1 */   "_idx", "_meta", "_model", "_config",
+    /* fts5 */   "_data", "_docsize",
+    /* fts3/4 */ "_segments", "_segdir", "_stat",
+    /* rtree */  "_node", "_parent", "_rowid"
+  };
   unsigned int i;
   size_t nTable = strlen(zTable);
 
+  *pbRebuildable = 0;
   for(i=0; i<sizeof(azSuffix)/sizeof(azSuffix[0]); i++){
     size_t nSfx = strlen(azSuffix[i]);
+    const char *zModule;
     char *zOwner;
     Table *pTab;
     if( nTable<=nSfx || strcmp(&zTable[nTable-nSfx], azSuffix[i])!=0 ){
@@ -517140,15 +527561,45 @@ static char *mergeVec1DerivedShadowOwner(sqlite3 *db, const char *zTable){
     zOwner = sqlite3_mprintf("%.*s", (int)(nTable-nSfx), zTable);
     if( !zOwner ) return 0;
     pTab = sqlite3FindTable(db, zOwner, "main");
-    if( pTab && IsVirtual(pTab)
-     && pTab->u.vtab.nArg>0
-     && sqlite3_stricmp(pTab->u.vtab.azArg[0], "vec1")==0
-     && sqlite3IsShadowTableOf(db, pTab, zTable) ){
+    if( !pTab || !IsVirtual(pTab) || pTab->u.vtab.nArg<=0
+     || !sqlite3IsShadowTableOf(db, pTab, zTable) ){
+      sqlite3_free(zOwner);
+      return 0;
+    }
+    zModule = pTab->u.vtab.azArg[0];
+
+    if( sqlite3_stricmp(zModule, "fts5")==0
+     || sqlite3_stricmp(zModule, "fts4")==0
+     || sqlite3_stricmp(zModule, "fts3")==0 ){
+      /* The merged content is authoritative, so a rebuild regenerates the
+      ** index over both sides' rows. Contentless has no such content. */
+      *pbRebuildable = !mergeFtsIsContentless(pTab);
+      return zOwner;
+    }
+    if( sqlite3_stricmp(zModule, "rtree")==0
+     || sqlite3_stricmp(zModule, "rtree_i32")==0 ){
+      /* An r-tree keeps its coordinates in %_node and offers no rebuild, so
+      ** a conflicting node is a conflict in the data itself. */
+      *pbRebuildable = 0;
+      return zOwner;
+    }
+    if( sqlite3_stricmp(zModule, "vec1")!=0 ){
+      sqlite3_free(zOwner);
+      return 0;
+    }
+    {
       /* Eligible only when %_base still holds raw vectors AND the stored
       ** model the rebuild depends on is present: vec1 treats a NULL
       ** rebuild argument as "keep the current model" and proceeds on
       ** cached state, so a missing model row would let the merge commit
       ** a stale index instead of failing. */
+      /* Eligible only when %_base still holds raw vectors AND the stored
+      ** model the rebuild depends on is present: vec1 treats a NULL
+      ** rebuild argument as "keep the current model" and proceeds on
+      ** cached state, so a missing model row would let the merge commit
+      ** a stale index instead of failing. Uncompressed builds store bucket
+      ** numbers in %_base instead of vectors, so auto-resolving their index
+      ** conflicts would silently lose the discarded side's vectors. */
       char *zQry = sqlite3_mprintf(
           "SELECT (SELECT count(*) FROM \"%w_base\""
           "         WHERE typeof(vector)!='blob')=0"
@@ -517163,10 +527614,15 @@ static char *mergeVec1DerivedShadowOwner(sqlite3 *db, const char *zTable){
       }
       sqlite3_finalize(pStmt);
       sqlite3_free(zQry);
-      if( bEligible ) return zOwner;
+      if( bEligible ){
+        *pbRebuildable = 1;
+        return zOwner;
+      }
+      /* An ineligible vec1 shadow keeps its conflicts resolvable, which is
+      ** this module's existing contract; it is not reported as derived. */
+      sqlite3_free(zOwner);
+      return 0;
     }
-    sqlite3_free(zOwner);
-    return 0;
   }
   return 0;
 }
@@ -517184,7 +527640,8 @@ int mergeFilterDerivedShadowConflicts(
   int *pnConflictTables,
   int *pTotalConflicts,
   char ***pazRebuild,
-  int *pnRebuild
+  int *pnRebuild,
+  char **pzRefuse
 ){
   int i, j, rc = SQLITE_OK;
   char **azOwner = 0;
@@ -517194,10 +527651,25 @@ int mergeFilterDerivedShadowConflicts(
   memset(azOwner, 0, (*pnConflictTables)*sizeof(char*));
 
   for(i=0; i<*pnConflictTables; i++){
+    int bRebuildable = 0;
     if( aConflictTables[i].nSchemaObjects>0
      || aConflictTables[i].nConflicts<=0
-     || (azOwner[i] = mergeVec1DerivedShadowOwner(
-            db, aConflictTables[i].zName))==0 ){
+     || (azOwner[i] = mergeDerivedShadowOwner(
+            db, aConflictTables[i].zName, &bRebuildable))==0 ){
+      doltliteFreeNameList(azOwner, *pnConflictTables);
+      return SQLITE_OK;
+    }
+    if( !bRebuildable ){
+      /* Neither resolution can be right: the discarded side's rows are gone
+      ** from an index nothing can regenerate, and committing either one puts
+      ** an index that disagrees with its own table into history. Refuse. */
+      if( pzRefuse && *pzRefuse==0 ){
+        *pzRefuse = sqlite3_mprintf(
+            "cannot merge: '%s' indexes data that cannot be rebuilt from the "
+            "merged rows, and both sides changed it. Merge on one branch, or "
+            "drop and recreate '%s' after merging",
+            azOwner[i], azOwner[i]);
+      }
       doltliteFreeNameList(azOwner, *pnConflictTables);
       return SQLITE_OK;
     }
@@ -517230,6 +527702,382 @@ int mergeFilterDerivedShadowConflicts(
 #endif
 
 /************** End of doltlite_merge_pass2.c ********************************/
+/************** Begin file doltlite_merge_predetect.c ************************/
+#ifdef DOLTLITE_PROLLY
+
+/* #include "doltlite_merge_int.h" */
+
+/* Merge pre-detection: refusals decided by reading the three schemas, before
+** pass 1 walks a single entry. A merge whose correct answer this engine cannot
+** represent has to be refused here, while the branches are still intact. */
+
+/* The index's key columns, but only for the plain case: a parenthesised list of
+** bare column names with nothing after it. An expression index, a partial
+** index's WHERE clause, an explicit collation or a sort order all make two
+** indexes over the same column different things, and this reports those as not
+** plain rather than trying to compare them. Returns 0 unless every element is a
+** bare name. */
+static int mergeIndexPlainKey(const char *zSql, char ***pazCol, int *pnCol){
+  const char *zOpen, *zClose, *z;
+  char **az = 0;
+  int n = 0, i;
+
+  *pazCol = 0;
+  *pnCol = 0;
+  if( !zSql ) return 0;
+  zOpen = strchr(zSql, '(');
+  if( !zOpen ) return 0;
+  for(zClose=zOpen+1; *zClose && *zClose!=')'; zClose++){
+    /* A nested paren is a function call or a parenthesised expression. */
+    if( *zClose=='(' ) return 0;
+  }
+  if( *zClose!=')' ) return 0;
+  for(z=zClose+1; *z; z++){
+    if( !sqlite3Isspace(*z) && *z!=';' ) return 0;
+  }
+  z = zOpen + 1;
+  while( z<zClose ){
+    const char *zTok;
+    int nTok;
+    while( z<zClose && (sqlite3Isspace(*z) || *z==',') ) z++;
+    if( z>=zClose ) break;
+    zTok = z;
+    while( z<zClose && *z!=',' ) z++;
+    nTok = (int)(z-zTok);
+    while( nTok>0 && sqlite3Isspace(zTok[nTok-1]) ) nTok--;
+    if( nTok<=0 ) goto plain_key_fail;
+    for(i=0; i<nTok; i++){
+      /* Anything but one bare name -- ASC, COLLATE, a quoted form -- is not a
+      ** comparison this can make safely. */
+      if( !(sqlite3Isalnum(zTok[i]) || zTok[i]=='_' || zTok[i]=='$') ){
+        goto plain_key_fail;
+      }
+    }
+    {
+      char **azNew = sqlite3_realloc(az, (n+1)*(int)sizeof(char*));
+      if( !azNew ) goto plain_key_fail;
+      az = azNew;
+      az[n] = sqlite3_mprintf("%.*s", nTok, zTok);
+      if( !az[n] ) goto plain_key_fail;
+      n++;
+    }
+  }
+  if( n==0 ) goto plain_key_fail;
+  *pazCol = az;
+  *pnCol = n;
+  return 1;
+
+plain_key_fail:
+  for(i=0; i<n; i++) sqlite3_free(az[i]);
+  sqlite3_free(az);
+  return 0;
+}
+
+/* Two indexes whose key is the same bare columns in the same order. */
+static int mergeIndexSameKey(const char *zSqlA, const char *zSqlB){
+  char **azA = 0, **azB = 0;
+  int nA = 0, nB = 0, i, same = 0;
+
+  if( mergeIndexPlainKey(zSqlA, &azA, &nA)
+   && mergeIndexPlainKey(zSqlB, &azB, &nB)
+   && nA==nB ){
+    same = 1;
+    for(i=0; i<nA && same; i++){
+      if( sqlite3_stricmp(azA[i], azB[i])!=0 ) same = 0;
+    }
+  }
+  for(i=0; i<nA; i++) sqlite3_free(azA[i]);
+  for(i=0; i<nB; i++) sqlite3_free(azB[i]);
+  sqlite3_free(azA);
+  sqlite3_free(azB);
+  return same;
+}
+
+/* One side added an index covering the same columns as an index that already
+** existed. Dolt refuses to merge that -- "multiple indexes covering the same
+** column set cannot be merged" -- because it cannot tell which of the two the
+** merged table should keep, and keeping both would impose one side's
+** uniqueness on the other. Only a merge that also has to reconcile the other
+** branch's work reaches this; an addition on its own is the user's business. */
+int mergePass1CheckDuplicateIndexColumns(MergePass1Ctx *c){
+  int side, i, j;
+
+  /* A merge only. Reverting, cherry-picking or rebasing a commit has one
+  ** intended result, and the branch it replays onto asked for it, so there is
+  ** no disagreement here to hand back. Refusing would also reject restoring a
+  ** state the branch held before. */
+  if( !c->bBranchMerge ) return SQLITE_OK;
+
+  for(side=0; side<2; side++){
+    SchemaEntry *aNew = side ? c->aTheirsSchema : c->aOursSchema;
+    int nNew = side ? c->nTheirsSchema : c->nOursSchema;
+    SchemaEntry *aOther = side ? c->aOursSchema : c->aTheirsSchema;
+    int nOther = side ? c->nOursSchema : c->nTheirsSchema;
+
+    for(i=0; i<nNew; i++){
+      if( !aNew[i].zType || strcmp(aNew[i].zType, "index")!=0 ) continue;
+      if( !aNew[i].zName || !aNew[i].zSql || !aNew[i].zTblName ) continue;
+      if( findSchemaEntry(c->aAncSchema, c->nAncSchema, aNew[i].zName) ){
+        continue;
+      }
+      for(j=0; j<c->nAncSchema; j++){
+        SchemaEntry *pOld = &c->aAncSchema[j];
+        if( !pOld->zType || strcmp(pOld->zType, "index")!=0 ) continue;
+        if( !pOld->zName || !pOld->zSql || !pOld->zTblName ) continue;
+        if( sqlite3_stricmp(pOld->zTblName, aNew[i].zTblName)!=0 ) continue;
+        /* Only a merge that keeps both of them duplicates anything. A side that
+        ** dropped the older index replaced it rather than doubling it, and the
+        ** drop carries into the merge, so there is nothing to refuse. */
+        if( !findSchemaEntry(aNew, nNew, pOld->zName) ) continue;
+        if( !findSchemaEntry(aOther, nOther, pOld->zName) ) continue;
+        if( !mergeIndexSameKey(aNew[i].zSql, pOld->zSql) ) continue;
+        if( c->pzErrMsg ){
+          sqlite3_free(*c->pzErrMsg);
+          *c->pzErrMsg = sqlite3_mprintf(
+              "cannot merge: indexes '%s' and '%s' cover the same columns of "
+              "table '%s'; drop one of them, then merge",
+              aNew[i].zName, pOld->zName, aNew[i].zTblName);
+        }
+        return SQLITE_ERROR;
+      }
+    }
+  }
+  return SQLITE_OK;
+}
+
+/* One side dropped a column while the other edited that same column's value in
+** a row they both already had. The edit has nowhere to go in the merged table,
+** and discarding it decides for the user which branch's intent wins. Dolt
+** reports it as a conflict; refuse rather than resolve it here. Rows the other
+** side added or removed are not affected, and neither is an edit to any other
+** column. */
+int mergePass1CheckRowEditOfDroppedColumn(MergePass1Ctx *c){
+  int side, i, j;
+
+  /* A merge only. Reverting, cherry-picking or rebasing a commit has one
+  ** intended result, and the branch it replays onto asked for it, so there is
+  ** no disagreement here to hand back. Refusing would also reject restoring a
+  ** state the branch held before. */
+  if( !c->bBranchMerge ) return SQLITE_OK;
+
+  for(side=0; side<2; side++){
+    SchemaEntry *aDrop = side ? c->aTheirsSchema : c->aOursSchema;
+    int nDrop = side ? c->nTheirsSchema : c->nOursSchema;
+    SchemaEntry *aEdit = side ? c->aOursSchema : c->aTheirsSchema;
+    int nEdit = side ? c->nOursSchema : c->nTheirsSchema;
+    struct TableEntry *aEditCat = side ? c->aOurs : c->aTheirs;
+    int nEditCat = side ? c->nOurs : c->nTheirs;
+
+    for(i=0; i<c->nAncSchema; i++){
+      const char *zTable = c->aAncSchema[i].zName;
+      SchemaEntry *pDropSe;
+      SchemaEntry *pEditSe;
+      struct TableEntry *pAncCat;
+      struct TableEntry *pEditCatEnt;
+      ParsedColumn *aAncCols = 0;
+      ParsedColumn *aDropCols = 0;
+      int nAncCols = 0, nDropCols = 0;
+
+      if( !zTable || !c->aAncSchema[i].zType ) continue;
+      if( strcmp(c->aAncSchema[i].zType, "table")!=0 ) continue;
+      pDropSe = findSchemaEntry(aDrop, nDrop, zTable);
+      pEditSe = findSchemaEntry(aEdit, nEdit, zTable);
+      if( !pDropSe || !pEditSe || !pDropSe->zSql || !pEditSe->zSql ) continue;
+      /* The editing side must have left the columns alone, or this is a schema
+      ** disagreement the schema merge already judges. */
+      if( strcmp(pEditSe->zSql, c->aAncSchema[i].zSql)!=0 ) continue;
+      if( strcmp(pDropSe->zSql, c->aAncSchema[i].zSql)==0 ) continue;
+      pAncCat = doltliteFindTableByName(c->aAnc, c->nAnc, zTable);
+      pEditCatEnt = doltliteFindTableByName(aEditCat, nEditCat, zTable);
+      if( !pAncCat || !pEditCatEnt ) continue;
+      if( prollyHashCompare(&pAncCat->root, &pEditCatEnt->root)==0 ) continue;
+      if( parseColumns(c->aAncSchema[i].zSql, &aAncCols, &nAncCols)!=SQLITE_OK ){
+        continue;
+      }
+      if( parseColumns(pDropSe->zSql, &aDropCols, &nDropCols)!=SQLITE_OK ){
+        freeColumns(aAncCols, nAncCols);
+        continue;
+      }
+      for(j=0; j<nAncCols; j++){
+        int bEdited = 0;
+        int rc;
+        if( parsedColumnIndexByName(aDropCols, nDropCols,
+                                    aAncCols[j].zName)>=0 ){
+          continue;
+        }
+        /* Renamed rather than dropped keeps its own behaviour. */
+        if( j<nDropCols
+         && parsedColumnIndexByName(aAncCols, nAncCols,
+                                    aDropCols[j].zName)<0 ){
+          continue;
+        }
+        rc = mergeRowEditsColumn(c->db, &pAncCat->root, &pEditCatEnt->root,
+                                 pAncCat->flags, pEditCatEnt->flags,
+                                 j, &bEdited);
+        if( rc!=SQLITE_OK ){
+          freeColumns(aAncCols, nAncCols);
+          freeColumns(aDropCols, nDropCols);
+          return rc;
+        }
+        if( bEdited ){
+          if( c->pzErrMsg ){
+            sqlite3_free(*c->pzErrMsg);
+            *c->pzErrMsg = sqlite3_mprintf(
+                "cannot merge: column '%s' of table '%s' was dropped on one "
+                "branch and its value changed on the other; drop the column "
+                "on both branches, or revert the change, then merge",
+                aAncCols[j].zName, zTable);
+          }
+          freeColumns(aAncCols, nAncCols);
+          freeColumns(aDropCols, nDropCols);
+          return SQLITE_ERROR;
+        }
+      }
+      freeColumns(aAncCols, nAncCols);
+      freeColumns(aDropCols, nDropCols);
+    }
+  }
+  return SQLITE_OK;
+}
+
+/* A trigger whose table the other side renamed or dropped. A trigger has to
+** resolve when the schema loads -- unlike a view, which is only text until it
+** is used -- so a merged catalog holding a trigger on a table that is no
+** longer there cannot be loaded, and the merge reported the database as
+** malformed.
+**
+** Dolt merges a rename and keeps the trigger pointing at the old name, which
+** is a dangling trigger its own information_schema cannot read. That is not a
+** result this engine can represent, so refuse and say why. A drop of the
+** table is the same hole: refuse as dropped, not as renamed. */
+int mergePass1CheckTriggerOverRenamedTable(MergePass1Ctx *c){
+  int side, i, j;
+
+  for(side=0; side<2; side++){
+    SchemaEntry *aTrig = side ? c->aTheirsSchema : c->aOursSchema;
+    int nTrig = side ? c->nTheirsSchema : c->nOursSchema;
+    SchemaEntry *aOther = side ? c->aOursSchema : c->aTheirsSchema;
+    int nOther = side ? c->nOursSchema : c->nTheirsSchema;
+
+    for(i=0; i<nTrig; i++){
+      const char *zTable = aTrig[i].zTblName;
+      int bRenamed = 0;
+      if( !aTrig[i].zType || strcmp(aTrig[i].zType, "trigger")!=0 ) continue;
+      if( !aTrig[i].zName || !zTable ) continue;
+      /* A trigger the ancestor already had went through the rename with the
+      ** table on the renaming side, so the merge has a correct copy to keep.
+      ** Only one added beside the rename has nowhere to land. */
+      if( findSchemaEntry(c->aAncSchema, c->nAncSchema, aTrig[i].zName) ){
+        continue;
+      }
+      if( !findSchemaEntry(c->aAncSchema, c->nAncSchema, zTable) ) continue;
+      if( findSchemaEntry(aOther, nOther, zTable) ) continue;
+      /* Gone from the other side under its ancestor name. A table of theirs the
+      ** ancestor never had, whose columns are the ancestor table's columns, is
+      ** that table under a new name. Dropping it and creating something
+      ** unrelated looks the same from the names alone, so the columns decide
+      ** whether this is a rename or a drop. */
+      {
+        SchemaEntry *pAncTbl = findSchemaEntry(c->aAncSchema, c->nAncSchema,
+                                               zTable);
+        ParsedColumn *aAncCols = 0;
+        int nAncCols = 0;
+        if( !pAncTbl || !pAncTbl->zSql ) continue;
+        if( parseColumns(pAncTbl->zSql, &aAncCols, &nAncCols)!=SQLITE_OK ){
+          continue;
+        }
+        for(j=0; j<nOther && !bRenamed; j++){
+          ParsedColumn *aCand = 0;
+          int nCand = 0, m, same;
+          if( !aOther[j].zType || strcmp(aOther[j].zType, "table")!=0 ) continue;
+          if( !aOther[j].zName || !aOther[j].zSql ) continue;
+          if( findSchemaEntry(c->aAncSchema, c->nAncSchema, aOther[j].zName) ){
+            continue;
+          }
+          if( parseColumns(aOther[j].zSql, &aCand, &nCand)!=SQLITE_OK ) continue;
+          same = nCand==nAncCols;
+          for(m=0; m<nCand && same; m++){
+            if( sqlite3_stricmp(aCand[m].zName, aAncCols[m].zName)!=0
+             || !parsedColumnDefinitionsMatch(&aCand[m], &aAncCols[m]) ){
+              same = 0;
+            }
+          }
+          freeColumns(aCand, nCand);
+          if( same ) bRenamed = 1;
+        }
+        freeColumns(aAncCols, nAncCols);
+      }
+      if( c->pzErrMsg ){
+        sqlite3_free(*c->pzErrMsg);
+        if( bRenamed ){
+          *c->pzErrMsg = sqlite3_mprintf(
+              "cannot merge: trigger '%s' runs on table '%s', which the other "
+              "branch renamed; drop or recreate the trigger, then merge",
+              aTrig[i].zName, zTable);
+        }else{
+          *c->pzErrMsg = sqlite3_mprintf(
+              "cannot merge: trigger '%s' runs on table '%s', which the other "
+              "branch dropped; drop or recreate the trigger, then merge",
+              aTrig[i].zName, zTable);
+        }
+      }
+      return SQLITE_ERROR;
+    }
+  }
+  return SQLITE_OK;
+}
+
+/* An index one side added over a column the other side renamed. Nothing here
+** retargets the index to the new name, and a merged catalog naming a column
+** its table does not have cannot be loaded at all -- the merge used to report
+** the database as corrupt. Refuse it instead, the way a primary-key change is
+** refused, and say why.
+**
+** This is a deliberate divergence from Dolt, which merges these and keeps the
+** index on the renamed column. */
+int mergePass1CheckIndexOverRenamedColumn(MergePass1Ctx *c){
+  int side, i;
+
+  for(side=0; side<2; side++){
+    SchemaEntry *aNew = side ? c->aTheirsSchema : c->aOursSchema;
+    int nNew = side ? c->nTheirsSchema : c->nOursSchema;
+    SchemaEntry *aOther = side ? c->aOursSchema : c->aTheirsSchema;
+    int nOther = side ? c->nOursSchema : c->nTheirsSchema;
+
+    for(i=0; i<nNew; i++){
+      SchemaEntry *pAncTbl;
+      SchemaEntry *pOtherTbl;
+      char *zCol = 0;
+      if( !aNew[i].zType || strcmp(aNew[i].zType, "index")!=0 ) continue;
+      if( !aNew[i].zName || !aNew[i].zSql || !aNew[i].zTblName ) continue;
+      if( findSchemaEntry(c->aAncSchema, c->nAncSchema, aNew[i].zName) ){
+        continue;
+      }
+      if( findSchemaEntry(aOther, nOther, aNew[i].zName) ) continue;
+      pAncTbl = findSchemaEntry(c->aAncSchema, c->nAncSchema, aNew[i].zTblName);
+      pOtherTbl = findSchemaEntry(aOther, nOther, aNew[i].zTblName);
+      if( !pAncTbl || !pOtherTbl ) continue;
+      if( !mergeIndexColumnRenamedAway(aNew[i].zSql, pAncTbl->zSql,
+                                       pOtherTbl->zSql, &zCol) ){
+        continue;
+      }
+      if( c->pzErrMsg ){
+        sqlite3_free(*c->pzErrMsg);
+        *c->pzErrMsg = sqlite3_mprintf(
+            "cannot merge: index '%s' covers column '%s' of table '%s', which "
+            "the other branch renamed; drop or recreate the index, then merge",
+            aNew[i].zName, zCol, aNew[i].zTblName);
+      }
+      sqlite3_free(zCol);
+      return SQLITE_ERROR;
+    }
+  }
+  return SQLITE_OK;
+}
+
+#endif /* DOLTLITE_PROLLY */
+
+/************** End of doltlite_merge_predetect.c ****************************/
 /************** Begin file doltlite_merge_rows.c *****************************/
 #ifdef DOLTLITE_PROLLY
 
@@ -518385,6 +529233,62 @@ static int rowMergeCallback(void *pCtx, const ThreeWayChange *pChange){
   return rc;
 }
 
+/* Did the other side change this column's value in a row that already existed?
+** Dropping a column and editing that same column's value on another branch is
+** a cell-level modify-versus-delete, which Dolt reports as a conflict. Rows
+** the other side added or removed do not count, and neither does an edit to
+** any other column, so the comparison has to be per row and per field. */
+int mergeRowEditsColumn(
+  sqlite3 *db,
+  const ProllyHash *pAncRoot,
+  const ProllyHash *pOtherRoot,
+  u8 ancFlags,
+  u8 otherFlags,
+  int iField,
+  int *pbEdited
+){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  ProllyCache *pCache = doltliteGetCache(db);
+  ProllyDiffIter iter;
+  ProllyDiffChange *pChange = 0;
+  int rc;
+
+  *pbEdited = 0;
+  if( !cs || !pCache || iField<0 ) return SQLITE_OK;
+  if( prollyHashIsEmpty(pAncRoot) || prollyHashIsEmpty(pOtherRoot) ){
+    return SQLITE_OK;
+  }
+  memset(&iter, 0, sizeof(iter));
+  rc = prollyDiffIterOpen(&iter, cs, pCache, pAncRoot, pOtherRoot,
+                          ancFlags, otherFlags);
+  if( rc!=SQLITE_OK ) return rc;
+
+  while( (rc = prollyDiffIterStep(&iter, &pChange))==SQLITE_ROW ){
+    RecField *aOld = 0;
+    RecField *aNew = 0;
+    int nOld = 0, nNew = 0;
+    if( pChange->type!=PROLLY_DIFF_MODIFY ) continue;
+    if( !pChange->pOldVal || !pChange->pNewVal ) continue;
+    if( parseRecordFields(pChange->pOldVal, pChange->nOldVal, &aOld, &nOld)<0 ){
+      continue;
+    }
+    if( parseRecordFields(pChange->pNewVal, pChange->nNewVal, &aNew, &nNew)<0 ){
+      sqlite3_free(aOld);
+      continue;
+    }
+    if( iField<nOld && iField<nNew
+     && fieldEquals(pChange->pOldVal, &aOld[iField],
+                    pChange->pNewVal, &aNew[iField])!=0 ){
+      *pbEdited = 1;
+    }
+    sqlite3_free(aOld);
+    sqlite3_free(aNew);
+    if( *pbEdited ) break;
+  }
+  prollyDiffIterClose(&iter);
+  return rc==SQLITE_ROW || rc==SQLITE_DONE ? SQLITE_OK : rc;
+}
+
 int canFastMerge(
   sqlite3 *db,
   const char *zName,
@@ -519182,6 +530086,8 @@ int trySchemaColumnMerge(
   const char *zOursSql,
   const char *zTheirsSql,
   char ***ppAddCols, int *pnAddCols,
+  char ***ppDropCols, int *pnDropCols,
+  char ***ppRenameCols, int *pnRenameCols,
   int *pSchemaChoice,
   int *pResolvedDivergence,
   char **pzErrDetail
@@ -519191,10 +530097,18 @@ int trySchemaColumnMerge(
   int rc;
   char **azAdd = 0;
   int nAdd = 0, nAddAlloc = 0;
+  char **azDrop = 0;
+  int nDrop = 0, nDropAlloc = 0;
+  char **azRename = 0;
+  int nRename = 0, nRenameAlloc = 0;
   int i;
 
   *ppAddCols = 0;
   *pnAddCols = 0;
+  if( ppDropCols ) *ppDropCols = 0;
+  if( pnDropCols ) *pnDropCols = 0;
+  if( ppRenameCols ) *ppRenameCols = 0;
+  if( pnRenameCols ) *pnRenameCols = 0;
   *pSchemaChoice = SCHEMA_MERGE_DEFAULT;
   *pResolvedDivergence = 0;
 
@@ -519332,6 +530246,36 @@ int trySchemaColumnMerge(
     }
   }
 
+  /* The scan above only recognizes a rename on their side, so one on ours
+  ** went unseen and the merge fell through to incompatible. A column of ours
+  ** that the ancestor never had, sitting where a vanished ancestor column
+  ** used to sit and carrying its definition, is that rename. */
+  if( *pSchemaChoice==SCHEMA_MERGE_DEFAULT ){
+    for(i=0; i<nOurs; i++){
+      ParsedColumn *theirAncestor;
+      if( findColumn(aAnc, nAnc, aOurs[i].zName)
+       || findColumn(aTheirs, nTheirs, aOurs[i].zName)
+       || i>=nAnc
+       || sqlite3_stricmp(aOurs[i].zName, aAnc[i].zName)==0
+       || findColumn(aOurs, nOurs, aAnc[i].zName)
+       || !parsedColumnDefinitionsMatch(&aOurs[i], &aAnc[i]) ){
+        continue;
+      }
+      theirAncestor = findColumn(aTheirs, nTheirs, aAnc[i].zName);
+      if( theirAncestor && strcmp(theirAncestor->zDef, aAnc[i].zDef)==0 ){
+        *pSchemaChoice = SCHEMA_MERGE_OURS;
+      }else{
+        if( pzErrDetail ){
+          *pzErrDetail = sqlite3_mprintf(
+            "column '%s' renamed on one branch and modified on another",
+            aAnc[i].zName);
+        }
+        rc = SQLITE_ERROR;
+        goto schema_merge_cleanup;
+      }
+    }
+  }
+
   for(i=0; i<nOurs; i++){
     ParsedColumn *ancCol = findColumn(aAnc, nAnc, aOurs[i].zName);
     if( ancCol ){
@@ -519364,6 +530308,18 @@ int trySchemaColumnMerge(
     nAdd = 0;
     nAddAlloc = 0;
     for(i=0; i<nOurs; i++){
+      /* A column of ours the ancestor never had, sitting where a vanished
+      ** ancestor column sat and carrying its definition, is our rename. The
+      ** adopted schema keeps that column under its old name, so replaying the
+      ** new name as an addition would keep both and leave the new one empty.
+      ** The rename pass below carries it across instead. */
+      if( i<nAnc
+       && !findColumn(aAnc, nAnc, aOurs[i].zName)
+       && !findColumn(aOurs, nOurs, aAnc[i].zName)
+       && findColumn(aTheirs, nTheirs, aAnc[i].zName)
+       && parsedColumnDefinitionsMatch(&aOurs[i], &aAnc[i]) ){
+        continue;
+      }
       if( !findColumn(aAnc, nAnc, aOurs[i].zName)
        && !findColumn(aTheirs, nTheirs, aOurs[i].zName) ){
         rc = DOLTLITE_GROW_ARRAY(&azAdd, &nAddAlloc, nAdd+1, 4);
@@ -519379,14 +530335,73 @@ int trySchemaColumnMerge(
   }
 
 schema_merge_done:
+  /* The merged layout is the selected side's, so the columns the other side
+  ** deleted are still in it and have to be carried across as deletions. With
+  ** no side selected the layout is ours plus their additions, which leaves
+  ** their deletions just as unrepresented. A column the other side renamed is
+  ** absent under its old name too, and its replacement sits at the same
+  ** position, which is what tells the two apart. */
+  if( ppDropCols && pnDropCols ){
+    ParsedColumn *aSel = *pSchemaChoice==SCHEMA_MERGE_THEIRS ? aTheirs : aOurs;
+    ParsedColumn *aOth = *pSchemaChoice==SCHEMA_MERGE_THEIRS ? aOurs : aTheirs;
+    int nSel = *pSchemaChoice==SCHEMA_MERGE_THEIRS ? nTheirs : nOurs;
+    int nOth = *pSchemaChoice==SCHEMA_MERGE_THEIRS ? nOurs : nTheirs;
+    for(i=0; i<nAnc; i++){
+      if( !findColumn(aSel, nSel, aAnc[i].zName) ) continue;
+      if( findColumn(aOth, nOth, aAnc[i].zName) ) continue;
+      if( i<nOth
+       && !findColumn(aAnc, nAnc, aOth[i].zName)
+       && parsedColumnDefinitionsMatch(&aOth[i], &aAnc[i]) ){
+        /* Renamed, not deleted. The adopted layout still calls the column by
+        ** its ancestor name, so the merge has to carry the rename across or
+        ** the other side's new name is simply lost. */
+        if( ppRenameCols && pnRenameCols ){
+          rc = DOLTLITE_GROW_ARRAY(&azRename, &nRenameAlloc, nRename+2, 4);
+          if( rc!=SQLITE_OK ) goto schema_merge_cleanup;
+          azRename[nRename] = sqlite3_mprintf("%s", aAnc[i].zName);
+          azRename[nRename+1] = sqlite3_mprintf("%s", aOth[i].zName);
+          if( !azRename[nRename] || !azRename[nRename+1] ){
+            sqlite3_free(azRename[nRename]);
+            sqlite3_free(azRename[nRename+1]);
+            rc = SQLITE_NOMEM;
+            goto schema_merge_cleanup;
+          }
+          nRename += 2;
+        }
+        continue;
+      }
+      rc = DOLTLITE_GROW_ARRAY(&azDrop, &nDropAlloc, nDrop+1, 4);
+      if( rc!=SQLITE_OK ) goto schema_merge_cleanup;
+      azDrop[nDrop] = sqlite3_mprintf("%s", aAnc[i].zName);
+      if( !azDrop[nDrop] ){
+        rc = SQLITE_NOMEM;
+        goto schema_merge_cleanup;
+      }
+      nDrop++;
+    }
+  }
   *ppAddCols = azAdd;
   *pnAddCols = nAdd;
   azAdd = 0; nAdd = 0;
+  if( ppDropCols && pnDropCols ){
+    *ppDropCols = azDrop;
+    *pnDropCols = nDrop;
+    azDrop = 0; nDrop = 0;
+  }
+  if( ppRenameCols && pnRenameCols ){
+    *ppRenameCols = azRename;
+    *pnRenameCols = nRename;
+    azRename = 0; nRename = 0;
+  }
 
 schema_merge_cleanup:
   freeColumns(aAnc, nAnc);
   freeColumns(aOurs, nOurs);
   freeColumns(aTheirs, nTheirs);
+  { int j; for(j=0;j<nDrop;j++) sqlite3_free(azDrop[j]); }
+  sqlite3_free(azDrop);
+  { int j; for(j=0;j<nRename;j++) sqlite3_free(azRename[j]); }
+  sqlite3_free(azRename);
   if( rc!=SQLITE_OK ){
     { int j; for(j=0;j<nAdd;j++) sqlite3_free(azAdd[j]); }
     sqlite3_free(azAdd);
@@ -519409,7 +530424,7 @@ int doltliteTableSchemaConflictDetail(
   *pzDetail = 0;
   if( !zAncestorSql || !zOurSql || !zTheirSql ) return SQLITE_OK;
   rc = trySchemaColumnMerge(zAncestorSql, zOurSql, zTheirSql,
-                            &azAdd, &nAdd, &schemaChoice,
+                            &azAdd, &nAdd, 0, 0, 0, 0, &schemaChoice,
                             &resolvedDivergence, pzDetail);
   for(i=0; i<nAdd; i++) sqlite3_free(azAdd[i]);
   sqlite3_free(azAdd);
@@ -519538,7 +530553,11 @@ done:
 }
 
 
-int normalizeTheirsToMergedLayout(
+/* Rewrite the tree at pTheirsRoot, whose records follow zTheirsSql, into the
+** merged layout described by zOursSql. pOursRoot is the other side of the
+** merge, read only to tell rows that side also holds from rows this one
+** introduces. Either side of a merge can be the one converted. */
+int normalizeSideToMergedLayout(
   sqlite3 *db,
   const char *zTable,
   const ProllyHash *pOursRoot,
@@ -519555,6 +530574,7 @@ int normalizeTheirsToMergedLayout(
   int nAnc = 0, nOurs = 0, nTheirs = 0;
   int *aMap = 0;
   int nMerged;
+  int nDropped = 0;
   ProllyMutMap mm;
   int mmInit = 0;
   ProllyCursor cur;
@@ -519587,6 +530607,7 @@ int normalizeTheirsToMergedLayout(
   for(j=0; j<nTheirs; j++){
     int found = parsedColumnIndexByName(
         aOurs, nOurs, aTheirs[j].zName);
+    int bInAnc = 0;
     if( found<0 ){
       int ai = parsedColumnIndexByName(
           aAnc, nAnc, aTheirs[j].zName);
@@ -519597,6 +530618,7 @@ int normalizeTheirsToMergedLayout(
         ai = j;
       }
       if( ai>=0 ){
+        bInAnc = 1;
         found = parsedColumnIndexByName(
             aOurs, nOurs, aAnc[ai].zName);
         if( found<0 && ai<nOurs
@@ -519607,9 +530629,33 @@ int normalizeTheirsToMergedLayout(
         }
       }
     }
-    aMap[j] = (found>=0) ? found : nMerged++;
+    if( found>=0 ){
+      aMap[j] = found;
+    }else if( bInAnc ){
+      /* The ancestor had this column and the merged layout does not, so the
+      ** merged side dropped it. Appending it as a new column instead would
+      ** resurrect dropped data as a trailing field the schema cannot name. */
+      aMap[j] = -1;
+      nDropped++;
+    }else{
+      aMap[j] = nMerged++;
+    }
   }
   if( nMerged > DOLTLITE_MAX_RECORD_FIELDS ){ rc = SQLITE_ERROR; goto done; }
+
+  /* Records already sit at their merged positions, so the existing tree is
+  ** the answer. Trailing columns the merged layout adds read as absent from a
+  ** short record, which is what a rewrite would store anyway. */
+  if( nDropped==0 ){
+    int bSamePositions = 1;
+    for(j=0; j<nTheirs; j++){
+      if( aMap[j]!=j ){ bSamePositions = 0; break; }
+    }
+    if( bSamePositions ){
+      memcpy(pOutRoot, pTheirsRoot, sizeof(*pOutRoot));
+      goto done;
+    }
+  }
 
   /* Slots this side does not supply take the declared default of whichever
   ** schema owns them: ours for the columns we keep, theirs for the ones
@@ -519688,7 +530734,9 @@ int normalizeTheirsToMergedLayout(
       int tgt = aMap[j];
       int st = info.aType[j];
       const u8 *body = pVal + info.aOffset[j];
-      DoltliteSerialValue *m = &aMem[tgt];
+      DoltliteSerialValue *m;
+      if( tgt<0 ) continue;
+      m = &aMem[tgt];
       memset(m, 0, sizeof(*m));
       m->eType = SQLITE_NULL;
       if( st==0 ){
@@ -520154,9 +531202,6 @@ static int storeConflictBytes(
     rc = chunkStorePut(cs, pData, nData, &newHash);
     if( rc!=SQLITE_OK ) return rc;
     rc = doltliteSetSessionConflictsCatalog(db, &newHash);
-    if( rc==SQLITE_OK ){
-      rc = doltliteSetSessionMergeConflicts(db, &newHash);
-    }
   }
   if( rc!=SQLITE_OK ) return rc;
   mode = doltliteVcTxnMode(db);
@@ -521146,21 +532191,18 @@ static void conflictsResolveFinishNoConflictTable(
   sqlite3_result_error(ctx, "table not found", -1);
 }
 
-static void conflictsResolveFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+static void conflictsResolveParsedFunc(
+  sqlite3_context *ctx,
+  int useOurs,
+  const char *zTable
+){
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   ChunkStore *cs = doltliteGetChunkStore(db);
-  const char *zMode, *zTable;
   ConflictTableInfo table;
   int found = 0;
   int j, rc;
 
-  if( doltliteCmdRejectDetached(ctx) ) return;
   if(!cs){ sqlite3_result_error(ctx,"no database",-1); return; }
-  if(argc!=2){ sqlite3_result_error(ctx,"usage: dolt_conflicts_resolve('--ours'|'--theirs','table')",-1); return; }
-
-  zMode = (const char*)sqlite3_value_text(argv[0]);
-  zTable = (const char*)sqlite3_value_text(argv[1]);
-  if(!zMode||!zTable){ sqlite3_result_error(ctx,"invalid args",-1); return; }
 
   rc = loadConflictTable(db, cs, zTable, &table, &found);
   if( rc!=SQLITE_OK ){
@@ -521178,7 +532220,7 @@ static void conflictsResolveFunc(sqlite3_context *ctx, int argc, sqlite3_value *
   freeConflictTable(&table);
   found = 0;
 
-  if( strcmp(zMode,"--ours")==0 ){
+  if( useOurs ){
     rc = removeConflictTableFromCatalog(db, cs, zTable, &found);
     if( rc!=SQLITE_OK ){
       sqlite3_result_error_code(ctx, rc);
@@ -521190,7 +532232,7 @@ static void conflictsResolveFunc(sqlite3_context *ctx, int argc, sqlite3_value *
       conflictsResolveFinishNoConflictTable(ctx, db, zTable);
     }
 
-  }else if( strcmp(zMode,"--theirs")==0 ){
+  }else{
     rc = loadConflictTable(db, cs, zTable, &table, &found);
     if( rc!=SQLITE_OK ){
       sqlite3_result_error_code(ctx, rc);
@@ -521220,9 +532262,30 @@ static void conflictsResolveFunc(sqlite3_context *ctx, int argc, sqlite3_value *
       conflictsResolveFinishNoConflictTable(ctx, db, zTable);
     }
 
-  }else{
-    sqlite3_result_error(ctx, "use --ours or --theirs", -1);
   }
+}
+
+static void conflictsResolveFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  DoltliteCmdArgs args;
+  int useOurs = 0, useTheirs = 0;
+  DoltliteCmdOption aOption[] = {
+    { "ours", 0, DOLTLITE_CMD_OPTION_FLAG, &useOurs, 0 },
+    { "theirs", 0, DOLTLITE_CMD_OPTION_FLAG, &useTheirs, 0 }
+  };
+  int rc;
+
+  if( doltliteCmdRejectDetached(ctx) ) return;
+  rc = doltliteCmdParseArgs(ctx, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ) return;
+  if( useOurs + useTheirs!=1 || args.nPositional!=1 ){
+    doltliteCmdArgsClear(&args);
+    sqlite3_result_error(ctx,
+      "usage: dolt_conflicts_resolve('--ours'|'--theirs','table')", -1);
+    return;
+  }
+  conflictsResolveParsedFunc(ctx, useOurs, args.azPositional[0]);
+  doltliteCmdArgsClear(&args);
 }
 
 int doltliteConflictsRegister(sqlite3 *db){
@@ -522238,6 +533301,18 @@ static int gcRun(
     *pzPhase = "failed to acquire lock for gc";
     return rc;
   }
+  /* The sweep republishes the store by renaming a rebuilt file over this path.
+  ** A connection that may not write must not do that, and neither may one
+  ** whose file was replaced underneath it: the path now names a database this
+  ** handle never opened, and the rename would destroy it. Checked after the
+  ** refresh, which is what detects the replacement. */
+  if( cs->readOnly || cs->movedReadOnly ){
+    chunkStoreUnlock(cs);
+    *pzPhase = cs->readOnly
+             ? "attempt to write a readonly database"
+             : "cannot rewrite a database file that was replaced";
+    return SQLITE_READONLY;
+  }
   if( bForceRefresh ){
     rc = chunkStoreForceRefresh(cs);
     if( rc!=SQLITE_OK ){
@@ -522245,6 +533320,13 @@ static int gcRun(
       *pzPhase = "failed to refresh store for gc";
       return rc;
     }
+  }
+
+  rc = csMaterializeIndex(cs);
+  if( rc!=SQLITE_OK ){
+    chunkStoreUnlock(cs);
+    *pzPhase = "gc index load failed";
+    return rc;
   }
 
   rc = prollyHashSetInit(&marked, chunkIndexCount(&cs->index) > 64 ? chunkIndexCount(&cs->index) : 64);
@@ -526258,7 +537340,7 @@ static int patchAppendDropObject(PatchCursor *pCur, const char *zTable,
   return rc;
 }
 
-static int patchAppendObjectDiffs(
+static int patchAppendObjectDrops(
   PatchCursor *pCur, const char *zTable,
   SchemaEntry *aFrom, int nFrom,
   SchemaEntry *aTo, int nTo
@@ -526278,6 +537360,15 @@ static int patchAppendObjectDiffs(
       if( rc!=SQLITE_OK ) return rc;
     }
   }
+  return SQLITE_OK;
+}
+
+static int patchAppendIndexCreates(
+  PatchCursor *pCur, const char *zTable,
+  SchemaEntry *aFrom, int nFrom,
+  SchemaEntry *aTo, int nTo
+){
+  int i, rc;
   for(i=0; i<nTo; i++){
     SchemaEntry *p = &aTo[i];
     SchemaEntry *q;
@@ -526290,6 +537381,18 @@ static int patchAppendObjectDiffs(
     }
   }
   return SQLITE_OK;
+}
+
+static int patchAppendObjectDiffs(
+  PatchCursor *pCur, const char *zTable,
+  SchemaEntry *aFrom, int nFrom,
+  SchemaEntry *aTo, int nTo
+){
+  int rc = patchAppendObjectDrops(pCur,zTable,aFrom,nFrom,aTo,nTo);
+  if( rc==SQLITE_OK ){
+    rc = patchAppendIndexCreates(pCur,zTable,aFrom,nFrom,aTo,nTo);
+  }
+  return rc;
 }
 
 /* Views never appear in the table walk: a view's tbl_name is the view
@@ -526486,6 +537589,181 @@ static int patchAppendRebuild(
 done:
   sqlite3_free(aUsed);
   sqlite3_free(zTemp);
+  return rc;
+}
+
+static const char *patchSchemaBodyEnd(const char *zBody){
+  const char *z = zBody;
+  int depth = 0;
+  while( *z ){
+    char c = *z;
+    if( c=='"' || c=='`' || c=='\'' ){
+      z++;
+      while( *z ){
+        if( *z==c ){
+          if( z[1]==c ){ z += 2; continue; }
+          z++;
+          break;
+        }
+        z++;
+      }
+    }else if( c=='[' ){
+      z++;
+      while( *z && *z!=']' ) z++;
+      if( *z ) z++;
+    }else{
+      if( c=='(' ) depth++;
+      if( c==')' && --depth==0 ) return z;
+      z++;
+    }
+  }
+  return 0;
+}
+
+static int patchSchemaItem(
+  const char *zSql,
+  int iWanted,
+  const char **pzItem,
+  int *pnItem
+){
+  const char *zBody = patchSchemaBody(zSql);
+  const char *zEnd;
+  const char *z;
+  const char *zItem;
+  int iItem = 0;
+  int depth = 0;
+  *pzItem = 0;
+  *pnItem = 0;
+  if( !zBody ) return SQLITE_CORRUPT;
+  zEnd = patchSchemaBodyEnd(zBody);
+  if( !zEnd ) return SQLITE_CORRUPT;
+  zItem = zBody + 1;
+  for(z=zItem; z<=zEnd; z++){
+    char c = *z;
+    if( z==zEnd || (c==',' && depth==0) ){
+      const char *zStart = zItem;
+      const char *zStop = z;
+      while( zStart<zStop && sqlite3Isspace(*zStart) ) zStart++;
+      while( zStop>zStart && sqlite3Isspace(zStop[-1]) ) zStop--;
+      if( zStop==zStart ) return SQLITE_CORRUPT;
+      if( iWanted<0 || iWanted==iItem ){
+        *pzItem = zStart;
+        *pnItem = (int)(zStop-zStart);
+        if( iWanted>=0 ) return SQLITE_OK;
+      }
+      iItem++;
+      zItem = z + 1;
+    }else if( c=='"' || c=='`' || c=='\'' ){
+      char q = c;
+      z++;
+      while( z<zEnd ){
+        if( *z==q ){
+          if( z+1<zEnd && z[1]==q ){ z++; }
+          else break;
+        }
+        z++;
+      }
+    }else if( c=='[' ){
+      while( z<zEnd && *z!=']' ) z++;
+    }else if( c=='(' ){
+      depth++;
+    }else if( c==')' ){
+      depth--;
+    }
+  }
+  return *pzItem ? SQLITE_OK : SQLITE_NOTFOUND;
+}
+
+static int patchNativeAlter(
+  const PatchTable *pTable,
+  const PatchSchema *pFrom,
+  const PatchSchema *pTo,
+  char **pzAlter
+){
+  sqlite3 *tmp = 0;
+  sqlite3_stmt *pStmt = 0;
+  char *zAlter = 0;
+  const char *zActual = 0;
+  int i, nDiff = 0, iDiff = -1;
+  int isCandidate = 0;
+  int rc = SQLITE_OK;
+  *pzAlter = 0;
+  if( strcmp(pTable->zFromName,pTable->zToName)!=0 ) return SQLITE_OK;
+  if( pFrom->col.nCol==pTo->col.nCol ){
+    for(i=0; i<pFrom->col.nCol; i++){
+      if( strcmp(pFrom->col.azName[i],pTo->col.azName[i])!=0 ){
+        nDiff++;
+        iDiff = i;
+      }
+    }
+    if( nDiff==1 ){
+      const char *zItem = 0;
+      int nItem = 0;
+      int nIdent = 0;
+      rc = patchSchemaItem(pTable->pToSchema->zSql,iDiff,&zItem,&nItem);
+      if( rc!=SQLITE_OK ) return rc;
+      if( zItem[0]=='"' || zItem[0]=='`' ){
+        char q = zItem[0];
+        for(nIdent=1; nIdent<nItem; nIdent++){
+          if( zItem[nIdent]==q ){
+            if( nIdent+1<nItem && zItem[nIdent+1]==q ){ nIdent++; continue; }
+            nIdent++;
+            break;
+          }
+        }
+      }else if( zItem[0]=='[' ){
+        for(nIdent=1; nIdent<nItem && zItem[nIdent-1]!=']'; nIdent++){}
+      }else{
+        while( nIdent<nItem && !sqlite3Isspace(zItem[nIdent])
+            && zItem[nIdent]!='(' && zItem[nIdent]!=',' ) nIdent++;
+      }
+      if( nIdent<=0 || nIdent>nItem ) return SQLITE_CORRUPT;
+      isCandidate = 1;
+      zAlter = sqlite3_mprintf(
+          "ALTER TABLE \"%w\" RENAME COLUMN \"%w\" TO %.*s",
+          pTable->zFromName,pFrom->col.azName[iDiff],nIdent,zItem);
+    }
+  }else if( pTo->col.nCol==pFrom->col.nCol+1 ){
+    const char *zItem = 0;
+    int nItem = 0;
+    for(i=0; i<pFrom->col.nCol; i++){
+      if( strcmp(pFrom->col.azName[i],pTo->col.azName[i])!=0 ) return SQLITE_OK;
+    }
+    rc = patchSchemaItem(pTable->pToSchema->zSql,-1,&zItem,&nItem);
+    if( rc!=SQLITE_OK ) return rc;
+    isCandidate = 1;
+    zAlter = sqlite3_mprintf("ALTER TABLE \"%w\" ADD COLUMN %.*s",
+                             pTable->zFromName,nItem,zItem);
+  }
+  if( !zAlter ) return isCandidate ? SQLITE_NOMEM : SQLITE_OK;
+  rc = sqlite3_open(":memory:",&tmp);
+  if( rc==SQLITE_OK ){
+    rc = sqlite3_exec(tmp,pTable->pFromSchema->zSql,0,0,0);
+  }
+  if( rc==SQLITE_OK ) rc = sqlite3_exec(tmp,zAlter,0,0,0);
+  if( rc==SQLITE_OK ){
+    rc = sqlite3_prepare_v2(tmp,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+        -1,&pStmt,0);
+  }
+  if( rc==SQLITE_OK ){
+    sqlite3_bind_text(pStmt,1,pTable->zToName,-1,SQLITE_STATIC);
+    rc = sqlite3_step(pStmt);
+    if( rc==SQLITE_ROW ){
+      zActual = (const char*)sqlite3_column_text(pStmt,0);
+      if( zActual && strcmp(zActual,pTable->pToSchema->zSql)==0 ){
+        *pzAlter = zAlter;
+        zAlter = 0;
+      }
+      rc = SQLITE_OK;
+    }else if( rc==SQLITE_DONE ){
+      rc = SQLITE_CORRUPT;
+    }
+  }
+  if( rc!=SQLITE_OK && rc!=SQLITE_NOMEM ) rc = SQLITE_OK;
+  sqlite3_finalize(pStmt);
+  if( tmp ) sqlite3_close(tmp);
+  sqlite3_free(zAlter);
   return rc;
 }
 
@@ -526821,6 +538099,7 @@ static int patchGenerateTable(
   int iTemp
 ){
   PatchSchema from, to;
+  char *zNativeAlter = 0;
   int schemaChanged, pkChanged = 0;
   int rc = SQLITE_OK;
   memset(&from,0,sizeof(from));
@@ -526856,8 +538135,21 @@ static int patchGenerateTable(
   if( schemaChanged ){
     pkChanged = pTable->pFromTable->flags!=pTable->pToTable->flags
              || patchPrimaryKeyChanged(&from,&to);
-    rc = patchAppendRebuild(pCur,pTable,&from,&to,aFromSchema,nFromSchema,
-                            aToSchema,nToSchema,iTemp,!pkChanged);
+    rc = patchNativeAlter(pTable,&from,&to,&zNativeAlter);
+    if( rc==SQLITE_OK && zNativeAlter ){
+      rc = patchAppendObjectDrops(pCur,pTable->zFromName,
+              aFromSchema,nFromSchema,aToSchema,nToSchema);
+      if( rc==SQLITE_OK ){
+        rc = patchAppendRow(pCur,pTable->zToName,"schema",zNativeAlter);
+      }
+      if( rc==SQLITE_OK ){
+        rc = patchAppendIndexCreates(pCur,pTable->zToName,
+                aFromSchema,nFromSchema,aToSchema,nToSchema);
+      }
+    }else if( rc==SQLITE_OK ){
+      rc = patchAppendRebuild(pCur,pTable,&from,&to,aFromSchema,nFromSchema,
+                              aToSchema,nToSchema,iTemp,!pkChanged);
+    }
   }else{
     rc = patchAppendObjectDiffs(pCur,pTable->zToName,
            aFromSchema,nFromSchema,aToSchema,nToSchema);
@@ -526867,6 +538159,7 @@ static int patchGenerateTable(
     else rc=patchAppendData(pCur,db,pTable,&from,&to);
   }
 done:
+  sqlite3_free(zNativeAlter);
   patchSchemaClear(&from);
   patchSchemaClear(&to);
   return rc;
@@ -527654,6 +538947,21 @@ static struct TableEntry *dsNameIndexFind(
   return r<0 ? 0 : (struct TableEntry*)(pIdx->aBase + (size_t)r*pIdx->stride);
 }
 
+static struct TableEntry *dsFindTableByNameNoCase(
+  struct TableEntry *aCat,
+  int nCat,
+  const char *zName
+){
+  int i;
+  if( !zName ) return 0;
+  for(i=0; i<nCat; i++){
+    if( aCat[i].zName && sqlite3_stricmp(aCat[i].zName, zName)==0 ){
+      return &aCat[i];
+    }
+  }
+  return 0;
+}
+
 static int dsRequireRefs(sqlite3_vtab *pVtab, int idxNum, const char *zName){
   if( (idxNum & 3)!=3 ){
     sqlite3_free(pVtab->zErrMsg);
@@ -528060,7 +539368,8 @@ static int dsFilterInit(
 }
 
 static int dsTableNameMatchesFilter(const DsFilterCtx *pCtx, const char *zName){
-  return !pCtx->zTblFilter || strcmp(zName, pCtx->zTblFilter)==0;
+  return !pCtx->zTblFilter
+      || sqlite3_stricmp(zName, pCtx->zTblFilter)==0;
 }
 
 /* pRef is present in one root but its name is absent from the other. If the
@@ -528090,14 +539399,18 @@ static int dstAdvance(DstCursor *c, sqlite3 *db){
 
   while( c->iName<pCtx->nNames ){
     const char *zName = pCtx->azNames[c->iName++];
+    const char *zFromName = zName;
+    const char *zToName = zName;
     struct TableEntry *pFromEntry, *pToEntry;
     DsStatRow row;
 
     if( !dsTableNameMatchesFilter(pCtx, zName) ) continue;
 
     if( pCtx->zTblFilter ){
-      pFromEntry = doltliteFindTableByName(c->aFromCat, c->nFromCat, zName);
-      pToEntry = doltliteFindTableByName(c->aToCat, c->nToCat, zName);
+      pFromEntry = dsFindTableByNameNoCase(c->aFromCat, c->nFromCat, zName);
+      pToEntry = dsFindTableByNameNoCase(c->aToCat, c->nToCat, zName);
+      if( pFromEntry ) zFromName = pFromEntry->zName;
+      if( pToEntry ) zToName = pToEntry->zName;
     }else{
       pFromEntry = dsNameIndexFind(&c->fromIdx, zName);
       pToEntry = dsNameIndexFind(&c->toIdx, zName);
@@ -528130,13 +539443,23 @@ static int dstAdvance(DstCursor *c, sqlite3 *db){
      && prollyHashCompare(&pFromEntry->schemaHash, &pToEntry->schemaHash)==0 ){
       continue;
     }
-    rc = dsComputeTableStats(db, zName, zName, &pCtx->fromCat, &pCtx->toCat,
+    rc = dsComputeTableStats(db, zFromName, zToName,
+                             &pCtx->fromCat, &pCtx->toCat,
                              pFromEntry, pToEntry, &row);
     if( rc!=SQLITE_OK ){
       sqlite3_free(row.zTableName);
       return rc;
     }
     if( !row.zTableName ) continue;
+    if( pCtx->zTblFilter ){
+      char *zFilteredName = sqlite3_mprintf("%s", pCtx->zTblFilter);
+      if( !zFilteredName ){
+        sqlite3_free(row.zTableName);
+        return SQLITE_NOMEM;
+      }
+      sqlite3_free(row.zTableName);
+      row.zTableName = zFilteredName;
+    }
 
     if( row.rowsAdded==0 && row.rowsDeleted==0 && row.rowsModified==0
      && row.cellsAdded==0 && row.cellsDeleted==0 && row.cellsModified==0 ){
@@ -528173,8 +539496,10 @@ static int dstFilter(sqlite3_vtab_cursor *cur,
   /* Match Dolt: a table filter must name a table present on at least one
   ** side. Absent from both is "table not found", not an empty result. */
   if( c->fctx.zTblFilter
-   && !doltliteFindTableByName(c->aFromCat, c->nFromCat, c->fctx.zTblFilter)
-   && !doltliteFindTableByName(c->aToCat, c->nToCat, c->fctx.zTblFilter) ){
+   && !dsFindTableByNameNoCase(c->aFromCat, c->nFromCat,
+                               c->fctx.zTblFilter)
+   && !dsFindTableByNameNoCase(c->aToCat, c->nToCat,
+                               c->fctx.zTblFilter) ){
     sqlite3_free(v->base.zErrMsg);
     v->base.zErrMsg = sqlite3_mprintf("table not found: %s", c->fctx.zTblFilter);
     rc = SQLITE_ERROR;
@@ -528477,8 +539802,8 @@ static int dssAdvance(DssCursor *c, sqlite3 *db){
     if( !dsTableNameMatchesFilter(pCtx, zName) ) continue;
 
     if( pCtx->zTblFilter ){
-      pFromEntry = doltliteFindTableByName(c->aFromCat, c->nFromCat, zName);
-      pToEntry = doltliteFindTableByName(c->aToCat, c->nToCat, zName);
+      pFromEntry = dsFindTableByNameNoCase(c->aFromCat, c->nFromCat, zName);
+      pToEntry = dsFindTableByNameNoCase(c->aToCat, c->nToCat, zName);
     }else{
       pFromEntry = dsNameIndexFind(&c->fromIdx, zName);
       pToEntry = dsNameIndexFind(&c->toIdx, zName);
@@ -528498,6 +539823,10 @@ static int dssAdvance(DssCursor *c, sqlite3 *db){
                                 &c->toIdx) ){
         continue;
       }
+    }
+    if( pCtx->zTblFilter ){
+      if( pToEntry ) zName = pToEntry->zName;
+      else if( pFromEntry ) zName = pFromEntry->zName;
     }
     rc = dssAppendTableChange(c, db, zName, pFromEntry, pToEntry);
     if( rc!=SQLITE_OK ) return rc;
@@ -529368,14 +540697,28 @@ u8 *doltliteBuildRecord(const DoltliteSerialValue *aMem, int nField, int *pnOut)
 #ifdef DOLTLITE_PROLLY
 
 /* #include "sqliteInt.h" */
+/* #include "doltlite_internal.h" */
 /* #include "doltlite_ignore.h" */
 /* #include <string.h> */
 
-static unsigned char ignoreLower(unsigned char c){
-  return (c>='A' && c<='Z') ? c + 32 : c;
+typedef struct IgnoreMatch IgnoreMatch;
+struct IgnoreMatch {
+  char *zPattern;
+  u8 ignored;
+  u8 removed;
+};
+
+static const char *ignoreUtf8Next(const char *z){
+  z++;
+  while( ((unsigned char)*z & 0xc0)==0x80 ) z++;
+  return z;
 }
 
-static int ignorePatternMatch(const char *zPat, const char *zStr){
+static int ignorePatternMatchMode(
+  const char *zPat,
+  const char *zStr,
+  int patternMode
+){
   const char *pStar = 0;
   const char *sStar = 0;
 
@@ -529386,15 +540729,15 @@ static int ignorePatternMatch(const char *zPat, const char *zStr){
       pStar = zPat;
       sStar = zStr;
       zPat++;
-    }else if( c=='?' ){
+    }else if( c=='?' && (!patternMode || (*zStr!='*' && *zStr!='%')) ){
       zPat++;
-      zStr++;
-    }else if( ignoreLower(c)==ignoreLower((unsigned char)*zStr) ){
+      zStr = ignoreUtf8Next(zStr);
+    }else if( c==(unsigned char)*zStr ){
       zPat++;
       zStr++;
     }else if( pStar ){
       zPat = pStar + 1;
-      sStar++;
+      sStar = ignoreUtf8Next(sStar);
       zStr = sStar;
     }else{
       return 0;
@@ -529404,13 +540747,134 @@ static int ignorePatternMatch(const char *zPat, const char *zStr){
   return *zPat == 0;
 }
 
-static int ignoreSpecificity(const char *zPat){
-  int n = 0;
-  while( *zPat ){
-    if( *zPat != '*' && *zPat != '%' && *zPat != '?' ) n++;
-    zPat++;
+static int ignorePatternMatch(const char *zPat, const char *zStr){
+  return ignorePatternMatchMode(zPat, zStr, 0);
+}
+
+static int ignorePatternCovers(const char *zLess, const char *zMore){
+  return ignorePatternMatchMode(zLess, zMore, 1);
+}
+
+static unsigned char ignorePatternNext(const char **pzPattern){
+  unsigned char c = (unsigned char)**pzPattern;
+  if( !c ) return 0;
+  (*pzPattern)++;
+  if( c=='*' || c=='%' ){
+    while( **pzPattern=='*' || **pzPattern=='%' ) (*pzPattern)++;
+    return '%';
   }
-  return n;
+  return c;
+}
+
+static int ignorePatternsEquivalent(const char *zA, const char *zB){
+  unsigned char a, b;
+  do{
+    a = ignorePatternNext(&zA);
+    b = ignorePatternNext(&zB);
+    if( a!=b ) return 0;
+  }while( a );
+  return 1;
+}
+
+static void ignoreMatchesClear(IgnoreMatch *aMatch, int nMatch){
+  int i;
+  for(i=0; i<nMatch; i++) sqlite3_free(aMatch[i].zPattern);
+  sqlite3_free(aMatch);
+}
+
+static int ignoreMatchAppend(
+  IgnoreMatch **paMatch,
+  int *pnMatch,
+  int *pnAlloc,
+  const char *zPattern,
+  int ignored
+){
+  IgnoreMatch *p;
+  int rc;
+  rc = DOLTLITE_GROW_ARRAY(paMatch, pnAlloc, *pnMatch+1, 8);
+  if( rc!=SQLITE_OK ) return rc;
+  p = &(*paMatch)[*pnMatch];
+  memset(p, 0, sizeof(*p));
+  p->zPattern = sqlite3_mprintf("%s", zPattern);
+  if( !p->zPattern ) return SQLITE_NOMEM;
+  p->ignored = ignored!=0;
+  (*pnMatch)++;
+  return SQLITE_OK;
+}
+
+static int ignoreConflict(
+  const char *zTable,
+  const char *zIgnored,
+  const char *zKept,
+  char **pzErr
+){
+  if( pzErr ){
+    *pzErr = sqlite3_mprintf(
+        "the table %s matches conflicting patterns in dolt_ignore:\n"
+        "ignored:     %s\nnot ignored: %s",
+        zTable, zIgnored, zKept);
+    if( !*pzErr ) return SQLITE_NOMEM;
+  }
+  return SQLITE_CONSTRAINT;
+}
+
+static int ignoreResolveMatches(
+  IgnoreMatch *aMatch,
+  int nMatch,
+  const char *zTable,
+  int *pIgnored,
+  char **pzErr
+){
+  int i, j;
+  int nIgnored = 0;
+  int nKept = 0;
+  int nIgnoredRemoved = 0;
+  int nKeptRemoved = 0;
+  const char *zIgnored = 0;
+  const char *zKept = 0;
+
+  for(i=0; i<nMatch; i++){
+    if( aMatch[i].ignored ) nIgnored++;
+    else nKept++;
+  }
+  if( nIgnored==0 ) return SQLITE_OK;
+  if( nKept==0 ){
+    *pIgnored = 1;
+    return SQLITE_OK;
+  }
+
+  for(i=0; i<nMatch; i++){
+    if( !aMatch[i].ignored ) continue;
+    for(j=0; j<nMatch; j++){
+      if( aMatch[j].ignored ) continue;
+      if( ignorePatternsEquivalent(aMatch[i].zPattern, aMatch[j].zPattern) ){
+        return ignoreConflict(zTable, aMatch[i].zPattern,
+                              aMatch[j].zPattern, pzErr);
+      }
+      if( ignorePatternCovers(aMatch[i].zPattern, aMatch[j].zPattern) ){
+        aMatch[i].removed = 1;
+      }
+      if( ignorePatternCovers(aMatch[j].zPattern, aMatch[i].zPattern) ){
+        aMatch[j].removed = 1;
+      }
+    }
+  }
+
+  for(i=0; i<nMatch; i++){
+    if( aMatch[i].ignored ){
+      if( aMatch[i].removed ) nIgnoredRemoved++;
+      else if( !zIgnored ) zIgnored = aMatch[i].zPattern;
+    }else{
+      if( aMatch[i].removed ) nKeptRemoved++;
+      else if( !zKept ) zKept = aMatch[i].zPattern;
+    }
+  }
+  if( nIgnoredRemoved==nIgnored ) return SQLITE_OK;
+  if( nKeptRemoved==nKept ){
+    *pIgnored = 1;
+    return SQLITE_OK;
+  }
+  return ignoreConflict(zTable, zIgnored, zKept, pzErr);
 }
 
 enum DoltliteIgnoreSchemaState {
@@ -529480,13 +540944,12 @@ int doltliteCheckIgnore(
   char **pzErr
 ){
   sqlite3_stmt *pStmt = 0;
+  IgnoreMatch *aMatch = 0;
   int rc;
+  int rc2;
   int schemaState;
-  int bestSpec = -1;
-  int bestIgnored = 0;
-  char *zBestPat = 0;
-  int tieDisagrees = 0;
-  char *zTiePat = 0;
+  int nMatch = 0;
+  int nAlloc = 0;
 
   *pIgnored = 0;
   if( pzErr ) *pzErr = 0;
@@ -529516,55 +540979,206 @@ int doltliteCheckIgnore(
   while( (rc = sqlite3_step(pStmt))==SQLITE_ROW ){
     const char *zPat = (const char*)sqlite3_column_text(pStmt, 0);
     int ign = sqlite3_column_int(pStmt, 1);
-    int spec;
     if( !zPat ) continue;
     if( !ignorePatternMatch(zPat, zTable) ) continue;
-    spec = ignoreSpecificity(zPat);
-    if( spec > bestSpec ){
-      bestSpec = spec;
-      bestIgnored = ign;
-      sqlite3_free(zBestPat);
-      zBestPat = sqlite3_mprintf("%s", zPat);
-      if( !zBestPat ){ rc = SQLITE_NOMEM; break; }
-      tieDisagrees = 0;
-      sqlite3_free(zTiePat);
-      zTiePat = 0;
-    }else if( spec==bestSpec && ign!=bestIgnored ){
-      tieDisagrees = 1;
-      sqlite3_free(zTiePat);
-      zTiePat = sqlite3_mprintf("%s", zPat);
-      if( !zTiePat ){ rc = SQLITE_NOMEM; break; }
-    }
+    rc = ignoreMatchAppend(&aMatch, &nMatch, &nAlloc, zPat, ign);
+    if( rc!=SQLITE_OK ) break;
   }
-  sqlite3_finalize(pStmt);
-
-  if( rc!=SQLITE_DONE && rc!=SQLITE_ROW && rc!=SQLITE_OK ){
-    sqlite3_free(zBestPat);
-    sqlite3_free(zTiePat);
+  if( rc==SQLITE_DONE ) rc = SQLITE_OK;
+  rc2 = sqlite3_finalize(pStmt);
+  if( rc==SQLITE_OK && rc2!=SQLITE_OK ) rc = rc2;
+  if( rc!=SQLITE_OK ){
+    ignoreMatchesClear(aMatch, nMatch);
     return rc;
   }
+  rc = ignoreResolveMatches(aMatch, nMatch, zTable, pIgnored, pzErr);
+  ignoreMatchesClear(aMatch, nMatch);
+  return rc;
+}
 
-  if( tieDisagrees ){
-    if( pzErr ){
-      const char *zIgn = bestIgnored ? zBestPat : zTiePat;
-      const char *zKeep = bestIgnored ? zTiePat : zBestPat;
-      *pzErr = sqlite3_mprintf(
-          "the table %s matches conflicting patterns in dolt_ignore:\n"
-          "ignored:     %s\nnot ignored: %s",
-          zTable, zIgn, zKeep);
-    }
-    sqlite3_free(zBestPat);
-    sqlite3_free(zTiePat);
-    return SQLITE_CONSTRAINT;
-  }
+typedef struct IgnoreVtab IgnoreVtab;
+struct IgnoreVtab {
+  sqlite3_vtab base;
+  sqlite3 *db;
+};
 
-  if( bestSpec >= 0 ){
-    *pIgnored = bestIgnored;
-  }
+typedef struct IgnoreCursor IgnoreCursor;
+struct IgnoreCursor {
+  sqlite3_vtab_cursor base;
+};
 
-  sqlite3_free(zBestPat);
-  sqlite3_free(zTiePat);
+static const char *zIgnoreVtabSchema =
+  "CREATE TABLE x(pattern TEXT NOT NULL PRIMARY KEY, "
+  "ignored TINYINT NOT NULL) WITHOUT ROWID";
+
+static const char *zIgnoreCreate =
+  "CREATE TABLE main.dolt_ignore("
+  "pattern TEXT NOT NULL, ignored TINYINT NOT NULL, PRIMARY KEY(pattern))";
+
+static int ignoreSetErr(IgnoreVtab *p, int rc){
+  sqlite3_free(p->base.zErrMsg);
+  p->base.zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+  return rc;
+}
+
+static int ignoreConnect(sqlite3 *db, void *pAux, int argc,
+    const char *const*argv, sqlite3_vtab **ppVtab, char **pzErr){
+  IgnoreVtab *pVtab;
+  int rc;
+  (void)pAux; (void)argc; (void)argv; (void)pzErr;
+  rc = doltliteVtabConnectSimple(db, zIgnoreVtabSchema,
+      sizeof(*pVtab), ppVtab);
+  if( rc!=SQLITE_OK ) return rc;
+  pVtab = (IgnoreVtab*)*ppVtab;
+  pVtab->db = db;
   return SQLITE_OK;
+}
+
+static int ignoreBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo){
+  (void)pVtab;
+  pInfo->estimatedCost = 10.0;
+  pInfo->estimatedRows = 0;
+  return SQLITE_OK;
+}
+
+static int ignoreOpen(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor){
+  (void)pVtab;
+  return doltliteVtabOpenCursor(ppCursor, sizeof(IgnoreCursor));
+}
+
+static int ignoreFilter(sqlite3_vtab_cursor *pCursor,
+    int idxNum, const char *idxStr, int argc, sqlite3_value **argv){
+  (void)pCursor; (void)idxNum; (void)idxStr; (void)argc; (void)argv;
+  return SQLITE_OK;
+}
+
+static int ignoreNext(sqlite3_vtab_cursor *pCursor){
+  (void)pCursor;
+  return SQLITE_OK;
+}
+
+static int ignoreEof(sqlite3_vtab_cursor *pCursor){
+  (void)pCursor;
+  return 1;
+}
+
+static int ignoreColumn(sqlite3_vtab_cursor *pCursor,
+    sqlite3_context *ctx, int iCol){
+  (void)pCursor; (void)ctx; (void)iCol;
+  return SQLITE_OK;
+}
+
+static int ignoreRowid(sqlite3_vtab_cursor *pCursor, sqlite3_int64 *pRowid){
+  (void)pCursor;
+  *pRowid = 0;
+  return SQLITE_OK;
+}
+
+static int ignoreMaterialize(IgnoreVtab *p){
+  char *zErr = 0;
+  int rc;
+  if( sqlite3FindTable(p->db, "dolt_ignore", "main") ) return SQLITE_OK;
+  rc = sqlite3_exec(p->db, zIgnoreCreate, 0, 0, &zErr);
+  if( rc!=SQLITE_OK ){
+    sqlite3_free(p->base.zErrMsg);
+    p->base.zErrMsg = sqlite3_mprintf("%s",
+        zErr ? zErr : sqlite3_errstr(rc));
+    sqlite3_free(zErr);
+  }
+  return rc;
+}
+
+static int ignoreBegin(sqlite3_vtab *pBase){
+  return ignoreMaterialize((IgnoreVtab*)pBase);
+}
+
+static int ignoreExecBound(IgnoreVtab *p, const char *zSql,
+                           sqlite3_value *pArg1, sqlite3_value *pArg2,
+                           sqlite3_value *pArg3){
+  sqlite3_stmt *pStmt = 0;
+  int rc = sqlite3_prepare_v3(p->db, zSql, -1,
+                              SQLITE_PREPARE_NO_VTAB, &pStmt, 0);
+  if( rc!=SQLITE_OK ) return ignoreSetErr(p, rc);
+  if( pArg1 ) sqlite3_bind_value(pStmt, 1, pArg1);
+  if( pArg2 ) sqlite3_bind_value(pStmt, 2, pArg2);
+  if( pArg3 ) sqlite3_bind_value(pStmt, 3, pArg3);
+  sqlite3_step(pStmt);
+  rc = sqlite3_finalize(pStmt);
+  if( rc!=SQLITE_OK ) return ignoreSetErr(p, rc);
+  return SQLITE_OK;
+}
+
+static const char *ignoreInsertSql(sqlite3 *db){
+  switch( sqlite3_vtab_on_conflict(db) ){
+    case SQLITE_REPLACE:
+      return "INSERT OR REPLACE INTO main.dolt_ignore(pattern, ignored) "
+             "VALUES(?1, ?2)";
+    case SQLITE_IGNORE:
+      return "INSERT OR IGNORE INTO main.dolt_ignore(pattern, ignored) "
+             "VALUES(?1, ?2)";
+    case SQLITE_FAIL:
+      return "INSERT OR FAIL INTO main.dolt_ignore(pattern, ignored) "
+             "VALUES(?1, ?2)";
+    case SQLITE_ROLLBACK:
+      return "INSERT OR ROLLBACK INTO main.dolt_ignore(pattern, ignored) "
+             "VALUES(?1, ?2)";
+    default:
+      return "INSERT INTO main.dolt_ignore(pattern, ignored) VALUES(?1, ?2)";
+  }
+}
+
+static const char *ignoreUpdateSql(sqlite3 *db){
+  switch( sqlite3_vtab_on_conflict(db) ){
+    case SQLITE_REPLACE:
+      return "UPDATE OR REPLACE main.dolt_ignore SET pattern=?1, ignored=?2 "
+             "WHERE pattern=?3";
+    case SQLITE_IGNORE:
+      return "UPDATE OR IGNORE main.dolt_ignore SET pattern=?1, ignored=?2 "
+             "WHERE pattern=?3";
+    case SQLITE_FAIL:
+      return "UPDATE OR FAIL main.dolt_ignore SET pattern=?1, ignored=?2 "
+             "WHERE pattern=?3";
+    case SQLITE_ROLLBACK:
+      return "UPDATE OR ROLLBACK main.dolt_ignore SET pattern=?1, ignored=?2 "
+             "WHERE pattern=?3";
+    default:
+      return "UPDATE main.dolt_ignore SET pattern=?1, ignored=?2 "
+             "WHERE pattern=?3";
+  }
+}
+
+static int ignoreUpdate(sqlite3_vtab *pBase, int argc, sqlite3_value **argv,
+                        sqlite3_int64 *pRowid){
+  IgnoreVtab *p = (IgnoreVtab*)pBase;
+  int rc;
+
+  rc = ignoreMaterialize(p);
+  if( rc!=SQLITE_OK ) return rc;
+
+  if( argc==1 ){
+    return ignoreExecBound(p,
+        "DELETE FROM main.dolt_ignore WHERE pattern=?1", argv[0], 0, 0);
+  }
+  if( sqlite3_value_type(argv[0])!=SQLITE_NULL ){
+    return ignoreExecBound(p,
+        ignoreUpdateSql(p->db), argv[2], argv[3], argv[0]);
+  }
+
+  rc = ignoreExecBound(p, ignoreInsertSql(p->db), argv[2], argv[3], 0);
+  if( rc!=SQLITE_OK ) return rc;
+  if( pRowid ) *pRowid = sqlite3_last_insert_rowid(p->db);
+  return SQLITE_OK;
+}
+
+static sqlite3_module doltliteIgnoreModule = {
+  0, 0, ignoreConnect, ignoreBestIndex, doltliteVtabDisconnect, 0,
+  ignoreOpen, doltliteVtabClose, ignoreFilter, ignoreNext, ignoreEof,
+  ignoreColumn, ignoreRowid,
+  ignoreUpdate, ignoreBegin, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+
+int doltliteIgnoreRegister(sqlite3 *db){
+  return sqlite3_create_module(db, "dolt_ignore", &doltliteIgnoreModule, 0);
 }
 
 #endif
@@ -530502,6 +542116,8 @@ struct TestAuth {
   sqlite3_xauth xAuth;
   void *pAuthArg;
   int hasCommand;
+  int hasPragma;
+  int hasTestRun;
 };
 
 static int testAuthorizer(void *pArg, int action, const char *z1,
@@ -530514,6 +542130,14 @@ static int testAuthorizer(void *pArg, int action, const char *z1,
     if( pFunc && (pFunc->funcFlags & SQLITE_FUNC_DIRECT)!=0 ){
       p->hasCommand = 1;
     }
+  }
+  if( rc==SQLITE_OK && action==SQLITE_PRAGMA ){
+    p->hasPragma = 1;
+    rc = SQLITE_DENY;
+  }
+  if( rc==SQLITE_OK && action==SQLITE_READ && z1
+      && sqlite3_stricmp(z1, "dolt_test_run")==0 ){
+    p->hasTestRun = 1;
   }
   return rc;
 }
@@ -530530,13 +542154,25 @@ static int testPrepare(sqlite3 *db, const char *zQuery,
   auth.xAuth = db->xAuth;
   auth.pAuthArg = db->pAuthArg;
   auth.hasCommand = 0;
+  auth.hasPragma = 0;
+  auth.hasTestRun = 0;
   db->xAuth = testAuthorizer;
   db->pAuthArg = &auth;
   rc = sqlite3_prepare_v2(db, zQuery, -1, &pStmt, &zTail);
   db->xAuth = auth.xAuth;
   db->pAuthArg = auth.pAuthArg;
+  if( auth.hasPragma ){
+    sqlite3_finalize(pStmt);
+    *pzMessage = sqlite3_mprintf("Cannot execute PRAGMA queries");
+    return SQLITE_OK;
+  }
   if( rc!=SQLITE_OK ){
     *pzMessage = testPrepareError(db);
+    return SQLITE_OK;
+  }
+  if( auth.hasTestRun ){
+    sqlite3_finalize(pStmt);
+    *pzMessage = sqlite3_mprintf("Cannot call dolt_test_run in dolt_tests");
     return SQLITE_OK;
   }
   if( !pStmt ){
@@ -530549,10 +542185,30 @@ static int testPrepare(sqlite3 *db, const char *zQuery,
     return SQLITE_OK;
   }
   while( zTail && zTail[0] ){
+    auth.hasCommand = 0;
+    auth.hasPragma = 0;
+    auth.hasTestRun = 0;
+    db->xAuth = testAuthorizer;
+    db->pAuthArg = &auth;
     rc = sqlite3_prepare_v2(db, zTail, -1, &pExtra, &zNext);
+    db->xAuth = auth.xAuth;
+    db->pAuthArg = auth.pAuthArg;
+    if( auth.hasPragma ){
+      sqlite3_finalize(pExtra);
+      sqlite3_finalize(pStmt);
+      *pzMessage = sqlite3_mprintf("Cannot execute PRAGMA queries");
+      return SQLITE_OK;
+    }
     if( rc!=SQLITE_OK ){
       sqlite3_finalize(pStmt);
       *pzMessage = sqlite3_mprintf("Can only run exactly one query");
+      return SQLITE_OK;
+    }
+    if( auth.hasTestRun ){
+      sqlite3_finalize(pExtra);
+      sqlite3_finalize(pStmt);
+      *pzMessage = sqlite3_mprintf(
+          "Cannot call dolt_test_run in dolt_tests");
       return SQLITE_OK;
     }
     if( pExtra ){
@@ -530567,11 +542223,6 @@ static int testPrepare(sqlite3 *db, const char *zQuery,
   if( !sqlite3_stmt_readonly(pStmt) ){
     sqlite3_finalize(pStmt);
     *pzMessage = sqlite3_mprintf("Cannot execute write queries");
-    return SQLITE_OK;
-  }
-  if( sqlite3_strlike("%dolt_test_run(%", zQuery, 0)==0 ){
-    sqlite3_finalize(pStmt);
-    *pzMessage = sqlite3_mprintf("Cannot call dolt_test_run in dolt_tests");
     return SQLITE_OK;
   }
   *ppStmt = pStmt;
@@ -530979,6 +542630,8 @@ char *doltliteCanonicalizeSchemaSql(const char *zSql, const char *zName){
   const char *z = zSql;
   int inSingle = 0;
   int inDouble = 0;
+  int inBacktick = 0;
+  int inBracket = 0;
   int pendingSpace = 0;
   int rc;
 
@@ -531022,7 +542675,31 @@ char *doltliteCanonicalizeSchemaSql(const char *zSql, const char *zName){
     }
     if( inDouble ){
       sqlite3_str_appendchar(pStr, 1, (char)c);
-      if( c=='"' ) inDouble = 0;
+      if( c=='"' ){
+        if( z[1]=='"' ){
+          sqlite3_str_appendchar(pStr, 1, '"');
+          z++;
+        }else{
+          inDouble = 0;
+        }
+      }
+      continue;
+    }
+    if( inBacktick ){
+      sqlite3_str_appendchar(pStr, 1, (char)c);
+      if( c=='`' ){
+        if( z[1]=='`' ){
+          sqlite3_str_appendchar(pStr, 1, '`');
+          z++;
+        }else{
+          inBacktick = 0;
+        }
+      }
+      continue;
+    }
+    if( inBracket ){
+      sqlite3_str_appendchar(pStr, 1, (char)c);
+      if( c==']' ) inBracket = 0;
       continue;
     }
     if( c=='\'' ){
@@ -531041,6 +542718,24 @@ char *doltliteCanonicalizeSchemaSql(const char *zSql, const char *zName){
       pendingSpace = 0;
       inDouble = 1;
       sqlite3_str_appendchar(pStr, 1, '"');
+      continue;
+    }
+    if( c=='`' ){
+      if( pendingSpace && sqlite3_str_length(pStr)>0 ){
+        sqlite3_str_appendchar(pStr, 1, ' ');
+      }
+      pendingSpace = 0;
+      inBacktick = 1;
+      sqlite3_str_appendchar(pStr, 1, '`');
+      continue;
+    }
+    if( c=='[' ){
+      if( pendingSpace && sqlite3_str_length(pStr)>0 ){
+        sqlite3_str_appendchar(pStr, 1, ' ');
+      }
+      pendingSpace = 0;
+      inBracket = 1;
+      sqlite3_str_appendchar(pStr, 1, '[');
       continue;
     }
     if( isspace(c) ){
@@ -532613,7 +544308,8 @@ static int tableExists(sqlite3 *db, const char *zName){
   int rc;
 
   zSql = sqlite3_mprintf(
-      "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=%Q",
+      "SELECT 1 FROM main.sqlite_master "
+      "WHERE type='table' AND name=%Q COLLATE NOCASE",
       zName);
   if( !zSql ) return -1;
   rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0);
@@ -532762,6 +544458,11 @@ static void doltVerifyConstraintsFunc(
   sqlite3 *db = sqlite3_context_db_handle(context);
   int bAll = 0;
   int bOutputOnly = 0;
+  DoltliteCmdArgs args;
+  DoltliteCmdOption aOption[] = {
+    { "all", 'a', DOLTLITE_CMD_OPTION_FLAG, &bAll, 0 },
+    { "output-only", 0, DOLTLITE_CMD_OPTION_FLAG, &bOutputOnly, 0 }
+  };
   const char **azArgTables = 0;
   int nArgTables = 0;
   int nArgAlloc = 0;
@@ -532782,34 +544483,22 @@ static void doltVerifyConstraintsFunc(
   memset(&emptyCat, 0, sizeof(emptyCat));
   memset(&headCommit, 0, sizeof(headCommit));
   memset(&headHash, 0, sizeof(headHash));
+  memset(&args, 0, sizeof(args));
 
   if( doltliteCmdRejectDetached(context) ) return;
   for(i=0; i<argc; i++){
     const char *zArg = (const char*)sqlite3_value_text(argv[i]);
-    int exists;
     if( !zArg || !zArg[0] ){
       sqlite3_result_error(context, "invalid empty argument", -1);
       goto cleanup;
     }
-    if( strcmp(zArg, "--all")==0 || strcmp(zArg, "-a")==0 ){
-      bAll = 1;
-      continue;
-    }
-    if( strcmp(zArg, "--output-only")==0 ){
-      bOutputOnly = 1;
-      continue;
-    }
-    if( zArg[0]=='-' ){
-      char *zErr = sqlite3_mprintf(
-          "unknown flag '%s' (supported: --all, --output-only)", zArg);
-      if( zErr ){
-        sqlite3_result_error(context, zErr, -1);
-        sqlite3_free(zErr);
-      }else{
-        sqlite3_result_error_nomem(context);
-      }
-      goto cleanup;
-    }
+  }
+  rc = doltliteCmdParseArgs(context, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ) goto cleanup;
+  for(i=0; i<args.nPositional; i++){
+    const char *zArg = args.azPositional[i];
+    int exists;
     exists = tableExists(db, zArg);
     if( exists<0 ){
       sqlite3_result_error_nomem(context);
@@ -532966,6 +544655,7 @@ detection_done:
 cleanup:
   freeStringList(azChanged, nChanged);
   sqlite3_free((void*)azArgTables);
+  doltliteCmdArgsClear(&args);
 }
 
 int doltliteVerifyConstraintsRegister(sqlite3 *db){
@@ -537843,6 +549533,28 @@ struct RemoteMutationCtx {
   int isDelete;
 };
 
+static const char *remoteSqlNormalizeName(
+  sqlite3_context *ctx,
+  const char *zName,
+  char **pzOwned
+){
+  const char *zInput = zName;
+  const char *zEnd;
+  *pzOwned = 0;
+  while( sqlite3Isspace(*zName) ) zName++;
+  zEnd = zName + strlen(zName);
+  while( zEnd>zName && sqlite3Isspace(zEnd[-1]) ) zEnd--;
+  if( zName==zInput && zEnd[0]==0 ) return zName;
+  *pzOwned = sqlite3_mprintf("%.*s", (int)(zEnd-zName), zName);
+  if( !*pzOwned ) sqlite3_result_error_nomem(ctx);
+  return *pzOwned;
+}
+
+static int remoteSqlNameIsValid(const char *zName){
+  return strpbrk(zName,
+    " \t\n\r./\\!@#$%^&*(){}[],.<>'\"?=+|")==0;
+}
+
 static int mutateRemoteRef(sqlite3 *db, ChunkStore *cs, void *pArg){
   RemoteMutationCtx *p = (RemoteMutationCtx*)pArg;
   (void)db;
@@ -538011,6 +549723,8 @@ static void doltRemoteFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 
   if( strcmp(zAction, "add")==0 ){
     const char *zUrl;
+    const char *zNormalizedName;
+    char *zOwnedName;
     if( argc<3 ){
       doltliteVcResultError(ctx, db, "url required for add");
       return;
@@ -538024,9 +549738,17 @@ static void doltRemoteFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv)
       doltliteVcResultError(ctx, db, "url required for add");
       return;
     }
-    m.zName = zName;
+    zNormalizedName = remoteSqlNormalizeName(ctx, zName, &zOwnedName);
+    if( !zNormalizedName ) return;
+    if( !remoteSqlNameIsValid(zNormalizedName) ){
+      sqlite3_free(zOwnedName);
+      doltliteVcResultError(ctx, db, "remote name invalid");
+      return;
+    }
+    m.zName = zNormalizedName;
     m.zUrl = zUrl;
     rc = doltliteMutateRefs(db, mutateRemoteRef, &m);
+    sqlite3_free(zOwnedName);
     if( rc!=SQLITE_OK ){
       (void)doltliteVcSealSavepointError(db);
       remoteSqlResultError(ctx, rc,
@@ -538034,13 +549756,18 @@ static void doltRemoteFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv)
       return;
     }
   }else if( strcmp(zAction, "remove")==0 ){
+    const char *zNormalizedName;
+    char *zOwnedName;
     if( argc>2 ){
       doltliteVcResultError(ctx, db, "too many arguments");
       return;
     }
-    m.zName = zName;
+    zNormalizedName = remoteSqlNormalizeName(ctx, zName, &zOwnedName);
+    if( !zNormalizedName ) return;
+    m.zName = zNormalizedName;
     m.isDelete = 1;
     rc = doltliteMutateRefs(db, mutateRemoteRef, &m);
+    sqlite3_free(zOwnedName);
     if( rc!=SQLITE_OK ){
       (void)doltliteVcSealSavepointError(db);
       remoteSqlResultError(ctx, rc,
@@ -538060,43 +549787,19 @@ static void doltRemoteFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   sqlite3_result_int(ctx, 0);
 }
 
-static void doltPushFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+static void doltPushParsedFunc(
+  sqlite3_context *ctx,
+  const char *zRemoteName,
+  const char *zBranch,
+  int bForce
+){
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   ChunkStore *cs = doltliteGetChunkStore(db);
   DoltliteRemote *pRemote = 0;
   const char *zUrl = 0;
-  const char *zRemoteName;
-  const char *zBranch;
-  int bForce = 0;
   int rc;
 
   if( !cs ){ doltliteVcResultError(ctx, db, "no database"); return; }
-  if( argc<2 ){
-    doltliteVcResultError(ctx, db, "usage: dolt_push(remote, branch [, '--force'])");
-    return;
-  }
-
-  zRemoteName = (const char*)sqlite3_value_text(argv[0]);
-  zBranch = (const char*)sqlite3_value_text(argv[1]);
-  if( !zRemoteName || !zBranch ){
-    doltliteVcResultError(ctx, db, "remote and branch required");
-    return;
-  }
-
-  if( argc>=3 ){
-    const char *zOpt = (const char*)sqlite3_value_text(argv[2]);
-    if( argc>3 ){
-      doltliteVcResultError(ctx, db, "too many arguments");
-      return;
-    }
-    if( zOpt && strcmp(zOpt, "--force")==0 ){
-      bForce = 1;
-    }else{
-      (void)doltliteVcSealSavepointError(db);
-      doltliteCmdResultUnknownOption(ctx, zOpt);
-      return;
-    }
-  }
 
   rc = remoteSqlOpenNamedRemote(cs, zRemoteName, &zUrl, &pRemote);
   if( remoteSqlReportOpenError(ctx, db, rc, 0) ) return;
@@ -538117,6 +549820,40 @@ static void doltPushFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   }
   pRemote->xClose(pRemote);
   sqlite3_result_int(ctx, 0);
+}
+
+static void doltPushFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+  DoltliteCmdArgs args;
+  int bForce = 0;
+  DoltliteCmdOption aOption[] = {
+    { "force", 0, DOLTLITE_CMD_OPTION_FLAG, &bForce, 0 }
+  };
+  int rc;
+
+  if( argc<2 ){
+    doltliteVcResultError(ctx, db,
+        "usage: dolt_push(remote, branch [, '--force'])");
+    return;
+  }
+  rc = doltliteCmdParseArgs(ctx, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ){
+    (void)doltliteVcSealSavepointError(db);
+    return;
+  }
+  if( args.nPositional<2 ){
+    doltliteCmdArgsClear(&args);
+    doltliteVcResultError(ctx, db, "remote and branch required");
+    return;
+  }
+  if( args.nPositional>2 ){
+    doltliteCmdArgsClear(&args);
+    doltliteVcResultError(ctx, db, "too many arguments");
+    return;
+  }
+  doltPushParsedFunc(ctx, args.azPositional[0], args.azPositional[1], bForce);
+  doltliteCmdArgsClear(&args);
 }
 
 static int parseRemoteBranchNames(
@@ -538849,9 +550586,48 @@ static void doltCredsFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
         sqlite3_result_int(ctx, 0);
       }
     }
+  }else if( strcmp(action, "export")==0 ){
+    const char *kid;
+    DoltliteCreds *cred = 0;
+    if( argc<2 || argc>3 || !sqlite3_value_text(argv[1]) ||
+        (argc==3 && !sqlite3_value_text(argv[2])) ){
+      doltliteVcResultError(ctx, db,
+          "usage: dolt_creds('export', <kid> [, <authorized-keys-dir>])");
+      return;
+    }
+    kid = (const char*)sqlite3_value_text(argv[1]);
+    if( doltliteCredsLoad(0, kid, &cred)!=0 ){
+      doltliteVcResultError(ctx, db, "no such credential");
+      return;
+    }
+    if( argc==2 ){
+      char *json = doltliteCredsToPublicJwk(cred);
+      if( json ){
+        sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+        sqlite3_free(json);
+      }else{
+        doltliteVcResultError(ctx, db, "out of memory");
+      }
+    }else{
+      const char *dir = (const char*)sqlite3_value_text(argv[2]);
+      if( doltliteCredsSavePublic(cred, dir)!=0 ){
+        doltliteVcResultError(ctx, db, "failed to export public credential");
+      }else{
+        char *msg = sqlite3_mprintf(
+            "Exported public credential %s to %s", kid, dir);
+        if( msg ){
+          sqlite3_result_text(ctx, msg, -1, SQLITE_TRANSIENT);
+          sqlite3_free(msg);
+        }else{
+          doltliteVcResultError(ctx, db, "out of memory");
+        }
+      }
+    }
+    doltliteCredsFree(cred);
   }else{
     doltliteVcResultError(ctx, db,
-        "usage: dolt_creds(['list'] | 'rm', <kid>); use SELECT dolt_creds_new() to create");
+        "usage: dolt_creds(['list'] | 'rm', <kid> | 'export', <kid> "
+        "[, <authorized-keys-dir>]); use SELECT dolt_creds_new() to create");
   }
 }
 #endif /* DOLTLITE_HAVE_AUTH */

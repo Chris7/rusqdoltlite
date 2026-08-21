@@ -2,17 +2,15 @@
 
 The files in `doltlite/` are pristine upstream artifacts. RusqDoltLite changes
 belong in [`patches/`](patches/README.md) and are applied to a build-directory
-copy of the amalgamation. This separation is intentional: `upgrade.sh` may
+copy of the amalgamation. This separation is intentional: `upgrade_git.sh` may
 replace the upstream files without erasing or hiding local behavior.
 
-Use `upgrade.sh` to vendor a tagged DoltLite release. Use
-`upgrade_git.sh` to clone the upstream Git ref configured by
+Use `upgrade_git.sh` to clone the exact upstream Git release ref configured by
 `DOLTLITE_GIT_REF` in that script, build its amalgamation, vendor the matching
 remote sources, regenerate bindings, check the local patch series, and run the
-same bundled test suites. The ref defaults to `master` and may also be set to a
-tag for a reproducible upgrade.
+same bundled test suites.
 
-Some releases, including `v0.11.50`, keep `doltlite_remotesrv.c` in the native
+Some releases, including `v0.11.52`, keep `doltlite_remotesrv.c` in the native
 library but omit it from the published amalgamation. Both upgraders vendor that
 pristine sidecar. For Cargo builds with the `remote` feature, `build.rs` adds an
 amalgamation-compatible copy only under `OUT_DIR` and compiles the matching
