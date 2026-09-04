@@ -26,10 +26,10 @@ extern "C" {
 pub const SQLITE_VERSION: &::core::ffi::CStr = c"3.54.0";
 pub const SQLITE_VERSION_NUMBER: i32 = 3054000;
 pub const SQLITE_SOURCE_ID: &::core::ffi::CStr =
-    c"2026-08-01 15:08:48 be245e136a550faa7c84694156c40dc9778f50b00016892c29a2314bef14alt1";
+    c"2026-08-31 20:43:10 6f73383647fdf579dca72e15cc8a9627be72fd524e8e843e7d62dfc9253ealt1";
 pub const SQLITE_SCM_BRANCH: &::core::ffi::CStr = c"trunk";
 pub const SQLITE_SCM_TAGS: &::core::ffi::CStr = c"";
-pub const SQLITE_SCM_DATETIME: &::core::ffi::CStr = c"2026-08-01T15:08:48.942Z";
+pub const SQLITE_SCM_DATETIME: &::core::ffi::CStr = c"2026-08-31T20:43:10.952Z";
 pub const SQLITE_OK: i32 = 0;
 pub const SQLITE_ERROR: i32 = 1;
 pub const SQLITE_INTERNAL: i32 = 2;
@@ -103,6 +103,7 @@ pub const SQLITE_IOERR_CORRUPTFS: i32 = 8458;
 pub const SQLITE_IOERR_IN_PAGE: i32 = 8714;
 pub const SQLITE_IOERR_BADKEY: i32 = 8970;
 pub const SQLITE_IOERR_CODEC: i32 = 9226;
+pub const SQLITE_IOERR_CHUNK_SOURCE: i32 = 9482;
 pub const SQLITE_LOCKED_SHAREDCACHE: i32 = 262;
 pub const SQLITE_LOCKED_VTAB: i32 = 518;
 pub const SQLITE_BUSY_RECOVERY: i32 = 261;
@@ -353,6 +354,7 @@ pub const SQLITE_LIMIT_TRIGGER_DEPTH: i32 = 10;
 pub const SQLITE_LIMIT_WORKER_THREADS: i32 = 11;
 pub const SQLITE_LIMIT_PARSER_DEPTH: i32 = 12;
 pub const SQLITE_LIMIT_SCHEMA: i32 = 13;
+pub const SQLITE_LIMIT_TRIGGER_STEPS: i32 = 14;
 pub const SQLITE_PREPARE_PERSISTENT: ::core::ffi::c_uint = 1;
 pub const SQLITE_PREPARE_NORMALIZE: ::core::ffi::c_uint = 2;
 pub const SQLITE_PREPARE_NO_VTAB: ::core::ffi::c_uint = 4;
@@ -514,6 +516,9 @@ pub const SQLITE_SCANSTAT_SELECTID: i32 = 5;
 pub const SQLITE_SCANSTAT_PARENTID: i32 = 6;
 pub const SQLITE_SCANSTAT_NCYCLE: i32 = 7;
 pub const SQLITE_SCANSTAT_COMPLEX: i32 = 1;
+pub const DOLTLITE_SOURCE_OK: i32 = 0;
+pub const DOLTLITE_SOURCE_NOTFOUND: i32 = 1;
+pub const DOLTLITE_SOURCE_IOERR: i32 = 2;
 pub const SQLITE_SERIALIZE_NOCOPY: ::core::ffi::c_uint = 1;
 pub const SQLITE_DESERIALIZE_FREEONCLOSE: ::core::ffi::c_uint = 1;
 pub const SQLITE_DESERIALIZE_RESIZEABLE: ::core::ffi::c_uint = 2;
@@ -2656,6 +2661,43 @@ unsafe extern "C" {
     pub fn sqlite3_snapshot_recover(
         db: *mut sqlite3,
         zDb: *const ::core::ffi::c_char,
+    ) -> ::core::ffi::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct doltlite_chunk_source {
+    pub iVersion: ::core::ffi::c_int,
+    pub pCtx: *mut ::core::ffi::c_void,
+    pub xGet: ::core::option::Option<
+        unsafe extern "C" fn(
+            pCtx: *mut ::core::ffi::c_void,
+            aHash: *const ::core::ffi::c_uchar,
+            ppBytes: *mut *mut ::core::ffi::c_uchar,
+            pnBytes: *mut ::core::ffi::c_int,
+        ) -> ::core::ffi::c_int,
+    >,
+    pub xGetMany: ::core::option::Option<
+        unsafe extern "C" fn(
+            pCtx: *mut ::core::ffi::c_void,
+            nHash: ::core::ffi::c_int,
+            aHash: *const ::core::ffi::c_uchar,
+            apBytes: *mut *mut ::core::ffi::c_uchar,
+            anBytes: *mut ::core::ffi::c_int,
+        ) -> ::core::ffi::c_int,
+    >,
+}
+unsafe extern "C" {
+    pub fn doltlite_set_chunk_source(
+        db: *mut sqlite3,
+        zDbName: *const ::core::ffi::c_char,
+        pSource: *mut doltlite_chunk_source,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn doltlite_init_lazy(
+        db: *mut sqlite3,
+        pRefs: *const ::core::ffi::c_void,
+        nRefs: ::core::ffi::c_int,
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {

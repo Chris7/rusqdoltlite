@@ -273,7 +273,7 @@ mod build_bundled {
 
         cfg.compile(lib_name);
         if win_target() {
-            // The v0.11.52 amalgamation always includes its remote client and
+            // The DoltLite amalgamation always includes its remote client and
             // auth implementation, even when the Rust `remote` feature (which
             // exposes the in-process server) is disabled. Emit these after the
             // static archive because GNU linkers resolve libraries in order.

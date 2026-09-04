@@ -8,7 +8,7 @@ Enable the `remote` feature to embed DoltLite's HTTP remote server:
 
 ```toml
 [dependencies]
-rusqlite = { package = "rusqdoltlite", version = "0.40.17", features = ["remote"] }
+rusqlite = { package = "rusqdoltlite", version = "0.40.18", features = ["remote"] }
 ```
 
 ```rust,no_run

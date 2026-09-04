@@ -148,10 +148,10 @@ extern "C" {
 */
 #define SQLITE_VERSION        "3.54.0"
 #define SQLITE_VERSION_NUMBER 3054000
-#define SQLITE_SOURCE_ID      "2026-08-01 15:08:48 be245e136a550faa7c84694156c40dc9778f50b00016892c29a2314bef14alt1"
+#define SQLITE_SOURCE_ID      "2026-08-31 20:43:10 6f73383647fdf579dca72e15cc8a9627be72fd524e8e843e7d62dfc9253ealt1"
 #define SQLITE_SCM_BRANCH     "trunk"
 #define SQLITE_SCM_TAGS       ""
-#define SQLITE_SCM_DATETIME   "2026-08-01T15:08:48.942Z"
+#define SQLITE_SCM_DATETIME   "2026-08-31T20:43:10.952Z"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -539,6 +539,7 @@ SQLITE_API int sqlite3_exec(
 #define SQLITE_IOERR_IN_PAGE           (SQLITE_IOERR | (34<<8))
 #define SQLITE_IOERR_BADKEY            (SQLITE_IOERR | (35<<8))
 #define SQLITE_IOERR_CODEC             (SQLITE_IOERR | (36<<8))
+#define SQLITE_IOERR_CHUNK_SOURCE      (SQLITE_IOERR | (37<<8))
 #define SQLITE_LOCKED_SHAREDCACHE      (SQLITE_LOCKED |  (1<<8))
 #define SQLITE_LOCKED_VTAB             (SQLITE_LOCKED |  (2<<8))
 #define SQLITE_BUSY_RECOVERY           (SQLITE_BUSY   |  (1<<8))
@@ -3523,6 +3524,11 @@ SQLITE_API int sqlite3_set_authorizer(
 ** is the name of the inner-most trigger or view that is responsible for
 ** the access attempt or NULL if this access attempt is directly from
 ** top-level SQL code.
+**
+** The case of strings in the 3rd through the 6th argument to the
+** authorization callback is arbitrary.  Authorization callbacks
+** implementations should use [sqlite3_stricmp()] or similar when
+** doing comparisons against those values.
 */
 /******************************************* 3rd ************ 4th ***********/
 #define SQLITE_CREATE_INDEX          1   /* Index Name      Table Name      */
@@ -4436,6 +4442,10 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 ** [[SQLITE_LIMIT_SCHEMA]] ^(<dt>SQLITE_LIMIT_SCHEMA</dt>
 ** <dd>The maximum number of objects (tables, indexes, triggers, and views)
 ** defined by the database schema.</dd>)^
+**
+** [[SQLITE_LIMIT_TRIGGER_STEPS]] ^(<dt>SQLITE_LIMIT_TRIGGER_STEPS</dt>
+** <dd>The maximum number of SQL statements that can be contained within
+** a single trigger.</dd>)^
 ** </dl>
 */
 #define SQLITE_LIMIT_LENGTH                    0
@@ -4452,6 +4462,7 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 #define SQLITE_LIMIT_WORKER_THREADS           11
 #define SQLITE_LIMIT_PARSER_DEPTH             12
 #define SQLITE_LIMIT_SCHEMA                   13
+#define SQLITE_LIMIT_TRIGGER_STEPS            14
 
 /*
 ** CAPI3REF: Prepare Flags
@@ -11200,6 +11211,82 @@ SQLITE_API int sqlite3_snapshot_cmp(
 ** [SQLITE_ENABLE_SNAPSHOT] option.
 */
 SQLITE_API int sqlite3_snapshot_recover(sqlite3 *db, const char *zDb);
+
+/*
+** CAPI3REF: DoltLite chunk source
+**
+** A chunk source supplies content-addressed chunks that are absent from one
+** database on a connection. Version 1 requires both callbacks. xGetMany()
+** receives a contiguous array of 20-byte hashes. It returns
+** DOLTLITE_SOURCE_OK with absent entries left as NULL, or may return
+** DOLTLITE_SOURCE_NOTFOUND when the whole batch is absent. Every non-NULL
+** output buffer must use sqlite3_malloc(); ownership transfers to DoltLite
+** immediately, regardless of the callback's return code.
+**
+** Callbacks are synchronous and must not re-enter the same database
+** connection. The source is used only for reads. Verified chunks are cached
+** in the database file when it is writable, or in a bounded connection-local
+** memory cache when it is read-only. The callback object and its context must
+** outlive a successful registration. A failed registration does not retain
+** pSource. A host registration takes precedence over an origin-backed source
+** selected for the current database open. Passing NULL clears the host
+** registration and restores that built-in source when present.
+** The built-in source is selected with the lazy_origin=1 database URI
+** parameter and is inert until the store records an origin remote.
+**
+** zDbName selects one attached database and follows SQLite database-name
+** conventions; NULL selects "main".
+*/
+typedef struct doltlite_chunk_source doltlite_chunk_source;
+struct doltlite_chunk_source {
+  int iVersion;
+  void *pCtx;
+  int (SQLITE_CALLBACK *xGet)(
+    void *pCtx,
+    const unsigned char aHash[20],
+    unsigned char **ppBytes,
+    int *pnBytes
+  );
+  int (SQLITE_CALLBACK *xGetMany)(
+    void *pCtx,
+    int nHash,
+    const unsigned char *aHash,
+    unsigned char **apBytes,
+    int *anBytes
+  );
+};
+
+#define DOLTLITE_SOURCE_OK        0
+#define DOLTLITE_SOURCE_NOTFOUND  1
+#define DOLTLITE_SOURCE_IOERR     2
+
+SQLITE_API int SQLITE_APICALL doltlite_set_chunk_source(
+  sqlite3 *db,
+  const char *zDbName,
+  doltlite_chunk_source *pSource
+);
+
+/*
+** CAPI3REF: Initialize a lazy DoltLite database
+**
+** Install a serialized DoltLite refs blob as the refs state of the main
+** database. The database may be fresh or may already contain chunks cached
+** from an earlier refs state. Existing chunks remain valid because their
+** addresses are content hashes. If a chunk source is registered, DoltLite
+** immediately loads the new branch state through it; otherwise graph loading
+** is deferred until a source is registered or the graph is first accessed.
+**
+** The refs blob may include the origin remote and tracking refs. DoltLite
+** copies the blob before this function returns. The database must be writable
+** and outside a transaction. The refs update is durable before any immediate
+** source-backed hydration; if that hydration fails, the installed refs remain
+** available for a later retry.
+*/
+SQLITE_API int SQLITE_APICALL doltlite_init_lazy(
+  sqlite3 *db,
+  const void *pRefs,
+  int nRefs
+);
 
 /*
 ** CAPI3REF: Serialize a database
