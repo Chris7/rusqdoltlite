@@ -194,7 +194,7 @@ fn set_url_updates_existing_remote() -> Result<()> {
 }
 
 #[test]
-fn pull_persists_a_new_local_branch() -> Result<()> {
+fn pull_persists_remote_branch_to_current_local_branch() -> Result<()> {
     let temp = tempfile::tempdir().expect("tempdir");
     let source_path = temp.path().join("source.db");
     let remote_path = temp.path().join("remote.db");
@@ -209,6 +209,12 @@ fn pull_persists_a_new_local_branch() -> Result<()> {
     let _: i64 = source.query_row("SELECT dolt_add('-A')", [], |row| row.get(0))?;
     let _: String = source.query_row("SELECT dolt_commit('-m', 'main')", [], |row| row.get(0))?;
     let _: i64 = source.query_row("SELECT dolt_branch('feature')", [], |row| row.get(0))?;
+    let _: i64 = source.query_row("SELECT dolt_checkout('feature')", [], |row| row.get(0))?;
+    source.execute("INSERT INTO widgets VALUES(2, 'feature')", [])?;
+    let _: i64 = source.query_row("SELECT dolt_add('-A')", [], |row| row.get(0))?;
+    let _: String =
+        source.query_row("SELECT dolt_commit('-m', 'feature')", [], |row| row.get(0))?;
+    let _: i64 = source.query_row("SELECT dolt_checkout('main')", [], |row| row.get(0))?;
     let _: i64 = source.query_row(
         "SELECT dolt_remote('add', 'origin', ?1)",
         params![remote_url],
@@ -225,19 +231,33 @@ fn pull_persists_a_new_local_branch() -> Result<()> {
         params![format!("file://{}", remote_path.display())],
         |row| row.get(0),
     )?;
-    let _: i64 = clone.query_row("SELECT dolt_branch('-d', 'feature')", [], |row| row.get(0))?;
+    let _: i64 = clone.query_row("SELECT dolt_branch('-D', 'feature')", [], |row| row.get(0))?;
     let _: i64 = clone.query_row("SELECT dolt_pull('origin', 'feature')", [], |row| {
         row.get(0)
     })?;
     drop(clone);
 
     let reopened = Connection::open(&clone_path)?;
-    let branch_exists: bool = reopened.query_row(
+    let feature_exists: bool = reopened.query_row(
         "SELECT EXISTS(SELECT 1 FROM dolt_branches WHERE name = 'feature')",
         [],
         |row| row.get(0),
     )?;
-    assert!(branch_exists);
+    let active_branch: String =
+        reopened.query_row("SELECT active_branch()", [], |row| row.get(0))?;
+    let local_hash: String =
+        reopened.query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))?;
+    let tracking_hash: String =
+        reopened.query_row("SELECT dolt_hashof('origin/feature')", [], |row| row.get(0))?;
+    let pulled_name: String =
+        reopened.query_row("SELECT name FROM widgets WHERE id = 2", [], |row| {
+            row.get(0)
+        })?;
+
+    assert!(!feature_exists);
+    assert_eq!(active_branch, "main");
+    assert_eq!(local_hash, tracking_hash);
+    assert_eq!(pulled_name, "feature");
 
     Ok(())
 }

@@ -320,7 +320,19 @@ mod build_bundled {
              #undef DOLTLITE_TLS_H\n",
         );
         for line in source.lines() {
-            if amalgamated_headers.contains(&line.trim()) {
+            let trimmed = line.trim();
+            if amalgamated_headers.contains(&trimmed) {
+                continue;
+            }
+            if trimmed == "#include \"doltlite_tls.h\"" {
+                // The sidecar must re-include this header after disabling
+                // DOLTLITE_AUTH_CLIENT_ONLY to expose its server declarations.
+                // DoltLite v0.50.7 also defines doltliteConnOpen inline there,
+                // so give that redundant definition a private name.
+                appended.push_str("#define doltliteConnOpen doltliteBundledServerHeaderConnOpen\n");
+                appended.push_str(line);
+                appended.push('\n');
+                appended.push_str("#undef doltliteConnOpen\n");
                 continue;
             }
             appended.push_str(line);
