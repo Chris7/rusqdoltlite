@@ -1,5 +1,5 @@
 Subject: [PATCH] Support dolt_remote set-url core storage
-Base: DoltLite v0.50.7
+Base: DoltLite v0.50.8
 
 Add storage support for retargeting an existing remote.
 

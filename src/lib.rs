@@ -1440,7 +1440,7 @@ mod test {
         }
         let db = Connection::open("file:dummy.db?mode=memory&cache=shared")?;
         if cfg!(feature = "bundled") {
-            assert_eq!(Some(":memory:"), db.path());
+            assert_eq!(Some("/dummy.db"), db.path());
         } else {
             assert_eq!(Some(""), db.path());
         }
