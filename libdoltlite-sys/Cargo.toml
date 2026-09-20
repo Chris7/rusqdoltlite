@@ -10,13 +10,18 @@ links = "doltlite"
 build = "build.rs"
 keywords = ["sqlite", "doltlite", "ffi"]
 categories = ["external-ffi-bindings"]
-exclude = ["**/*.sh"]
+exclude = ["/upgrade_git.sh"]
 
 [features]
 default = ["min_sqlite_version_3_34_1"]
 # Use bundled DoltLite sources.
 bundled = ["cc", "bundled_bindings"]
 bundled-windows = ["cc", "bundled_bindings"]
+# Build Cloud Backed SQLite's block-cache VFS into the bundled DoltLite
+# archive.  The CBS source is intentionally fetched separately because its
+# upstream distribution has empty licensing/readme files; set
+# BLOCKCACHEVFS_SOURCE_DIR to the checked-out source directory.
+blockcachevfs = ["bundled", "pkg-config"]
 # Enable the HTTP remote client and in-process remote server APIs.
 remote = []
 buildtime_bindgen = ["bindgen", "pkg-config", "vcpkg"]

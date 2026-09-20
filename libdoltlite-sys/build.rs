@@ -117,6 +117,9 @@ mod build_bundled {
         let mut cfg = cc::Build::new();
         cfg.file(&patched_source);
 
+        #[cfg(feature = "blockcachevfs")]
+        add_blockcachevfs(&mut cfg, manifest_dir, out_dir);
+
         // DoltLite's amalgamation includes both Windows headers used by
         // SQLite and Winsock2 headers used by the remote implementation.
         // Without this, <windows.h> may include legacy <winsock.h>, which
@@ -272,6 +275,8 @@ mod build_bundled {
         println!("cargo:rerun-if-env-changed=LIBSQLITE3_FLAGS");
 
         cfg.compile(lib_name);
+        #[cfg(feature = "blockcachevfs")]
+        link_blockcachevfs();
         if win_target() {
             // The DoltLite amalgamation always includes its remote client and
             // auth implementation, even when the Rust `remote` feature (which
@@ -286,6 +291,194 @@ mod build_bundled {
         }
 
         println!("cargo:lib_dir={out_dir}");
+    }
+
+    #[cfg(feature = "blockcachevfs")]
+    fn add_blockcachevfs(cfg: &mut cc::Build, manifest_dir: &Path, out_dir: &str) {
+        use std::fs;
+
+        let source_dir = env::var_os("BLOCKCACHEVFS_SOURCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!(
+                    "feature `blockcachevfs` requires BLOCKCACHEVFS_SOURCE_DIR; see the README for the checksum-pinned CBS fetch helper"
+                )
+            });
+        if !source_dir.is_dir() {
+            panic!(
+                "BLOCKCACHEVFS_SOURCE_DIR does not name a directory: {}",
+                source_dir.display()
+            );
+        }
+        println!("cargo:rerun-if-env-changed=BLOCKCACHEVFS_SOURCE_DIR");
+
+        // CBS ships a sqlite3.h next to its sources.  Its quoted includes
+        // would win over -I paths and silently compile against a second
+        // SQLite ABI.  Compile from an OUT_DIR staging directory containing
+        // only CBS's VFS files and the bundled DoltLite public header under
+        // the name expected by CBS instead.
+        let stage = Path::new(out_dir).join("blockcachevfs-src");
+        fs::create_dir_all(&stage).expect("could not create CBS source staging directory");
+        let sources = [
+            "blockcachevfs.c",
+            "simplexml.c",
+            "bcvutil.c",
+            "bcvmodule.c",
+            "bcvlog.c",
+            "bcvencrypt.c",
+        ];
+        let headers = [
+            "blockcachevfs.h",
+            "bcv_int.h",
+            "bcvutil.h",
+            "bcvmodule.h",
+            "bcvencrypt.h",
+            "simplexml.h",
+        ];
+        for name in sources.iter().chain(headers.iter()).copied() {
+            let from = source_dir.join(name);
+            if !from.is_file() {
+                panic!("CBS source directory is missing {}", from.display());
+            }
+            fs::copy(&from, stage.join(name)).unwrap_or_else(|error| {
+                panic!("could not stage CBS source {}: {error}", from.display())
+            });
+            println!("cargo:rerun-if-changed={}", from.display());
+        }
+        fs::copy(
+            manifest_dir.join("doltlite/doltlite.h"),
+            stage.join("sqlite3.h"),
+        )
+        .expect("could not stage bundled DoltLite header for CBS");
+        apply_blockcache_patches(&stage, &manifest_dir.join("patches/blockcachevfs"));
+
+        cfg.files(sources.iter().map(|name| stage.join(name)))
+            .include(&stage)
+            .flag("-DSQLITE_CORE")
+            .flag("-DSQLITE_THREADSAFE=1")
+            .warnings(false);
+
+        // CBS uses libcurl and OpenSSL directly.  Prefer pkg-config when the
+        // target supplies it, but retain the conventional linker names for
+        // systems where the development packages do not ship .pc files.
+        let curl = pkg_config::Config::new()
+            .cargo_metadata(false)
+            .probe("libcurl")
+            .or_else(|_| {
+                pkg_config::Config::new()
+                    .cargo_metadata(false)
+                    .probe("curl")
+            });
+        let openssl = pkg_config::Config::new()
+            .cargo_metadata(false)
+            .probe("openssl");
+        if let Ok(ref lib) = curl {
+            cfg.includes(&lib.include_paths);
+        } else if let Ok(path) = env::var("BLOCKCACHEVFS_CURL_INCLUDE_DIR") {
+            cfg.include(path);
+        } else {
+            panic!(
+                "could not find libcurl with pkg-config; set BLOCKCACHEVFS_CURL_INCLUDE_DIR to its headers"
+            );
+        }
+        if let Ok(ref lib) = openssl {
+            cfg.includes(&lib.include_paths);
+        } else if let Ok(path) = env::var("BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR") {
+            cfg.include(path);
+        } else {
+            panic!(
+                "could not find OpenSSL with pkg-config; set BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR to its headers"
+            );
+        }
+        println!("cargo:rerun-if-env-changed=BLOCKCACHEVFS_CURL_INCLUDE_DIR");
+        println!("cargo:rerun-if-env-changed=BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR");
+    }
+
+    #[cfg(feature = "blockcachevfs")]
+    fn apply_blockcache_patches(stage: &Path, patch_dir: &Path) {
+        use std::process::Command;
+
+        println!("cargo:rerun-if-changed={}", patch_dir.display());
+        let mut patches = std::fs::read_dir(patch_dir)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not read CBS patch directory {}: {error}",
+                    patch_dir.display()
+                )
+            })
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|error| panic!("could not read CBS patch: {error}"))
+                    .path()
+            })
+            .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+            .collect::<Vec<_>>();
+        patches.sort();
+        for patch in &patches {
+            println!("cargo:rerun-if-changed={}", patch.display());
+        }
+        if patches.is_empty() {
+            panic!("the CBS patch set is empty");
+        }
+        let ceiling = stage.parent().unwrap_or(stage);
+        let output = Command::new("git")
+            .arg("apply")
+            .args(&patches)
+            .current_dir(stage)
+            .env("GIT_CEILING_DIRECTORIES", ceiling)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not apply CBS patches: {error}. Git is required to build blockcachevfs"
+                )
+            });
+        if !output.status.success() {
+            panic!(
+                "could not apply CBS patches to {}:\n{}",
+                stage.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(feature = "blockcachevfs")]
+    fn link_blockcachevfs() {
+        let curl = pkg_config::Config::new()
+            .cargo_metadata(false)
+            .probe("libcurl")
+            .or_else(|_| {
+                pkg_config::Config::new()
+                    .cargo_metadata(false)
+                    .probe("curl")
+            });
+        let openssl = pkg_config::Config::new()
+            .cargo_metadata(false)
+            .probe("openssl");
+        let curl_found = curl.is_ok();
+        let openssl_found = openssl.is_ok();
+        for lib in [curl, openssl].into_iter().flatten() {
+            for path in lib.link_paths {
+                println!("cargo:rustc-link-search=native={}", path.display());
+            }
+            for name in lib.libs {
+                println!("cargo:rustc-link-lib={name}");
+            }
+            for name in lib.frameworks {
+                println!("cargo:rustc-link-lib=framework={name}");
+            }
+        }
+        // Development environments without pkg-config commonly still expose
+        // the conventional shared-library names.
+        if !curl_found {
+            println!("cargo:rustc-link-lib=curl");
+        }
+        if !openssl_found {
+            println!("cargo:rustc-link-lib=ssl");
+            println!("cargo:rustc-link-lib=crypto");
+        }
     }
 
     fn append_remote_server_if_missing(amalgamation: &Path, server_source: &Path) -> bool {

@@ -24,6 +24,90 @@ mod bindings {
 }
 pub use bindings::*;
 
+/// Raw Cloud Backed SQLite block-cache VFS interface.
+#[cfg(feature = "blockcachevfs")]
+pub mod blockcachevfs {
+    use core::ffi::{c_char, c_int, c_void};
+
+    use super::{sqlite3, sqlite3_int64};
+
+    /// Opaque Cloud Backed SQLite VFS handle.
+    #[repr(C)]
+    pub struct sqlite3_bcvfs {
+        _private: [u8; 0],
+    }
+
+    /// Authentication callback used by the CBS VFS.
+    pub type sqlite3_bcvfs_auth_callback = unsafe extern "C" fn(
+        p_ctx: *mut c_void,
+        z_storage: *const c_char,
+        z_account: *const c_char,
+        z_container: *const c_char,
+        pz_auth_token: *mut *mut c_char,
+    ) -> c_int;
+
+    /// Busy callback used by an upload checkpoint.
+    pub type sqlite3_bcvfs_busy_callback = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+
+    pub const SQLITE_BCV_CACHESIZE: c_int = 1;
+    pub const SQLITE_BCV_NREQUEST: c_int = 2;
+    pub const SQLITE_BCV_HTTPTIMEOUT: c_int = 3;
+    pub const SQLITE_BCV_CURLVERBOSE: c_int = 4;
+    pub const SQLITE_BCV_HTTPLOG_TIMEOUT: c_int = 5;
+    pub const SQLITE_BCV_HTTPLOG_NENTRY: c_int = 6;
+
+    pub const SQLITE_BCV_ATTACH_SECURE: c_int = 0x0001;
+    pub const SQLITE_BCV_ATTACH_IFNOT: c_int = 0x0002;
+
+    unsafe extern "C" {
+        pub fn sqlite3_bcvfs_create(
+            z_dir: *const c_char,
+            z_name: *const c_char,
+            pp_fs: *mut *mut sqlite3_bcvfs,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_destroy(fs: *mut sqlite3_bcvfs) -> c_int;
+        pub fn sqlite3_bcvfs_isdaemon(fs: *mut sqlite3_bcvfs) -> c_int;
+        pub fn sqlite3_bcvfs_register_vtab(db: *mut sqlite3) -> c_int;
+        pub fn sqlite3_bcvfs_config(
+            fs: *mut sqlite3_bcvfs,
+            op: c_int,
+            value: sqlite3_int64,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_auth_callback(
+            fs: *mut sqlite3_bcvfs,
+            auth_ctx: *mut c_void,
+            auth: Option<sqlite3_bcvfs_auth_callback>,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_attach(
+            fs: *mut sqlite3_bcvfs,
+            z_storage: *const c_char,
+            z_account: *const c_char,
+            z_container: *const c_char,
+            z_alias: *const c_char,
+            flags: c_int,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_detach(
+            fs: *mut sqlite3_bcvfs,
+            z_alias: *const c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_poll(
+            fs: *mut sqlite3_bcvfs,
+            z_container: *const c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_upload(
+            fs: *mut sqlite3_bcvfs,
+            z_container: *const c_char,
+            busy: Option<sqlite3_bcvfs_busy_callback>,
+            busy_ctx: *mut c_void,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+    }
+}
+
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 mod remote {
     use core::ffi::{c_char, c_int, c_long};

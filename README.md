@@ -2,6 +2,86 @@
 
 This project is a fork of [`Rusqlite`](https://github.com/rusqlite/rusqlite) using [`DoltLite`](https://github.com/dolthub/doltlite) as the SQLite backend. It should be possible to use this library just as you would use rusqlite.
 
+## Cloud Backed SQLite block-cache VFS
+
+The optional `blockcachevfs` feature builds Cloud Backed SQLite's six VFS
+sources into the bundled DoltLite archive. CBS is not vendored because its
+upstream checkout has empty `COPYING` and `README` files. Fetch and review the
+checksum-pinned source with:
+
+```sh
+CBS_DIR=$(libdoltlite-sys/fetch_blockcachevfs.sh)
+BLOCKCACHEVFS_SOURCE_DIR="$CBS_DIR" cargo build --features blockcachevfs
+```
+
+The helper pins Fossil check-in
+`50e099ad7bf1d12d747f59b0af973d12809887480463fc9893846b0d6ee22e94` and
+SHA-256 `b322811e8ec4224753f2d9309ed0f011d81c9f2540ce81bd7b5a6a9550d7d03a`.
+The target also needs libcurl and OpenSSL development headers and libraries.
+When pkg-config cannot locate them, set
+`BLOCKCACHEVFS_CURL_INCLUDE_DIR` and `BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR`.
+The helper path above is for a source checkout; registry consumers should run
+the helper separately and pass the resulting absolute source directory.
+
+Google storage keeps its default endpoint exactly
+`https://storage.googleapis.com`. For a Google-compatible test service, pass
+an HTTP or HTTPS base endpoint; it must not contain `&` because it is encoded
+in the CBS module selector, and CBS trims trailing slashes before adding the
+bucket. The auth callback's bearer token is sent to this endpoint, so use test
+credentials with emulators:
+
+```rust,no_run
+use rusqlite::blockcachevfs::AttachSpec;
+
+let attach = AttachSpec::google_with_endpoint(
+    "test-project",
+    "bucket",
+    "http://127.0.0.1:4443/",
+);
+```
+
+This uses the CBS module selector `google?endpoint=<base-url>` and requires a
+compatible Google XML API endpoint. `fake-gcs-server` can be useful for
+routing and read-request tests, but it is not an end-to-end CBS backend: its
+writes use the JSON upload API, while CBS writes use direct object PUTs. For
+routing/read tests, start it with its filesystem backend (`-scheme http -port
+4443 -backend filesystem`). The built-in Google module
+still uses its hard-coded `storage.googleapis.com` behavior unless this
+endpoint option is supplied.
+
+For a multi-tenant endpoint, pass the remote container as `bucket/prefix` and
+choose a slash-free local alias. Attach, read, write, and upload paths then
+remain under that prefix:
+
+```rust,no_run
+use rusqlite::blockcachevfs::AttachSpec;
+
+let attach = AttachSpec::google("test-project", "bucket/tenants/acme")
+    .alias("acme");
+```
+
+Orphan cleanup and object listing are separate privileged maintenance
+operations; the current low-level list URL is bucket-root oriented.
+
+```rust,no_run
+use rusqlite::blockcachevfs::{AttachSpec, AuthError, BlockCacheVfs, Config};
+
+# fn main() -> rusqlite::Result<()> {
+let vfs = BlockCacheVfs::builder("cache")?
+    .auth_callback(|storage, _project, _bucket| {
+        std::env::var("GOOGLE_ACCESS_TOKEN")
+            .map_err(|error| AuthError(format!("{storage} auth: {error}")))
+    })
+    .config(Config::CacheSize(256 * 1024 * 1024))
+    .init()?;
+vfs.attach(&AttachSpec::google("my-project", "my-bucket").alias("data"))?;
+let db = vfs.open("/data/example.db")?;
+vfs.poll("data")?;
+vfs.upload("data")?;
+# drop(db);
+# Ok(()) }
+```
+
 ## In-process remote server
 
 Enable the `remote` feature to embed DoltLite's HTTP remote server:

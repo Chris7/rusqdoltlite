@@ -46,6 +46,8 @@ functions = []
 trace = []
 # Use bundled SQLite sources (instead of the one provided by your OS / distribution)
 bundled = ["libdoltlite-sys?/bundled", "modern_sqlite"]
+# Cloud Backed SQLite block-cache VFS (requires a bundled native backend).
+blockcachevfs = ["bundled", "libdoltlite-sys?/blockcachevfs"]
 buildtime_bindgen = ["libdoltlite-sys?/buildtime_bindgen", "sqlite-wasm-rs?/bindgen"]
 # sqlite3_limit
 limits = []
