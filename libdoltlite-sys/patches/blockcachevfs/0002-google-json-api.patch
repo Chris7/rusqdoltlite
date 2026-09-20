@@ -1,0 +1,1101 @@
+--- a/bcvmodule.c
++++ b/bcvmodule.c
+@@ -19,6 +19,7 @@
+ #include <sys/stat.h>
+ #include <fcntl.h>
+ #include <errno.h>
++#include <ctype.h>
+ #include <openssl/hmac.h>
+ #include <openssl/sha.h>
+ #include <openssl/md5.h>
+@@ -187,6 +188,25 @@
+   }
+ }
+ 
++/* CreateBucket returns HTTP 409 when the bucket already exists. The public
++** create API treats that case as success and verifies access by uploading
++** the manifest immediately afterwards. */
++static void bcvModuleCreateCb(
++  sqlite3_bcv_job *pCtx,
++  sqlite3_bcv_request *pReq,
++  void *pApp
++){
++  int rc;
++  const char *zStatus = 0;
++  (void)pApp;
++  rc = sqlite3_bcv_request_status(pReq, &zStatus);
++  if( rc==409 ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_OK, 0);
++  }else if( rc!=SQLITE_OK ){
++    sqlite3_bcv_job_error(pCtx, rc, zStatus);
++  }
++}
++
+ static void bcvModuleFetchCb(
+   sqlite3_bcv_job *pCtx, 
+   sqlite3_bcv_request *pReq, 
+@@ -1008,16 +1028,547 @@
+   }
+ }
+ 
++/*
++** Small, strict JSON helpers used by the Google JSON API.  This is not a
++** general-purpose JSON implementation: it validates the structure while
++** locating object members, and decodes only JSON strings.  In particular,
++** it does not use strstr() to find fields, so a name or value containing a
++** field name cannot confuse the response parser.
++*/
++static int bcvJsonSkipString(const u8 *a, int n, int *pi){
++  int i = *pi;
++  if( i>=n || a[i]!='"' ) return SQLITE_ERROR;
++  i++;
++  while( i<n ){
++    if( a[i]=='"' ){
++      *pi = i+1;
++      return SQLITE_OK;
++    }
++    if( a[i]=='\\' ){
++      i++;
++      if( i>=n ) return SQLITE_ERROR;
++      if( a[i]=='u' ){
++        int j;
++        for(j=0; j<4; j++){
++          i++;
++          if( i>=n || !isxdigit(a[i]) ) return SQLITE_ERROR;
++        }
++      }else if( !strchr("\\\"/bfnrt", a[i]) ){
++        return SQLITE_ERROR;
++      }
++    }else if( a[i]<0x20 ){
++      return SQLITE_ERROR;
++    }
++    i++;
++  }
++  return SQLITE_ERROR;
++}
++
++static int bcvJsonSkipValue(const u8 *a, int n, int *pi);
++
++static int bcvJsonSkipObject(const u8 *a, int n, int *pi){
++  int i = *pi;
++  if( i>=n || a[i]!='{' ) return SQLITE_ERROR;
++  i++;
++  while( i<n && isspace(a[i]) ) i++;
++  if( i<n && a[i]=='}' ){
++    *pi = i+1;
++    return SQLITE_OK;
++  }
++  while( 1 ){
++    if( bcvJsonSkipString(a, n, &i)!=SQLITE_OK ) return SQLITE_ERROR;
++    while( i<n && isspace(a[i]) ) i++;
++    if( i>=n || a[i++]!=':' ) return SQLITE_ERROR;
++    if( bcvJsonSkipValue(a, n, &i)!=SQLITE_OK ) return SQLITE_ERROR;
++    while( i<n && isspace(a[i]) ) i++;
++    if( i<n && a[i]==',' ){
++      i++;
++      while( i<n && isspace(a[i]) ) i++;
++      if( i<n && a[i]=='}' ) return SQLITE_ERROR;
++      continue;
++    }
++    if( i<n && a[i]=='}' ){
++      *pi = i+1;
++      return SQLITE_OK;
++    }
++    return SQLITE_ERROR;
++  }
++}
++
++static int bcvJsonSkipArray(const u8 *a, int n, int *pi){
++  int i = *pi;
++  if( i>=n || a[i]!='[' ) return SQLITE_ERROR;
++  i++;
++  while( i<n && isspace(a[i]) ) i++;
++  if( i<n && a[i]==']' ){
++    *pi = i+1;
++    return SQLITE_OK;
++  }
++  while( 1 ){
++    if( bcvJsonSkipValue(a, n, &i)!=SQLITE_OK ) return SQLITE_ERROR;
++    while( i<n && isspace(a[i]) ) i++;
++    if( i<n && a[i]==',' ){
++      i++;
++      while( i<n && isspace(a[i]) ) i++;
++      if( i<n && a[i]==']' ) return SQLITE_ERROR;
++      continue;
++    }
++    if( i<n && a[i]==']' ){
++      *pi = i+1;
++      return SQLITE_OK;
++    }
++    return SQLITE_ERROR;
++  }
++}
++
++static int bcvJsonSkipValue(const u8 *a, int n, int *pi){
++  int i = *pi;
++  int j;
++  while( i<n && isspace(a[i]) ) i++;
++  if( i>=n ) return SQLITE_ERROR;
++  *pi = i;
++  if( a[i]=='"' ) return bcvJsonSkipString(a, n, pi);
++  if( a[i]=='{' ) return bcvJsonSkipObject(a, n, pi);
++  if( a[i]=='[' ) return bcvJsonSkipArray(a, n, pi);
++  if( n-i>=4 && 0==memcmp(&a[i], "true", 4) ){
++    j = i+4;
++    if( j==n || isspace(a[j]) || a[j]==',' || a[j]==']' || a[j]=='}' ){
++      *pi = j;
++      return SQLITE_OK;
++    }
++    return SQLITE_ERROR;
++  }
++  if( n-i>=5 && 0==memcmp(&a[i], "false", 5) ){
++    j = i+5;
++    if( j==n || isspace(a[j]) || a[j]==',' || a[j]==']' || a[j]=='}' ){
++      *pi = j;
++      return SQLITE_OK;
++    }
++    return SQLITE_ERROR;
++  }
++  if( n-i>=4 && 0==memcmp(&a[i], "null", 4) ){
++    j = i+4;
++    if( j==n || isspace(a[j]) || a[j]==',' || a[j]==']' || a[j]=='}' ){
++      *pi = j;
++      return SQLITE_OK;
++    }
++    return SQLITE_ERROR;
++  }
++  if( a[i]=='-' || (a[i]>='0' && a[i]<='9') ){
++    if( a[i]=='-' ) i++;
++    if( i>=n ) return SQLITE_ERROR;
++    if( a[i]=='0' ){
++      i++;
++    }else{
++      if( a[i]<'1' || a[i]>'9' ) return SQLITE_ERROR;
++      while( i<n && a[i]>='0' && a[i]<='9' ) i++;
++    }
++    if( i<n && a[i]=='.' ){
++      i++;
++      if( i>=n || a[i]<'0' || a[i]>'9' ) return SQLITE_ERROR;
++      while( i<n && a[i]>='0' && a[i]<='9' ) i++;
++    }
++    if( i<n && (a[i]=='e' || a[i]=='E') ){
++      i++;
++      if( i<n && (a[i]=='+' || a[i]=='-' ) ) i++;
++      if( i>=n || a[i]<'0' || a[i]>'9' ) return SQLITE_ERROR;
++      while( i<n && a[i]>='0' && a[i]<='9' ) i++;
++    }
++    if( i<n && !isspace(a[i]) && a[i]!=',' && a[i]!=']' && a[i]!='}' ){
++      return SQLITE_ERROR;
++    }
++    *pi = i;
++    return SQLITE_OK;
++  }
++  return SQLITE_ERROR;
++}
++
++/* Validate one complete JSON object, including trailing bytes. */
++static int bcvJsonRootObject(const u8 *a, int n){
++  int i = 0;
++  while( i<n && isspace(a[i]) ) i++;
++  if( bcvJsonSkipObject(a, n, &i)!=SQLITE_OK ) return SQLITE_ERROR;
++  while( i<n && isspace(a[i]) ) i++;
++  return i==n ? SQLITE_OK : SQLITE_ERROR;
++}
++
++static int bcvJsonHex4(const u8 *a, unsigned *pOut){
++  int i;
++  unsigned v = 0;
++  for(i=0; i<4; i++){
++    int c = a[i];
++    if( c>='0' && c<='9' ) v = (v<<4) | (unsigned)(c-'0');
++    else if( c>='a' && c<='f' ) v = (v<<4) | (unsigned)(c-'a'+10);
++    else if( c>='A' && c<='F' ) v = (v<<4) | (unsigned)(c-'A'+10);
++    else return SQLITE_ERROR;
++  }
++  *pOut = v;
++  return SQLITE_OK;
++}
++
++static int bcvJsonAppendUtf8(char **pzOut, int *pnOut, unsigned cp){
++  char *z = *pzOut;
++  if( cp<=0x7F ){
++    z[(*pnOut)++] = (char)cp;
++  }else if( cp<=0x7FF ){
++    z[(*pnOut)++] = (char)(0xC0 | (cp>>6));
++    z[(*pnOut)++] = (char)(0x80 | (cp&0x3F));
++  }else if( cp<=0xFFFF ){
++    z[(*pnOut)++] = (char)(0xE0 | (cp>>12));
++    z[(*pnOut)++] = (char)(0x80 | ((cp>>6)&0x3F));
++    z[(*pnOut)++] = (char)(0x80 | (cp&0x3F));
++  }else if( cp<=0x10FFFF ){
++    z[(*pnOut)++] = (char)(0xF0 | (cp>>18));
++    z[(*pnOut)++] = (char)(0x80 | ((cp>>12)&0x3F));
++    z[(*pnOut)++] = (char)(0x80 | ((cp>>6)&0x3F));
++    z[(*pnOut)++] = (char)(0x80 | (cp&0x3F));
++  }else{
++    return SQLITE_ERROR;
++  }
++  return SQLITE_OK;
++}
++
++static int bcvJsonDecodeString(
++  const u8 *a, int iStart, int iEnd, char **pzOut
++){
++  int i = iStart;
++  int nOut = 0;
++  char *zOut;
++  if( iStart>=iEnd || a[iStart]!='"' || a[iEnd-1]!='"' ) return SQLITE_ERROR;
++  zOut = sqlite3_malloc(iEnd-iStart+1);
++  if( zOut==0 ) return SQLITE_NOMEM;
++  i++;
++  while( i<iEnd-1 ){
++    unsigned cp;
++    if( a[i]!='\\' ){
++      zOut[nOut++] = (char)a[i++];
++      continue;
++    }
++    i++;
++    if( i>=iEnd-1 ) goto json_error;
++    switch( a[i++] ){
++      case '"': zOut[nOut++] = '"'; break;
++      case '\\': zOut[nOut++] = '\\'; break;
++      case '/': zOut[nOut++] = '/'; break;
++      case 'b': zOut[nOut++] = '\b'; break;
++      case 'f': zOut[nOut++] = '\f'; break;
++      case 'n': zOut[nOut++] = '\n'; break;
++      case 'r': zOut[nOut++] = '\r'; break;
++      case 't': zOut[nOut++] = '\t'; break;
++      case 'u':
++        if( i+4>iEnd-1 || bcvJsonHex4(&a[i], &cp)!=SQLITE_OK ) goto json_error;
++        i += 4;
++        if( cp>=0xD800 && cp<=0xDBFF ){
++          unsigned lo;
++          if( i+6>iEnd-1 || a[i]!='\\' || a[i+1]!='u'
++           || bcvJsonHex4(&a[i+2], &lo)!=SQLITE_OK
++           || lo<0xDC00 || lo>0xDFFF
++          ) goto json_error;
++          i += 6;
++          cp = 0x10000 + ((cp-0xD800)<<10) + (lo-0xDC00);
++        }else if( cp>=0xDC00 && cp<=0xDFFF ){
++          goto json_error;
++        }
++        if( cp==0 || bcvJsonAppendUtf8(&zOut, &nOut, cp)!=SQLITE_OK ) goto json_error;
++        break;
++      default:
++        goto json_error;
++    }
++  }
++  zOut[nOut] = '\0';
++  *pzOut = zOut;
++  return SQLITE_OK;
++
++json_error:
++  sqlite3_free(zOut);
++  return SQLITE_ERROR;
++}
++
++/* Locate an object member and return its value range. */
++static int bcvJsonObjectMember(
++  const u8 *a, int iStart, int iEnd, const char *zKey,
++  int *piValue, int *piValueEnd
++){
++  int i = iStart;
++  int nKey = strlen(zKey);
++  if( i>=iEnd || a[i]!='{' ) return SQLITE_ERROR;
++  i++;
++  while( 1 ){
++    int iKeyStart, iKeyEnd, iValStart, iValEnd;
++    while( i<iEnd && isspace(a[i]) ) i++;
++    if( i<iEnd && a[i]=='}' ) return SQLITE_NOTFOUND;
++    iKeyStart = i;
++    if( bcvJsonSkipString(a, iEnd, &i)!=SQLITE_OK ) return SQLITE_ERROR;
++    iKeyEnd = i;
++    while( i<iEnd && isspace(a[i]) ) i++;
++    if( i>=iEnd || a[i++]!=':' ) return SQLITE_ERROR;
++    while( i<iEnd && isspace(a[i]) ) i++;
++    iValStart = i;
++    if( bcvJsonSkipValue(a, iEnd, &i)!=SQLITE_OK ) return SQLITE_ERROR;
++    iValEnd = i;
++    {
++      int bMatch = iKeyEnd-iKeyStart==nKey+2
++          && 0==memcmp(&a[iKeyStart+1], zKey, nKey);
++      while( i<iEnd && isspace(a[i]) ) i++;
++      if( i<iEnd && a[i]=='}' ){
++        if( bMatch ){
++          *piValue = iValStart;
++          *piValueEnd = iValEnd;
++          return SQLITE_OK;
++        }
++        return SQLITE_NOTFOUND;
++      }
++      if( i>=iEnd || a[i]!=',' ) return SQLITE_ERROR;
++      if( bMatch ){
++        *piValue = iValStart;
++        *piValueEnd = iValEnd;
++        return SQLITE_OK;
++      }
++      i++;
++    }
++  }
++}
++
+ typedef struct BcvGoogle BcvGoogle;
+ struct BcvGoogle {
+   const char *zUser;
+   const char *zSecret;
+   const char *zCont;
++  const char *zEndpoint;
++  const char *zBucket;
++  const char *zPrefix;
+   const char *zBase;
++  char *zCreateBody;
++  int bJson;
+   int nMaxResults;
+ };
+ 
++static int bcvGoogleUrlSafe(unsigned char c){
++  return (c>='A' && c<='Z') || (c>='a' && c<='z')
++      || (c>='0' && c<='9') || c=='-' || c=='_' || c=='.' || c=='~';
++}
++
++static char *bcvGoogleUrlEncode(const char *zIn){
++  static const char aHex[] = "0123456789ABCDEF";
++  int nIn = strlen(zIn);
++  int i;
++  int nOut = 0;
++  char *zOut;
++  for(i=0; i<nIn; i++){
++    unsigned char c = (unsigned char)zIn[i];
++    nOut += bcvGoogleUrlSafe(c) ? 1 : 3;
++  }
++  zOut = sqlite3_malloc(nOut+1);
++  if( zOut ){
++    int j = 0;
++    for(i=0; i<nIn; i++){
++      unsigned char c = (unsigned char)zIn[i];
++      if( bcvGoogleUrlSafe(c) ){
++        zOut[j++] = (char)c;
++      }else{
++        zOut[j++] = '%';
++        zOut[j++] = aHex[c>>4];
++        zOut[j++] = aHex[c&0x0F];
++      }
++    }
++    zOut[j] = '\0';
++  }
++  return zOut;
++}
++
++/* Return the object name relative to the bucket, including any configured
++** container prefix. The prefix is normalized to end in '/'. */
++static char *bcvGoogleJsonObjectName(
++  BcvGoogle *p, const char *zFile
++){
++  if( p->zPrefix && p->zPrefix[0] ){
++    return sqlite3_mprintf("%s%s", p->zPrefix, zFile);
++  }
++  return sqlite3_mprintf("%s", zFile);
++}
++
++static char *bcvGoogleJsonQuote(const char *zIn){
++  int nIn = strlen(zIn);
++  int i;
++  int nOut = 2;
++  char *zOut;
++  for(i=0; i<nIn; i++){
++    unsigned char c = (unsigned char)zIn[i];
++    nOut += c<0x20 ? 6 : (c=='"' || c=='\\' ? 2 : 1);
++  }
++  zOut = sqlite3_malloc(nOut+1);
++  if( zOut ){
++    int j = 0;
++    zOut[j++] = '"';
++    for(i=0; i<nIn; i++){
++      unsigned char c = (unsigned char)zIn[i];
++      if( c=='"' || c=='\\' ) zOut[j++] = '\\';
++      if( c<0x20 ){
++        static const char aHex[] = "0123456789ABCDEF";
++        zOut[j++] = '\\';
++        zOut[j++] = 'u';
++        zOut[j++] = '0';
++        zOut[j++] = '0';
++        zOut[j++] = aHex[c>>4];
++        zOut[j++] = aHex[c&0x0F];
++      }else{
++        zOut[j++] = (char)c;
++      }
++    }
++    zOut[j++] = '"';
++    zOut[j] = '\0';
++  }
++  return zOut;
++}
++
++static int bcvGoogleJsonGeneration(
++  sqlite3_bcv_job *pCtx, sqlite3_bcv_request *pReq
++){
++  const u8 *aBody;
++  int nBody;
++  int iValue, iValueEnd;
++  char *zGeneration = 0;
++  int rc;
++
++  aBody = sqlite3_bcv_request_body(pReq, &nBody);
++  rc = bcvJsonRootObject(aBody, nBody);
++  if( rc==SQLITE_OK ){
++    rc = bcvJsonObjectMember(
++        aBody, 0, nBody, "generation", &iValue, &iValueEnd
++    );
++  }
++  if( rc==SQLITE_OK && aBody[iValue]=='"' ){
++    rc = bcvJsonDecodeString(aBody, iValue, iValueEnd, &zGeneration);
++  }else if( rc==SQLITE_OK ){
++    rc = SQLITE_ERROR;
++  }
++  if( rc==SQLITE_OK ){
++    sqlite3_bcv_job_etag(pCtx, zGeneration);
++  }else if( rc==SQLITE_NOTFOUND ){
++    rc = SQLITE_ERROR;
++  }
++  sqlite3_free(zGeneration);
++  return rc;
++}
++
++static void bcvGoogleJsonPutCb(
++  sqlite3_bcv_job *pCtx,
++  sqlite3_bcv_request *pReq,
++  void *pApp
++){
++  const char *zStatus = 0;
++  int rc = sqlite3_bcv_request_status(pReq, &zStatus);
++  if( rc!=SQLITE_OK ){
++    sqlite3_bcv_job_error(pCtx, rc, zStatus);
++  }else if( bcvGoogleJsonGeneration(pCtx, pReq)!=SQLITE_OK ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_ERROR,
++        "invalid Google JSON upload response");
++  }
++}
++
++static int bcvGoogleJsonList(
++  sqlite3_bcv_container *pCont,
++  sqlite3_bcv_job *pCtx, sqlite3_bcv_request *pReq, char **pzNext
++){
++  BcvGoogle *p = (BcvGoogle*)pCont;
++  const u8 *aBody;
++  int nBody;
++  int iItems, iItemsEnd;
++  int i = 0;
++  int rc;
++  *pzNext = 0;
++  aBody = sqlite3_bcv_request_body(pReq, &nBody);
++  if( bcvJsonRootObject(aBody, nBody)!=SQLITE_OK ) return SQLITE_ERROR;
++  rc = bcvJsonObjectMember(aBody, 0, nBody, "items", &iItems, &iItemsEnd);
++  if( rc!=SQLITE_NOTFOUND ){
++    if( rc!=SQLITE_OK ) return SQLITE_ERROR;
++    if( aBody[iItems]=='n' ){
++      if( iItemsEnd-iItems==4 && 0==memcmp(&aBody[iItems], "null", 4) ){
++        iItems = 0;
++      }else{
++        return SQLITE_ERROR;
++      }
++    }
++  }
++  if( rc==SQLITE_OK && iItems ){
++    if( aBody[iItems]!='[' ) return SQLITE_ERROR;
++    i = iItems+1;
++    while( 1 ){
++      int iObj, iObjEnd, iName, iNameEnd;
++      char *zName = 0;
++      while( i<iItemsEnd && isspace(aBody[i]) ) i++;
++      if( i<iItemsEnd && aBody[i]==']' ) break;
++      iObj = i;
++      if( bcvJsonSkipObject(aBody, iItemsEnd, &i)!=SQLITE_OK ){
++        return SQLITE_ERROR;
++      }
++      iObjEnd = i;
++      rc = bcvJsonObjectMember(
++          aBody, iObj, iObjEnd, "name", &iName, &iNameEnd
++      );
++      if( rc!=SQLITE_OK || aBody[iName]!='"' ) return SQLITE_ERROR;
++      rc = bcvJsonDecodeString(aBody, iName, iNameEnd, &zName);
++      if( rc!=SQLITE_OK ) return rc;
++      if( p->zPrefix && p->zPrefix[0] ){
++        int nPrefix = strlen(p->zPrefix);
++        if( strncmp(zName, p->zPrefix, nPrefix)!=0 ){
++          sqlite3_free(zName);
++          return SQLITE_ERROR;
++        }
++        sqlite3_bcv_job_result(
++            pCtx, (const u8*)&zName[nPrefix], -1
++        );
++      }else{
++        sqlite3_bcv_job_result(pCtx, (const u8*)zName, -1);
++      }
++      sqlite3_free(zName);
++      while( i<iItemsEnd && isspace(aBody[i]) ) i++;
++      if( i<iItemsEnd && aBody[i]==',' ){
++        i++;
++        continue;
++      }
++      if( i<iItemsEnd && aBody[i]==']' ) break;
++      return SQLITE_ERROR;
++    }
++  }
++
++  rc = bcvJsonObjectMember(aBody, 0, nBody, "nextPageToken", &iItems, &iItemsEnd);
++  if( rc==SQLITE_OK ){
++    if( aBody[iItems]!='"' ) return SQLITE_ERROR;
++    rc = bcvJsonDecodeString(aBody, iItems, iItemsEnd, pzNext);
++  }else if( rc==SQLITE_NOTFOUND ){
++    rc = SQLITE_OK;
++  }
++  return rc;
++}
++
++static void bcvGoogleListFiles(
++  sqlite3_bcv_container*, sqlite3_bcv_job*, const char*
++);
++
++static void bcvGoogleJsonListCb(
++  sqlite3_bcv_job *pCtx,
++  sqlite3_bcv_request *pReq,
++  void *pApp
++){
++  sqlite3_bcv_container *pCont = (sqlite3_bcv_container*)pApp;
++  const char *zStatus = 0;
++  char *zNext = 0;
++  int rc = sqlite3_bcv_request_status(pReq, &zStatus);
++  if( rc!=SQLITE_OK ){
++    sqlite3_bcv_job_error(pCtx, rc, zStatus);
++  }else if( bcvGoogleJsonList(pCont, pCtx, pReq, &zNext)!=SQLITE_OK ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_ERROR,
++        "invalid Google JSON list response");
++  }else if( zNext && zNext[0] ){
++    bcvGoogleListFiles(pCont, pCtx, zNext);
++  }
++  sqlite3_free(zNext);
++}
++
+ static void bcvGoogleClose(sqlite3_bcv_container *pCont){
++  BcvGoogle *p = (BcvGoogle*)pCont;
++  sqlite3_free(p->zCreateBody);
+   sqlite3_free(pCont);
+ }
+ 
+@@ -1033,7 +1584,11 @@
+   BcvGoogle *pNew;
+   int rc = SQLITE_OK;
+   const char *zEndpoint = "https://storage.googleapis.com";
++  int bJson = 0;
+   int nMaxResults = GOOGLE_MAX_RESULTS;
++  int nBucket;
++  int nPrefix;
++  int nJsonPrefix;
+   int i;
+ 
+   /* Keep maxresults accepted for compatibility with generic CBS callers,
+@@ -1050,9 +1605,19 @@
+         return SQLITE_ERROR;
+       }
+       zEndpoint = zVal;
++    }else if( 0==sqlite3_stricmp(zKey, "api") ){
++      if( zVal && 0==sqlite3_stricmp(zVal, "json") ){
++        bJson = 1;
++      }else if( zVal==0 || 0!=sqlite3_stricmp(zVal, "xml") ){
++        *pzErrmsg = sqlite3_mprintf(
++            "bad argument to api parameter \"%s\" - must be \"xml\" or \"json\"",
++            zVal ? zVal : ""
++        );
++        return SQLITE_ERROR;
++      }
+     }else{
+       *pzErrmsg = sqlite3_mprintf(
+-          "bad parameter \"%s\" - must be \"endpoint\" or \"maxresults\"",
++          "bad parameter \"%s\" - must be \"api\", \"endpoint\" or \"maxresults\"",
+           zKey
+       );
+       return SQLITE_ERROR;
+@@ -1063,13 +1628,24 @@
+   int nSecret = bcvStrlen(zSecret);
+   int nContainer = bcvStrlen(zContainer);
+   int nEndpoint = bcvStrlen(zEndpoint);
++  const char *zSlash = bJson && zContainer ? strchr(zContainer, '/') : 0;
++  nBucket = zSlash ? (int)(zSlash-zContainer) : nContainer;
++  nPrefix = zSlash ? nContainer-nBucket-1 : 0;
++  nJsonPrefix = nPrefix>0 && zContainer[nContainer-1]!='/'
++      ? nPrefix+1 : nPrefix;
++  if( bJson && nBucket==0 ){
++    *pzErrmsg = sqlite3_mprintf("JSON Google container must start with a bucket name");
++    return SQLITE_ERROR;
++  }
+   while( nEndpoint>0 && zEndpoint[nEndpoint-1]=='/' ) nEndpoint--;
+   if( nEndpoint==0 ){
+     *pzErrmsg = sqlite3_mprintf("endpoint parameter may not be empty");
+     return SQLITE_ERROR;
+   }
+   int nBase = nEndpoint + 1 + nContainer;
+-  int nByte = sizeof(BcvGoogle) + nUser + nSecret + nContainer + nBase + 4;
++  int nByte = sizeof(BcvGoogle) + nUser + 1 + nSecret + 1
++      + nContainer + 1 + nEndpoint + 1 + nBase + 1;
++  if( bJson ) nByte += nBucket + 1 + nJsonPrefix + 1;
+ 
+   pNew = (BcvGoogle*)bcvMallocRc(&rc, nByte);
+   if( pNew ){
+@@ -1084,6 +1660,19 @@
+     memcpy(zCsr, zContainer, nContainer);
+     pNew->zCont = zCsr;
+     zCsr += nContainer+1;
++    memcpy(zCsr, zEndpoint, nEndpoint);
++    pNew->zEndpoint = zCsr;
++    zCsr += nEndpoint+1;
++    pNew->bJson = bJson;
++    if( bJson ){
++      memcpy(zCsr, zContainer, nBucket);
++      pNew->zBucket = zCsr;
++      zCsr += nBucket+1;
++      if( nPrefix ) memcpy(zCsr, &zContainer[nBucket+1], nPrefix);
++      if( nJsonPrefix>nPrefix ) zCsr[nPrefix] = '/';
++      pNew->zPrefix = zCsr;
++      zCsr += nJsonPrefix+1;
++    }
+     pNew->nMaxResults = nMaxResults;
+     sqlite3_snprintf(
+         nBase+1, zCsr, "%.*s/%s", nEndpoint, zEndpoint, zContainer
+@@ -1104,6 +1693,60 @@
+   BcvGoogle *p = (BcvGoogle*)pCont;
+   sqlite3_bcv_request *pReq = 0;
+ 
++  if( p->bJson ){
++    char *zBucket = bcvGoogleUrlEncode(p->zBucket);
++    char *zObjectName = bcvGoogleJsonObjectName(p, zFile);
++    char *zObject = zObjectName ? bcvGoogleUrlEncode(zObjectName) : 0;
++    char *zGeneration = 0;
++    char *zUri = 0;
++    if( flags & BCV_MODULE_CONDITION_ETAG ){
++      zGeneration = zETag ? bcvGoogleUrlEncode((const char*)zETag) : 0;
++    }
++    if( zBucket==0 || zObjectName==0 || zObject==0
++     || ((flags & BCV_MODULE_CONDITION_ETAG) && zGeneration==0)
++    ){
++      sqlite3_free(zBucket);
++      sqlite3_free(zObjectName);
++      sqlite3_free(zObject);
++      sqlite3_free(zGeneration);
++      sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++      return;
++    }
++    if( flags & BCV_MODULE_CONDITION_ETAG ){
++      zUri = sqlite3_mprintf(
++          "%s/download/storage/v1/b/%s/o/%s?alt=media&ifGenerationNotMatch=%s",
++          p->zEndpoint, zBucket, zObject, zGeneration
++      );
++    }else{
++      zUri = sqlite3_mprintf(
++          "%s/download/storage/v1/b/%s/o/%s?alt=media",
++          p->zEndpoint, zBucket, zObject
++      );
++    }
++    if( zUri==0 ){
++      sqlite3_free(zBucket);
++      sqlite3_free(zObjectName);
++      sqlite3_free(zObject);
++      sqlite3_free(zGeneration);
++      sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++      return;
++    }
++    pReq = sqlite3_bcv_job_request(pCtx,
++        (void*)"x-goog-generation", bcvModuleFetchCb
++    );
++    if( pReq ){
++      sqlite3_bcv_request_set_uri(pReq, zUri);
++      bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++      sqlite3_bcv_request_set_header(pReq, AZURE_MIMETYPE_HDR);
++    }
++    sqlite3_free(zUri);
++    sqlite3_free(zBucket);
++    sqlite3_free(zObjectName);
++    sqlite3_free(zObject);
++    sqlite3_free(zGeneration);
++    return;
++  }
++
+   pReq = sqlite3_bcv_job_request(pCtx, 
+       (void*)"x-goog-generation", bcvModuleFetchCb
+   );
+@@ -1125,6 +1768,51 @@
+   BcvGoogle *p = (BcvGoogle*)pCont;
+   sqlite3_bcv_request *pReq = 0;
+ 
++  if( p->bJson ){
++    char *zBucket = bcvGoogleUrlEncode(p->zBucket);
++    char *zObjectName = bcvGoogleJsonObjectName(p, zFile);
++    char *zObject = zObjectName ? bcvGoogleUrlEncode(zObjectName) : 0;
++    char *zGeneration = 0;
++    if( zETag ){
++      zGeneration = bcvGoogleUrlEncode(
++          (zETag[0]=='*' && zETag[1]=='\0') ? "0" : zETag
++      );
++    }
++    if( zBucket==0 || zObjectName==0 || zObject==0
++     || (zETag && zGeneration==0)
++    ){
++      sqlite3_free(zBucket);
++      sqlite3_free(zObjectName);
++      sqlite3_free(zObject);
++      sqlite3_free(zGeneration);
++      sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++      return;
++    }
++    pReq = sqlite3_bcv_job_request(pCtx, 0, bcvGoogleJsonPutCb);
++    if( pReq ){
++      sqlite3_bcv_request_set_method(pReq, SQLITE_BCV_METHOD_POST);
++      if( zGeneration ){
++        bcvUriPrintf(pCtx, pReq,
++            "%s/upload/storage/v1/b/%s/o?uploadType=media&name=%s&ifGenerationMatch=%s",
++            p->zEndpoint, zBucket, zObject, zGeneration
++        );
++      }else{
++        bcvUriPrintf(pCtx, pReq,
++            "%s/upload/storage/v1/b/%s/o?uploadType=media&name=%s",
++            p->zEndpoint, zBucket, zObject
++        );
++      }
++      bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++      sqlite3_bcv_request_set_header(pReq, AZURE_MIMETYPE_HDR);
++      sqlite3_bcv_request_set_body(pReq, aData, nData);
++    }
++    sqlite3_free(zBucket);
++    sqlite3_free(zObjectName);
++    sqlite3_free(zObject);
++    sqlite3_free(zGeneration);
++    return;
++  }
++
+   pReq = sqlite3_bcv_job_request(pCtx,
+       (void*)"x-goog-generation", bcvModulePutCb
+   );
+@@ -1147,13 +1835,52 @@
+   BcvGoogle *p = (BcvGoogle*)pCont;
+   sqlite3_bcv_request *pReq = 0;
+ 
++  if( p->bJson ){
++    char *zBucket = bcvGoogleUrlEncode(p->zBucket);
++    char *zObjectName = bcvGoogleJsonObjectName(p, zFile);
++    char *zObject = zObjectName ? bcvGoogleUrlEncode(zObjectName) : 0;
++    char *zGeneration = zETag ? bcvGoogleUrlEncode(zETag) : 0;
++    if( zBucket==0 || zObjectName==0 || zObject==0
++     || (zETag && zGeneration==0)
++    ){
++      sqlite3_free(zBucket);
++      sqlite3_free(zObjectName);
++      sqlite3_free(zObject);
++      sqlite3_free(zGeneration);
++      sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++      return;
++    }
++    pReq = sqlite3_bcv_job_request(pCtx, 0, bcvModuleGenericCb);
++    if( pReq ){
++      sqlite3_bcv_request_set_method(pReq, SQLITE_BCV_METHOD_DELETE);
++      if( zGeneration ){
++        bcvUriPrintf(pCtx, pReq,
++            "%s/storage/v1/b/%s/o/%s?ifGenerationMatch=%s",
++            p->zEndpoint, zBucket, zObject, zGeneration
++        );
++      }else{
++        bcvUriPrintf(pCtx, pReq,
++            "%s/storage/v1/b/%s/o/%s", p->zEndpoint, zBucket, zObject
++        );
++      }
++      bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++    }
++    sqlite3_free(zBucket);
++    sqlite3_free(zObjectName);
++    sqlite3_free(zObject);
++    sqlite3_free(zGeneration);
++    return;
++  }
++
+   pReq = sqlite3_bcv_job_request(pCtx, 0, bcvModuleGenericCb);
+-  sqlite3_bcv_request_set_method(pReq, SQLITE_BCV_METHOD_DELETE);
+-  bcvUriPrintf(pCtx, pReq, "%s/%s", p->zBase, zFile);
+-  bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
+-  sqlite3_bcv_request_set_header(pReq, AZURE_MIMETYPE_HDR);
+-  if( zETag ){
+-    bcvHdrPrintf(pCtx, pReq, "x-goog-if-generation-match: %s", zETag);
++  if( pReq ){
++    sqlite3_bcv_request_set_method(pReq, SQLITE_BCV_METHOD_DELETE);
++    bcvUriPrintf(pCtx, pReq, "%s/%s", p->zBase, zFile);
++    bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++    sqlite3_bcv_request_set_header(pReq, AZURE_MIMETYPE_HDR);
++    if( zETag ){
++      bcvHdrPrintf(pCtx, pReq, "x-goog-if-generation-match: %s", zETag);
++    }
+   }
+ }
+ 
+@@ -1167,11 +1894,58 @@
+   const int nMax = p->nMaxResults;
+   sqlite3_bcv_request *pReq = 0;
+ 
++  if( p->bJson ){
++    const char *zJobPrefix = sqlite3_bcv_job_prefix(pCtx);
++    char *zPrefixName = bcvGoogleJsonObjectName(
++        p, zJobPrefix ? zJobPrefix : ""
++    );
++    char *zBucket = bcvGoogleUrlEncode(p->zBucket);
++    char *zPrefixEnc = zPrefixName ? bcvGoogleUrlEncode(zPrefixName) : 0;
++    char *zMarkerEnc = zMarker ? bcvGoogleUrlEncode(zMarker) : 0;
++    char *zUri = 0;
++    if( zPrefixName==0 || zBucket==0 || zPrefixEnc==0
++     || (zMarker && zMarkerEnc==0)
++    ){
++      sqlite3_free(zPrefixName);
++      sqlite3_free(zBucket);
++      sqlite3_free(zPrefixEnc);
++      sqlite3_free(zMarkerEnc);
++      sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++      return;
++    }
++    zUri = sqlite3_mprintf(
++        "%s/storage/v1/b/%s/o?maxResults=%d&prefix=%s%s%s",
++        p->zEndpoint, zBucket, nMax, zPrefixEnc,
++        zMarker ? "&pageToken=" : "", zMarker ? zMarkerEnc : ""
++    );
++    if( zUri==0 ){
++      sqlite3_free(zPrefixName);
++      sqlite3_free(zBucket);
++      sqlite3_free(zPrefixEnc);
++      sqlite3_free(zMarkerEnc);
++      sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++      return;
++    }
++    pReq = sqlite3_bcv_job_request(pCtx, (void*)pCont, bcvGoogleJsonListCb);
++    if( pReq ){
++      sqlite3_bcv_request_set_uri(pReq, zUri);
++      bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++    }
++    sqlite3_free(zUri);
++    sqlite3_free(zPrefixName);
++    sqlite3_free(zBucket);
++    sqlite3_free(zPrefixEnc);
++    sqlite3_free(zMarkerEnc);
++    return;
++  }
++
+   pReq = sqlite3_bcv_job_request(pCtx, (void*)p, bcvGoogleListCb);
+-  bcvUriPrintf(pCtx, pReq, "%s?max-keys=%d%s%s", p->zBase, nMax,
+-      zMarker ? "&marker=" : "", zMarker ? zMarker : ""
+-  );
+-  bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++  if( pReq ){
++    bcvUriPrintf(pCtx, pReq, "%s?max-keys=%d%s%s", p->zBase, nMax,
++        zMarker ? "&marker=" : "", zMarker ? zMarker : ""
++    );
++    bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++  }
+ }
+ 
+ static void bcvGoogleListCb(
+@@ -1197,17 +1971,70 @@
+   BcvGoogle *p = (BcvGoogle*)pCont;
+   sqlite3_bcv_request *pReq = 0;
+ 
++  if( p->bJson ){
++    char *zProject = bcvGoogleUrlEncode(p->zUser);
++    char *zName = bcvGoogleJsonQuote(p->zBucket);
++    if( zProject && zName && p->zCreateBody==0 ){
++      p->zCreateBody = sqlite3_mprintf("{\"name\":%s}", zName);
++    }
++    if( zProject==0 || zName==0 || p->zCreateBody==0 ){
++      sqlite3_free(zProject);
++      sqlite3_free(zName);
++      sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++      return;
++    }
++    pReq = sqlite3_bcv_job_request(pCtx, 0, bcvModuleCreateCb);
++    if( pReq ){
++      sqlite3_bcv_request_set_method(pReq, SQLITE_BCV_METHOD_POST);
++      bcvUriPrintf(pCtx, pReq, "%s/storage/v1/b?project=%s",
++          p->zEndpoint, zProject
++      );
++      bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++      sqlite3_bcv_request_set_header(pReq, "Content-Type: application/json");
++      sqlite3_bcv_request_set_body(
++          pReq, (const unsigned char*)p->zCreateBody, strlen(p->zCreateBody)
++      );
++    }
++    sqlite3_free(zProject);
++    sqlite3_free(zName);
++    return;
++  }
++
+   pReq = sqlite3_bcv_job_request(pCtx, 0, bcvModuleGenericCb);
+-  sqlite3_bcv_request_set_method(pReq, SQLITE_BCV_METHOD_PUT);
+-  sqlite3_bcv_request_set_uri(pReq, p->zBase);
+-  bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
+-  bcvHdrPrintf(pCtx, pReq, "x-goog-project-id: %s", p->zUser);
++  if( pReq ){
++    sqlite3_bcv_request_set_method(pReq, SQLITE_BCV_METHOD_PUT);
++    sqlite3_bcv_request_set_uri(pReq, p->zBase);
++    bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++    bcvHdrPrintf(pCtx, pReq, "x-goog-project-id: %s", p->zUser);
++  }
+ }
+ 
+ static void bcvGoogleDestroy(
+   sqlite3_bcv_container *pCont, 
+   sqlite3_bcv_job *pCtx
+ ){
++  BcvGoogle *p = (BcvGoogle*)pCont;
++  if( p->bJson ){
++    char *zBucket;
++    sqlite3_bcv_request *pReq;
++    if( p->zPrefix && p->zPrefix[0] ){
++      sqlite3_bcv_job_error(pCtx, SQLITE_MISUSE,
++          "refusing to delete a Google bucket while a prefix is configured");
++      return;
++    }
++    zBucket = bcvGoogleUrlEncode(p->zBucket);
++    if( zBucket==0 ){
++      sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++      return;
++    }
++    pReq = sqlite3_bcv_job_request(pCtx, 0, bcvModuleGenericCb);
++    if( pReq ){
++      sqlite3_bcv_request_set_method(pReq, SQLITE_BCV_METHOD_DELETE);
++      bcvUriPrintf(pCtx, pReq, "%s/storage/v1/b/%s", p->zEndpoint, zBucket);
++      bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
++    }
++    sqlite3_free(zBucket);
++  }
+ }
+ 
+ int bcvInstallBuiltinModules(void){
+@@ -1239,4 +2066,3 @@
+   }
+   return rc;
+ }
+-
+
+--- a/bcvmodule.h
++++ b/bcvmodule.h
+@@ -101,8 +101,8 @@
+ /*
+ ** Set the method of an HTTP(S) request allocated by sqlite3_bcv_job_request()
+ ** within the same cloud module method call or HTTP(S) reply callback.
+-** The second argument must be one of SQLITE_BCV_METHOD_GET, _PUT, _DELETE
+-** or _HEAD. If this function is not called on a request handle, the
++** The second argument must be one of SQLITE_BCV_METHOD_GET, _PUT, _POST,
++** _DELETE or _HEAD. If this function is not called on a request handle, the
+ ** request uses the default method - GET.
+ */
+ void sqlite3_bcv_request_set_method(sqlite3_bcv_request*, int eMethod);
+@@ -114,6 +114,7 @@
+ #define SQLITE_BCV_METHOD_PUT     2
+ #define SQLITE_BCV_METHOD_DELETE  3
+ #define SQLITE_BCV_METHOD_HEAD    4
++#define SQLITE_BCV_METHOD_POST    5
+ 
+ /*
+ ** Set the URI of an HTTP(S) request allocated by sqlite3_bcv_job_request()
+@@ -158,7 +159,7 @@
+ void sqlite3_bcv_request_set_header(sqlite3_bcv_request*, const char *zHdr);
+ 
+ /*
+-** Set the body of an HTTP(S) request. This is only meaningful for PUT
++** Set the body of an HTTP(S) request. This is meaningful for PUT and POST
+ ** requests. Parameter aData must point to a buffer nData bytes in size
+ ** containing the data to use as the request body. This function takes a
+ ** copy of the buffer if necessary, the cloud storage module implementation
+
+--- a/bcvutil.c
++++ b/bcvutil.c
+@@ -32,7 +32,7 @@
+ **
+ **  *  An integer indicating the type of HTTPS request that will be issued.
+ **     This is one of the SQLITE_BCV_METHOD_XXX values defined in header
+-**     file bcvmodule.h - 1==GET, 2==PUT, 3==DELETE, 4==HEAD.
++**     file bcvmodule.h - 1==GET, 2==PUT, 3==DELETE, 4==HEAD, 5==POST.
+ **
+ **  *  A nul-terminated string set to the URI that will be requested. This
+ **     URI includes all parameters, possibly including parameters containing
+@@ -183,7 +183,7 @@
+ 
+ struct sqlite3_bcv_request {
+   BcvDispatchJob *pJob;           /* Job that owns this request */
+-  int eMethod;                    /* SQLITE_BCV_METHOD_GET/PUT/DELETE */
++  int eMethod;                    /* SQLITE_BCV_METHOD_GET/PUT/POST/DELETE */
+   int nRetry;                     /* # of times request has already failed */
+   i64 iRetryTime;                 /* Do not retry before this time */
+   char *zUri;                     /* URI */
+@@ -194,7 +194,7 @@
+ 
+   i64 iLogId;                     /* Logging id of request */
+ 
+-  const u8 *aBody;                /* Buffer of data to upload (METHOD_PUT) */
++  const u8 *aBody;                /* Buffer of data to upload */
+   int nBody;                      /* Size of aBody[] in bytes */
+   int iBody;                      /* Current offset in aBody[] */
+ 
+@@ -2975,7 +2975,8 @@
+       pReq->iLogId,
+       pReq->pJob->zLogmsg,
+       pReq->eMethod==SQLITE_BCV_METHOD_GET ? "GET" :
+-      pReq->eMethod==SQLITE_BCV_METHOD_PUT ? "PUT" : "DELETE",
++      pReq->eMethod==SQLITE_BCV_METHOD_PUT ? "PUT" :
++      pReq->eMethod==SQLITE_BCV_METHOD_POST ? "POST" : "DELETE",
+       zRetry ? zRetry : "", zUri
+     );
+     if( zMsg ){
+@@ -3114,6 +3115,13 @@
+         break;
+       }
+ 
++      case SQLITE_BCV_METHOD_POST:
++        curl_easy_setopt(pCurl, CURLOPT_POST, 1L);
++        curl_easy_setopt(pCurl, CURLOPT_POSTFIELDS, (void*)pReq->aBody);
++        curl_easy_setopt(pCurl, CURLOPT_POSTFIELDSIZE_LARGE,
++            (curl_off_t)pReq->nBody);
++        break;
++
+       default: assert( pReq->eMethod==SQLITE_BCV_METHOD_DELETE );
+         curl_easy_setopt(pCurl, CURLOPT_CUSTOMREQUEST, "DELETE");
+         curl_easy_setopt(pCurl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)0);
+@@ -4151,4 +4159,3 @@
+   return bcvEncrypt(pKey->pKey, (const u8*)aLocal, aData, nData);
+ }
+ 
+-
+
+--- a/bcvlog.c
++++ b/bcvlog.c
+@@ -99,6 +99,7 @@
+ }
+ 
+ 
++
+ /*
+ ** The logging-object mutex must be held to call this function. It
+ ** frees any log entries that should be freed according to the configured
+@@ -210,12 +211,13 @@
+ */
+ static const char *bcvLogMethodString(int eMethod){
+   const char *azRet[] = {
+-    0, "GET", "PUT", "DELETE", "HEAD"
++    0, "GET", "PUT", "DELETE", "HEAD", "POST"
+   };
+   assert( SQLITE_BCV_METHOD_GET==1 );
+   assert( SQLITE_BCV_METHOD_PUT==2 );
+   assert( SQLITE_BCV_METHOD_DELETE==3 );
+   assert( SQLITE_BCV_METHOD_HEAD==4 );
++  assert( SQLITE_BCV_METHOD_POST==5 );
+ 
+   assert( eMethod>=1 && eMethod<sizeof(azRet)/sizeof(azRet[0]) );
+   return azRet[eMethod];
+@@ -311,5 +313,3 @@
+   );
+ }
+ 
+-
+-
+

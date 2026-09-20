@@ -27,8 +27,10 @@ Google storage keeps its default endpoint exactly
 `https://storage.googleapis.com`. For a Google-compatible test service, pass
 an HTTP or HTTPS base endpoint; it must not contain `&` because it is encoded
 in the CBS module selector, and CBS trims trailing slashes before adding the
-bucket. The auth callback's bearer token is sent to this endpoint, so use test
-credentials with emulators:
+bucket. The XML API remains the default; select the JSON API explicitly with
+`AttachSpec::google_json(...)` or
+`AttachSpec::google_json_with_endpoint(...)`. The auth callback's bearer token
+is sent to this endpoint, so use test credentials with emulators:
 
 ```rust,no_run
 use rusqlite::blockcachevfs::AttachSpec;
@@ -38,16 +40,68 @@ let attach = AttachSpec::google_with_endpoint(
     "bucket",
     "http://127.0.0.1:4443/",
 );
+
+let json_attach = AttachSpec::google_json_with_endpoint(
+    "test-project",
+    "bucket/tenant-a",
+    "http://127.0.0.1:14091",
+);
 ```
 
-This uses the CBS module selector `google?endpoint=<base-url>` and requires a
-compatible Google XML API endpoint. `fake-gcs-server` can be useful for
-routing and read-request tests, but it is not an end-to-end CBS backend: its
-writes use the JSON upload API, while CBS writes use direct object PUTs. For
-routing/read tests, start it with its filesystem backend (`-scheme http -port
-4443 -backend filesystem`). The built-in Google module
-still uses its hard-coded `storage.googleapis.com` behavior unless this
-endpoint option is supplied.
+The XML selector `google?endpoint=<base-url>` requires a compatible Google XML
+API endpoint. `fake-gcs-server` can be used with the JSON selector for emulator
+integration (`-scheme http -port 14091`); the JSON endpoint is opt-in and does
+not change the XML default. The endpoint override is intended for local
+emulators and gateways; production Google storage keeps the hard-coded
+`storage.googleapis.com` base.
+
+S3 uses AWS Signature Version 4 for every request, including custom
+S3-compatible endpoints. The default constructor uses virtual-hosted AWS
+addressing; custom endpoints use path-style addressing. `bucket/prefix`
+containers are isolated to that prefix, and the native module uses ETags for
+conditional fetch, upload, and delete operations:
+
+```rust,no_run
+use rusqlite::blockcachevfs::{s3_secret_with_session_token, AttachSpec};
+
+let attach = AttachSpec::s3("ACCESS_KEY", "bucket/tenant-a", "us-east-1")
+    .alias("tenant-a");
+let local_s3 = AttachSpec::s3_with_endpoint(
+    "test",
+    "bucket/tenant-a",
+    "us-east-1",
+    "http://127.0.0.1:14567",
+);
+
+// Return this value from the VFS auth callback for temporary credentials.
+let secret = s3_secret_with_session_token("SECRET_ACCESS_KEY", "SESSION_TOKEN")
+    .expect("valid S3 credentials");
+```
+
+The S3 authentication callback returns the secret access key. For temporary
+credentials, return `secret-access-key\nsession-token` using the helper above;
+the session token is signed as `x-amz-security-token` and is never put in the
+module selector or URL. The strict Floci emulator at the endpoint above is a
+convenient local SigV4 test service.
+
+To reuse CBS's own emulator tests, provide a full upstream checkout and run
+the runner once per backend. It applies this repository's numbered patches to
+a disposable copy and runs the upstream `util_api1.test` and
+`util_upload2.test` plus `bcvfs_poll1.test`; it does not duplicate their test
+logic, and rewrites only that test's hard-coded container names to unique names
+in the disposable copy:
+
+```sh
+export BLOCKCACHEVFS_CBS_CHECKOUT=/path/to/cloudsqlite-trunk
+BLOCKCACHEVFS_S3_ENDPOINT=http://127.0.0.1:14567 \
+  tools/run_blockcachevfs_cbs_tests
+BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT=http://127.0.0.1:14091 \
+  tools/run_blockcachevfs_cbs_tests
+```
+
+The runner requires Tcl, libcurl, and OpenSSL development headers to build
+CBS's Tcl test binary. It exits with status 77 when an endpoint or checkout is
+not configured.
 
 For a multi-tenant endpoint, pass the remote container as `bucket/prefix` and
 choose a slash-free local alias. Attach, read, write, and upload paths then

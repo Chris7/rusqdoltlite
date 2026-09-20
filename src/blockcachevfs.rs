@@ -30,10 +30,36 @@ impl std::error::Error for AuthError {}
 pub type AuthCallback =
     dyn Fn(&str, &str, &str) -> std::result::Result<String, AuthError> + Send + Sync + 'static;
 
+/// Encode temporary S3 credentials for the CBS authentication callback.
+///
+/// CBS receives the access key in [`Storage::s3`] and the value returned by
+/// the callback as its secret.  A session token is represented by one newline
+/// separator: `secret-access-key\nsession-token`.  The native S3 module
+/// signs the token as `x-amz-security-token`; it is not placed in the module
+/// selector or URL.  Both values must be non-empty and may not contain a
+/// newline.
+pub fn s3_secret_with_session_token(
+    secret_access_key: impl AsRef<str>,
+    session_token: impl AsRef<str>,
+) -> std::result::Result<String, AuthError> {
+    let secret_access_key = secret_access_key.as_ref();
+    let session_token = session_token.as_ref();
+    if secret_access_key.is_empty()
+        || session_token.is_empty()
+        || secret_access_key.contains(['\r', '\n'])
+        || session_token.contains(['\r', '\n'])
+    {
+        return Err(AuthError(
+            "S3 secret access keys and session tokens must be non-empty and newline-free".into(),
+        ));
+    }
+    Ok(format!("{secret_access_key}\n{session_token}"))
+}
+
 /// Cloud storage identity and container.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Storage {
-    /// CBS provider name, such as `google` or `azure`.
+    /// CBS provider name, such as `google`, `s3`, or `azure`.
     pub provider: String,
     /// Provider account or project name.
     pub account: String,
@@ -63,6 +89,14 @@ impl Storage {
         Self::new("google", project, bucket)
     }
 
+    /// Construct a Google Cloud Storage specification using the JSON API.
+    ///
+    /// `bucket` may be `bucket/prefix` for a multi-tenant container.  The
+    /// authentication callback must return a Google bearer token.
+    pub fn google_json(project: impl Into<String>, bucket: impl Into<String>) -> Self {
+        Self::new("google?api=json", project, bucket)
+    }
+
     /// Construct a Google-compatible storage specification with a custom HTTP
     /// endpoint. `bucket` may be `bucket/prefix` for a multi-tenant container;
     /// when attaching it, use a slash-free local alias. The endpoint is an
@@ -77,6 +111,50 @@ impl Storage {
         Self::new(
             format!("google?endpoint={}", endpoint.as_ref()),
             project,
+            bucket,
+        )
+    }
+
+    /// Construct a Google-compatible JSON API specification with a custom
+    /// HTTP endpoint.  The endpoint is inserted into the CBS selector and
+    /// therefore must not contain `&` (or other selector syntax).
+    pub fn google_json_with_endpoint(
+        project: impl Into<String>,
+        bucket: impl Into<String>,
+        endpoint: impl AsRef<str>,
+    ) -> Self {
+        Self::new(
+            format!("google?api=json&endpoint={}", endpoint.as_ref()),
+            project,
+            bucket,
+        )
+    }
+
+    /// Construct an AWS S3 specification using the standard AWS endpoint.
+    ///
+    /// `access_key` is passed as the CBS account.  Return the secret access
+    /// key (or [`s3_secret_with_session_token`]) from the authentication
+    /// callback.  `bucket` may be `bucket/prefix`.
+    pub fn s3(
+        access_key: impl Into<String>,
+        bucket: impl Into<String>,
+        region: impl Into<String>,
+    ) -> Self {
+        Self::new(format!("s3?region={}", region.into()), access_key, bucket)
+    }
+
+    /// Construct an S3-compatible specification using a custom HTTP(S)
+    /// endpoint.  Custom endpoints use path-style addressing in the native
+    /// module, which makes this suitable for local S3 emulators.
+    pub fn s3_with_endpoint(
+        access_key: impl Into<String>,
+        bucket: impl Into<String>,
+        region: impl Into<String>,
+        endpoint: impl AsRef<str>,
+    ) -> Self {
+        Self::new(
+            format!("s3?region={}&endpoint={}", region.into(), endpoint.as_ref()),
+            access_key,
             bucket,
         )
     }
@@ -114,6 +192,11 @@ impl AttachSpec {
         Self::new(Storage::google(project, bucket))
     }
 
+    /// Construct a Google Cloud Storage JSON API attachment.
+    pub fn google_json(project: impl Into<String>, bucket: impl Into<String>) -> Self {
+        Self::new(Storage::google_json(project, bucket))
+    }
+
     /// Construct a Google-compatible attachment with a custom HTTP endpoint.
     /// `bucket` may be `bucket/prefix`; use [`Self::alias`] with a slash-free
     /// alias in that case. The endpoint is an HTTP or HTTPS base URL without
@@ -125,6 +208,43 @@ impl AttachSpec {
         endpoint: impl AsRef<str>,
     ) -> Self {
         Self::new(Storage::google_with_endpoint(project, bucket, endpoint))
+    }
+
+    /// Construct a Google-compatible JSON API attachment with a custom
+    /// endpoint.
+    #[must_use]
+    pub fn google_json_with_endpoint(
+        project: impl Into<String>,
+        bucket: impl Into<String>,
+        endpoint: impl AsRef<str>,
+    ) -> Self {
+        Self::new(Storage::google_json_with_endpoint(
+            project, bucket, endpoint,
+        ))
+    }
+
+    /// Construct an AWS S3 attachment.  The authentication callback should
+    /// return the secret access key, optionally encoded with
+    /// [`s3_secret_with_session_token`].
+    pub fn s3(
+        access_key: impl Into<String>,
+        bucket: impl Into<String>,
+        region: impl Into<String>,
+    ) -> Self {
+        Self::new(Storage::s3(access_key, bucket, region))
+    }
+
+    /// Construct an S3-compatible attachment using a custom endpoint.
+    #[must_use]
+    pub fn s3_with_endpoint(
+        access_key: impl Into<String>,
+        bucket: impl Into<String>,
+        region: impl Into<String>,
+        endpoint: impl AsRef<str>,
+    ) -> Self {
+        Self::new(Storage::s3_with_endpoint(
+            access_key, bucket, region, endpoint,
+        ))
     }
 
     /// Set the local alias.
@@ -210,8 +330,11 @@ impl Builder {
 
     /// Set the cloud authentication callback.
     ///
-    /// The returned bearer token is sent to the selected storage endpoint;
-    /// use test credentials when targeting an emulator.
+    /// The callback owns the provider credential material.  Google returns a
+    /// bearer token, while S3 returns the secret access key (or the newline
+    /// encoding produced by [`s3_secret_with_session_token`]); the native
+    /// module keeps those credentials out of request URLs and logs.  Use test
+    /// credentials when targeting an emulator.
     #[must_use]
     pub fn auth_callback<F>(mut self, callback: F) -> Self
     where
@@ -494,6 +617,45 @@ mod tests {
             local.storage.provider,
             "google?endpoint=http://localhost:4443/"
         );
+    }
+
+    #[test]
+    fn google_json_and_s3_selectors_are_exact() {
+        assert_eq!(
+            Storage::google_json("project", "bucket/prefix").provider,
+            "google?api=json"
+        );
+        assert_eq!(
+            Storage::google_json_with_endpoint("project", "bucket", "http://127.0.0.1:14091/")
+                .provider,
+            "google?api=json&endpoint=http://127.0.0.1:14091/"
+        );
+
+        let s3 = AttachSpec::s3("access", "bucket/prefix", "us-west-2").alias("local");
+        assert_eq!(s3.storage.provider, "s3?region=us-west-2");
+        assert_eq!(s3.storage.account, "access");
+        assert_eq!(s3.storage.container, "bucket/prefix");
+        assert_eq!(
+            AttachSpec::s3_with_endpoint(
+                "access",
+                "bucket",
+                "us-east-1",
+                "http://127.0.0.1:14567/"
+            )
+            .storage
+            .provider,
+            "s3?region=us-east-1&endpoint=http://127.0.0.1:14567/"
+        );
+    }
+
+    #[test]
+    fn s3_session_credentials_use_one_unambiguous_separator() {
+        assert_eq!(
+            s3_secret_with_session_token("secret", "session").expect("valid credentials"),
+            "secret\nsession"
+        );
+        assert!(s3_secret_with_session_token("", "session").is_err());
+        assert!(s3_secret_with_session_token("secret", "bad\ntoken").is_err());
     }
 
     #[test]
