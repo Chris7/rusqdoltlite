@@ -91,6 +91,100 @@ jobs:
           RUSTFLAGS: -Ctarget-feature=+crt-static -Cdebuginfo=1
         run: cargo build --features bundled
 
+  blockcachevfs-backends:
+    name: Blockcache VFS backends
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: hecrj/setup-rust-action@v2
+        with:
+          rust-version: stable
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: blockcachevfs }
+      - name: Install blockcachevfs test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential libcurl4-openssl-dev libssl-dev pkg-config tcl-dev
+      - name: Fetch full pinned CBS checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          checkout="${RUNNER_TEMP}/cloudsqlite-cbs"
+          libdoltlite-sys/fetch_blockcachevfs.sh --checkout "$checkout"
+          {
+            echo "BLOCKCACHEVFS_CBS_CHECKOUT=$checkout"
+            echo "BLOCKCACHEVFS_SOURCE_DIR=$checkout/src"
+          } >> "$GITHUB_ENV"
+      - name: Rust blockcachevfs feature tests
+        run: cargo test --workspace --features blockcachevfs --all-targets --verbose
+      - name: Start pinned emulator containers
+        run: |
+          set -euo pipefail
+          docker run --detach \
+            --name rusqdoltlite-blockcache-gcs \
+            --publish 4443:4443 \
+            fsouza/fake-gcs-server:1.54.0 \
+            -scheme http -port 4443 -backend memory
+          docker run --detach \
+            --name rusqdoltlite-blockcache-s3 \
+            --publish 4566:4566 \
+            --env FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
+            floci/floci:2.1.0
+      - name: Wait for emulator readiness
+        id: emulator_readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcs_ready=0
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:4443/storage/v1/b >/dev/null; then
+              gcs_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$gcs_ready" -ne 1 ]; then
+            docker logs rusqdoltlite-blockcache-gcs
+            exit 1
+          fi
+
+          s3_ready=0
+          for _ in $(seq 1 90); do
+            if curl --fail --silent --show-error --max-time 2 \
+              --output /dev/null http://127.0.0.1:4566/_localstack/health; then
+              s3_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$s3_ready" -ne 1 ]; then
+            docker logs rusqdoltlite-blockcache-s3
+            exit 1
+          fi
+      - name: Run shared CBS suite against Google JSON
+        if: always() && steps.emulator_readiness.outcome == 'success'
+        env:
+          BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT: http://127.0.0.1:4443
+          BLOCKCACHEVFS_GOOGLE_PROJECT: test-project
+          BLOCKCACHEVFS_GOOGLE_TOKEN: test-token
+        run: tools/run_blockcachevfs_cbs_tests
+      - name: Run shared CBS suite against S3
+        if: always() && steps.emulator_readiness.outcome == 'success'
+        env:
+          BLOCKCACHEVFS_S3_ENDPOINT: http://127.0.0.1:4566
+          BLOCKCACHEVFS_S3_ACCESS_KEY: test
+          BLOCKCACHEVFS_S3_SECRET: test
+          BLOCKCACHEVFS_S3_REGION: us-east-1
+        run: tools/run_blockcachevfs_cbs_tests
+      - name: Emulator logs and cleanup
+        if: always()
+        run: |
+          docker ps -a --filter name=rusqdoltlite-blockcache || true
+          docker logs rusqdoltlite-blockcache-gcs || true
+          docker logs rusqdoltlite-blockcache-s3 || true
+          docker rm --force rusqdoltlite-blockcache-gcs rusqdoltlite-blockcache-s3 || true
+
   test-sqlite-wasm:
     name: Test wasm32-unknown-unknown
     runs-on: ubuntu-latest

@@ -93,6 +93,9 @@ in the disposable copy:
 
 ```sh
 export BLOCKCACHEVFS_CBS_CHECKOUT=/path/to/cloudsqlite-trunk
+# Or fetch the exact pinned checkout used by CI:
+# libdoltlite-sys/fetch_blockcachevfs.sh --checkout "$BLOCKCACHEVFS_CBS_CHECKOUT"
+export BLOCKCACHEVFS_SOURCE_DIR="$BLOCKCACHEVFS_CBS_CHECKOUT/src"
 BLOCKCACHEVFS_S3_ENDPOINT=http://127.0.0.1:14567 \
   tools/run_blockcachevfs_cbs_tests
 BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT=http://127.0.0.1:14091 \
