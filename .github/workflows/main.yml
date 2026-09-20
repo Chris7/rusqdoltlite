@@ -107,6 +107,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes build-essential libcurl4-openssl-dev libssl-dev pkg-config tcl-dev
+      - name: Locate Tcl headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          tcl_header="$(find /usr/include /usr/local/include -type f -name tcl.h -print -quit 2>/dev/null || true)"
+          if [ -z "$tcl_header" ]; then
+            echo "tcl.h was not found after installing tcl-dev" >&2
+            exit 1
+          fi
+          tcl_include="$(dirname "$tcl_header")"
+          existing_cppflags="${CPPFLAGS:-}"
+          if [ -n "$existing_cppflags" ]; then
+            printf 'CPPFLAGS=%s -I%s\n' "$existing_cppflags" "$tcl_include" >> "$GITHUB_ENV"
+          else
+            printf 'CPPFLAGS=-I%s\n' "$tcl_include" >> "$GITHUB_ENV"
+          fi
       - name: Fetch full pinned CBS checkout
         shell: bash
         run: |
