@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - gcs
   pull_request:
     branches:
       - master
