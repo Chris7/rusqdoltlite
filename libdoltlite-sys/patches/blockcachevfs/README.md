@@ -34,3 +34,43 @@ workflow is added.
 
 Google JSON bucket destroy has the same empty-bucket restriction and refuses a
 configured prefix. The legacy Google XML destroy behavior is unchanged.
+
+`0004-create-if-not-exists.patch` adds the safe bootstrap primitive used by
+the Rust API. It creates `manifest.bcv` with provider conditional-create
+semantics (`ifGenerationMatch=0` for Google JSON, generation `0` for Google
+XML, and `If-None-Match: *` for S3) and falls back to provider bucket creation
+after a missing-manifest/indeterminate (5xx) preflight or failed first
+request. Existing manifests therefore fail without being
+overwritten, including when two initializers race.
+
+`0005-vfs-access.patch` makes the VFS `xAccess` callback report attached
+container and manifest database paths accurately. This is required by
+DoltLite's normal database-open sequence, which probes the container path
+before opening the remote database.
+
+`0006-manifest-file-size.patch` reports the finite block-rounded extent of a
+database instead of CBS's large compatibility sentinel. This keeps clients
+that scan file extents, including DoltLite's chunk store, within the attached
+manifest's blocks.
+
+`0008-safe-wal-header-read.patch` bounds CBS's WAL-header byte adjustments to
+the requested read buffer. This avoids writing beyond short SQLite header
+reads used by clients such as DoltLite.
+
+`0009-doltlite-lock-sidecar.patch` recognizes DoltLite's `.<db>-lock`
+sidecar as an internal local lock file when the inner database exists in the
+attached manifest. It keeps the container client reference and delegates
+locking to the underlying local VFS without adding the sidecar to the main
+database file list, writing a marker, or opening a cache file.
+
+`0010-doltlite-truncate-noop.patch` permits a block-rounded no-op truncate
+when the manifest database has no dirty-block allocation. Actual shrinking
+still requires the allocation and uses the existing undirty path.
+
+`0011-doltlite-upload-lock.patch` calls DoltLite's upload-lock hook around the
+checkpoint for each uploaded database and keeps the resulting graph lock until
+cleanup after the upload. `SQLITE_NOTFOUND` means the database is not a
+DoltLite store and preserves CBS's stock checkpoint path; other hook errors
+abort the upload. The Rust build enables this integration with the
+`BCV_DOLTLITE_INTEGRATION` define; standalone CBS builds therefore retain the
+stock path without requiring DoltLite symbols.

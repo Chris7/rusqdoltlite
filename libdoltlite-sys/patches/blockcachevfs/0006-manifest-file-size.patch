@@ -1,0 +1,26 @@
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -1919,7 +1919,21 @@ static int bcvfsFileSize(sqlite3_file *pFd, sqlite3_int64 *pSize){
+     case BCVFS_PASSTHRU_FILE:
+       rc = pFile->pFile->pMethods->xFileSize(pFile->pFile, pSize);
+       break;
+
+     default: {
++      if( eType==BCVFS_DATABASE_FILE ){
++        sqlite3_bcvfs *pFs = pFile->pFs;
++        /* The large sentinel used by the original VFS is unsuitable for
++        ** clients that scan the file extent (including DoltLite). Resolve
++        ** the current manifest before reporting the block-backed extent. */
++        ENTER_VFS_MUTEX; {
++          rc = bcvfsGetManifestRef(pFile, SQLITE_IOERR);
++          if( rc==SQLITE_OK ){
++            *pSize = (sqlite3_int64)pFile->pManDb->nBlkLocal
++                   * pFile->pMan->szBlk;
++          }
++        } LEAVE_VFS_MUTEX;
++        break;
++      }
+       assert( eType==BCVFS_DATABASE_FILE || eType==BCVFS_PROXY_FILE );
+       *pSize = ((sqlite3_int64)1 << (16 + 31)) - (1<<16);
+       break;

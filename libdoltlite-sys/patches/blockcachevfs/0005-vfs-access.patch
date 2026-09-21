@@ -1,0 +1,45 @@
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -3405,8 +3405,39 @@ static int bcvfsAccess(
+   const char *zPath, 
+   int flags, 
+   int *pResOut
+ ){
+-  int rc = SQLITE_OK;
++  sqlite3_bcvfs *pFs = (sqlite3_bcvfs*)pVfs;
++  BcvDbPath *pPath = 0;
++  int rc;
++  (void)flags;
+   *pResOut = 0;
+-  return rc;
++
++  /* SQLite asks xAccess() about the local-looking names used by this VFS.
++  ** Report the attached manifest state instead of unconditionally saying
++  ** that every CBS database is absent. In particular, DoltLite probes the
++  ** container directory before opening its database file. */
++  rc = bcvfsDecodeName(pFs, zPath, &pPath);
++  if( rc==SQLITE_OK && pPath && (pPath->zContainer || pPath->zDatabase) ){
++    ENTER_VFS_MUTEX; {
++      Container *pCont = 0;
++      if( pPath->zContainer ){
++        pCont = bcvfsFindContAlias(&pFs->c, pPath->zContainer, 0);
++        if( pCont ){
++          *pResOut = 1;
++          if( pPath->zDatabase ){
++            ManifestDb *pDb = bcvfsFindDatabase(
++                pCont->pMan, pPath->zDatabase, -1
++            );
++            *pResOut = (pDb && pDb->nBlkLocal>0);
++          }
++        }
++      }
++    } LEAVE_VFS_MUTEX;
++    sqlite3_free(pPath);
++    return SQLITE_OK;
++  }
++  sqlite3_free(pPath);
++
++  /* Preserve normal access checks for temporary and non-CBS paths. */
++  return pFs->c.pVfs->xAccess(pFs->c.pVfs, zPath, flags, pResOut);
+ }

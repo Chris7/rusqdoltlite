@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::error::{check, Error};
 use crate::{Connection, OpenFlags, Result};
 
+use crate::ffi::bcvutil as raw_util;
 use crate::ffi::blockcachevfs as raw;
 
 /// An error returned by an authentication callback.
@@ -192,7 +193,9 @@ impl AttachSpec {
         Self::new(Storage::google(project, bucket))
     }
 
-    /// Construct a Google Cloud Storage JSON API attachment.
+    /// Construct a Google Cloud Storage JSON API attachment. `bucket` may be
+    /// `bucket/prefix`; use [`Self::alias`] with a slash-free alias in that
+    /// case.
     pub fn google_json(project: impl Into<String>, bucket: impl Into<String>) -> Self {
         Self::new(Storage::google_json(project, bucket))
     }
@@ -211,7 +214,9 @@ impl AttachSpec {
     }
 
     /// Construct a Google-compatible JSON API attachment with a custom
-    /// endpoint.
+    /// endpoint. `bucket` may be `bucket/prefix`; use [`Self::alias`] with a
+    /// slash-free alias in that case. The endpoint is an HTTP or HTTPS base
+    /// URL, must not contain `&`, and is sent the callback's bearer token.
     #[must_use]
     pub fn google_json_with_endpoint(
         project: impl Into<String>,
@@ -480,7 +485,9 @@ impl BlockCacheVfs {
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Connection> {
         self.open_with_flags(
             path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
     }
 
@@ -505,6 +512,125 @@ impl BlockCacheVfs {
         })
     }
 
+    /// Initialize a new CBS container and manifest if it does not exist.
+    ///
+    /// This operation is non-destructive: an existing manifest is rejected
+    /// by a provider conditional-create request and remains unchanged. Only
+    /// call it for a new storage container or prefix. CBS also attempts to
+    /// create a provider bucket when its backend supports that operation; for
+    /// providers where bucket creation is privileged, create it with the
+    /// provider's management API first.
+    pub fn initialize_container(&self, storage: &Storage) -> Result<()> {
+        let handle = self.open_bcv(storage, "initialize_container")?;
+        let rc = unsafe { raw_util::sqlite3_bcv_create_if_not_exists(handle.0, 0, 0) };
+        bcv_result("initialize_container", rc, &handle)
+    }
+
+    /// Upload a valid, non-empty local SQLite database as a new remote name.
+    ///
+    /// The storage container must already have been initialized with
+    /// [`Self::initialize_container`]. This is the bootstrap operation for a
+    /// new remote database; [`Self::upload`] flushes changes to an attached
+    /// database and is not a replacement for this method.
+    pub fn create_database(
+        &self,
+        storage: &Storage,
+        local_path: impl AsRef<Path>,
+        remote_name: &str,
+    ) -> Result<()> {
+        let local_path = local_path.as_ref();
+        let metadata = std::fs::metadata(local_path).map_err(|error| {
+            Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_CANTOPEN),
+                Some(format!(
+                    "create_database: cannot inspect local database: {error}"
+                )),
+            )
+        })?;
+        if metadata.len() == 0 {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_MISMATCH),
+                Some("create_database: local database is empty".into()),
+            ));
+        }
+        let local = cstring_path(local_path)?;
+        let remote = CString::new(remote_name).map_err(Error::NulError)?;
+        if remote_name.is_empty() {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_MISMATCH),
+                Some("create_database: remote name is empty".into()),
+            ));
+        }
+
+        // Open read-only through rusqlite first so an arbitrary non-empty
+        // file cannot be advertised as a database to the native uploader.
+        let connection = Connection::open_with_flags(
+            local_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let _: i64 = connection.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        connection.close().map_err(|(_, error)| error)?;
+
+        let handle = self.open_bcv(storage, "create_database")?;
+        let rc = unsafe { raw_util::sqlite3_bcv_upload(handle.0, local.as_ptr(), remote.as_ptr()) };
+        bcv_result("create_database", rc, &handle)
+    }
+
+    fn open_bcv(&self, storage: &Storage, operation: &str) -> Result<BcvHandle> {
+        let module = CString::new(storage.provider.as_str()).map_err(Error::NulError)?;
+        let account = CString::new(storage.account.as_str()).map_err(Error::NulError)?;
+        let container = CString::new(storage.container.as_str()).map_err(Error::NulError)?;
+        let auth = self.auth_for(storage)?;
+        let mut handle = ptr::null_mut();
+        let rc = unsafe {
+            raw_util::sqlite3_bcv_open(
+                module.as_ptr(),
+                account.as_ptr(),
+                auth.as_ptr(),
+                container.as_ptr(),
+                &mut handle,
+            )
+        };
+        let handle = BcvHandle(handle);
+        if rc == crate::ffi::SQLITE_OK {
+            if handle.0.is_null() {
+                return Err(Error::SqliteFailure(
+                    crate::ffi::Error::new(crate::ffi::SQLITE_NOMEM),
+                    Some(format!("{operation}: native API returned a null handle")),
+                ));
+            }
+            Ok(handle)
+        } else {
+            Err(bcv_error(operation, rc, &handle))
+        }
+    }
+
+    fn auth_for(&self, storage: &Storage) -> Result<CString> {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self._auth.callback)(
+                storage.provider.as_str(),
+                storage.account.as_str(),
+                storage.container.as_str(),
+            )
+        }));
+        let token = match result {
+            Ok(Ok(token)) => token,
+            Ok(Err(error)) => {
+                return Err(Error::SqliteFailure(
+                    crate::ffi::Error::new(crate::ffi::SQLITE_AUTH),
+                    Some(format!("CBS authentication callback failed: {error}")),
+                ))
+            }
+            Err(_) => {
+                return Err(Error::SqliteFailure(
+                    crate::ffi::Error::new(crate::ffi::SQLITE_ERROR),
+                    Some("CBS authentication callback panicked".into()),
+                ))
+            }
+        };
+        CString::new(token).map_err(Error::NulError)
+    }
+
     fn with_container<F>(&self, name: &str, call: F) -> Result<()>
     where
         F: FnOnce(&CStr, *mut *mut c_char) -> c_int,
@@ -513,6 +639,50 @@ impl BlockCacheVfs {
         let mut err = ptr::null_mut();
         result_with_err(call(&container, &mut err), &mut err)
     }
+}
+
+struct BcvHandle(*mut raw_util::sqlite3_bcv);
+
+impl Drop for BcvHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { raw_util::sqlite3_bcv_close(self.0) };
+        }
+    }
+}
+
+fn bcv_result(operation: &str, rc: c_int, handle: &BcvHandle) -> Result<()> {
+    if rc == crate::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(bcv_error(operation, rc, handle))
+    }
+}
+
+fn bcv_error(operation: &str, rc: c_int, handle: &BcvHandle) -> Error {
+    let detail = if handle.0.is_null() {
+        None
+    } else {
+        unsafe {
+            let message = raw_util::sqlite3_bcv_errmsg(handle.0);
+            (!message.is_null()).then(|| CStr::from_ptr(message).to_string_lossy().into_owned())
+        }
+    };
+    let message = match detail {
+        Some(detail) if !detail.is_empty() => {
+            format!("{operation} failed (native/HTTP code {rc}): {detail}")
+        }
+        _ => format!("{operation} failed (native/HTTP code {rc})"),
+    };
+    // bcvutil may return HTTP status codes (>= 400), which are not SQLite
+    // result codes. Keep the original code in the message and expose a valid
+    // SQLite error category to callers.
+    let sqlite_code = if rc >= 400 {
+        crate::ffi::SQLITE_IOERR
+    } else {
+        rc
+    };
+    Error::SqliteFailure(crate::ffi::Error::new(sqlite_code), Some(message))
 }
 
 fn cstring_path(path: &Path) -> Result<CString> {

@@ -356,6 +356,7 @@ mod build_bundled {
             .include(&stage)
             .flag("-DSQLITE_CORE")
             .flag("-DSQLITE_THREADSAFE=1")
+            .define("BCV_DOLTLITE_INTEGRATION", None)
             .warnings(false);
 
         // CBS uses libcurl and OpenSSL directly.  Prefer pkg-config when the

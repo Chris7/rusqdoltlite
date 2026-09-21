@@ -31,3 +31,9 @@ Each patch owns one independently removable behavior. Currently,
 
 Keep new behavior isolated the same way so an upstreamed fix can be removed
 without rebasing unrelated changes.
+
+`0003-support-blockcachevfs-upload-lock.patch` exports the DoltLite graph-lock
+hooks used by the CBS upload integration. The upload-side patch holds that
+lock across checkpointing and manifest installation so an upload observes a
+stable block set; a database without a DoltLite store reports `SQLITE_NOTFOUND`
+and retains CBS's stock behavior.

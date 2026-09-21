@@ -1,0 +1,54 @@
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -16,6 +16,11 @@
+ #include <openssl/hmac.h>
+ #include <openssl/sha.h>
+ #include <openssl/md5.h>
++
++#ifdef BCV_DOLTLITE_INTEGRATION
++SQLITE_API int SQLITE_APICALL sqlite3_doltlite_bcvfs_upload_lock(sqlite3*,const char*,void**);
++SQLITE_API void SQLITE_APICALL sqlite3_doltlite_bcvfs_upload_unlock(void*);
++#endif
+ 
+ typedef struct BcvFileCache BcvFileCache;
+ typedef struct BcvKVStore BcvKVStore;
+@@ -4641,6 +4641,9 @@
+   i64 iDbId;
+   sqlite3 *db;
+   ManifestDb *pDb;
++#ifdef BCV_DOLTLITE_INTEGRATION
++  void *pDoltliteLock;
++#endif
+ };
+ 
+ typedef struct UploadBlockCtx UploadBlockCtx;
+@@ -5006,9 +5006,16 @@
+       if( rc==SQLITE_OK ){
+         int nLog = 0;
+         int nCkpt = 0;
+         BcvfsFile *pFile = 0;
++#ifdef BCV_DOLTLITE_INTEGRATION
++        rc = sqlite3_doltlite_bcvfs_upload_lock(
++            pUp->db, zDbPragma, &pUp->pDoltliteLock
++        );
++        if( rc==SQLITE_NOTFOUND ) rc = SQLITE_OK;
++        if( rc!=SQLITE_OK ) continue;
++#endif
+         sqlite3_file_control(pUp->db, "main", BCV_FCNTL_FD, (void*)&pFile);
+         pFile->bHoldCkpt = 1;
+         rc = sqlite3_wal_checkpoint_v2(
+             pUp->db, zDbPragma, SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt
+         );
+@@ -5159,5 +5168,11 @@
+         sqlite3_file_control(db, "main", BCV_FCNTL_FD, (void*)&pFile);
+         bcvfsReleaseCheckpointer(pFile);
++#ifdef BCV_DOLTLITE_INTEGRATION
++        if( ctx.aDb[iDb].pDoltliteLock ){
++          sqlite3_doltlite_bcvfs_upload_unlock(ctx.aDb[iDb].pDoltliteLock);
++          ctx.aDb[iDb].pDoltliteLock = 0;
++        }
++#endif
+         if( dbPragma==0 ) sqlite3_close(db);
+       }
+       sqlite3_free(ctx.aDb[iDb].zPath);

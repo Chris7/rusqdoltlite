@@ -108,6 +108,40 @@ pub mod blockcachevfs {
     }
 }
 
+/// Raw Cloud Backed SQLite database-management interface.
+#[cfg(feature = "blockcachevfs")]
+pub mod bcvutil {
+    use core::ffi::{c_char, c_int};
+
+    /// Opaque Cloud Backed SQLite database-management handle.
+    #[repr(C)]
+    pub struct sqlite3_bcv {
+        _private: [u8; 0],
+    }
+
+    unsafe extern "C" {
+        pub fn sqlite3_bcv_open(
+            z_module: *const c_char,
+            z_user: *const c_char,
+            z_auth: *const c_char,
+            z_container: *const c_char,
+            pp_out: *mut *mut sqlite3_bcv,
+        ) -> c_int;
+        pub fn sqlite3_bcv_close(handle: *mut sqlite3_bcv);
+        pub fn sqlite3_bcv_errmsg(handle: *mut sqlite3_bcv) -> *const c_char;
+        pub fn sqlite3_bcv_upload(
+            handle: *mut sqlite3_bcv,
+            z_local: *const c_char,
+            z_remote: *const c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcv_create_if_not_exists(
+            handle: *mut sqlite3_bcv,
+            sz_name: c_int,
+            sz_block: c_int,
+        ) -> c_int;
+    }
+}
+
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 mod remote {
     use core::ffi::{c_char, c_int, c_long};

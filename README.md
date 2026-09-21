@@ -23,6 +23,25 @@ When pkg-config cannot locate them, set
 The helper path above is for a source checkout; registry consumers should run
 the helper separately and pass the resulting absolute source directory.
 
+The supported distribution helper is also available at the repository root as
+`fetch_blockcachevfs.sh`; it is included in the `rusqdoltlite` package. It
+downloads the reviewed, checksum-pinned CBS sources on demand and never
+downloads from `build.rs`. A source-only asset is suitable for a feature build;
+CI and the upstream Tcl suite need a full checkout:
+
+```sh
+CBS_DIR=$(./fetch_blockcachevfs.sh)
+./fetch_blockcachevfs.sh --checkout "$PWD/.cache/cloudsqlite-checkout"
+BLOCKCACHEVFS_SOURCE_DIR="$CBS_DIR" cargo build --features blockcachevfs
+```
+
+The helper records a checksum marker, so repeating a request for the same
+validated destination is safe. It refuses to mix a different archive into a
+non-empty destination. When using a packaged crate, copy the root helper (or
+the equivalent helper from `libdoltlite-sys`) to a writable cache directory
+and set `BLOCKCACHEVFS_SOURCE_DIR` to its extracted source directory; CBS is
+not included in either crate archive.
+
 Google storage keeps its default endpoint exactly
 `https://storage.googleapis.com`. For a Google-compatible test service, pass
 an HTTP or HTTPS base endpoint; it must not contain `&` because it is encoded
@@ -49,11 +68,10 @@ let json_attach = AttachSpec::google_json_with_endpoint(
 ```
 
 The XML selector `google?endpoint=<base-url>` requires a compatible Google XML
-API endpoint. `fake-gcs-server` can be used with the JSON selector for emulator
-integration (`-scheme http -port 14091`); the JSON endpoint is opt-in and does
-not change the XML default. The endpoint override is intended for local
-emulators and gateways; production Google storage keeps the hard-coded
-`storage.googleapis.com` base.
+API endpoint. `fake-gcs-server` is exercised by the opt-in JSON emulator tests
+with `-scheme http -port 4443`; select the JSON API explicitly because the
+existing XML default remains unchanged. Production Google storage keeps the
+hard-coded `storage.googleapis.com` base.
 
 S3 uses AWS Signature Version 4 for every request, including custom
 S3-compatible endpoints. The default constructor uses virtual-hosted AWS
@@ -77,6 +95,28 @@ let local_s3 = AttachSpec::s3_with_endpoint(
 let secret = s3_secret_with_session_token("SECRET_ACCESS_KEY", "SESSION_TOKEN")
     .expect("valid S3 credentials");
 ```
+
+To bootstrap a new remote database, initialize a new container or prefix and
+upload a valid local SQLite file before attaching it:
+
+```rust,no_run
+use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Storage};
+
+# fn main() -> rusqlite::Result<()> {
+let vfs = BlockCacheVfs::builder("cache")?
+    .auth_callback(|_, _, _| Ok("test-token".to_owned()))
+    .init()?;
+let storage = Storage::google_json("test-project", "bucket/tenant-a");
+vfs.initialize_container(&storage)?; // fails if the storage/prefix exists
+vfs.create_database(&storage, "seed.sqlite", "database.sqlite")?;
+vfs.attach(&AttachSpec::new(storage).alias("tenant-a"))?;
+# Ok(()) }
+```
+
+`initialize_container` is a non-destructive create-if-absent operation: an
+existing manifest causes an error and remains unchanged. `create_database`
+requires a non-empty, valid SQLite file; after attachment, use `upload` to
+flush changes to that existing remote database.
 
 The S3 authentication callback returns the secret access key. For temporary
 credentials, return `secret-access-key\nsession-token` using the helper above;

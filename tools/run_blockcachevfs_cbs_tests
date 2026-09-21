@@ -82,7 +82,14 @@ cp -a "$checkout"/. "$tmp/"
 git -C "$tmp/src" apply \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0001-google-endpoint.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0002-google-json-api.patch" \
-  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0003-s3-module.patch"
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0003-s3-module.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0004-create-if-not-exists.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0005-vfs-access.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0006-manifest-file-size.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0008-safe-wal-header-read.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0009-doltlite-lock-sidecar.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0010-doltlite-truncate-noop.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0011-doltlite-upload-lock.patch"
 
 export BLOCKCACHEVFS_CBS_BASE_CONFIG="$checkout/test/config.tcl"
 cp "$repo_root/tools/blockcachevfs-cbs-config.tcl" "$tmp/test/config.tcl"

@@ -133,6 +133,8 @@ jobs:
             echo "BLOCKCACHEVFS_CBS_CHECKOUT=$checkout"
             echo "BLOCKCACHEVFS_SOURCE_DIR=$checkout/src"
           } >> "$GITHUB_ENV"
+      - name: Check distributed CBS helpers stay synchronized
+        run: tools/check_blockcachevfs_helper_sync
       - name: Rust blockcachevfs feature tests
         run: cargo test --workspace --features blockcachevfs --all-targets --verbose
       - name: Start pinned emulator containers
@@ -179,6 +181,16 @@ jobs:
             docker logs rusqdoltlite-blockcache-s3
             exit 1
           fi
+      - name: Rust bootstrap test against Google JSON
+        if: always() && steps.emulator_readiness.outcome == 'success'
+        env:
+          BLOCKCACHEVFS_GCS_EMULATOR: http://127.0.0.1:4443
+        run: cargo test --test blockcachevfs_emulator --features blockcachevfs -- --ignored --exact google_json_emulator_bootstrap
+      - name: Rust bootstrap test against S3
+        if: always() && steps.emulator_readiness.outcome == 'success'
+        env:
+          BLOCKCACHEVFS_S3_EMULATOR: http://127.0.0.1:4566
+        run: cargo test --test blockcachevfs_emulator --features blockcachevfs -- --ignored --exact s3_emulator_bootstrap
       - name: Run shared CBS suite against Google JSON
         if: always() && steps.emulator_readiness.outcome == 'success'
         env:

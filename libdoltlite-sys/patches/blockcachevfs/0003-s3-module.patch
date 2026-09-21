@@ -224,13 +224,13 @@
 +  p->nMaxResults = nMaxResults;
 +  p->zAccessKey = sqlite3_mprintf("%s", zUser);
 +  p->zSecretKey = zNewline
-+      ? sqlite3_mprintf("%.*s", (int)(zNewline-zSecret))
++      ? sqlite3_mprintf("%.*s", (int)(zNewline-zSecret), zSecret)
 +      : sqlite3_mprintf("%s", zSecret);
 +  p->zSessionToken = zNewline && zNewline[1]
 +      ? sqlite3_mprintf("%s", zNewline+1) : 0;
 +  p->zRegion = sqlite3_mprintf("%s", zRegion);
 +  p->zBucket = zSlash
-+      ? sqlite3_mprintf("%.*s", (int)(zSlash-zContainer))
++      ? sqlite3_mprintf("%.*s", (int)(zSlash-zContainer), zContainer)
 +      : sqlite3_mprintf("%s", zContainer);
 +  if( zSlash && zSlash[1] ){
 +    p->zPrefix = sqlite3_mprintf("%s", zSlash+1);
