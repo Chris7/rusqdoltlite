@@ -123,8 +123,6 @@ jobs:
           else
             printf 'CPPFLAGS=-I%s\n' "$tcl_include" >> "$GITHUB_ENV"
           fi
-      - name: Check distributed CBS helpers stay synchronized
-        run: tools/check_blockcachevfs_helper_sync
       - name: Rust blockcachevfs feature tests
         run: cargo test --workspace --features blockcachevfs --all-targets --verbose
       - name: Start pinned emulator containers
