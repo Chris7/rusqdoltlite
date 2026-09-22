@@ -1,0 +1,104 @@
+#
+# 19-July-2020
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_fault1
+
+bcv_install_vfs_wrapper
+
+#-------------------------------------------------------------------------
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 a1.db { 
+  CREATE TABLE ttt(x); 
+  INSERT INTO ttt VALUES(1), (2), (3);
+}
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach -alias c1 $cmd cont1
+bcvfs_attach -alias c2 $cmd cont1
+
+sqlite3 db2 /c1/a1.db -vfs bcvfs
+sqlite3 db3 /c2/a1.db -vfs bcvfs
+do_test 1.0 {
+  db3 eval { SELECT * FROM ttt }
+} {1 2 3}
+
+do_oom_ioerr_test 1 -prepare {
+  sqlite3 db /c2/a1.db -vfs bcvfs
+  db eval { INSERT INTO ttt VALUES('xyz') }
+  db2 eval { 
+    INSERT INTO ttt VALUES('abc');
+    PRAGMA bcv_upload;
+  }
+} -body {
+  db eval { PRAGMA bcv_poll }
+} -test {
+  set res {1 {cannot update manifest - write collision on database a1.db}}
+  test_result $res {1 {SQL logic error}}
+  db close
+}
+
+catch { db close }
+db2 close
+db3 close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 a1.db { 
+  CREATE TABLE ttt(x); 
+  INSERT INTO ttt VALUES(1), (2), (3);
+  CREATE TABLE yyy(x); 
+  WITH s(i) AS (
+    SELECT 1000 UNION ALL SELECT i-1 FROM s WHERE i>1
+  )
+  INSERT INTO yyy SELECT randomblob(800) FROM s;
+}
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/a1.db -vfs bcvfs
+do_execsql_test 2.0 {
+  SELECT count(*) FROM yyy;
+  INSERT INTO ttt VALUES(4);
+} {1000}
+db close
+
+do_oom_test 2 -prepare {
+} -body {
+  set ::cmd [bcvfs_create testdir "bcvfs"]
+  set {} {}
+} -test {
+  set res {0 {}}
+  catch { $::cmd destroy }
+}
+
+catch { $::cmd destroy }
+
+#-------------------------------------------------------------------------
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_create_container cont2
+bcv_upload_new_db cont1 a1.db { 
+  CREATE TABLE x(y);
+}
+bcv_upload_new_db cont2 a2.db { 
+  CREATE TABLE x(y);
+}
+
+do_oom_test 3 -prepare {
+  bcv_mkdir testdir
+  set ::cmd [bcvfs_create testdir "bcvfs"]
+  bcvfs_attach $::cmd cont1
+} -body {
+  $::cmd detach cont1
+} -test {
+  set res {0 {}}
+  catch { $::cmd destroy }
+}
+
+finish_test
+

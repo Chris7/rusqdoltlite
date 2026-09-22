@@ -1,0 +1,71 @@
+#
+# 26-July-2021
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix proxy_delay2
+
+# This test is designed to run with the proxy.tcl/azurite combination 
+# only. Print an error message and exit if it cannot be found.
+if {[catch bcv_proxy_test msg]} { puts $msg ; exit }
+
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+}
+
+bcv_create_container cont
+bcv_upload_new_db cont t1.db {
+  CREATE TABLE yyy(x, y);
+  CREATE INDEX y1 ON yyy(x, y);
+  WITH s(i) AS (
+    VALUES(1) UNION ALL SELECT i+1 FROM s WHERE i < 40
+  )
+  INSERT INTO yyy SELECT hex(randomblob(300)), hex(randomblob(300)) FROM s;
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont
+
+sqlite3 db /cont/t1.db -vfs bcvfs
+bcv_proxy_config {
+   INSERT INTO new_client_message(pattern, action) VALUES
+      ('GET%', 'partial 30000')
+}
+
+
+puts "# This takes a while - ~15s"
+do_catchsql_test 1.1 {
+  PRAGMA integrity_check
+} {1 {SQL logic error}}
+
+db close
+$cmd destroy
+
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+$cmd config httptimeout 5
+bcvfs_attach $cmd cont
+
+sqlite3 db /cont/t1.db -vfs bcvfs
+bcv_proxy_config {
+    INSERT INTO new_client_message(pattern, action) VALUES
+      ('GET%', 'stallafter 30000')
+}
+
+puts "# This takes a while - ~20s"
+do_catchsql_test 1.2 {
+  PRAGMA integrity_check
+} {1 {SQL logic error}}
+
+db close
+$cmd destroy
+
+finish_test
+

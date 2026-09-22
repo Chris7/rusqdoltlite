@@ -4,43 +4,23 @@ This project is a fork of [`Rusqlite`](https://github.com/rusqlite/rusqlite) usi
 
 ## Cloud Backed SQLite block-cache VFS
 
-The optional `blockcachevfs` feature builds Cloud Backed SQLite's six VFS
-sources into the bundled DoltLite archive. CBS is not vendored because its
-upstream checkout has empty `COPYING` and `README` files. Fetch and review the
-checksum-pinned source with:
+The optional `blockcachevfs` feature builds Cloud Backed SQLite's VFS into the
+bundled DoltLite archive. The complete pinned Cloud Backed SQLite checkout is
+vendored under `libdoltlite-sys/cloudsqlite` and is included in the
+`libdoltlite-sys` crate package, so builds do not download native sources or
+require a source-directory environment variable:
 
 ```sh
-CBS_DIR=$(libdoltlite-sys/fetch_blockcachevfs.sh)
-BLOCKCACHEVFS_SOURCE_DIR="$CBS_DIR" cargo build --features blockcachevfs
+cargo build --features blockcachevfs
 ```
 
-The helper pins Fossil check-in
-`50e099ad7bf1d12d747f59b0af973d12809887480463fc9893846b0d6ee22e94` and
-SHA-256 `b322811e8ec4224753f2d9309ed0f011d81c9f2540ce81bd7b5a6a9550d7d03a`.
-The target also needs libcurl and OpenSSL development headers and libraries.
+The vendored checkout is from Fossil check-in
+`50e099ad7bf1d12d747f59b0af973d12809887480463fc9893846b0d6ee22e94`; the
+corresponding upstream source archive has SHA-256
+`b322811e8ec4224753f2d9309ed0f011d81c9f2540ce81bd7b5a6a9550d7d03a`.
+The target still needs libcurl and OpenSSL development headers and libraries.
 When pkg-config cannot locate them, set
 `BLOCKCACHEVFS_CURL_INCLUDE_DIR` and `BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR`.
-The helper path above is for a source checkout; registry consumers should run
-the helper separately and pass the resulting absolute source directory.
-
-The supported distribution helper is also available at the repository root as
-`fetch_blockcachevfs.sh`; it is included in the `rusqdoltlite` package. It
-downloads the reviewed, checksum-pinned CBS sources on demand and never
-downloads from `build.rs`. A source-only asset is suitable for a feature build;
-CI and the upstream Tcl suite need a full checkout:
-
-```sh
-CBS_DIR=$(./fetch_blockcachevfs.sh)
-./fetch_blockcachevfs.sh --checkout "$PWD/.cache/cloudsqlite-checkout"
-BLOCKCACHEVFS_SOURCE_DIR="$CBS_DIR" cargo build --features blockcachevfs
-```
-
-The helper records a checksum marker, so repeating a request for the same
-validated destination is safe. It refuses to mix a different archive into a
-non-empty destination. When using a packaged crate, copy the root helper (or
-the equivalent helper from `libdoltlite-sys`) to a writable cache directory
-and set `BLOCKCACHEVFS_SOURCE_DIR` to its extracted source directory; CBS is
-not included in either crate archive.
 
 Google storage keeps its default endpoint exactly
 `https://storage.googleapis.com`. For a Google-compatible test service, pass
@@ -124,18 +104,14 @@ the session token is signed as `x-amz-security-token` and is never put in the
 module selector or URL. The strict Floci emulator at the endpoint above is a
 convenient local SigV4 test service.
 
-To reuse CBS's own emulator tests, provide a full upstream checkout and run
-the runner once per backend. It applies this repository's numbered patches to
-a disposable copy and runs the upstream `util_api1.test` and
+To reuse CBS's own emulator tests, run the shared runner once per backend. It
+uses the same vendored checkout, applies this repository's numbered patches to
+a disposable copy, and runs the upstream `util_api1.test` and
 `util_upload2.test` plus `bcvfs_poll1.test`; it does not duplicate their test
 logic, and rewrites only that test's hard-coded container names to unique names
 in the disposable copy:
 
 ```sh
-export BLOCKCACHEVFS_CBS_CHECKOUT=/path/to/cloudsqlite-trunk
-# Or fetch the exact pinned checkout used by CI:
-# libdoltlite-sys/fetch_blockcachevfs.sh --checkout "$BLOCKCACHEVFS_CBS_CHECKOUT"
-export BLOCKCACHEVFS_SOURCE_DIR="$BLOCKCACHEVFS_CBS_CHECKOUT/src"
 BLOCKCACHEVFS_S3_ENDPOINT=http://127.0.0.1:14567 \
   tools/run_blockcachevfs_cbs_tests
 BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT=http://127.0.0.1:14091 \
@@ -143,8 +119,8 @@ BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT=http://127.0.0.1:14091 \
 ```
 
 The runner requires Tcl, libcurl, and OpenSSL development headers to build
-CBS's Tcl test binary. It exits with status 77 when an endpoint or checkout is
-not configured.
+CBS's Tcl test binary. It exits with status 77 when an endpoint is not
+configured.
 
 For a multi-tenant endpoint, pass the remote container as `bucket/prefix` and
 choose a slash-free local alias. Attach, read, write, and upload paths then

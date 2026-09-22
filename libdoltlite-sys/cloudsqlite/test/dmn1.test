@@ -1,0 +1,184 @@
+#
+# 08-Feb-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix dmn1
+
+#-------------------------------------------------------------------------
+# 1.*: Test that containers can be attached and detached, and that this
+#      is visible via virtual tables bcv_container and bcv_database 
+#      on connections opened on path "/".
+#
+
+bcv_create_container cont1
+bcv_create_container cont2
+bcv_create_container cont3
+bcv_create_container cont4
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE t1(x, y);
+  INSERT INTO t1 VALUES(1, 2);
+}
+bcv_upload_empty_database cont2 t2.db
+bcv_upload_empty_database cont3 t3.db
+bcv_upload_empty_database cont4 t4.db
+
+foreach bRestart {0 1} {
+  if {$bRestart} {
+    db close
+    wait_daemon 0
+    $cmd destroy
+  }
+
+  start_new_daemon 0 -log v
+  set cmd [bcvfs_create testdir.0 "bcvfs"]
+  sqlite3 db / -vfs bcvfs
+  sqlite3_bcvfs_register_vtab db
+
+  do_test 1.$bRestart.0 { $cmd isdaemon } 1
+
+  foreach {tn script qres} {
+    1 {
+      bcvfs_attach $cmd cont1
+    } {
+      cont1 cont1 0
+    }
+  
+    2 {
+      bcvfs_attach $cmd cont2
+      bcvfs_attach -alias c3 $cmd cont3
+    } {
+      c3 cont3 0
+      cont2 cont2 0
+      cont1 cont1 0
+    }
+  
+    3 {
+      $cmd detach cont2
+    } {
+      c3 cont3 0
+      cont1 cont1 0
+    }
+  
+    4 {
+      $cmd detach c3
+    } {
+      cont1 cont1 0
+    }
+  
+    5 {
+      $cmd detach cont1
+    } {
+    }
+  
+    6 {
+      bcvfs_attach $cmd cont1
+      bcvfs_attach $cmd cont2
+      bcvfs_attach -alias c3 $cmd cont3
+    } {
+      c3 cont3 0
+      cont2 cont2 0
+      cont1 cont1 0
+    }
+  } {
+    do_test 1.$bRestart.$tn.1 $script {}
+  
+    do_execsql_test 1.$bRestart.$tn.2 {
+      SELECT name, container, ncleanup FROM bcv_container
+    } $qres
+
+    if {$bRestart} {
+      db close
+      wait_daemon 0
+      $cmd destroy
+
+      start_daemon 0
+      set cmd [bcvfs_create testdir.0 "bcvfs"]
+      sqlite3 db / -vfs bcvfs
+      sqlite3_bcvfs_register_vtab db
+    }
+
+    do_execsql_test 1.$bRestart.$tn.3 {
+      SELECT name, container, ncleanup FROM bcv_container
+    } $qres
+  }
+}
+
+
+do_test 1.2.1 {
+  list [catch { bcvfs_attach $cmd cont2 } msg] $msg
+} {1 {1 container already attached: cont2}}
+
+do_test 1.2.2 {
+  list [catch { bcvfs_attach -ifnot $cmd cont2 } msg] $msg
+} {0 {}}
+
+do_execsql_test 1.2.3 {
+  SELECT name, container, ncleanup FROM bcv_container
+} {
+  c3 cont3 0
+  cont2 cont2 0
+  cont1 cont1 0
+}
+
+do_execsql_test 1.2.4 {
+  SELECT * FROM bcv_database
+} {
+  c3    t3.db 1 0 0 0 {} 0 0 0
+  cont2 t2.db 1 0 0 0 {} 0 0 0
+  cont1 t1.db 1 0 0 0 {} 0 0 0
+}
+
+db close
+$cmd destroy
+wait_daemon 0
+
+#-------------------------------------------------------------------------
+
+start_new_daemon 0
+
+set cmd [bcvfs_create testdir.0 "bcvfs"]
+sqlite3 db2 / -vfs bcvfs
+
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t1.db -vfs bcvfs
+
+do_execsql_test 2.0 {
+  SELECT * FROM t1;
+} {1 2}
+
+do_catch_test 2.1 {
+  $cmd detach cont1
+} {1 {rc=1: container is busy: cont1}}
+
+db close
+
+do_catch_test 2.2 {
+  $cmd detach cont1
+} {0 {}}
+
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1 -vfs bcvfs
+
+do_catch_test 2.3 {
+  $cmd detach cont1
+} {1 {rc=1: container is busy: cont1}}
+
+db close
+
+do_catch_test 2.4 {
+  $cmd detach cont1
+} {0 {}}
+
+do_catch_test 2.5 {
+  sqlite3 db /cont1/t1.db -vfs bcvfs
+} {1 {unable to open database file}}
+
+db2 close
+$cmd destroy
+wait_daemon 0
+
+finish_test
+

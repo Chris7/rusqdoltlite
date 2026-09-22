@@ -1,0 +1,101 @@
+#
+# 13-January-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_copy1
+
+bcv_create_container cont1
+
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  INSERT INTO x1 VALUES('hello', 'world');
+  INSERT INTO x1 VALUES('one', 'two');
+}
+
+bcv_upload_new_db cont1 t2.db {
+  CREATE TABLE y1(x, y);
+  INSERT INTO y1 VALUES('world', 'hello');
+  INSERT INTO y1 VALUES('two', 'one');
+}
+
+do_catch_test 1.0 {
+  bcv_copy_database -container cont1 t2.db t1.db
+} {1 {copy failed (1) - database t1.db already exists}}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t1.db -vfs bcvfs
+do_execsql_test 1.1 {
+  SELECT * FROM x1
+} {hello world one two}
+
+do_catch_test 1.2 {
+  bcv_copy_database -container cont1 t1.db t3.db
+  bcv_copy_database -container cont1 t3.db t4.db
+  bcv_copy_database -container cont1 t4.db t1.db
+} {1 {copy failed (1) - database t1.db already exists}}
+
+$cmd poll cont1
+do_execsql_test 1.3 {
+  SELECT * FROM x1
+} {hello world one two}
+
+do_catch_test 1.4 {
+  bcv_copy_database -container cont1 t1.db t5.db
+  bcv_copy_database -container cont1 t2.db t6.db
+  bcv_copy_database -container cont1 t1.db t7.db
+  bcv_copy_database -container cont1 t5.db t8.db
+  bcv_copy_database -container cont1 t8.db t5.db
+} {1 {copy failed (1) - database t5.db already exists}}
+
+$cmd poll cont1
+do_execsql_test 1.5 {
+  SELECT * FROM x1
+} {hello world one two}
+
+db close
+foreach file {t1.db t3.db t4.db t5.db t7.db t8.db} {
+  sqlite3 db /cont1/$file -vfs bcvfs
+  do_execsql_test 1.6.$file {
+    SELECT * FROM x1
+  } {hello world one two}
+  db close
+}
+
+foreach file {t2.db t6.db} {
+  sqlite3 db /cont1/$file -vfs bcvfs
+  do_execsql_test 1.7.$file {
+    SELECT * FROM y1
+  } {world hello two one}
+  db close
+}
+
+# Create two very long database names (more than 128 bytes):
+#
+set remote127 "tX[string repeat y 122].db"
+set remote128 "tX[string repeat y 123].db"
+
+do_test 1.8 {
+  bcv_copy_database -container cont1 t1.db $remote127
+} {}
+do_test 1.9 {
+  list [catch { bcv_copy_database -container cont1 t1.db $remote128 } msg] $msg
+} [list 1 "copy failed (1) - database name \"$remote128\" is too long (max = 127 bytes)"]
+
+$cmd poll cont1
+sqlite3 db /cont1/$file -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+do_execsql_test 1.10 {
+  SELECT database FROM bcv_database WHERE database LIKE 'tx%'
+} [list $remote127]
+
+db close
+
+$cmd destroy
+finish_test
+

@@ -1,5 +1,0 @@
-#!/bin/sh
-set -eu
-
-root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-cmp "$root/fetch_blockcachevfs.sh" "$root/libdoltlite-sys/fetch_blockcachevfs.sh"

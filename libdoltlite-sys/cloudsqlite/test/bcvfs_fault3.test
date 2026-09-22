@@ -1,0 +1,43 @@
+#
+# 12-May-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_fault1
+
+bcv_install_vfs_wrapper
+
+#-------------------------------------------------------------------------
+bcv_create_container cont1
+bcv_upload_new_db cont1 a1.db { 
+  CREATE TABLE ttt(x); 
+  CREATE INDEX i1 ON ttt(x);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<500
+  )
+  INSERT INTO ttt SELECT hex(randomblob(24)) FROM s;
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach -alias c1 $cmd cont1
+sqlite3 db /c1/a1.db -vfs bcvfs
+
+do_oom_ioerr_test 1 -prepare {
+} -body {
+  $::cmd prefetch_new pf c1 a1.db
+  pf run 1 1000
+  pf run 2 1000
+  pf run 3 1000
+  pf run 1000 1000
+} -test {
+  catch { pf destroy }
+  test_result {0 101} {0 7} {0 10}
+}
+
+db close
+$cmd destroy
+
+finish_test

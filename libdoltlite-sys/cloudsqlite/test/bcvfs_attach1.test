@@ -1,0 +1,100 @@
+#
+# 18-January-2022
+#
+#-------------------------------------------------------------------------
+#
+# This file tests the sqlite3_bcvfs_attach() API when used with an
+# in-process VFS.
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_attach1
+
+bcv_create_container mycont
+bcv_upload_new_db mycont xyz.db {
+  CREATE TABLE t1(x);
+  CREATE INDEX i1 ON t1(x);
+  INSERT INTO t1 VALUES(2), (4), (6);
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+file attributes testdir -permissions r-xr-xr-x
+
+do_test 1.1 {
+  list [catch {
+    bcvfs_attach $cmd mycont
+  } msg] $msg
+} {1 {14 failed to create directory: mycont}}
+
+catch { db close }
+$cmd destroy
+
+#-------------------------------------------------------------------------
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+
+do_test 2.1 {
+  bcvfs_attach $cmd mycont
+} {}
+
+do_test 2.2 {
+  list [catch {bcvfs_attach $cmd mycont} msg] $msg
+} {1 {5 container already attached: mycont}}
+
+do_test 2.3 {
+  list [catch {bcvfs_attach -ifnot $cmd mycont} msg] $msg
+} {0 {}}
+
+$cmd destroy
+
+#-------------------------------------------------------------------------
+bcv_create_container cont1 -blocksize [expr 128*1024]
+bcv_upload_new_db cont1 xyz.db {
+  CREATE TABLE x(y);
+}
+bcv_create_container cont2 -blocksize [expr 256*1024]
+bcv_upload_new_db cont2 abc.db {
+  CREATE TABLE x(y);
+}
+
+set ::cmd [bcvfs_create testdir bcvfs]
+do_test 3.1 {
+  bcvfs_attach $::cmd cont1
+} {}
+do_test 3.2 {
+  list [catch { bcvfs_attach $::cmd cont2 } msg] $msg
+} {1 {1 block size mismatch in container: cont2}}
+
+do_test 3.3b {
+  list [catch { bcvfs_attach $::cmd cont1 } msg] $msg
+} {1 {5 container already attached: cont1}}
+
+do_test 3.3a {
+  list [catch { bcvfs_attach -noerr $::cmd cont1 } msg] $msg
+} {1 5}
+
+$::cmd destroy
+
+#-------------------------------------------------------------------------
+# Test some error messages.
+#
+set ::cmd [bcvfs_create testdir bcvfs]
+
+do_catch_test 4.1 {
+  $::cmd attach aure $::C(user) cont1
+} {1 {1 no such module: aure}}
+
+do_catch_test 4.2 {
+  $::cmd attach azure?nosuchparam=1 $::C(user) cont1
+} {1 {1 bad parameter "nosuchparam" - must be "emulator" or "sas"}}
+
+do_catch_test 4.3 {
+  bcvfs_attach $::cmd nosuchcont
+} {1 {404 HTTP/1.1 404 The specified container does not exist.}}
+
+
+$::cmd destroy
+
+finish_test
+

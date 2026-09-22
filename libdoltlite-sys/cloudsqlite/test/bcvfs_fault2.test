@@ -1,0 +1,78 @@
+#
+# 03-Feb-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_fault2
+
+bcv_install_vfs_wrapper
+
+#-------------------------------------------------------------------------
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 a1.db { 
+  CREATE TABLE ttt(x); 
+  INSERT INTO ttt VALUES(1), (2), (3);
+}
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach -alias c1 $cmd cont1
+sqlite3 db /c1/a1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  DELETE FROM bcv_kv;
+  INSERT INTO bcv_kv VALUES('one', 'two');
+  INSERT INTO bcv_kv VALUES('three', 'four');
+}
+
+db close
+do_oom_test 1 -prepare {
+  sqlite3 db /c1/a1.db -vfs bcvfs
+  sqlite3_bcvfs_register_vtab db
+} -body {
+  db eval { SELECT * FROM bcv_kv }
+} -test {
+  set res {0 {one two three four}}
+  test_result $res {1 {no such table: bcv_kv}}
+  db close
+}
+
+sqlite3 dbdel /c1 -vfs bcvfs
+sqlite3_bcvfs_register_vtab dbdel
+
+do_oom_test 2 -prepare {
+  after 50
+  dbdel eval { DELETE FROM bcv_kv }
+  sqlite3 db /c1/a1.db -vfs bcvfs
+  sqlite3_bcvfs_register_vtab db
+  db eval { DELETE FROM bcv_kv WHERE name='filename.bin' }
+} -body {
+  db eval { INSERT INTO bcv_kv VALUES('filename.bin', 'datadatadata') }
+} -test {
+  set res {0 {}}
+  test_result $res {1 {no such table: bcv_kv}}
+  catch { db close }
+}
+
+do_oom_test 3 -prepare {
+  after 50
+  dbdel eval { 
+    DELETE FROM bcv_kv;
+    INSERT INTO bcv_kv VALUES('xyz', 'value');
+  }
+  sqlite3 db /c1/a1.db -vfs bcvfs
+  sqlite3_bcvfs_register_vtab db
+} -body {
+  db eval { DELETE FROM bcv_kv }
+} -test {
+  set res {0 {}}
+  test_result $res {1 {no such table: bcv_kv}}
+  catch { db close }
+}
+
+dbdel close
+$cmd destroy
+
+finish_test

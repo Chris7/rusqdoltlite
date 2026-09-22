@@ -1,0 +1,63 @@
+#
+# 26-July-2021
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix proxy_upload1
+
+# This test is designed to run with the proxy.tcl/azurite combination 
+# only. Print an error message and exit if it cannot be found.
+if {[catch bcv_proxy_test msg]} { puts $msg ; exit }
+
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+}
+
+bcv_create_container cont
+bcv_upload_new_db cont t1.db {
+  CREATE TABLE yyy(y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<1000
+  )
+  INSERT INTO yyy SELECT randomblob(4000) FROM s;
+}
+
+
+bcv_proxy_config {
+  INSERT INTO new_client_message(pattern, action) VALUES ('GET%', 'delay 100')
+}
+
+proc putslog {args} {
+  set str [lindex $args 0]
+  set pattern {.*\[(\d+)ms\].*}
+  if {[regexp $pattern $str -> ms]} {
+    lappend ::lTime $ms
+  }
+}
+
+file delete -force t1.db
+
+do_test 1.1 {
+  set bcv [bcv_open cont]
+  $bcv config log putslog
+  $bcv config nrequest 1
+  $bcv download t1.db t1.db
+} {0}
+do_test 1.2 {
+  $bcv errcode
+} {0}
+do_test 1.3 {
+  $bcv errmsg
+} {}
+$bcv close
+
+do_test 1.4 {
+  foreach t $::lTime {
+    if {$t<100} { error "time was $t ms - too short!" }
+  }
+} {}
+
+finish_test
+

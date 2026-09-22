@@ -1,0 +1,33 @@
+#
+# 13-February-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_file2
+
+bcv_mkdir testdir
+bcv_create_container -testnokv cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  INSERT INTO x1 VALUES('hello', 'world');
+}
+
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  SELECT value FROM bcv_kv WHERE name='blah';
+}
+do_execsql_test 1.1 {
+  INSERT INTO bcv_kv VALUES('abc', 'def');
+}
+
+db close
+$cmd destroy
+
+finish_test
+

@@ -1,0 +1,58 @@
+#
+# This file contains test cases focused on the sqlite3_bcv_upload() API.
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix util_upload1
+
+if {$C(use_sas)==0} { finish_test ; return }
+
+bcv_create_container cont
+
+bcv_upload_new_db cont t1.db {
+  CREATE TABLE x1(a, b);
+  INSERT INTO x1 VALUES(1, 2);
+}
+
+do_test 1.0 {
+  file delete -force x.db
+  sqlite3 db x.db
+  db eval {
+    CREATE TABLE x2(x, y);
+    INSERT INTO x2 VALUES('a', 'b');
+  }
+  db close
+} {}
+
+set bcv [bcv_open cont]
+do_test 1.1.1 {
+  $bcv upload x.db x1.db
+} {0}
+do_test 1.1.2 {
+  $bcv errcode
+} {0}
+do_test 1.1.3 {
+  $bcv errmsg
+} {}
+$bcv close
+
+proc xyz {args} {
+  puts $args
+}
+
+set bcv [bcv_open cont -auth [make_readonly_sas cont]]
+$bcv config log xyz
+do_test 1.2.1 {
+  $bcv upload x.db x2.db
+} {403}
+do_test 1.2.2 {
+  $bcv errcode
+} {403}
+do_test 1.2.3 {
+  string match "HTTP*403*" [$bcv errmsg]
+} {1}
+$bcv close
+
+
+finish_test
+

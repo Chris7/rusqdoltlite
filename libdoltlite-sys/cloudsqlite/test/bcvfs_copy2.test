@@ -1,0 +1,209 @@
+#
+# 13-January-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_copy2
+
+bcv_create_container cont1
+
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  INSERT INTO x1 VALUES('hello', 'world');
+  INSERT INTO x1 VALUES('one', 'two');
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  SELECT * FROM bcv_database
+} {
+  cont1 t1.db 1 1 0 0 {} 1 0 1
+}
+
+$cmd copy cont1 t1.db t2.db
+
+do_execsql_test 1.1 {
+  SELECT * FROM bcv_database
+} {
+  cont1 t1.db 1 1 0 0 {} 1 0 1
+  cont1 t2.db 1 1 0 0 copied 0 0 0
+}
+
+sqlite3 db2 /cont1/t2.db -vfs bcvfs
+do_execsql2_test 1.2 {
+  SELECT * FROM x1
+} {
+  hello world one two
+}
+do_execsql2_test 1.3 {
+  INSERT INTO x1 VALUES('A', 'B');
+  SELECT * FROM x1;
+} {
+  hello world one two A B
+}
+
+$cmd upload cont1 
+
+do_execsql2_test 1.4 {
+  SELECT * FROM x1;
+} {
+  hello world one two A B
+}
+
+$cmd copy cont1 t2.db t3.db
+do_execsql_test 1.5 {
+  SELECT * FROM bcv_database
+} {
+  cont1 t1.db 1 0 0 0 {} 1 0 1
+  cont1 t2.db 1 1 0 0 {} 1 0 0
+  cont1 t3.db 1 1 0 0 copied 0 0 0
+}
+
+db2 close
+db close
+$cmd destroy
+
+set cmd [bcvfs_create testdir bcvfs]
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.6 {
+  SELECT * FROM bcv_database
+} {
+  cont1 t1.db 1 1 0 0 {} 1 0 1
+  cont1 t2.db 1 1 0 0 {} 0 0 0
+  cont1 t3.db 1 1 0 0 copied 0 0 0
+}
+
+do_execsql_test 1.7 {
+  INSERT INTO x1 VALUES('yes', 'no');
+}
+
+$cmd upload cont1
+
+do_execsql_test 1.8 {
+  SELECT * FROM bcv_database
+} {
+  cont1 t1.db 1 1 0 0 {} 1 0 1
+  cont1 t2.db 1 1 0 0 {} 0 0 0
+  cont1 t3.db 1 1 0 0 {} 0 0 0
+}
+
+do_test 1.9 {
+  $cmd copy cont1 t1.db t4.db
+  set bcv [bcv_open cont1]
+  $bcv copy t1.db t5.db
+  $bcv close
+} {}
+
+$cmd poll cont1
+$cmd upload cont1
+
+db close
+$cmd destroy
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t4.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.10 {
+  SELECT database FROM bcv_database
+} {t1.db t2.db t3.db t5.db t4.db}
+
+do_execsql_test 1.11 {
+  SELECT * FROM x1;
+} {
+  hello world one two yes no
+}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+# Test some error cases that should prevent a poll from succeeding:
+#
+#   1) A database of the same name as a local database has been
+#      created remotely. And
+#
+#   2) Blocks required by a local database have been moved to the 
+#      delete list or deleted.
+#
+
+bcv_create_container cont1
+
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE t1(o, t);
+  INSERT INTO t1 VALUES(1, 2);
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+$cmd copy cont1 t1.db newname.db
+
+bcv_upload_new_db cont1 newname.db {
+  CREATE TABLE t2(a, b);
+}
+
+do_test 2.0 {
+  list [catch { $cmd poll cont1 } msg] $msg
+} {1 {cannot update manifest - write collision on database newname.db}}
+
+set bcv [bcv_open cont1]
+$bcv delete newname.db
+
+do_test 2.1 {
+  $cmd poll cont1
+} {}
+
+$bcv delete t1.db
+$bcv close
+
+do_test 2.2 {
+  list [catch { $cmd poll cont1 } msg] $msg
+} {1 {cannot update manifest - write collision on database newname.db}}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+# Ensure that local databases may not be copied.
+#
+
+bcv_create_container cont1
+
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE t1(o, t);
+  INSERT INTO t1 VALUES(1, 2);
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_test 3.1 {
+  $cmd copy cont1 t1.db t2.db
+} {}
+
+do_test 3.2 {
+  list [catch { $cmd copy cont1 t2.db t3.db } msg] $msg
+} {1 {1 cannot copy database t2.db}}
+
+db close
+$cmd destroy
+finish_test
+

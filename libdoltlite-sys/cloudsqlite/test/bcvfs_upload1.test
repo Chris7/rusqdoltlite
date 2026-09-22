@@ -1,0 +1,261 @@
+#
+# 13-January-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_upload1
+
+
+#-------------------------------------------------------------------------
+#
+bcv_mkdir testdir
+bcv_create_container cont1
+
+bcv_upload_new_db cont1 x1.db {
+  CREATE TABLE t1(a, b);
+}
+bcv_upload_new_db cont1 x2.db {
+  CREATE TABLE t1(a, b);
+}
+bcv_upload_new_db cont1 x3.db {
+  CREATE TABLE t1(a, b);
+}
+
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach $cmd cont1
+
+sqlite3 db1 /cont1/x1.db -vfs bcvfs
+sqlite3 db2 /cont1/x2.db -vfs bcvfs
+
+do_test 1.0 {
+  db1 eval {
+    INSERT INTO t1 VALUES(1, 2);
+    INSERT INTO t1 VALUES(3, 4);
+  }
+  db2 eval {
+    INSERT INTO t1 VALUES('a', 'b');
+    INSERT INTO t1 VALUES('c', 'd');
+  }
+} {}
+
+do_test 1.1 {
+  db2 eval { PRAGMA wal_checkpoint }
+  db1 eval { PRAGMA bcv_upload }
+  db2 eval { SELECT * FROM t1 }
+} {a b c d}
+
+do_test 1.2 {
+  sqlite3 db3 /cont1/x2.db -vfs bcvfs
+  db3 eval { SELECT * FROM t1 }
+} {a b c d}
+
+db1 close
+db2 close
+db3 close
+
+$cmd destroy
+
+#-------------------------------------------------------------------------
+#
+bcv_mkdir testdir
+bcv_create_container cont1
+set cmd [bcvfs_create testdir "bcvfs"]
+bcv_upload_new_db cont1 x1.db {
+  CREATE TABLE t1(a, b);
+}
+bcvfs_attach $cmd cont1
+
+sqlite3 db /cont1/x1.db -vfs bcvfs
+
+do_execsql_test 2.1 {
+  INSERT INTO t1 VALUES(1, 2);
+  INSERT INTO t1 VALUES(3, 4);
+}
+
+do_catchsql_test 2.2 {
+  BEGIN;
+    PRAGMA bcv_upload;
+} {1 {database is locked}}
+
+do_test 2.2 {
+  db eval ROLLBACK;
+  db eval { SELECT * FROM t1 } {
+    set res [list [catch { db eval { PRAGMA bcv_upload } } msg] $msg]
+  }
+  set res
+} {1 {database is locked}}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+#
+bcv_mkdir testdir
+bcv_create_container cont1
+set cmd [bcvfs_create testdir "bcvfs"]
+
+bcv_upload_new_db cont1 x1.db {
+  CREATE TABLE t1(a, b);
+}
+bcv_upload_new_db cont1 x2.db {
+  CREATE TABLE t2(a, b);
+}
+
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/x1.db -vfs bcvfs
+breakpoint
+do_execsql_test 3.1 {
+  ATTACH '/cont1/x2.db' AS aux;
+}
+
+do_execsql_test 3.1 {
+  INSERT INTO t1 VALUES('a', 'b');
+  INSERT INTO t1 VALUES('c', 'd');
+  INSERT INTO t2 VALUES(1, 2);
+  INSERT INTO t2 VALUES(3, 4);
+}
+
+do_execsql_test 3.2 {
+  PRAGMA aux.bcv_upload;
+} {}
+
+db close
+bcvfs_attach -alias c2 $cmd cont1
+sqlite3 db /c2/x1.db -vfs bcvfs
+
+do_execsql_test 3.3 {
+  ATTACH '/cont1/x2.db' AS aux;
+  SELECT * FROM t1;
+  SELECT * FROM t2;
+} {1 2 3 4}
+
+db close
+sqlite3 db /cont1/x1.db -vfs bcvfs
+sqlite3 db2 /cont1/x1.db -vfs bcvfs
+
+do_test 3.4 {
+  db2 eval {
+    BEGIN;
+      SELECT * FROM t1;
+  }
+  db eval {
+    INSERT INTO t1 VALUES(5, 6);
+  }
+
+  list [catch { db eval { PRAGMA bcv_upload } } msg] $msg
+} {1 {database is locked}}
+
+db close
+db2 close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+#
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 y2.db {
+  CREATE TABLE t2(a, b);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<1000
+  )
+  INSERT INTO t2 SELECT randomblob(350), randomblob(350) FROM s;
+  CREATE TABLE t3(x, y);
+}
+
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach -alias c1 $cmd cont1
+sqlite3 db /c1/y2.db -vfs bcvfs
+do_execsql_test 4.0 {
+  INSERT INTO t3 VALUES('a', 'b');
+  PRAGMA bcv_upload;
+}
+
+db close
+$cmd destroy
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach -alias c1 $cmd cont1
+sqlite3 db /c1/y2.db -vfs bcvfs
+do_execsql_test 4.1 {
+  SELECT * FROM t3;
+} {a b}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+# Test the error message from "PRAGMA bcv_upload" in the case where
+# the pre-condition prevents the manifest from being written.
+#
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 y2.db {
+  CREATE TABLE t2(a, b);
+  CREATE TABLE t3(x, y);
+}
+
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach -alias c1 $cmd cont1
+sqlite3 db /c1/y2.db -vfs bcvfs
+do_execsql_test 5.1 {
+  CREATE TABLE t4(u, v);
+}
+
+bcv_upload_empty_database cont1 y3.db
+
+breakpoint
+do_catchsql_test 5.2 {
+  PRAGMA bcv_upload
+} {1 {HTTP/1.1 412 The condition specified using HTTP conditional header(s) is not met.}}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+# Test that even if a wal file can be completely checkpointed, the 
+# database cannot be uploaded until the wal file can be truncated.
+#
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 w3.db {
+  CREATE TABLE t2(a, b);
+  INSERT INTO t2 VALUES('a', 'b');
+  INSERT INTO t2 VALUES('c', 'd');
+}
+
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach -alias c1 $cmd cont1
+sqlite3 db /c1/w3.db -vfs bcvfs
+sqlite3 db2 /c1/w3.db -vfs bcvfs
+
+do_execsql_test 6.1 {
+  INSERT INTO t2 VALUES('e', 'f');
+  INSERT INTO t2 VALUES('g', 'h');
+}
+
+do_execsql2_test 6.2 {
+  BEGIN;
+    SELECT * FROM t2
+} {a b c d e f g h}
+
+do_catchsql_test 6.3 {
+  PRAGMA bcv_upload
+} {1 {database is locked}}
+
+do_execsql2_test 6.4 {
+  COMMIT;
+} {}
+
+do_execsql_test 6.5 {
+  PRAGMA bcv_upload
+} {}
+
+db close
+db2 close
+$cmd destroy
+
+finish_test
+

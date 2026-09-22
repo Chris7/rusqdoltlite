@@ -1,0 +1,123 @@
+#
+# 19-July-2020
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_ping1
+
+
+#-------------------------------------------------------------------------
+# This test uses a single database in a single container. The container
+# is attached to the main VFS twice - once as "c1" and once as "c2".
+#
+bcv_create_container container1
+bcv_upload_empty_database container1 t1.db
+
+bcv_mkdir testdir
+set bcvfs [bcvfs_create testdir bcvfs]
+$bcvfs log {all} log_callback
+# proc log_callback {mask msg} { puts "111 $mask: $msg" }
+proc log_callback {mask msg} { }
+proc log_callback2 {mask msg} { puts "222 $mask: $msg" }
+
+bcvfs_attach -alias c1 $bcvfs container1
+sqlite3 db  /c1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a, b);
+  CREATE INDEX i1 ON t1(a);
+  CREATE INDEX i2 ON t1(b);
+  PRAGMA bcv_upload;
+}
+
+bcvfs_attach -alias c2 $bcvfs container1
+sqlite3 db2 /c2/t1.db -vfs bcvfs
+set bcv [bcv_open container1]
+
+bcv_mkdir testdir3
+set bcvfs3 [bcvfs_create testdir3 bcvfs3]
+bcvfs_attach -alias c4 $bcvfs3 container1
+$bcvfs3 destroy
+
+set row_per_step 10
+for {set ii 0} {$ii < 30} {incr ii} {
+  do_test 2.$ii.1 {
+    for {set jj 0} {$jj < $row_per_step} {incr jj} {
+      db eval {
+        INSERT INTO t1 SELECT randomblob(400), randomblob(400);
+      }
+    }
+  } {}
+  do_test 2.$ii.2 {
+    db eval { PRAGMA bcv_upload }
+  } {}
+
+  do_test 2.$ii.3 {
+    db2 eval { SELECT count(*) FROM t1 }
+  } [expr $row_per_step * $ii]
+
+  do_test 2.$ii.4a {
+    db eval { 
+      SELECT count(*) FROM t1;
+      PRAGMA integrity_check;
+    }
+  } [list [expr $row_per_step * ($ii+1)] ok]
+
+  do_test 2.$ii.4 {
+    $bcvfs poll c2
+    db2 eval { 
+      SELECT count(*) FROM t1;
+      PRAGMA integrity_check;
+    }
+  } [list [expr $row_per_step * ($ii+1)] ok]
+
+  bcv_mkdir testdir2
+  set bcvfs2 [bcvfs_create testdir2 bcvfs2]
+  bcvfs_attach -alias c3 $bcvfs2 container1
+  sqlite3 db3 /c3/t1.db -vfs bcvfs2
+  do_test 2.$ii.5 {
+    db3 eval { SELECT count(*) FROM t1; }
+  } [expr $row_per_step * ($ii+1)]
+  db3 close
+  $bcvfs2 destroy
+
+  set bcvfs4 [bcvfs_create testdir3 bcvfs4]
+  sqlite3 db4 /c4/t1.db -vfs bcvfs4
+  do_test 2.$ii.6 {
+    db4 eval { SELECT count(*) FROM t1; }
+  } [expr $row_per_step * $ii]
+  do_test 2.$ii.7 {
+    $bcvfs4 poll c4
+    db4 eval {
+      SELECT count(*) FROM t1;
+      PRAGMA integrity_check;
+    }
+  } [list [expr $row_per_step * ($ii+1)] ok]
+
+  db4 close
+  $bcvfs4 destroy
+
+  $bcv cleanup 0
+  $bcvfs poll c1
+
+  set len [expr $::C(namebytes)*2+4]
+  do_execsql_test 2.$ii.8 {
+    SELECT (
+        SELECT nblock FROM bcv_database WHERE container='c1'
+    )==(
+      SELECT count(*) FROM bcv_tfs WHERE length(name)==$len
+    )
+  } 1
+
+}
+
+db  close
+db2 close
+$bcvfs destroy
+$bcv close
+
+finish_test
+

@@ -1,0 +1,125 @@
+
+#-------------------------------------------------------------------------
+# This file contains automated tests for the blockvfscache system.
+#
+# Specifically, this file contains tests for the APIs exposed by
+# bcvutil.h.
+#
+
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcv_api
+
+bcv_create_container $D(container)
+
+# Check that an error is reported if a handle is opened but the
+# module does not exist.
+do_test 0.1 {
+  set rc [catch {
+    sqlite3_bcv_open nosuchmod?hello=1 user secret container
+  } msg]
+  list $rc $msg
+} {1 {no such module: nosuchmod}}
+
+do_test 1.0 {
+  file delete -force test.db4
+  sqlite3 dbL test.db4
+  dbL eval {
+    CREATE TABLE t1(a, b);
+    WITH s(i) AS (
+      VALUES(1) UNION ALL SELECT i+1 FROM s WHERE i<2500
+    )
+    INSERT INTO t1 SELECT randomblob(500), randomblob(500) FROM s;
+  }
+  dbL close
+} {}
+
+proc progress_handler {nDone nTotal} {
+  puts -nonewline "."
+  flush stdout
+  incr ::nCall
+  set ::nDone $nDone
+  set ::nTotal $nTotal
+  return 0
+}
+
+proc readfile {file} {
+  set fd [open $file]
+  fconfigure $fd -translation binary -encoding binary
+  set data [read $fd]
+  close $fd
+  set data
+}
+
+do_test 1.1.1 {
+  set ::bcv [bcv_open $D(container)]
+  $::bcv config progress progress_handler
+
+  set ::nDone 0
+  set ::nTotal 0
+  set ::nCall 0
+  $::bcv upload test.db4 test.db4
+} {0}
+do_test 1.1.2 { set ::nTotal } [file size test.db4]
+do_test 1.1.3 { set ::nDone  } [file size test.db4]
+
+do_test 1.2.1 {
+  set ::nUpcall $::nCall
+  set ::nDone 0
+  set ::nTotal 0
+  set ::nCall 0
+  file delete -force test.db4
+  $::bcv download test.db4 test.db5
+} {0}
+set rep [file size test.db5]
+set rep [expr (($rep+$D(blocksize)-1)/$D(blocksize)) * $D(blocksize)]
+do_test 1.2.2 { set ::nTotal } $rep
+do_test 1.2.3 { set ::nDone  } $rep
+do_test 1.2.4 { set ::nCall } $::nUpcall
+
+if {$tcl_platform(platform)=="unix"} {
+  catch { file delete -force symlink }
+  catch { file delete -force test.db7 }
+  file link symlink .
+  do_test 1.2.5 { 
+    $::bcv download test.db4 symlink/test.db7
+  } 0
+
+  set d7 [readfile test.db7]
+  set d5 [readfile test.db5]
+
+  do_test 1.2.6 { expr {$d7==$d5} } 1
+}
+
+proc progress_handler {nDone nTotal} {
+  if {$::nCall==5} {
+    return 1
+  }
+  incr ::nCall
+  return 0
+}
+do_test 1.3.1 {
+  sqlite3 dbL test.db5
+  dbL eval { UPDATE t1 SET a = randomblob(500); }
+  dbL close
+  set ::nCall 0
+  $::bcv upload test.db5 test.db5
+} {4}
+do_test 1.3.2 {
+  set ::nCall 0
+  $::bcv errmsg
+} {abort requested by progress callback}
+
+do_test 1.4.1 {
+  set ::nCall 0
+  $::bcv download test.db4 test.db6
+} {4}
+do_test 1.4.2 {
+  set ::nCall 0
+  $::bcv errmsg
+} {abort requested by progress callback}
+
+$::bcv close
+
+finish_test
+

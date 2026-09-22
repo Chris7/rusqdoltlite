@@ -1,0 +1,415 @@
+#
+# 13-January-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_file1
+
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  INSERT INTO x1 VALUES('hello', 'world');
+}
+
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+#$cmd log http log_callback
+proc log_callback {mask msg} { puts "$mask: $msg" }
+
+do_execsql_test 1.1 {
+  INSERT INTO bcv_kv VALUES('abc.txt', X'010203');
+  INSERT INTO bcv_kv VALUES('def.txt', '1234');
+} {}
+
+do_execsql_test 1.2 {
+  SELECT name FROM bcv_kv;
+} {abc.txt def.txt}
+
+do_execsql_test 1.3 {
+  SELECT name, quote(value) FROM bcv_kv;
+} {abc.txt X'010203' def.txt '1234'}
+
+do_execsql_test 1.4 {
+  UPDATE bcv_kv SET value = 'hello_world' WHERE name='abc.txt';
+} {}
+
+do_execsql_test 1.5 {
+  SELECT name, quote(value) FROM bcv_kv;
+} {abc.txt 'hello_world' def.txt '1234'}
+
+do_execsql_test 1.6 {
+  BEGIN;
+    SELECT name FROM bcv_kv;
+    INSERT INTO bcv_kv VALUES('ghi.txt', X'00000001');
+} {abc.txt def.txt}
+
+do_execsql_test 1.7 {
+    SELECT name FROM bcv_kv;
+} {abc.txt def.txt ghi.txt}
+
+do_execsql_test 1.8 {
+    SELECT name, quote(value) FROM bcv_kv;
+} {abc.txt 'hello_world' def.txt '1234' ghi.txt X'00000001'}
+
+do_execsql_test 1.9 {
+  COMMIT;
+  SELECT name, quote(value) FROM bcv_kv;
+} {abc.txt 'hello_world' def.txt '1234' ghi.txt X'00000001'}
+
+sqlite3 db2 /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db2
+
+do_execsql2_test 1.10 {
+  SELECT name, quote(value) FROM bcv_kv;
+} {abc.txt 'hello_world' def.txt '1234' ghi.txt X'00000001'}
+
+do_execsql2_test 1.11 {
+  BEGIN;
+    UPDATE bcv_kv SET value = 'lock_this_file' WHERE name='def.txt';
+    SELECT name, quote(value) FROM bcv_kv;
+} {abc.txt 'hello_world' def.txt 'lock_this_file' ghi.txt X'00000001'}
+
+do_execsql_test 1.12 {
+  SELECT name, quote(value) FROM bcv_kv;
+} {abc.txt 'hello_world' def.txt '1234' ghi.txt X'00000001'}
+
+do_execsql2_test 1.13 {
+  COMMIT;
+  SELECT name, quote(value) FROM bcv_kv;
+} {abc.txt 'hello_world' def.txt 'lock_this_file' ghi.txt X'00000001'}
+
+do_execsql2_test 1.14 {
+  UPDATE bcv_kv SET value=NULL WHERE name='ghi.txt';
+  SELECT name, quote(value) FROM bcv_kv;
+} {abc.txt 'hello_world' def.txt 'lock_this_file' ghi.txt NULL}
+
+db close
+db2 close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+
+bcv_mkdir testdir
+bcv_mkdir testdir2
+
+set cmd  [bcvfs_create testdir bcvfs]
+set cmd2 [bcvfs_create testdir2 bcvfs2]
+
+bcvfs_attach $cmd cont1
+bcvfs_attach $cmd2 cont1
+sqlite3 db  /cont1/t1.db -vfs bcvfs
+sqlite3 db2 /cont1/t1.db -vfs bcvfs2
+sqlite3_bcvfs_register_vtab db
+sqlite3_bcvfs_register_vtab db2
+
+do_execsql_test 2.0 {
+  DELETE FROM bcv_kv;
+  SELECT * FROM bcv_kv;
+} {}
+
+do_execsql_test 2.1 {
+  BEGIN;
+    SELECT * FROM bcv_kv;
+}
+
+do_execsql2_test 2.2 {
+  INSERT INTO bcv_kv VALUES('lock', 'I got the lock!');
+}
+
+set    wcm "upload bcv_kv.bcv failed (412) - "
+append wcm "HTTP/1.1 412 The condition specified using HTTP conditional header(s) is not met."
+
+do_catchsql_test 2.3 {
+    INSERT INTO bcv_kv VALUES('lock', 'my lock');
+  COMMIT;
+} [list 1 $wcm]
+
+do_execsql_test 2.4 {
+  SELECT * FROM bcv_kv;
+} {lock {I got the lock!}}
+
+do_execsql_test 2.6 {
+  BEGIN;
+    SELECT * FROM bcv_kv;
+} {lock {I got the lock!}}
+
+do_execsql2_test 2.7 {
+  UPDATE bcv_kv SET value='now I have it!' WHERE name='lock';
+} 
+
+do_catchsql_test 2.8 {
+  UPDATE bcv_kv SET value='and I!' WHERE name='lock';
+  COMMIT;
+} [list 1 $wcm]
+
+do_execsql_test 2.9 {
+  UPDATE bcv_kv SET value='and I!' WHERE name='lock';
+  SELECT * FROM bcv_kv;
+} {lock {and I!}}
+
+do_execsql_test 2.10 {
+  BEGIN;
+    SELECT * FROM bcv_kv;
+} {lock {and I!}}
+
+do_execsql2_test 2.11 {
+  DELETE FROM bcv_kv;
+} 
+
+do_catchsql_test 2.12 {
+    UPDATE bcv_kv SET value = 'xyz' WHERE name='lock'
+} {0 {}}
+
+do_execsql_test 2.13 {
+    SELECT * FROM bcv_kv;
+} {lock xyz}
+
+do_catchsql_test 2.14 {
+    INSERT INTO bcv_kv VALUES('lock', 'one two three');
+} {1 {constraint failed}}
+
+do_catchsql_test 2.15 {
+  COMMIT;
+} [list 1 $wcm]
+
+do_execsql_test 2.16 {
+  INSERT INTO bcv_kv VALUES('1', 'one');
+  INSERT INTO bcv_kv VALUES('2', 'two');
+} {}
+
+do_execsql_test 2.17 {
+  BEGIN;
+    SELECT * FROM bcv_kv;
+} {1 one 2 two}
+
+do_execsql2_test 2.18 {
+  UPDATE bcv_kv SET value = 'TWO' WHERE name='2'
+}
+
+do_catchsql_test 2.19 {
+  DELETE FROM bcv_kv WHERE name='2';
+  COMMIT;
+} [list 1 $wcm]
+
+db close
+db2 close
+$cmd destroy
+$cmd2 destroy
+
+#-------------------------------------------------------------------------
+
+bcv_mkdir testdir
+bcv_create_container xyz23
+
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd xyz23
+sqlite3 db /xyz23 -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 3.0 {
+  DELETE FROM bcv_kv;
+}
+
+do_execsql_test 3.1 {
+  INSERT INTO bcv_kv VALUES('one', 'two');
+}
+
+do_execsql_test 3.2 {
+  SELECT * FROM bcv_kv;
+} {one two}
+
+sqlite3 db2 /xyz23 -vfs bcvfs
+sqlite3_bcvfs_register_vtab db2
+do_execsql2_test 3.3 {
+  INSERT INTO bcv_kv VALUES('three', 'four');
+} {}
+db2 close
+
+do_execsql_test 3.4 {
+  SELECT * FROM bcv_kv;
+} {one two three four}
+
+do_catchsql_test 3.5 {
+  CREATE TABLE xy(x);
+} {1 {attempt to write a readonly database}}
+
+do_execsql_test 3.6 {
+  BEGIN;
+    CREATE TABLE xy(x);
+} {}
+
+do_catchsql_test 3.7 {
+  COMMIT
+} {1 {attempt to write a readonly database}}
+
+do_catchsql_test 3.8 {
+  PRAGMA journal_mode = wal;
+} {1 {cannot use "PRAGMA journal_mode" with bcvfs}}
+
+db close
+$cmd destroy
+
+
+#-------------------------------------------------------------------------
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcv_create_container xyz23
+bcv_upload_empty_database xyz23 a.db
+bcv_upload_empty_database xyz23 b.db
+bcvfs_attach $cmd xyz23
+
+sqlite3 db / -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_catchsql_test 4.0 {
+  SELECT * FROM bcv_kv
+} {1 {vtable constructor failed: bcv_kv}}
+
+do_execsql_test 4.1 {
+  SELECT name, container FROM bcv_container
+} {xyz23 xyz23}
+
+do_execsql_test 4.2 {
+  SELECT * FROM bcv_database
+} {
+  xyz23 a.db 1 0 0 0 {} 0 0 0
+  xyz23 b.db 1 0 0 0 {} 0 0 0
+}
+
+db close
+do_test 4.3 {
+  list [catch { sqlite3 db /xyz24 -vfs bcvfs } msg] $msg
+} {1 {unable to open database file}}
+
+sqlite3 db test.db
+sqlite3_bcvfs_register_vtab db
+do_catchsql_test 4.4 {
+  SELECT * FROM bcv_kv
+} {1 {vtable constructor failed: bcv_kv}}
+db close
+
+sqlite3 db /xyz23 -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+do_execsql_test 4.5 {
+  INSERT INTO bcv_tfs VALUES('abc.txt', 'content!');
+  INSERT INTO bcv_tfs VALUES('bcv_kx_001122', 'content!');
+  INSERT INTO bcv_tfs VALUES('bcv_kv_001P22', 'content!');
+}
+
+do_execsql_test 4.6 {
+  DELETE FROM bcv_kv;
+  SELECT * FROM bcv_kv;
+}
+
+do_execsql_test 4.7 {
+  INSERT INTO bcv_tfs VALUES('bcv_kv_616263', X'000000027400000000');
+}
+do_catchsql_test 4.8 {
+  SELECT * FROM bcv_kv
+} {0 {}}
+
+db close
+$cmd destroy
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcv_create_container cont1
+bcv_upload_empty_database cont1 a.db
+bcvfs_attach $cmd cont1
+
+sqlite3 db /cont1 -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+do_execsql_test 5.1 {
+  DELETE FROM bcv_kv;
+  INSERT INTO bcv_kv VALUES('k1', 'v1');
+  INSERT INTO bcv_kv VALUES('k2', 'v2');
+  INSERT INTO bcv_kv VALUES('k3', 'v3');
+}
+
+do_execsql_test 5.2 {
+  BEGIN;
+    DELETE FROM bcv_kv WHERE name='k2';
+    SELECT * FROM bcv_kv;
+} {k1 v1  k3 v3}
+
+do_execsql_test 5.3 {
+  ROLLBACK;
+  SELECT * FROM bcv_kv;
+} {k1 v1  k2 v2 k3 v3}
+
+do_catchsql_test 5.4 {
+  UPDATE bcv_kv SET name='k4' WHERE name='k1'
+} {0 {}}
+
+do_catchsql_test 5.5 {
+  UPDATE bcv_kv SET rowid=rowid+10
+} {0 {}}
+
+do_execsql_test 5.6 {
+  BEGIN;
+    DELETE FROM bcv_kv WHERE name = 'k3';
+    INSERT INTO bcv_kv VALUES('k3', 'v3');
+  COMMIT
+} {}
+
+do_execsql_test 5.7 {
+  REPLACE INTO bcv_kv VALUES('k3', 'v123');
+} {}
+
+do_execsql_test 5.8 {
+  SELECT * FROM bcv_kv WHERE name='k3'
+} {k3 v123}
+
+db close
+$cmd destroy
+
+if {$C(use_sas)} {
+  proc my_auth {zStorage zAccount zContainer} {
+    make_readonly_sas $zContainer
+  }
+  set cmd [bcvfs_create testdir bcvfs]
+  $cmd auth_callback my_auth
+  sqlite3 db /cont1 -vfs bcvfs
+  sqlite3_bcvfs_register_vtab db
+
+  do_execsql_test 5.9 {
+    SELECT * FROM bcv_kv
+  } {k4 v1 k2 v2 k3 v123}
+
+  set expect "upload bcv_kv.bcv failed (403) - HTTP/1.1 403"
+  do_test 5.10 {
+    set rc [catch { execsql { INSERT INTO bcv_kv VALUES('k5', 'v5') } } msg]
+    list $rc [string range $msg 0 [string length $expect]-1]
+  } [list 1 $expect]
+
+  proc my_auth {zStorage zAccount zContainer} {
+    return "thiswontwork"
+  }
+
+  set expect "download bcv_kv.bcv failed (403) - HTTP/1.1 403"
+  do_test 5.11 {
+    set rc [catch { execsql { INSERT INTO bcv_kv VALUES('k5', 'v5') } } msg]
+    list $rc [string range $msg 0 [string length $expect]-1]
+  } [list 1 $expect]
+
+  db close
+  $cmd destroy
+}
+
+sqlite3 db test.db
+sqlite3_bcvfs_register_vtab db
+do_catchsql_test 6.1 {
+  SELECT * FROM bcv_kv
+} {1 {vtable constructor failed: bcv_kv}}
+
+db close
+
+finish_test
+

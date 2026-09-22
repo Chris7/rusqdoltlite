@@ -1,8 +1,9 @@
 # Cloud Backed SQLite patches
 
-These numbered patches apply only to the checksum-pinned CBS source staged by
-`build.rs`. They are kept separate from the pristine fetched checkout. The
-Google storage module accepts an HTTP or HTTPS base URL through
+These numbered patches apply only to the pinned CBS source staged by
+`build.rs`. They are kept separate from the pristine vendored checkout under
+`../../cloudsqlite`.
+The Google storage module accepts an HTTP or HTTPS base URL through
 `endpoint=<base-url>` while retaining the default
 `https://storage.googleapis.com` endpoint and the `maxresults` option.
 The default Google module protocol is its existing XML-compatible API;

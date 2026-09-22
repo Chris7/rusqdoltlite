@@ -1,0 +1,58 @@
+#
+# 13-January-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix dmn_auth1
+
+if {$C(use_sas)==0} {
+  finish_test
+  return
+}
+
+bcv_create_container cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<1500
+  )
+  INSERT INTO x1 SELECT randomblob(400), randomblob(400) FROM s;
+}
+
+start_new_daemon 0 -cachesize [expr 5*128*1024]
+
+set ::nAuthCallback 0
+proc my_auth_callback {zStorage zAccount zContainer} {
+  incr ::nAuthCallback
+  set sas [make_sas $zContainer 2]
+  return $sas
+}
+
+set cmd [bcvfs_create testdir.0 bcvfs]
+$cmd auth_callback my_auth_callback
+bcvfs_attach $cmd cont1
+
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  PRAGMA cache_size = 10;
+  SELECT * FROM bcv_database
+} {cont1 t1.db 10 1 0 0 {} 1 0 1}
+
+for {set i 0} {$i < 10} {incr i} {
+  do_execsql_test 1.1.$i {
+    SELECT count(x || y) FROM x1
+  } {1500}
+  wait_ms 1000
+}
+
+db close
+$cmd destroy
+wait_daemon 0
+
+finish_test
+
+

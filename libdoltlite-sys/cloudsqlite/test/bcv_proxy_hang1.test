@@ -1,0 +1,48 @@
+#
+# 26-July-2021
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcv_proxy_hang1
+
+# This test is designed to run with the proxy.tcl/azurite combination 
+# only. Print an error message and exit if it cannot be found.
+if {[catch bcv_proxy_test msg]} { puts $msg ; exit }
+
+
+# Configure the proxy to pass everything straight through.
+#
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+}
+
+# Initialize a new system
+start_new_system -poll 1 
+
+# Write to one of the databases. Upload it.
+bcv_sqlite3 db test.db1
+do_execsql_test 1.0 {
+  CREATE TABLE x1(a INTEGER PRIMARY KEY, b TEXT);
+  PRAGMA bcv_upload;
+} {ok}
+
+bcv_proxy_config {
+  INSERT INTO new_client_message(pattern, action) VALUES
+    ('GET%', 'close');
+}
+
+wait_ms 5000
+
+bcv_proxy_config {
+  DELETE FROM new_client_message
+}
+
+do_test 1.1 {
+  bcv_attach -poll $::D(container)
+} {}
+
+
+finish_test
+

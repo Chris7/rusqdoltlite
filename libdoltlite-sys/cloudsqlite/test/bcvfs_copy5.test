@@ -1,0 +1,70 @@
+#
+# 30-March-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_copy5
+
+bcv_create_container cont1
+for {set i 1} {$i<=5} {incr i} {
+  bcv_upload_new_db cont1 t${i}.db {
+    CREATE TABLE x1(x, y);
+    INSERT INTO x1 VALUES('hello', 'world');
+    INSERT INTO x1 VALUES('one', 'two');
+  }
+}
+
+bcv_mkdir testdir
+
+do_test 1.0 {
+  set cmd [bcvfs_create testdir bcvfs]
+  bcvfs_attach $cmd cont1
+  $cmd destroy
+} {}
+
+# Try to copy a database that does not exist.
+#
+do_test 1.1 {
+  set cmd [bcvfs_create testdir bcvfs]
+  $cmd poll cont1
+  list [catch {$cmd copy cont1 t12.db new.db} msg] $msg
+} {1 {1 no such database: t12.db}}
+$cmd destroy
+
+# Try to clobber a database that does exist.
+#
+do_test 1.2 {
+  set cmd [bcvfs_create testdir bcvfs]
+  $cmd poll cont1
+  list [catch {$cmd copy cont1 t1.db t2.db} msg] $msg
+} {1 {1 database t2.db already exists}}
+$cmd destroy
+
+# Try to copy a local-only database
+#
+do_test 1.3a {
+  set cmd [bcvfs_create testdir bcvfs]
+  $cmd poll cont1
+  list [catch {$cmd copy cont1 t1.db new.db} msg] $msg
+} {0 {}}
+$cmd destroy
+do_test 1.3b {
+  set cmd [bcvfs_create testdir bcvfs]
+  $cmd poll cont1
+  list [catch {$cmd copy cont1 new.db newer.db} msg] $msg
+} {1 {1 cannot copy database new.db}}
+$cmd destroy
+
+# Try to copy within a container that is not attached
+#
+do_test 1.4 {
+  set cmd [bcvfs_create testdir bcvfs]
+  $cmd poll cont1
+  list [catch {$cmd copy nosuchcont t1.db t2.db} msg] $msg
+} {1 {1 no such container: nosuchcont}}
+$cmd destroy
+
+finish_test
+

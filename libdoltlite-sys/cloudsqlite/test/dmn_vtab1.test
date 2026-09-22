@@ -1,0 +1,57 @@
+#
+# 23-March-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix dmn_vtab1
+
+
+
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 test.db {
+  CREATE TABLE t1(x, y);
+}
+
+start_new_daemon 0
+set cmd [bcvfs_create testdir.0 "bcvfs"]
+bcvfs_attach $cmd cont1
+
+sqlite3 db /cont1/test.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  SELECT container, database, blockno, 
+    CASE WHEN blockid IS NULL THEN 'null' ELSE 'ok' END AS blockid,
+    cache, dirty FROM bcv_block;
+} {
+  cont1 test.db 0 ok 1 0
+}
+
+bcv_upload_new_db cont1 test.db2 {
+  CREATE TABLE t1(x, y);
+  WITH s(i) AS (
+      SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<500
+  )
+  INSERT INTO t1 SELECT randomblob(400), randomblob(400) FROM s;
+}
+
+$cmd poll cont1
+
+do_execsql_test 1.1 {
+  SELECT container, database, blockno, 
+    CASE WHEN blockid IS NULL THEN 'null' ELSE 'ok' END AS blockid,
+    cache, dirty FROM bcv_block;
+} [list {*}{
+  cont1 test.db 0 ok 1 0 cont1 test.db2 0 ok 0 0 cont1 test.db2 1 ok 0 0 cont1 test.db2 2 ok 0 0 cont1 test.db2 3 ok 0 0
+}]
+
+
+db close
+$cmd destroy
+wait_daemon 0
+
+finish_test
+

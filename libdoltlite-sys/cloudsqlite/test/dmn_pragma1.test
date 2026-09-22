@@ -1,0 +1,41 @@
+#
+# 31-May-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix dmn_pragma1
+
+bcv_create_container cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  INSERT INTO x1 VALUES('hello', 'world');
+  INSERT INTO x1 VALUES('one', 'two');
+}
+
+start_new_daemon 0
+set cmd [bcvfs_create testdir.0 "bcvfs"]
+sqlite3 db / -vfs bcvfs
+
+do_execsql_test 1.0 {
+  PRAGMA bcv_blocksize;
+} {0}
+
+bcvfs_attach $cmd cont1
+
+do_execsql_test 1.1 {
+  PRAGMA bcv_blocksize;
+} {131072}
+
+db close
+
+sqlite3 db /cont1/t1.db -vfs bcvfs
+do_execsql_test 1.2 {
+  PRAGMA bcv_blocksize;
+} {131072}
+
+db close
+$cmd destroy
+finish_test
+

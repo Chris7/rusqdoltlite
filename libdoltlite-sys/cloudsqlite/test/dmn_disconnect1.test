@@ -1,0 +1,87 @@
+#
+# 09-May-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix dmn_disconnect1
+
+bcv_create_container cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<5000
+  )
+  INSERT INTO x1 SELECT randomblob(100), randomblob(100) FROM s;
+}
+
+if {[info exists C(sas_cmd)]} {
+
+start_new_daemon 0 -log hme 
+
+set cmd [bcvfs_create testdir.0 bcvfs]
+bcvfs_attach $cmd cont1
+
+sqlite3 db /cont1/t1.db -vfs bcvfs
+do_execsql_test 2.0 {
+  SELECT count(*) FROM sqlite_schema
+} {1}
+
+proc bin_append_int32 {in int32} {
+  return "$in[binary format I $int32]"
+}
+proc bin_append_string {in str} {
+  set in [bin_append_int32 $in [string length $str]]
+  return "$in$str"
+}
+
+proc send_msg {socket type body} {
+  set msg "[binary format I $type][binary format I [string length $body]]$body"
+  puts -nonewline $socket $msg
+  flush $socket
+}
+
+proc read_portnumber {dir} {
+  set fd [open [file join $dir portnumber.bcv]]
+  set data [gets $fd]
+  close $fd
+  foreach {ip port} [split $data :] {}
+  return $port
+}
+
+# Open up a socket to the daemon process
+#
+set port [read_portnumber testdir.0]
+puts "connecting to $port"
+set s [socket 127.0.0.1 $port]
+fconfigure $s -encoding binary
+fconfigure $s -translation binary
+
+# Send HELLO message
+#
+set msg [bin_append_string ""   cont1]
+set msg [bin_append_string $msg t1.db]
+set msg [bin_append_int32  $msg 1]
+send_msg $s 1 $msg
+
+# Send READ message
+#
+set msg [bin_append_int32 "" 4]
+set msg [bin_append_int32 $msg 0]
+set msg [bin_append_string $msg [$C(sas_cmd) 0 cont1]]
+send_msg $s 8 $msg 
+
+# Close socket abruptly
+#
+close $s
+wait_ms 500
+
+db close
+$cmd destroy
+wait_daemon 0
+
+}
+
+finish_test
+

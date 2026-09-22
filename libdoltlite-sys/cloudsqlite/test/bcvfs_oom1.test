@@ -1,0 +1,141 @@
+#
+# 19-July-2020
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_oom1
+
+bcv_mkdir testdir
+bcv_create_container $D(container)
+bcv_upload_empty_database $D(container) a.db
+set cmd [bcvfs_create testdir "bcvfs"]
+
+do_test 1.0 {
+  bcvfs_attach -alias c1 $cmd $D(container)
+  sqlite3 db /c1/a.db -vfs bcvfs
+  execsql {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(4, 3), (2, 1);
+    PRAGMA bcv_upload;
+  }
+  db close
+} {}
+
+do_oom_test 1 -body {
+  sqlite3 db /c1/a.db -vfs bcvfs
+  db eval {
+    SELECT * FROM t1
+  }
+} -test {
+  test_result {0 {4 3 2 1}}
+  catch {db close}
+}
+
+$cmd destroy
+
+#-------------------------------------------------------------------------
+
+do_oom_test 2 -body {
+  bcv_mkdir testdir
+  set cmd [bcvfs_create testdir "bcvfs"]
+  bcvfs_attach -alias c1 $cmd $::D(container)
+  sqlite3 db /c1/a.db -vfs bcvfs
+  db eval {
+    SELECT * FROM t1
+  }
+} -test {
+  test_result {0 {4 3 2 1}} {1 7}
+  catch { db close }
+  catch { $cmd destroy }
+}
+
+#-------------------------------------------------------------------------
+
+do_oom_test 3 -prepare {
+  bcv_mkdir testdir
+  set cmd [bcvfs_create testdir "bcvfs"]
+  bcvfs_attach -alias c1 $cmd $::D(container)
+  sqlite3 db /c1/a.db -vfs bcvfs
+  db eval {
+    PRAGMA wal_autocheckpoint = 0;
+    WITH s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<800)
+    INSERT INTO t1 SELECT randomblob(300), randomblob(300) FROM s;
+  }
+} -body {
+  db eval { PRAGMA wal_checkpoint }
+  set {} {}
+} -test {
+  test_result {0 {}}
+  catch { db close }
+  catch { $cmd destroy }
+}
+
+#-------------------------------------------------------------------------
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 a1.db { CREATE TABLE ttt(x); }
+bcv_upload_new_db cont1 a2.db { CREATE TABLE ttt(x); }
+bcv_upload_new_db cont1 a3.db { CREATE TABLE ttt(x); }
+
+do_oom_test 3b -prepare {
+  bcv_mkdir testdir
+  set ::cmd [bcvfs_create testdir "bcvfs"]
+  bcvfs_attach -alias c1 $::cmd cont1
+
+  sqlite3 db1 /c1/a1.db -vfs bcvfs
+  sqlite3 db2 /c1/a2.db -vfs bcvfs
+  $::cmd poll c1
+
+  db1 eval {
+    INSERT INTO ttt VALUES('hello world');
+    PRAGMA wal_checkpoint;
+  }
+  db2 eval {
+    INSERT INTO ttt VALUES('one two three');
+  }
+} -body {
+  db2 eval { PRAGMA bcv_upload }
+  set {} {}
+} -test {
+  test_result {0 {}}
+  db1 close
+  db2 close 
+  $::cmd destroy
+}
+
+#-------------------------------------------------------------------------
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 a1.db { 
+  CREATE TABLE ttt(x); 
+  CREATE INDEX uuu ON ttt(x);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<200
+  )
+  INSERT INTO ttt SELECT randomblob(700) FROM s;
+}
+
+do_oom_test2 4 -prepare {
+  bcv_mkdir testdir
+  set ::cmd [bcvfs_create testdir "bcvfs"]
+  bcvfs_attach -alias c1 $::cmd cont1
+  sqlite3 db /c1/a1.db -vfs bcvfs
+
+  db eval {
+    UPDATE ttt SET x = randomblob(700);
+    PRAGMA wal_checkpoint;
+  }
+} -body {
+  db eval { PRAGMA bcv_upload }
+  set {} {}
+} -test {
+  test_result {0 {}}
+  db close
+  $::cmd destroy
+}
+
+
+finish_test
+

@@ -1,0 +1,73 @@
+#
+# 19-Oct-2023
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix proxy_prefetch
+
+# This test is designed to run with the proxy.tcl/azurite combination 
+# only. Print an error message and exit if it cannot be found.
+if {[catch bcv_proxy_test msg]} { puts $msg ; exit }
+
+bcv_proxy_config { 
+  DELETE FROM new_client_message;
+}
+
+start_new_daemon 0 -log hm
+
+bcv_create_container cont1
+
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE yyy(y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<10000
+  )
+  INSERT INTO yyy SELECT hex(randomblob(400)) FROM s;
+}
+bcv_upload_new_db cont1 t2.db {
+  CREATE TABLE x1(x);
+  INSERT INTO x1 VALUES('no crash');
+}
+
+set cmd [bcvfs_create testdir.0 bcvfs]
+bcvfs_attach $cmd cont1
+
+sqlite3 db2 /cont1/t2.db -vfs bcvfs
+
+
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.1 {
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {
+  cont1 t1.db 63 1
+  cont1 t2.db  1 1
+}
+
+bcv_proxy_config {
+  INSERT INTO new_client_message(pattern, action) VALUES ('GET%', 'delay 1000')
+}
+
+do_test 1.2 {
+  $cmd prefetch_new pf cont1 t1.db
+  pf run 1 10000
+} {0}
+
+pf destroy
+wait_ms 2000
+
+do_execsql2_test 1.3 {
+  SELECT * FROM x1
+} {{no crash}}
+
+db2 close
+db close
+
+wait_ms 100
+
+$cmd destroy
+finish_test
+

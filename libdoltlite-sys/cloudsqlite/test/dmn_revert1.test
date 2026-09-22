@@ -1,0 +1,43 @@
+#
+# 09-May-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix dmn_revert1
+
+start_new_daemon 0
+
+bcv_create_container cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<5000
+  )
+  INSERT INTO x1 SELECT randomblob(100), randomblob(100) FROM s;
+}
+
+set cmd [bcvfs_create testdir.0 bcvfs]
+bcvfs_attach $cmd cont1
+
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {
+  cont1 t1.db 9 1
+}
+
+do_test 1.1 {
+  $cmd revert cont1
+} {}
+
+
+db close
+$cmd destroy
+wait_daemon 0
+
+finish_test
+

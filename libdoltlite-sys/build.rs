@@ -297,20 +297,17 @@ mod build_bundled {
     fn add_blockcachevfs(cfg: &mut cc::Build, manifest_dir: &Path, out_dir: &str) {
         use std::fs;
 
-        let source_dir = env::var_os("BLOCKCACHEVFS_SOURCE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!(
-                    "feature `blockcachevfs` requires BLOCKCACHEVFS_SOURCE_DIR; see the README for the checksum-pinned CBS fetch helper"
-                )
-            });
+        let source_dir = manifest_dir.join("cloudsqlite/src");
         if !source_dir.is_dir() {
             panic!(
-                "BLOCKCACHEVFS_SOURCE_DIR does not name a directory: {}",
+                "vendored Cloud Backed SQLite source directory is missing: {}",
                 source_dir.display()
             );
         }
-        println!("cargo:rerun-if-env-changed=BLOCKCACHEVFS_SOURCE_DIR");
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir.join("cloudsqlite").display()
+        );
 
         // CBS ships a sqlite3.h next to its sources.  Its quoted includes
         // would win over -I paths and silently compile against a second

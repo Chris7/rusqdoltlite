@@ -1,0 +1,46 @@
+#
+# 26-July-2021
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix proxy_delay1
+
+# This test is designed to run with the proxy.tcl/azurite combination 
+# only. Print an error message and exit if it cannot be found.
+if {[catch bcv_proxy_test msg]} { puts $msg ; exit }
+
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+}
+
+bcv_create_container cont
+bcv_upload_new_db cont t1.db {
+  CREATE TABLE yyy(y);
+}
+
+proc log_callback {mask msg} { puts "$mask: $msg" }
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+$cmd log http log_callback
+bcvfs_attach $cmd cont
+
+proc log_callback {mask msg} { puts "$mask: $msg" }
+$cmd log all log_callback
+
+$cmd config httptimeout 5
+
+# 86400000ms == 24 hours
+bcv_proxy_config {
+  INSERT INTO new_client_message(pattern, action) VALUES
+    ('GET%', 'delay 86400000')
+}
+
+do_test 1.0 {
+  list [catch { $cmd poll cont } msg] $msg
+} {1 {Timeout was reached}}
+
+$cmd destroy
+finish_test
+

@@ -4,3 +4,4 @@ libsqlite3-sys/bindgen-bindings/* linguist-generated
 
 # Unified patch artifacts intentionally preserve source-context whitespace.
 libdoltlite-sys/patches/blockcachevfs/*.patch whitespace=-trailing-space
+libdoltlite-sys/cloudsqlite/** linguist-vendored

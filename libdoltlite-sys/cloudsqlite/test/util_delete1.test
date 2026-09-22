@@ -1,0 +1,102 @@
+#
+# This file contains test cases focused on the sqlite3_bcv_delete() API.
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix util_delete1
+
+if {$C(use_sas)==0} { finish_test ; return }
+
+bcv_create_container cont
+
+bcv_upload_new_db cont t1.db {
+  CREATE TABLE x1(a, b);
+  INSERT INTO x1 VALUES(1, 2);
+}
+bcv_upload_new_db cont t2.db {
+  CREATE TABLE x1(a, b);
+  INSERT INTO x1 VALUES(3, 4);
+}
+bcv_upload_new_db cont t3.db {
+  CREATE TABLE x1(a, b);
+  INSERT INTO x1 VALUES(5, 6);
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont
+
+sqlite3 db /cont -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  SELECT container, database FROM bcv_database
+} {
+  cont t1.db
+  cont t2.db
+  cont t3.db
+}
+
+set bcv [bcv_open cont]
+$bcv delete t2.db
+
+do_execsql_test 1.1 {
+  SELECT container, database FROM bcv_database
+} {
+  cont t1.db
+  cont t2.db
+  cont t3.db
+}
+
+$cmd poll cont
+
+do_execsql_test 1.2 {
+  SELECT container, database FROM bcv_database
+} {
+  cont t1.db
+  cont t3.db
+}
+
+do_test 1.3.1 {
+  $bcv delete nosuchdb.db
+} {1}
+do_test 1.3.2 {
+  $bcv errcode
+} {1}
+do_test 1.3.3 {
+  $bcv errmsg
+} {no such database: nosuchdb.db}
+
+do_test 1.4.1 {
+  $bcv delete t3.db
+} {0}
+do_test 1.4.2 {
+  $bcv errcode
+} {0}
+do_test 1.4.3 {
+  $bcv errmsg
+} {}
+
+$bcv close
+
+set bcv [bcv_open cont -auth [make_readonly_sas cont]]
+do_test 1.5.1 {
+  $bcv delete t1.db
+} {403}
+do_test 1.5.2 {
+  $bcv errcode
+} {403}
+$cmd poll cont
+do_execsql_test 1.5.5 {
+  SELECT container, database FROM bcv_database
+} {
+  cont t1.db
+}
+
+$bcv close
+
+db close
+$cmd destroy
+
+finish_test
+

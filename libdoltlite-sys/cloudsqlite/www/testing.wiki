@@ -1,0 +1,83 @@
+
+<h1>How To Run Local Tests</h1>
+
+The system can use the Azure emulator Azurite to run tests locally on Linux.
+Version 3.6.0 or newer, or the latest code from the "master" branch is 
+required.
+
+<h2>1. Install Local Node.js System </h2>
+
+Download a node.js binary package from:
+  
+  [https://nodejs.org/en/]
+
+e.g.
+
+  [https://nodejs.org/dist/v12.16.1/node-v12.16.1-linux-x64.tar.xz]
+
+Unpack the archive somewhere and add the "bin" sub-directory to the 
+users PATH.  e.g.
+
+<pre>
+     PATH=~/node-v12.16.1-linux-x64/bin:$PATH 
+</pre>
+
+Also set environment variable NPM_CONFIG_PREFIX to a location that will be
+used to install Azurite. And add the "bin" sub-directory of it to the users
+PATH as well:
+
+<pre>
+     export NPM_CONFIG_PREFIX=~/.npm-global
+     PATH=$NPM_CONFIG_PREFIX/bin:$PATH
+</pre>
+
+<h2>2. Install Azurite </h2>
+
+Obtain sufficiently new code with the following or similar:
+
+<pre>
+     git clone https://github.com/Azure/Azurite.git 
+</pre>
+
+Then, in the source directory:
+
+<pre>
+     npm ci
+     npm run build
+     npm install -g
+</pre>
+
+And to check that it installed:
+
+<pre>
+     azurite version
+</pre>
+
+<h2>3. Run The Azurite Tests </h2>
+
+Build the blockcachevfsd binaries with:
+
+<pre>
+     ../blockcachevfs/configure && make all
+</pre>
+
+Start the azurite emulator in an empty directory:
+
+<pre>
+     azurite
+</pre>
+
+Run the test/runtests.tcl script from the blockcachevfs build directory using 'bcvtclsqlite". e.g.
+
+<pre>
+     ./bcvtclsqlite ../blockcachevfs/test/runtests.tcl
+</pre>
+
+<h2>3. Run The Proxy/Azurite Tests </h2>
+
+todo: describe how to start the proxy and run these tests...
+
+
+  
+
+

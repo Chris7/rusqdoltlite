@@ -7,19 +7,13 @@ set -eu
 # checkout.
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-checkout=${BLOCKCACHEVFS_CBS_CHECKOUT:-}
-if [ -z "$checkout" ] && [ -n "${BLOCKCACHEVFS_SOURCE_DIR:-}" ]; then
-  source_parent=$(CDPATH= cd -- "${BLOCKCACHEVFS_SOURCE_DIR%/}/.." 2>/dev/null && pwd || true)
-  if [ -f "$source_parent/test/runtests.tcl" ]; then
-    checkout=$source_parent
-  fi
-fi
+checkout="$repo_root/libdoltlite-sys/cloudsqlite"
 s3_bucket_was_set=${BLOCKCACHEVFS_S3_BUCKET+x}
 google_bucket_was_set=${BLOCKCACHEVFS_GOOGLE_BUCKET+x}
 
-if [ -z "$checkout" ] || [ ! -d "$checkout/src" ] || [ ! -f "$checkout/test/runtests.tcl" ]; then
-  echo "SKIP: set BLOCKCACHEVFS_CBS_CHECKOUT to an upstream Cloud SQLite checkout" >&2
-  exit 77
+if [ ! -d "$checkout/src" ] || [ ! -f "$checkout/test/runtests.tcl" ]; then
+  echo "vendored Cloud Backed SQLite checkout is incomplete: $checkout" >&2
+  exit 1
 fi
 if [ -z "${BLOCKCACHEVFS_S3_ENDPOINT:-}" ] \
   && [ -z "${BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT:-}" ]; then
