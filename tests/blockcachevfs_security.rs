@@ -23,66 +23,57 @@ const CHILD_ENV: &str = "RUSQ_DOLTLITE_VERBOSE_SECURITY_CHILD";
 const ENDPOINT_ENV: &str = "RUSQ_DOLTLITE_VERBOSE_SECURITY_ENDPOINT";
 const ROUTE_CHILD_ENV: &str = "RUSQ_DOLTLITE_S3_ROUTE_CHILD";
 const PROXY_ENV: &str = "RUSQ_DOLTLITE_S3_ROUTE_PROXY";
+const ROUTE_BUCKET_ENV: &str = "RUSQ_DOLTLITE_S3_ROUTE_BUCKET";
 const ACCESS_KEY: &str = "access-key-canary-verbose";
 const SECRET_KEY: &str = "secret-key-canary-verbose";
 const SESSION_TOKEN: &str = "session-token-canary-verbose";
 
 unsafe extern "C" fn route_log(ctx: *mut c_void, message: *const c_char) {
-    let messages = &mut *ctx.cast::<Vec<String>>();
+    let _ = ctx;
     if !message.is_null() {
-        messages.push(CStr::from_ptr(message).to_string_lossy().into_owned());
+        let message = CStr::from_ptr(message).to_string_lossy();
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{message}");
+        let _ = stdout.flush();
     }
+    // The callback runs immediately before CBS hands the request to libcurl.
+    // Exit after recording that URI so this test cannot contact AWS or spend
+    // time in CBS's retry loop. The parent still places a local proxy in the
+    // HTTPS_PROXY slot as a guard against an unexpected transfer.
+    std::process::exit(0);
 }
 
 fn route_child() {
     let _proxy = std::env::var(PROXY_ENV).expect("S3 route proxy");
-    for (bucket, expected_uri) in [
-        (
-            "my.bucket",
-            "https://s3.us-west-2.amazonaws.com/my.bucket/manifest.bcv",
-        ),
-        (
-            "ordinary-bucket",
-            "https://ordinary-bucket.s3.us-west-2.amazonaws.com/manifest.bcv",
-        ),
-    ] {
-        let module = CString::new("s3?region=us-west-2").expect("module selector");
-        let account = CString::new("route-test-access").expect("access key");
-        let secret = CString::new("route-test-secret").expect("secret key");
-        let bucket = CString::new(bucket).expect("bucket");
-        let mut handle = ptr::null_mut();
-        let rc = unsafe {
-            raw_util::sqlite3_bcv_open(
-                module.as_ptr(),
-                account.as_ptr(),
-                secret.as_ptr(),
-                bucket.as_ptr(),
-                &mut handle,
-            )
-        };
-        assert_eq!(rc, 0, "S3 handle must open: {bucket:?}");
-        assert!(!handle.is_null());
+    let bucket =
+        CString::new(std::env::var(ROUTE_BUCKET_ENV).expect("S3 route bucket")).expect("bucket");
+    let module = CString::new("s3?region=us-west-2").expect("module selector");
+    let account = CString::new("route-test-access").expect("access key");
+    let secret = CString::new("route-test-secret").expect("secret key");
+    let mut handle = ptr::null_mut();
+    let rc = unsafe {
+        raw_util::sqlite3_bcv_open(
+            module.as_ptr(),
+            account.as_ptr(),
+            secret.as_ptr(),
+            bucket.as_ptr(),
+            &mut handle,
+        )
+    };
+    assert_eq!(rc, 0, "S3 handle must open: {bucket:?}");
+    assert!(!handle.is_null());
 
-        let mut messages: Vec<String> = Vec::new();
-        let rc = unsafe {
-            sqlite3_bcv_config(
-                handle,
-                3,
-                (&mut messages as *mut Vec<String>).cast::<c_void>(),
-                route_log as unsafe extern "C" fn(*mut c_void, *const c_char),
-            )
-        };
-        assert_eq!(rc, 0, "S3 log callback must configure");
-        let _ = unsafe { raw_util::sqlite3_bcv_create_if_not_exists(handle, 0, 0) };
-        unsafe { raw_util::sqlite3_bcv_close(handle) };
-
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.contains(expected_uri)),
-            "request URI for {bucket:?} was not logged as expected: {messages:?}"
-        );
-    }
+    let rc = unsafe {
+        sqlite3_bcv_config(
+            handle,
+            3,
+            ptr::null_mut::<c_void>(),
+            route_log as unsafe extern "C" fn(*mut c_void, *const c_char),
+        )
+    };
+    assert_eq!(rc, 0, "S3 log callback must configure");
+    let _ = unsafe { raw_util::sqlite3_bcv_create_if_not_exists(handle, 0, 0) };
+    unreachable!("the log callback must terminate the route child");
 }
 
 fn verbose_child() {
@@ -153,8 +144,16 @@ fn curl_verbose_does_not_log_s3_credentials() {
                 break;
             }
         }
+        let response = format!(
+            "HTTP/1.1 404 Not Found\r\n\
+             Authorization: {ACCESS_KEY}\r\n\
+             x-amz-security-token: {SESSION_TOKEN}\r\n\
+             x-secret-key: {SECRET_KEY}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
         stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .write_all(response.as_bytes())
             .expect("HTTP response");
         String::from_utf8_lossy(&request).into_owned()
     });
@@ -179,7 +178,7 @@ fn curl_verbose_does_not_log_s3_credentials() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        stderr.contains("* ") || stderr.contains("< "),
+        stderr.contains("* "),
         "verbose diagnostics were not emitted:\n{stderr}"
     );
     assert!(request.starts_with("GET /bucket/manifest.bcv"), "{request}");
@@ -215,6 +214,8 @@ fn dotted_aws_bucket_uses_tls_valid_path_style_host() {
     );
     let stop = Arc::new(AtomicBool::new(false));
     let server_stop = Arc::clone(&stop);
+    let proxy_seen = Arc::new(AtomicBool::new(false));
+    let server_proxy_seen = Arc::clone(&proxy_seen);
     let server = thread::spawn(move || {
         listener
             .set_nonblocking(true)
@@ -228,13 +229,11 @@ fn dotted_aws_bucket_uses_tls_valid_path_style_host() {
                 thread::sleep(Duration::from_millis(10));
                 continue;
             };
+            server_proxy_seen.store(true, Ordering::Relaxed);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let mut request = Vec::new();
             let mut buffer = [0u8; 1024];
-            loop {
-                let Ok(n) = stream.read(&mut buffer) else {
-                    break;
-                };
+            while let Ok(n) = stream.read(&mut buffer) {
                 if n == 0 {
                     break;
                 }
@@ -249,31 +248,59 @@ fn dotted_aws_bucket_uses_tls_valid_path_style_host() {
         }
     });
 
-    let output = Command::new(std::env::current_exe().expect("test executable path"))
-        .args([
-            "--exact",
-            "dotted_aws_bucket_uses_tls_valid_path_style_host",
-            "--nocapture",
-        ])
-        .env(ROUTE_CHILD_ENV, "1")
-        .env(PROXY_ENV, &proxy)
-        .env("HTTPS_PROXY", &proxy)
-        .env("https_proxy", &proxy)
-        .env("HTTP_PROXY", &proxy)
-        .env("http_proxy", &proxy)
-        .env("ALL_PROXY", "")
-        .env("all_proxy", "")
-        .env("NO_PROXY", "")
-        .env("no_proxy", "")
-        .output()
-        .expect("run isolated S3 routing child test");
+    let executable = std::env::current_exe().expect("test executable path");
+    let run_child = |bucket: &str| {
+        Command::new(&executable)
+            .args([
+                "--exact",
+                "dotted_aws_bucket_uses_tls_valid_path_style_host",
+                "--nocapture",
+            ])
+            .env(ROUTE_CHILD_ENV, "1")
+            .env(ROUTE_BUCKET_ENV, bucket)
+            .env(PROXY_ENV, &proxy)
+            .env("HTTPS_PROXY", &proxy)
+            .env("https_proxy", &proxy)
+            .env("HTTP_PROXY", &proxy)
+            .env("http_proxy", &proxy)
+            .env("ALL_PROXY", "")
+            .env("all_proxy", "")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .output()
+            .expect("run isolated S3 routing child test")
+    };
+    let dotted = run_child("my.bucket");
+    let ordinary = run_child("ordinary-bucket");
     stop.store(true, Ordering::Relaxed);
     server.join().expect("HTTPS proxy thread");
 
     assert!(
-        output.status.success(),
-        "isolated S3 routing child failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        dotted.status.success(),
+        "isolated dotted S3 routing child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&dotted.stdout),
+        String::from_utf8_lossy(&dotted.stderr)
+    );
+    assert!(
+        ordinary.status.success(),
+        "isolated ordinary S3 routing child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ordinary.stdout),
+        String::from_utf8_lossy(&ordinary.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&dotted.stdout)
+            .contains("https://s3.us-west-2.amazonaws.com/my.bucket/manifest.bcv"),
+        "dotted bucket URI was not logged:\n{}",
+        String::from_utf8_lossy(&dotted.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&ordinary.stdout)
+            .contains("https://ordinary-bucket.s3.us-west-2.amazonaws.com/manifest.bcv"),
+        "ordinary bucket URI was not logged:\n{}",
+        String::from_utf8_lossy(&ordinary.stdout)
+    );
+    assert!(
+        !proxy_seen.load(Ordering::Relaxed),
+        "route URI test unexpectedly attempted a proxy transfer"
     );
 }

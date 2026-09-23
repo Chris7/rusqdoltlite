@@ -103,10 +103,11 @@ flush changes to that existing remote database.
 The S3 authentication callback returns the secret access key. For temporary
 credentials, return `secret-access-key\nsession-token` using the helper above;
 the session token is signed as `x-amz-security-token` and is never put in the
-module selector or URL. Enabling `Config::CurlVerbose(true)` keeps connection
-and response diagnostics while omitting outgoing request headers and body data,
-so those credentials do not appear in stderr. The strict Floci emulator at the
-endpoint above is a convenient local SigV4 test service.
+module selector or URL. Enabling `Config::CurlVerbose(true)` leaves only
+non-header libcurl diagnostic text on stderr; raw HTTP headers and payloads are
+omitted, excluding raw credential-bearing HTTP headers from verbose output.
+The strict Floci emulator at the endpoint above is a convenient local SigV4
+test service.
 
 To reuse CBS's own emulator tests, run the shared runner once per backend. It
 uses the same vendored checkout, applies this repository's numbered patches to

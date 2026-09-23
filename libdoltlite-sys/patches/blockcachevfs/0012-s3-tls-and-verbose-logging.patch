@@ -26,16 +26,17 @@
      const char *zPath;
 --- a/bcvutil.c
 +++ b/bcvutil.c
-@@ -2955,6 +2955,33 @@
+@@ -2955,6 +2955,32 @@
    return CURL_SEEKFUNC_OK;
  }
  
 +/*
-+** CURLOPT_VERBOSE normally writes the complete outgoing request, including
-+** Authorization and x-amz-security-token headers, to stderr. Keep the
-+** useful connection and response diagnostics while omitting all outgoing
-+** headers and body data. In particular, ignoring CURLINFO_HEADER_OUT here
-+** is safe even if libcurl splits one header line across several callbacks.
++** CURLOPT_VERBOSE normally writes the complete request and response headers,
++** including Authorization and x-amz-security-token values, to stderr. Keep
++** useful connection diagnostics while omitting all HTTP headers and body
++** data. Ignoring both header callback types here is safe even if libcurl
++** splits one header line across several callbacks or a server reflects a
++** credential in its response.
 +*/
 +static int bcvCurlDebug(
 +  CURL *pCurl, curl_infotype eType, char *pData, size_t nData, void *pCtx
@@ -45,10 +46,8 @@
 +  (void)pCtx;
 +  if( eType==CURLINFO_TEXT ){
 +    zPrefix = "* ";
-+  }else if( eType==CURLINFO_HEADER_IN ){
-+    zPrefix = "< ";
 +  }else{
-+    /* This includes CURLINFO_HEADER_OUT and CURLINFO_DATA_OUT. */
++    /* This includes both header types and all request/response body data. */
 +    return 0;
 +  }
 +  fwrite(zPrefix, 1, strlen(zPrefix), stderr);

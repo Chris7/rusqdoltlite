@@ -285,9 +285,9 @@ pub enum Config {
     RequestCount(i64),
     /// HTTP timeout in seconds.
     HttpTimeout(i64),
-    /// Enable verbose libcurl logging. CBS omits outgoing request headers and
-    /// body data so authorization and temporary-session credentials stay out
-    /// of stderr.
+    /// Enable verbose libcurl logging. Only non-header diagnostic text is
+    /// written to stderr; raw HTTP headers and payloads are omitted, excluding
+    /// raw credential-bearing HTTP headers from verbose output.
     CurlVerbose(bool),
     /// HTTP-log entry timeout in seconds.
     HttpLogTimeout(i64),

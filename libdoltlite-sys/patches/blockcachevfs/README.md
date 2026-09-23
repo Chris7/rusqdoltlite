@@ -37,10 +37,10 @@ workflow is added.
 
 `0012-s3-tls-and-verbose-logging.patch` selects the TLS-valid AWS path-style
 endpoint for dotted bucket names and filters verbose libcurl output. When
-`CurlVerbose` is enabled, CBS retains connection and response diagnostics
-but omits outgoing request headers and body data. This keeps authorization and
-temporary-session credentials out of stderr while preserving useful libcurl
-connection information.
+`CurlVerbose` is enabled, only non-header libcurl diagnostic text remains on
+stderr; raw HTTP headers and payloads are omitted. This keeps authorization
+and temporary-session credentials out of the raw verbose HTTP output while
+preserving useful connection information.
 
 Google JSON bucket destroy has the same empty-bucket restriction and refuses a
 configured prefix. The legacy Google XML destroy behavior is unchanged.
