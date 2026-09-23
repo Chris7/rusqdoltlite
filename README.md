@@ -55,7 +55,9 @@ hard-coded `storage.googleapis.com` base.
 
 S3 uses AWS Signature Version 4 for every request, including custom
 S3-compatible endpoints. The default constructor uses virtual-hosted AWS
-addressing; custom endpoints use path-style addressing. `bucket/prefix`
+addressing for ordinary bucket names and path-style addressing through the
+regional AWS endpoint for dotted bucket names, which keeps TLS certificate
+validation valid. Custom endpoints use path-style addressing. `bucket/prefix`
 containers are isolated to that prefix, and the native module uses ETags for
 conditional fetch, upload, and delete operations:
 
@@ -101,8 +103,10 @@ flush changes to that existing remote database.
 The S3 authentication callback returns the secret access key. For temporary
 credentials, return `secret-access-key\nsession-token` using the helper above;
 the session token is signed as `x-amz-security-token` and is never put in the
-module selector or URL. The strict Floci emulator at the endpoint above is a
-convenient local SigV4 test service.
+module selector or URL. Enabling `Config::CurlVerbose(true)` keeps connection
+and response diagnostics while omitting outgoing request headers and body data,
+so those credentials do not appear in stderr. The strict Floci emulator at the
+endpoint above is a convenient local SigV4 test service.
 
 To reuse CBS's own emulator tests, run the shared runner once per backend. It
 uses the same vendored checkout, applies this repository's numbered patches to

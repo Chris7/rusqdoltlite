@@ -21,7 +21,9 @@ service can be selected with
 `0003-s3-module.patch` adds a built-in `s3` module. Use
 `s3?endpoint=http://127.0.0.1:9000&region=us-east-1&maxresults=1000` for an
 S3-compatible service; without `endpoint`, requests use the AWS virtual-hosted
-endpoint and `us-east-1`. The container is `bucket/prefix`, and a configured
+endpoint for ordinary bucket names and `us-east-1`. Dotted bucket names use the
+regional AWS path-style endpoint so TLS certificate validation succeeds. The
+container is `bucket/prefix`, and a configured
 prefix confines object and list operations; destroying such a container is
 rejected rather than deleting the bucket. S3 requests use SigV4 with the
 actual SHA-256 payload hash. Temporary credentials are passed as
@@ -32,6 +34,13 @@ module refuses to delete a configured-prefix container and does not
 recursively delete objects. The upstream `util_destroy1` non-empty-container
 case is intentionally excluded until a provider-specific object-delete
 workflow is added.
+
+`0012-s3-tls-and-verbose-logging.patch` selects the TLS-valid AWS path-style
+endpoint for dotted bucket names and filters verbose libcurl output. When
+`CurlVerbose` is enabled, CBS retains connection and response diagnostics
+but omits outgoing request headers and body data. This keeps authorization and
+temporary-session credentials out of stderr while preserving useful libcurl
+connection information.
 
 Google JSON bucket destroy has the same empty-bucket restriction and refuses a
 configured prefix. The legacy Google XML destroy behavior is unchanged.

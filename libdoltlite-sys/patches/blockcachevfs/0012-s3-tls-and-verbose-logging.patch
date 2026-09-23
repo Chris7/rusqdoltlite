@@ -1,0 +1,73 @@
+--- a/bcvmodule.c
++++ b/bcvmodule.c
+@@ -2060,8 +2060,17 @@
+   }
+ 
+   if( rc==SQLITE_OK && zEndpoint==0 ){
+     p->zScheme = sqlite3_mprintf("https");
+-    p->zHost = sqlite3_mprintf("%s.s3.%s.amazonaws.com", p->zBucket, p->zRegion);
+-    p->zBasePath = sqlite3_mprintf("");
+-    p->bPathStyle = 0;
++    if( strchr(p->zBucket, '.') ){
++      /* The AWS wildcard certificate does not cover a bucket name with a
++      ** dot when it is used as an additional host-name label. Use the
++      ** regional S3 host and put the bucket in the request path instead. */
++      p->zHost = sqlite3_mprintf("s3.%s.amazonaws.com", p->zRegion);
++      p->zBasePath = sqlite3_mprintf("");
++      p->bPathStyle = 1;
++    }else{
++      p->zHost = sqlite3_mprintf("%s.s3.%s.amazonaws.com", p->zBucket, p->zRegion);
++      p->zBasePath = sqlite3_mprintf("");
++      p->bPathStyle = 0;
++    }
+   }else if( rc==SQLITE_OK ){
+     const char *zSep = strstr(zEndpoint, "://");
+     const char *zAuthority;
+     const char *zPath;
+--- a/bcvutil.c
++++ b/bcvutil.c
+@@ -2955,6 +2955,33 @@
+   return CURL_SEEKFUNC_OK;
+ }
+ 
++/*
++** CURLOPT_VERBOSE normally writes the complete outgoing request, including
++** Authorization and x-amz-security-token headers, to stderr. Keep the
++** useful connection and response diagnostics while omitting all outgoing
++** headers and body data. In particular, ignoring CURLINFO_HEADER_OUT here
++** is safe even if libcurl splits one header line across several callbacks.
++*/
++static int bcvCurlDebug(
++  CURL *pCurl, curl_infotype eType, char *pData, size_t nData, void *pCtx
++){
++  const char *zPrefix;
++  (void)pCurl;
++  (void)pCtx;
++  if( eType==CURLINFO_TEXT ){
++    zPrefix = "* ";
++  }else if( eType==CURLINFO_HEADER_IN ){
++    zPrefix = "< ";
++  }else{
++    /* This includes CURLINFO_HEADER_OUT and CURLINFO_DATA_OUT. */
++    return 0;
++  }
++  fwrite(zPrefix, 1, strlen(zPrefix), stderr);
++  fwrite(pData, 1, nData, stderr);
++  fflush(stderr);
++  return 0;
++}
++
+ static void bcvDispatchLogRequest(BcvDispatch *p, BcvDispatchReq *pReq){
+   const char *zUri = pReq->zUriLog ? pReq->zUriLog : pReq->zUri;
+ 
+@@ -3125,9 +3157,10 @@
+     curl_easy_setopt(pCurl, CURLOPT_HEADERDATA, (void*)pReq);
+     curl_easy_setopt(pCurl, CURLOPT_WRITEFUNCTION, bcvWriteFunction);
+     curl_easy_setopt(pCurl, CURLOPT_WRITEDATA, (void*)pReq);
+     if( p->bVerbose ){
+       curl_easy_setopt(pCurl, CURLOPT_VERBOSE, 1L);
++      curl_easy_setopt(pCurl, CURLOPT_DEBUGFUNCTION, bcvCurlDebug);
+     }
+ 
+     curl_multi_add_handle(p->pMulti, pCurl);
+   }

@@ -83,7 +83,8 @@ git -C "$tmp/src" apply \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0008-safe-wal-header-read.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0009-doltlite-lock-sidecar.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0010-doltlite-truncate-noop.patch" \
-  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0011-doltlite-upload-lock.patch"
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0011-doltlite-upload-lock.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0012-s3-tls-and-verbose-logging.patch"
 
 export BLOCKCACHEVFS_CBS_BASE_CONFIG="$checkout/test/config.tcl"
 cp "$repo_root/tools/blockcachevfs-cbs-config.tcl" "$tmp/test/config.tcl"

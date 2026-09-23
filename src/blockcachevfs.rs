@@ -135,7 +135,9 @@ impl Storage {
     ///
     /// `access_key` is passed as the CBS account.  Return the secret access
     /// key (or [`s3_secret_with_session_token`]) from the authentication
-    /// callback.  `bucket` may be `bucket/prefix`.
+    /// callback.  `bucket` may be `bucket/prefix`. AWS uses virtual-hosted
+    /// addressing for ordinary bucket names and path-style addressing for
+    /// dotted bucket names so HTTPS certificate validation succeeds.
     pub fn s3(
         access_key: impl Into<String>,
         bucket: impl Into<String>,
@@ -283,7 +285,9 @@ pub enum Config {
     RequestCount(i64),
     /// HTTP timeout in seconds.
     HttpTimeout(i64),
-    /// Enable verbose libcurl logging.
+    /// Enable verbose libcurl logging. CBS omits outgoing request headers and
+    /// body data so authorization and temporary-session credentials stay out
+    /// of stderr.
     CurlVerbose(bool),
     /// HTTP-log entry timeout in seconds.
     HttpLogTimeout(i64),
