@@ -1,0 +1,61 @@
+#
+# 06-August-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix proxy_err2
+
+# This test is designed to run with the proxy.tcl/azurite combination 
+# only. Print an error message and exit if it cannot be found.
+if {[catch bcv_proxy_test msg]} { puts $msg ; exit }
+
+
+# Configure the proxy to pass everything straight through.
+#
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+}
+
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<1000
+  )
+  INSERT INTO x1 SELECT randomblob(400), randomblob(400) FROM s;
+}
+
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont1
+
+proc log_callback {topic msg} {
+  puts $msg
+}
+$cmd log http log_callback
+
+sqlite3 db /cont1/t1.db -vfs bcvfs
+do_execsql_test 1.0 {
+  SELECT sql FROM sqlite_schema
+} {
+ {CREATE TABLE x1(x, y)}
+}
+
+bcv_proxy_config {
+  INSERT INTO new_client_message(pattern, action) 
+    VALUES ('GET%', 'nerror 3 500 {Server Error} {}');
+}
+
+breakpoint
+do_execsql_test 1.1 {
+  SELECT count(y) FROM x1
+} {1000}
+
+
+db close
+$cmd destroy
+
+finish_test
+

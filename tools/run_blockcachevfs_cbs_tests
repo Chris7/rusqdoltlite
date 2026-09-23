@@ -1,0 +1,156 @@
+#!/bin/sh
+set -eu
+
+# Run CBS's own generic util*/bcvfs* tests against an emulator.  This script
+# deliberately reuses the upstream Tcl test logic; it only creates a config
+# overlay and applies this repository's numbered native patches to a disposable
+# checkout.
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+checkout="$repo_root/libdoltlite-sys/cloudsqlite"
+s3_bucket_was_set=${BLOCKCACHEVFS_S3_BUCKET+x}
+google_bucket_was_set=${BLOCKCACHEVFS_GOOGLE_BUCKET+x}
+
+if [ ! -d "$checkout/src" ] || [ ! -f "$checkout/test/runtests.tcl" ]; then
+  echo "vendored Cloud Backed SQLite checkout is incomplete: $checkout" >&2
+  exit 1
+fi
+if [ -z "${BLOCKCACHEVFS_S3_ENDPOINT:-}" ] \
+  && [ -z "${BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT:-}" ]; then
+  echo "SKIP: set an emulator endpoint (S3 or Google JSON) to run CBS tests" >&2
+  exit 77
+fi
+if [ -n "${BLOCKCACHEVFS_S3_ENDPOINT:-}" ] \
+  && [ -n "${BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT:-}" ]; then
+  echo "set only one emulator endpoint per run; invoke the runner once per backend" >&2
+  exit 2
+fi
+command -v tclsh >/dev/null 2>&1 || {
+  echo "SKIP: tclsh is required for the upstream CBS suite" >&2
+  exit 77
+}
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/rusqdoltlite-cbs-tests.XXXXXX")
+poll_test_included=0
+poll_container_a=
+poll_container_b=
+cleanup() {
+  cleanup_s3_bucket() {
+    [ -n "${1:-}" ] || return 0
+    AWS_ACCESS_KEY_ID="${BLOCKCACHEVFS_S3_ACCESS_KEY:-test}" \
+    AWS_SECRET_ACCESS_KEY="${BLOCKCACHEVFS_S3_SECRET:-test}" \
+    AWS_DEFAULT_REGION="${BLOCKCACHEVFS_S3_REGION:-us-east-1}" \
+      aws --endpoint-url "${BLOCKCACHEVFS_S3_ENDPOINT%/}" \
+        s3 rb "s3://${1}" --force >/dev/null 2>&1 || true
+  }
+  cleanup_google_bucket() {
+    [ -n "${1:-}" ] || return 0
+    curl -fsS -X DELETE \
+      -H "Authorization: Bearer ${BLOCKCACHEVFS_GOOGLE_TOKEN:-test-token}" \
+      "${BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT%/}/storage/v1/b/${1}" \
+      >/dev/null 2>&1 || true
+  }
+  if [ -n "${BLOCKCACHEVFS_S3_ENDPOINT:-}" ] \
+    && [ -z "$s3_bucket_was_set" ] \
+    && command -v aws >/dev/null 2>&1; then
+    cleanup_s3_bucket "${BLOCKCACHEVFS_S3_BUCKET:-}"
+    if [ "$poll_test_included" -eq 1 ]; then
+      cleanup_s3_bucket "$poll_container_a"
+      cleanup_s3_bucket "$poll_container_b"
+    fi
+  fi
+  if [ -n "${BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT:-}" ] \
+    && [ -z "$google_bucket_was_set" ] \
+    && command -v curl >/dev/null 2>&1; then
+    cleanup_google_bucket "${BLOCKCACHEVFS_GOOGLE_BUCKET:-}"
+    if [ "$poll_test_included" -eq 1 ]; then
+      cleanup_google_bucket "$poll_container_a"
+      cleanup_google_bucket "$poll_container_b"
+    fi
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT HUP INT TERM
+
+cp -a "$checkout"/. "$tmp/"
+git -C "$tmp/src" apply \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0001-google-endpoint.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0002-google-json-api.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0003-s3-module.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0004-create-if-not-exists.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0005-vfs-access.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0006-manifest-file-size.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0008-safe-wal-header-read.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0009-doltlite-lock-sidecar.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0010-doltlite-truncate-noop.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0011-doltlite-upload-lock.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0012-s3-tls-and-verbose-logging.patch"
+
+export BLOCKCACHEVFS_CBS_BASE_CONFIG="$checkout/test/config.tcl"
+cp "$repo_root/tools/blockcachevfs-cbs-config.tcl" "$tmp/test/config.tcl"
+
+suffix=${BLOCKCACHEVFS_TEST_SUFFIX:-$(date +%s)-$$}
+if [ -n "${BLOCKCACHEVFS_S3_ENDPOINT:-}" ]; then
+  export BLOCKCACHEVFS_S3_BUCKET="${BLOCKCACHEVFS_S3_BUCKET:-rusqdoltlite-$suffix}"
+  export BLOCKCACHEVFS_S3_BUCKET2="${BLOCKCACHEVFS_S3_BUCKET2:-${BLOCKCACHEVFS_S3_BUCKET}-second}"
+  export BLOCKCACHEVFS_S3_REGION="${BLOCKCACHEVFS_S3_REGION:-us-east-1}"
+  export BLOCKCACHEVFS_S3_ACCESS_KEY="${BLOCKCACHEVFS_S3_ACCESS_KEY:-test}"
+  export BLOCKCACHEVFS_S3_SECRET="${BLOCKCACHEVFS_S3_SECRET:-test}"
+fi
+if [ -n "${BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT:-}" ]; then
+  export BLOCKCACHEVFS_GOOGLE_BUCKET="${BLOCKCACHEVFS_GOOGLE_BUCKET:-rusqdoltlite-$suffix}"
+  export BLOCKCACHEVFS_GOOGLE_BUCKET2="${BLOCKCACHEVFS_GOOGLE_BUCKET2:-${BLOCKCACHEVFS_GOOGLE_BUCKET}-second}"
+  export BLOCKCACHEVFS_GOOGLE_PROJECT="${BLOCKCACHEVFS_GOOGLE_PROJECT:-test-project}"
+  export BLOCKCACHEVFS_GOOGLE_TOKEN="${BLOCKCACHEVFS_GOOGLE_TOKEN:-test-token}"
+fi
+
+# test_common.tcl owns the default container names. Override only those names
+# in this disposable copy so each backend uses unique buckets. The upstream
+# test logic and assertions remain unchanged.
+container_override=
+if [ -n "${BLOCKCACHEVFS_S3_ENDPOINT:-}" ]; then
+  container_override="$BLOCKCACHEVFS_S3_BUCKET"
+elif [ -n "${BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT:-}" ]; then
+  container_override="$BLOCKCACHEVFS_GOOGLE_BUCKET"
+fi
+if [ -n "$container_override" ]; then
+  container_override2="${BLOCKCACHEVFS_S3_BUCKET2:-${BLOCKCACHEVFS_GOOGLE_BUCKET2:-${container_override}-second}}"
+  awk -v value="$container_override" '
+    { print }
+    /^set D\(container2\)/ {
+      print "set D(container) " value
+      print "set D(container2) " value2
+    }
+  ' value2="$container_override2" "$tmp/test/test_common.tcl" >"$tmp/test/test_common.tcl.new"
+  mv "$tmp/test/test_common.tcl.new" "$tmp/test/test_common.tcl"
+fi
+
+if [ -f "$tmp/test/bcvfs_poll1.test" ] \
+  && grep -Eq '(^|[[:space:]])bcvfs_poll1\.test([[:space:]]|$)' "$tmp/test/config.tcl"; then
+  poll_test_included=1
+  poll_container_a="${container_override}-poll-a"
+  poll_container_b="${container_override}-poll-b"
+  awk -v replacement_a="$poll_container_a" -v replacement_b="$poll_container_b" '
+    function replace_literal(input, needle, replacement,    offset) {
+      while ((offset = index(input, needle)) != 0) {
+        input = substr(input, 1, offset - 1) replacement \
+          substr(input, offset + length(needle))
+      }
+      return input
+    }
+    {
+      line = replace_literal($0, "mycont", replacement_a)
+      line = replace_literal(line, "cont1", replacement_b)
+      print line
+    }
+  ' "$tmp/test/bcvfs_poll1.test" >"$tmp/test/bcvfs_poll1.test.new"
+  mv "$tmp/test/bcvfs_poll1.test.new" "$tmp/test/bcvfs_poll1.test"
+fi
+
+if [ ! -x "$tmp/configure" ]; then
+  echo "SKIP: disposable CBS checkout has no configure script" >&2
+  exit 77
+fi
+(cd "$tmp" && ./configure >/dev/null)
+(cd "$tmp" && make -j"${JOBS:-2}" bcvtclsqlite)
+(cd "$tmp" && ./bcvtclsqlite test/runtests.tcl -config 'rusqdoltlite_*')

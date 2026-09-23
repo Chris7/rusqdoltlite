@@ -1,0 +1,14 @@
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -1499,6 +1499,8 @@ static int bcvfsReadWriteDatabase(
+       rc = pCF->pMethods->xRead(pCF, pBuf, iAmt, iOff);
+       if( iOfst==0 ){
+         /* Force database to look like a wal database */
+-        ((u8*)pBuf)[18] = 0x02;
+-        ((u8*)pBuf)[19] = 0x02;
++        if( iAmt>=20 ){
++          ((u8*)pBuf)[18] = 0x02;
++          ((u8*)pBuf)[19] = 0x02;
++        }
+       }

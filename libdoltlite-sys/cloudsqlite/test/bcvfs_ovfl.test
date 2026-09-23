@@ -1,0 +1,44 @@
+#
+# 13-Feb-2024
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_ovfl
+
+bcv_install_vfs_wrapper
+
+bcv_create_container cont1
+
+file delete -force t1.db
+sqlite3 db t1.db
+do_execsql_test 1.0 {
+  PRAGMA page_size = 1024;
+  CREATE TABLE x1(x INTEGER PRIMARY KEY, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+5 FROM s WHERE i<2500
+  )
+  INSERT INTO x1 SELECT NULL, hex(randomblob(i)) FROM s;
+}
+
+set res [db one { SELECT group_concat(y) FROM x1 }]
+db close
+bcv_upload_database -container cont1 t1.db t1.db
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont1
+
+sqlite3 db /cont1/t1.db -vfs bcvfs -uri 1
+
+do_execsql_test 1.0 {
+  SELECT group_concat(y) FROM x1
+} $res
+
+db close
+$cmd destroy
+
+
+finish_test
+

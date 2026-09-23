@@ -1,0 +1,40 @@
+#
+# 20-May-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_busy1
+
+bcv_create_container cont1
+
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<5000
+  )
+  INSERT INTO x1 SELECT randomblob(100), randomblob(100) FROM s;
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t1.db -vfs bcvfs
+
+do_test 1.0 {
+  list [catch { $cmd destroy } msg] $msg
+} {1 rc=5}
+
+db close
+$cmd prefetch_new pf cont1 t1.db
+
+do_test 1.1 {
+  list [catch { $cmd destroy } msg] $msg
+} {1 rc=5}
+
+pf destroy
+$cmd destroy
+finish_test
+

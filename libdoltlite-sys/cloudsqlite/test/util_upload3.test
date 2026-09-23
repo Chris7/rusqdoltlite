@@ -1,0 +1,73 @@
+#
+# 09-November-2021
+#
+#-------------------------------------------------------------------------
+# This file contains tests for uploading and downloading files from
+# cloud storage.
+#
+
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcv_upload2
+
+bcv_create_container $D(container)
+
+file delete -force test.db
+sqlite3 db test.db
+do_execsql_test 1.0 {
+  PRAGMA page_size = 4096;
+  CREATE TABLE t1(a, b);
+}
+
+for {set ii 2} {$ii < 100} {incr ii} {
+  db eval "
+    CREATE TABLE t$ii (a, b);
+    INSERT INTO t$ii VALUES($ii, $ii);
+  "
+  bcv_upload_database test.db test.db.$ii
+
+  catch { file delete -force testX.db }
+  bcv_download_database test.db.$ii testX.db
+  sqlite3 dbX testX.db
+  do_test 1.$ii {
+    dbX eval { PRAGMA integrity_check }
+  } {ok}
+  dbX close
+}
+
+db close
+
+#-------------------------------------------------------------------------
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcv_create_container $D(container)
+bcv_upload_empty_database $D(container) t1.db
+bcvfs_attach $cmd $D(container)
+
+sqlite3 db /$D(container)/t1.db -vfs bcvfs
+
+for {set ii 2} {$ii < 100} {incr ii} {
+  db eval "
+    CREATE TABLE t$ii (a, b);
+    INSERT INTO t$ii VALUES($ii, $ii);
+    PRAGMA bcv_upload;
+  "
+
+  catch { file delete -force testX.db }
+  bcv_download_database t1.db testX.db
+  sqlite3 dbX testX.db
+  do_test 2.$ii.1 {
+    dbX eval { PRAGMA integrity_check }
+  } {ok}
+  do_test 2.$ii.2 {
+    dbX eval "SELECT * FROM t$ii"
+  } [list $ii $ii]
+  dbX close
+}
+
+db close
+$cmd destroy
+
+finish_test
+

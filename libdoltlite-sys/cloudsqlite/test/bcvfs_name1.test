@@ -1,0 +1,90 @@
+#
+# 13-January-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_name1
+
+
+#-------------------------------------------------------------------------
+# Test unusual characters in container aliases.
+#
+bcv_mkdir testdir
+bcv_create_container $D(container)
+bcv_upload_empty_database $D(container) a.db
+set cmd [bcvfs_create testdir "bcvfs"]
+
+set alias "abc{} -1.2_3ABC%"
+do_test 1.1 {
+  bcvfs_attach -alias $alias $cmd $D(container)
+  sqlite3 db /$alias/a.db -vfs bcvfs
+  execsql {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(4, 3), (2, 1);
+    PRAGMA bcv_upload;
+  }
+} {}
+
+do_test 1.2 {
+  bcvfs_attach -alias c1 $cmd $D(container)
+  sqlite3 db2 /c1/a.db -vfs bcvfs
+  execsql {
+    SELECT * FROM t1
+  }
+} {4 3 2 1}
+
+
+db  close
+db2 close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+# Note: depends on the cloud container state left by the block above.
+#
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach -alias c1 $cmd $D(container)
+
+foreach {tn oname} {
+  1 "/c1/a.db"
+  2 "\\c1\\a.db"
+} {
+  do_test 2.1.$tn {
+    sqlite3 db $oname -vfs bcvfs
+    db eval {
+      SELECT * FROM t1
+    }
+  } {4 3 2 1}
+  db close
+}
+
+foreach {tn oname} {
+  1 "c1/a.db"
+  2 "/c1/a/db"
+  3 "/c1/a\\db"
+} {
+  do_test 2.2.$tn {
+    list [catch { sqlite3 db $oname -vfs bcvfs } msg] $msg
+  } {1 {SQL logic error}}
+}
+
+foreach {tn oname} {
+  1 "/nosuchcontainer/a.db"
+  2 "/nosuchcontainer"
+} {
+  do_test 2.3.$tn {
+    list [catch { sqlite3 db $oname -vfs bcvfs } msg] $msg
+  } {1 {unable to open database file}}
+}
+
+# Try to attach a container that does not exist.
+do_test 2.4 {
+  list [catch { bcvfs_attach -alias cx $cmd nosuchcontainer } msg] $msg
+} {1 {404 HTTP/1.1 404 The specified container does not exist.}}
+
+$cmd destroy
+
+finish_test
+

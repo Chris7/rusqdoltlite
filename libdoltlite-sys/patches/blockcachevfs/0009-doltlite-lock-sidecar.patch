@@ -1,0 +1,48 @@
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -3277,7 +3277,7 @@
+     0                             /* xUnfetch */
+   };
+   sqlite3_bcvfs *pFs = (sqlite3_bcvfs*)pVfs;
+-  const int bIsMain = !!(flags & SQLITE_OPEN_MAIN_DB);
++  int bIsMain = !!(flags & SQLITE_OPEN_MAIN_DB);
+   BcvfsFile *pRet = (BcvfsFile*)pFile;
+   int rc = SQLITE_OK;
+   BcvDbPath *pPath = 0;
+@@ -3328,8 +3328,24 @@
+             if( pPath->zDatabase ){
+               int nDb = strlen(pPath->zDatabase);
+               ManifestDb *pDb;
+-              if( !bIsMain ) nDb -= 4;
+-              pDb = bcvfsFindDatabase(pCont->pMan, pPath->zDatabase, nDb);
++              int bIsLock = 0;
++              if( nDb>6
++               && pPath->zDatabase[0]=='.'
++               && memcmp(&pPath->zDatabase[nDb-5], "-lock", 5)==0
++              ){
++                pDb = bcvfsFindDatabase(
++                    pCont->pMan, &pPath->zDatabase[1], nDb-6
++                );
++                if( pDb && pDb->nBlkLocal>0 ){
++                  bIsLock = 1;
++                  bIsMain = 0;
++                  pRet->bIsMain = 0;
++                }
++              }
++              if( !bIsLock && !bIsMain ) nDb -= 4;
++              if( !bIsLock ){
++                pDb = bcvfsFindDatabase(pCont->pMan, pPath->zDatabase, nDb);
++              }
+               if( pDb==0 || pDb->nBlkLocal==0 ){
+                 rc = BCVFS_CANTOPEN;
+               }else{
+@@ -3370,7 +3386,7 @@
+               fout |= SQLITE_OPEN_READONLY;
+             }
+           }
+-          *pOutFlags = fout;
++          if( pOutFlags ) *pOutFlags = fout;
+           if( rc==SQLITE_OK && bIsMain ){
+             rc = bcvOpenLocal(pFs->zCacheFile, 0, bDaemon, &pRet->pCacheFile);
+           }

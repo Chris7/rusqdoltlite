@@ -1,0 +1,107 @@
+#
+# 02-March-2022
+#
+#-------------------------------------------------------------------------
+#
+# This file tests the effects of providing the cleanup() utility
+# with a bad SAS, or with a read-only SAS.
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix util_cleanup1
+
+if {$C(use_sas)==0} {
+  finish_test
+  return
+}
+
+
+# Tests:
+#
+#   1. Test the effects of a bad SAS (one that will not even 
+#      authorize reading the manifest file).
+#
+#   2. Test the effects of a readonly SAS when there are stray
+#      blocks (so that cleanup() attempts to upload a new manifest
+#      with the stray blocks listed as deleted blocks).
+#
+#   3. Test the effects of a readonly SAS when there are no stray
+#      blocks (first operation to fail is a DELETE request).
+#
+
+bcv_create_container zzzz
+bcv_upload_new_db zzzz x1.db {
+  CREATE TABLE t1(a, b);
+  INSERT INTO t1 VALUES(1, 2);
+}
+
+bcv_create_container zzzz
+bcv_upload_new_db zzzz x1.db {
+  CREATE TABLE t1(a, b);
+  INSERT INTO t1 VALUES(10, 20);
+}
+
+do_test 1.0 {
+  set bcv [bcv_open zzzz -auth thiswontwork]
+  $bcv cleanup 0
+} {403}
+do_test 1.1 {
+  $bcv errcode
+} {403}
+do_test 1.2 {
+  string match {download manifest failed (403) - HTTP/1.1 403*} [$bcv errmsg]
+} {1}
+$bcv close
+
+do_test 2.0 {
+  set bcv [bcv_open zzzz -auth [make_readonly_sas zzzz]]
+  $bcv cleanup 0
+} {403}
+do_test 2.1 {
+  $bcv errcode
+} {403}
+do_test 2.2 {
+  string match {upload manifest failed (403) - HTTP/1.1 403*} [$bcv errmsg]
+} {1}
+$bcv close
+
+# First, actually do the cleanup to get rid of the stray block. Then
+# write to the database via a VFS to create a deleted block.
+do_test 3.0 {
+  set bcv [bcv_open zzzz]
+  $bcv cleanup 0
+} {0}
+do_test 3.0.1 {
+  $bcv errcode
+} {0}
+do_test 3.0.2 {
+  $bcv errmsg
+} {}
+$bcv close
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd zzzz
+sqlite3 db /zzzz/x1.db -vfs bcvfs
+do_execsql_test 3.1 {
+  INSERT INTO t1 VALUES(30, 40);
+  PRAGMA bcv_upload;
+}
+db close
+$cmd destroy
+
+do_test 3.2 {
+  set bcv [bcv_open zzzz -auth [make_readonly_sas zzzz]]
+  $bcv cleanup 0
+} {403}
+do_test 3.3 {
+  $bcv errcode
+} {403}
+do_test 3.4 {
+  string match {delete block failed (403) - HTTP/1.1 403*} [$bcv errmsg]
+} {1}
+
+$bcv close
+
+finish_test
+

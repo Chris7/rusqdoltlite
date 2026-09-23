@@ -1,0 +1,146 @@
+--- a/bcvmodule.c
++++ b/bcvmodule.c
+@@ -1822,7 +1822,9 @@
+   bcvHdrPrintf(pCtx, pReq, "Authorization: Bearer %s", p->zSecret);
+   sqlite3_bcv_request_set_header(pReq, AZURE_MIMETYPE_HDR);
+   if( zETag ){
+-    bcvHdrPrintf(pCtx, pReq, "x-goog-if-generation-match: %s", zETag);
++    bcvHdrPrintf(pCtx, pReq, "x-goog-if-generation-match: %s",
++        (zETag[0]=='*' && zETag[1]=='\0') ? "0" : zETag
++    );
+   }
+   sqlite3_bcv_request_set_body(pReq, aData, nData);
+ }
+--- a/bcvutil.c
++++ b/bcvutil.c
+@@ -1154,6 +1154,35 @@
+   return p->errCode;
+ }
+ 
++/* Upload a new manifest only if no manifest currently exists. The '*'
++** sentinel is interpreted by each provider module as its conditional-create
++** primitive (If-None-Match: * or the provider equivalent).
++*/
++static int bcvManifestUploadIfNotExists(sqlite3_bcv *p, Manifest *pMan){
++  ManifestCtx ctx;
++  u8 *aMan = 0;
++  int nMan = 0;
++
++  ctx.p = p;
++  ctx.pMan = 0;
++  aMan = bcvManifestCompose(pMan, &nMan);
++  if( aMan==0 ){
++    p->errCode = SQLITE_NOMEM;
++  }else{
++    int rc = bcvDispatchPut(p->pDisp,
++        p->pCont, BCV_MANIFEST_FILE, "*", aMan, nMan,
++        (void*)&ctx, bcvManifestUploadParsedCb
++    );
++    if( rc==SQLITE_OK ){
++      rc = bcvDispatchRunAll(p->pDisp);
++      if( p->errCode ) rc = p->errCode;
++    }
++    p->errCode = rc;
++  }
++  sqlite3_free(aMan);
++  return p->errCode;
++}
++
+ static int bcvManifestNameToIndex(Manifest *p, const char *zDb){
+   int i;
+   for(i=0; i<p->nDb; i++){
+@@ -2372,6 +2401,80 @@
+   return p->errCode;
+ }
+ 
++/*
++** Create a new cloud storage manifest without replacing an existing one.
++** The provider conditional PUT is the concurrency boundary: two callers may
++** race, but only one can create the manifest. A failed first request causes
++** bucket creation and a conditional PUT retry; a bucket-create conflict is
++** treated as a concurrent creator and also retried.
++*/
++int sqlite3_bcv_create_if_not_exists(sqlite3_bcv *p, int szName, int szBlock){
++  Manifest man;
++
++  if( p->pCont==0 ) return p->errCode;
++  if( szName<=0 ) szName = BCV_DEFAULT_NAMEBYTES;
++  if( szBlock<=0 ) szBlock = BCV_DEFAULT_BLOCKSIZE;
++  if( szName<BCV_MIN_NAMEBYTES || szName>BCV_MAX_NAMEBYTES ){
++    return bcvApiError(p, SQLITE_RANGE, "parameter szName out of range");
++  }
++
++  memset(&man, 0, sizeof(man));
++  man.szBlk = szBlock;
++  man.nNamebytes = szName;
++  {
++    Manifest *pExisting = 0;
++    int rc = bcvManifestFetchParsed(p, &pExisting);
++    if( rc==SQLITE_OK ){
++      bcvManifestFree(pExisting);
++      return bcvApiError(p, SQLITE_CONSTRAINT,
++          "manifest already exists; refusing to replace it"
++      );
++    }
++    if( rc!=HTTP_NOT_FOUND && rc<500 ) return p->errCode;
++    bcvApiErrorClear(p);
++  }
++  bcvApiErrorClear(p);
++  if( bcvManifestUploadIfNotExists(p, &man)!=SQLITE_OK ){
++    BcvDispatch *pDisp = p->pDisp;
++    bcvApiErrorClear(p);
++    p->errCode = bcvDispatchCreate(pDisp, p->pCont, (void*)p, bcvCollectError);
++    if( p->errCode==SQLITE_OK ){
++      bcvDispatchRunAll(pDisp);
++    }
++    if( p->errCode==409 ){
++      bcvApiErrorClear(p);
++    }
++    if( p->errCode==SQLITE_OK ){
++      bcvManifestUploadIfNotExists(p, &man);
++    }
++  }
++
++  /* If the manifest was uploaded, upload an empty KV database. */
++  if( p->errCode==SQLITE_OK ){
++    int nKV = 0;
++    u8 *aKV = bcvEmptyKV(&p->errCode, &nKV);
++    if( aKV ){
++      int rc;
++      if( p->bTestNoKv==0 ){
++        rc = bcvDispatchPut(p->pDisp,
++            p->pCont, BCV_KV_FILE, 0, aKV, nKV, (void*)p, bcvKVUploadCb
++        );
++      }else{
++        rc = bcvDispatchDelete(p->pDisp,
++            p->pCont, BCV_KV_FILE, 0, (void*)p, bcvKVUploadCb
++        );
++      }
++      if( rc==SQLITE_OK ){
++        rc = bcvDispatchRunAll(p->pDisp);
++        if( p->errCode ) rc = p->errCode;
++      }
++      p->errCode = rc;
++      sqlite3_free(aKV);
++    }
++  }
++  return p->errCode;
++}
++
+ sqlite3_bcv_request *sqlite3_bcv_job_request(
+   sqlite3_bcv_job *pJob,          /* Call contex */
+   void *pApp,                     /* 3rd argument for xCallback */
+--- a/bcvutil.h
++++ b/bcvutil.h
+@@ -292,5 +292,11 @@
+ int sqlite3_bcv_create(sqlite3_bcv *p, int szName, int szBlock);
+ 
++/*
++** Create a new cloud storage manifest only when one does not already exist.
++** Concurrent callers are serialized by the provider conditional PUT.
++*/
++int sqlite3_bcv_create_if_not_exists(sqlite3_bcv *p, int szName, int szBlock);
++
+ /*
+ ** Delete the entire cloud storage container or bucket.
+ **

@@ -1,0 +1,92 @@
+#
+# 19-July-2020
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_cachesize1
+
+proc bcv_upload_empty_database {container dbname} {
+  file delete -force empty.db
+  sqlite3 db empty.db
+  db eval { PRAGMA user_version = 42 }
+  db close
+  bcv_upload_database -container $container empty.db $dbname
+}
+
+foreach {tn pragma result} {
+  1 "PRAGMA wal_checkpoint" 
+    {container1 test.db1 8 8 0 container1 test.db2 8 8 0}
+  2 "PRAGMA bcv_upload" 
+    {container1 test.db1 8 2 0 container1 test.db2 8 8 0}
+} {
+  bcv_create_container container1
+  bcv_upload_empty_database container1 test.db1
+  bcv_upload_empty_database container1 test.db2
+
+  bcv_mkdir testdir
+  set bcvfs [bcvfs_create testdir bcvfs]
+  $bcvfs config cachesize [expr 10*128*1024]
+
+  $bcvfs attach $::C(module) $::C(user) container1
+
+  sqlite3 db /container1/test.db1 -vfs bcvfs
+  sqlite3_bcvfs_register_vtab db
+
+  do_execsql_test 1.$tn.0 {
+    CREATE TABLE t1(x, y);
+    CREATE INDEX t1x ON t1(x);
+    CREATE INDEX t1y ON t1(y);
+  }
+
+  do_execsql_test 1.$tn.1 {
+    WITH x(i) AS ( SELECT 1 UNION ALL SELECT i+1 FROM x WHERE i<1000)
+    INSERT INTO t1 SELECT randomblob(200), randomblob(200) FROM x;
+  }
+
+  do_test 1.$tn.2 {
+    execsql $pragma
+    set {} {}
+  } {}
+
+  do_execsql_test 1.$tn.3 {
+    SELECT container, database, nblock, ncache, 0 FROM bcv_database
+  } [list \
+    container1 test.db1 8 8 0 \
+    container1 test.db2 1 0 0
+  ]
+
+  do_execsql_test 1.$tn.4 {
+    ATTACH '/container1/test.db2' AS aux;
+    CREATE TABLE aux.t2(x, y);
+    CREATE INDEX aux.t2x ON t2(x);
+    CREATE INDEX aux.t2y ON t2(y);
+    WITH x(i) AS ( SELECT 1 UNION ALL SELECT i+1 FROM x WHERE i<1000)
+    INSERT INTO t2 SELECT randomblob(200), randomblob(200) FROM x;
+  }
+  
+  do_test 1.$tn.5 {
+    execsql { PRAGMA aux.wal_checkpoint }
+    set {} {}
+  } {}
+  
+  do_execsql_test 1.$tn.6 {
+    SELECT container, database, nblock, ncache, 0 FROM bcv_database
+  } $result
+
+  do_execsql_test 1.$tn.7 {
+    PRAGMA main.integrity_check;
+  } {ok}
+
+  do_execsql_test 1.$tn.8 {
+    PRAGMA aux.integrity_check;
+    SELECT container, database, nblock, ncache, 0 FROM bcv_database
+  } "ok $result"
+
+  db close
+  $bcvfs destroy
+}
+
+finish_test
+

@@ -1,0 +1,288 @@
+#
+# 13-January-2022
+#
+#-------------------------------------------------------------------------
+#
+# This file contains tests verifying that 403 errors are handled 
+# correctly in SAS mode - that the xAuth callback is invoked to obtain
+# a new SAS when required, and that the 403 error (and sometimes message) 
+# is propagated back to the user correctly.
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_auth1
+
+if {$C(use_sas)==0} {
+  finish_test
+  return
+}
+
+set SQLITE_IOERR_AUTH [expr 10 + (28<<8)]
+
+#-------------------------------------------------------------------------
+# Check that SAS expiry is handled:
+#
+#   1.0 - Attach a container using an SAS with a lifetime of 2 seconds.
+#   1.1 - Sleep for 3 seconds.
+#   1.2 - Query a database in the container.
+#   1.3 - Check that a new SAS was obtained from the callback in test 1.2. 
+#
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  INSERT INTO x1 VALUES('hello', 'world');
+}
+
+set ::nAuthCallback 0
+proc my_auth_callback {zStorage zAccount zContainer} {
+  incr ::nAuthCallback
+  set sas [make_sas $zContainer 2]
+  return $sas
+}
+
+set cmd [bcvfs_create testdir bcvfs]
+$cmd auth_callback my_auth_callback
+
+do_test 1.0 {
+  bcvfs_attach $cmd cont1
+  sqlite3 db /cont1/t1.db -vfs bcvfs
+  set ::nAuthCallback
+} {1}
+
+do_test 1.1.sleeping_3000ms... {
+  after 3000
+  set {} {}
+} {}
+
+do_execsql_test 1.2 {
+  SELECT * FROM x1
+} {hello world}
+
+do_test 1.3 {
+  set ::nAuthCallback
+} {2}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+# Check that SAS expiry is handled:
+#
+#   2.0 - Attach a container using an SAS with a lifetime of 2 seconds.
+#   2.1 - Sleep for 3 seconds.
+#   2.2 - Query a database in the container, when a new SAS is requested,
+#         return a token that does not work. Caller gets an SQLITE_IOERR 
+#         error.
+#   2.3 - Query a database in the container, this time have the callback
+#         return a valid SAS token and verify that the query works and
+#         returns the correct data.
+#
+#   2.4-5 - Wait 3 seconds. Then write and attempt to upload the db using
+#         "PRAGMA bcv_upload". Have the callback return a dud SAS token and
+#         observe the SQLITE_IOERR error. 
+#
+#   2.6   Try the upload again - with the API. Observe the 403 error code
+#         and message.
+#
+
+set ::nAuthCallback 0
+proc my_auth_callback {zStorage zAccount zContainer} {
+  incr ::nAuthCallback
+  if {$::nAuthCallback==1} {
+    set sas [make_sas $zContainer 2]
+  } else {
+    set sas "helloworld"
+  }
+  return $sas
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+$cmd auth_callback my_auth_callback
+
+do_test 2.0 {
+  bcvfs_attach $cmd cont1
+  sqlite3 db /cont1/t1.db -vfs bcvfs
+} {}
+
+do_test 2.1.sleeping_3000ms... {
+  after 3000
+  set ::nAuthCallback
+} {1}
+
+do_catchsql_test 2.2 {
+  SELECT * FROM x1
+} {1 {disk I/O error}}
+
+set ::nAuthCallback 0
+do_catchsql_test 2.3 {
+  SELECT * FROM x1
+} {0 {hello world}}
+
+do_test 2.4.sleeping_3000ms... {
+  after 3000
+  set ::nAuthCallback
+} {1}
+
+do_test 2.5 {
+  set rc [catch { execsql {
+    INSERT INTO x1 VALUES('one', 'two');
+    PRAGMA bcv_upload;
+  } } msg]
+  list $rc [string range $msg 0 [string length "HTTP/1.1 403"]-1]
+} {1 {HTTP/1.1 403}}
+
+do_test 2.6 {
+  set rc [catch { $::cmd upload cont1 } msg]
+  list $rc [string range $msg 0 [string length "403 HTTP/1.1 403"]-1]
+} {1 {403 HTTP/1.1 403}}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+
+set ::nAuthCallback 0
+proc my_auth_callback {zStorage zAccount zContainer} {
+  incr ::nAuthCallback
+  if {$::nAuthCallback==1} {
+    set sas [make_sas $zContainer 2]
+  } else {
+    set sas "helloworld"
+  }
+  return $sas
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+$cmd auth_callback my_auth_callback
+
+do_test 3.0 {
+  bcvfs_attach $cmd cont1
+  sqlite3 db /cont1/t1.db -vfs bcvfs
+} {}
+
+do_test 3.1.sleeping_3000ms... {
+  after 3000
+  set ::nAuthCallback
+} {1}
+
+do_test 3.2 {
+  catch {execsql { PRAGMA bcv_poll }} msg
+  lrange $msg 0 1
+} {HTTP/1.1 403}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+
+set ::nAuthCallback 0
+proc my_auth_callback {zStorage zAccount zContainer} {
+  incr ::nAuthCallback
+  if {$::nAuthCallback==1} {
+    set sas [make_sas $zContainer 2]
+  } else {
+    set sas "helloworld"
+  }
+  return $sas
+}
+
+bcv_mkdir testdir
+bcv_create_container cont1
+set cmd [bcvfs_create testdir bcvfs]
+$cmd auth_callback my_auth_callback
+
+do_test 4.0 {
+  bcvfs_attach $cmd cont1
+  sqlite3 db /cont1 -vfs bcvfs
+  sqlite3_bcvfs_register_vtab db
+  db eval {
+    DELETE FROM bcv_kv;
+    INSERT INTO bcv_kv VALUES(1, 'one');
+    INSERT INTO bcv_kv VALUES(2, 'two');
+  }
+} {}
+
+do_test 4.1.sleeping_3000ms... {
+  after 3000
+  catch { db eval { SELECT * FROM bcv_kv } } msg
+  lrange $msg 0 6
+} {download bcv_kv.bcv failed (403) - HTTP/1.1 403}
+
+do_test 4.1.1 {
+  sqlite3_extended_errcode db
+} $SQLITE_IOERR_AUTH
+
+do_test 4.2.sleeping_3000ms... {
+  after 3000
+  set nAuthCallback 0
+  execsql {
+    SELECT * FROM bcv_kv
+  }
+} {1 one 2 two}
+
+do_test 4.3.sleeping_3000ms... {
+  set nAuthCallback 0
+  set ret [list]
+  db eval { SELECT * FROM bcv_kv } {
+    if {$name=="1"} { after 3000 }
+    lappend ret $name $value
+  }
+  concat $nAuthCallback $ret
+} {0 1 one 2 two}
+
+do_test 4.4.sleeping_3000ms... {
+  catch {
+    db eval { SELECT * FROM bcv_kv } {
+      if {$name=="1"} { after 3000 }
+    }
+  } 
+} {0}
+
+do_test 4.5.sleeping_3000ms... {
+  set nAuthCallback 0
+  execsql { BEGIN; SELECT * FROM bcv_kv }
+  set nAuthCallback 0
+  after 3000
+  execsql { INSERT INTO bcv_kv VALUES(3, 'three'); }
+  execsql { COMMIT; SELECT * FROM bcv_kv }
+} {1 one 2 two 3 three}
+
+do_test 4.6.sleeping_3000ms... {
+  execsql { BEGIN; SELECT * FROM bcv_kv }
+  execsql { INSERT INTO bcv_kv VALUES(4, 'four') }
+  after 3000
+  set rc [catch { db eval "COMMIT" } msg]
+  list $rc [lrange $msg 0 6]
+} {1 {upload bcv_kv.bcv failed (403) - HTTP/1.1 403}}
+
+do_test 4.7 {
+  sqlite3_extended_errcode db
+} $SQLITE_IOERR_AUTH
+
+do_test 4.8 {
+  set rc [catch { db eval { SELECT * FROM bcv_kv } } msg]
+  list $rc [lrange $msg 0 6]
+} {1 {download bcv_kv.bcv failed (403) - HTTP/1.1 403}}
+
+do_test 4.9 {
+  sqlite3_extended_errcode db
+} $SQLITE_IOERR_AUTH
+
+do_test 4.10 {
+  set rc [catch { db eval {UPDATE bcv_kv SET value='value' WHERE name=1} } msg]
+  list $rc [lrange $msg 0 6]
+} {1 {download bcv_kv.bcv failed (403) - HTTP/1.1 403}}
+
+do_test 4.11 {
+  sqlite3_extended_errcode db
+} $SQLITE_IOERR_AUTH
+
+db close
+$cmd destroy
+
+finish_test
+
+

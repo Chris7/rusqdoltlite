@@ -1,0 +1,80 @@
+
+<title> Client/Daemon Message Protocol </title>
+
+
+<table border=1 cellpadding=5>
+<tr><th>Message Type<th>Payload<th>Reply Payload
+<tr><td>ATTACH<td>
+  *  storage system,
+  *  account name,
+  *  container name,
+  *  container alias,
+  *  authentication string.<td>
+
+  *  error code,
+  *  error message.
+
+<tr><td>DETACH<td>
+  *  container alias<td>
+
+  *  error code,
+  *  error message.
+
+<tr><td>VTAB<td>
+  *  virtual table name ("bcv_database" or "bcv_container"),
+  *  filter string.<td>
+
+  *  error code,
+  *  error message,
+  *  table data.
+
+<tr><td>RESOLVE<td>
+  *  container alias.<td>
+
+  *  error code,
+  *  storage system,
+  *  account name,
+  *  container name.
+
+<tr><td>POLL<td>
+  *  container name,
+  *  authentication string.<td>
+
+  *  error code,
+  *  error message.
+
+<tr><td>PIN<td>
+  *  container name,
+  *  database name,
+  *  flag (pin or unpin),
+  *  authentication string.<td>
+
+  *  error code,
+  *  error message.
+
+<tr><td>HELLO<td>
+  *  container name,
+  *  database name.<td>
+
+  *  database page size,
+  *  system block size.
+  *  storage system,
+  *  account name,
+  *  container name.
+
+<tr><td>READ<td>
+  *  authentication string,
+  *  required block number,
+  *  MRU list.<td>
+
+  *  error code,
+  *  error message,
+  *  block to cache entry mapping.
+
+<tr><td>END<td>
+  *  MRU list.
+<td> <i>No reply message</i>
+
+
+</table>
+

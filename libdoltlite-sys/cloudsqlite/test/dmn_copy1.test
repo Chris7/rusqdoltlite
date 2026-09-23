@@ -1,0 +1,38 @@
+#
+# 30-March-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix dmn_copy1
+
+#-------------------------------------------------------------------------
+#
+start_new_daemon 0 -cachesize [expr 128*1024*10]
+bcv_create_container cont1
+
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<1000
+  )
+  INSERT INTO x1 SELECT randomblob(400), randomblob(400) FROM s;
+}
+
+set cmd [bcvfs_create testdir.0 bcvfs]
+bcvfs_attach $cmd cont1
+
+sqlite3 db /cont1/t1.db -vfs bcvfs
+db eval {SELECT * FROM sqlite_schema}
+
+do_test 1.0 {
+  list [catch { $cmd copy cont1 t1.db t2.db } msg] $msg
+} {1 {8 vfs is readonly}}
+
+db close
+$cmd destroy
+wait_daemon 0
+
+finish_test
+

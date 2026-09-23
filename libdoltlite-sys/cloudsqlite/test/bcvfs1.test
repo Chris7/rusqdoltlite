@@ -1,0 +1,212 @@
+#
+# 19-July-2020
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs1
+
+bcv_install_vfs_wrapper
+
+file delete -force $::D(dir)
+file mkdir $::D(dir)
+
+catch { file delete -force bcvtest.db }
+sqlite3 db bcvtest.db
+db eval { 
+  CREATE TABLE t1(x, y); 
+  INSERT INTO t1 VALUES('a', 'b');
+  INSERT INTO t1 VALUES('c', 'd');
+}
+db close
+
+set bUseHash [expr $::C(namebytes)>=24]
+
+bcv_create_container $D(container)
+bcv_upload_database bcvtest.db bcvtest1.db
+bcv_upload_database bcvtest.db bcvtest2.db
+
+set cmd [bcvfs_create $D(dir) "bcvfs"]
+
+do_test 1.0 {
+  sqlite3 db / -vfs bcvfs
+} {}
+do_test 1.01 {
+  sqlite3_bcvfs_register_vtab db
+} {}
+do_execsql_test 1.02 {
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {}
+do_test 1.03 {
+  $cmd isdaemon
+} 0
+
+do_test 1.1 {
+  $cmd attach -alias cloud $::C(module) $::C(user) $D(container)
+} {}
+
+do_execsql_test 1.2 {
+  SELECT container, database, nblock, ncache, 0 FROM bcv_database
+} {
+  cloud bcvtest1.db 1 0 0
+  cloud bcvtest2.db 1 0 0
+}
+do_execsql_test 1.3 {
+  SELECT name,storage,user,container FROM bcv_container;
+} [list cloud $C(module) $C(user) $D(container)]
+
+do_test 1.4 {
+  $cmd detach cloud
+} {}
+
+do_execsql_test 1.5 {
+  SELECT container, database, nblock, ncache, 0 FROM bcv_database
+} {}
+do_execsql_test 1.6 {
+  SELECT * FROM bcv_container;
+} {
+}
+db close
+
+#$cmd log http log_callback
+#proc log_callback {mask msg} { puts "$mask: $msg" }
+
+$cmd attach -alias cloud $::C(module) $::C(user) $D(container)
+$cmd log http log_callback
+proc log_callback {mask msg} { puts "$mask: $msg" }
+sqlite3 db /cloud/bcvtest1.db -vfs bcvfs
+do_execsql_test 2.1 {
+  SELECT * FROM t1
+} {a b c d}
+
+sqlite3_bcvfs_register_vtab db
+do_execsql_test 2.2 {
+  SELECT container, database, nblock, ncache, 0 FROM bcv_database
+} [list \
+  cloud bcvtest1.db 1 1 0 \
+  cloud bcvtest2.db 1 $bUseHash 0 \
+]
+
+do_execsql_test 2.3 {
+  INSERT INTO t1 VALUES('e', 'f');
+}
+
+do_execsql_test 2.4 {
+  PRAGMA bcv_upload;
+}
+
+do_execsql_test 2.4.1 {
+  PRAGMA bcv_upload;
+}
+
+do_execsql_test 2.5 {
+  SELECT * FROM t1
+} {a b c d e f}
+
+sqlite3_bcvfs_register_vtab db
+do_execsql_test 2.6 {
+  SELECT container, database, nblock, ncache, 0 FROM bcv_database
+} [list \
+  cloud bcvtest1.db 1 1 0 \
+  cloud bcvtest2.db 1 0 0 \
+]
+
+db close
+$cmd destroy
+set cmd [sqlite3_bcvfs_create $D(dir) "bcvfs"]
+
+do_test 2.7 {
+  sqlite3 db / -vfs bcvfs
+  sqlite3_bcvfs_register_vtab db
+} {}
+do_execsql_test 2.7 {
+  SELECT container, database, nblock, ncache, 0 FROM bcv_database
+
+} [list \
+  cloud bcvtest1.db 1 1 0 \
+  cloud bcvtest2.db 1 0 0 \
+]
+
+db close
+sqlite3 db /cloud/bcvtest1.db -vfs bcvfs
+
+do_execsql_test 2.8 {
+  SELECT * FROM t1
+} {a b c d e f}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+bcv_create_container mycont
+bcv_upload_new_db mycont xyz.db {
+  CREATE TABLE t1(x);
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd mycont
+sqlite3 db file:/mycont/xyz.db?vfs=bcvfs -uri 1
+do_execsql_test 3.1 {
+  CREATE TEMP TABLE t2(x);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<2000
+  )
+  INSERT INTO t2 SELECT randomblob(700) FROM s;
+}
+
+do_execsql_test 3.2 {
+  SELECT count(*) FROM (
+    SELECT x FROM t2 ORDER BY x LIMIT 5000
+  )
+} {2000}
+
+do_execsql_test 3.3 {
+  UPDATE t2 SET x=randomblob(701)
+} {}
+
+do_execsql_test 3.4 {
+  BEGIN;
+    UPDATE t2 SET x=randomblob(701);
+    SAVEPOINT abc;
+      UPDATE t2 SET x=randomblob(701);
+  COMMIT;
+} {}
+
+file delete -force test.db
+do_execsql_test 3.5 {
+  ATTACH 'file:test.db?vfs=unix' AS aux;
+  CREATE TABLE x1(z);
+}
+
+db close
+$cmd destroy
+
+#-------------------------------------------------------------------------
+
+set cmd [bcvfs_create testdir testme]
+do_test 4.1 {
+  list [catch { vfs_delete testme /home/dan } msg] $msg
+} {1 rc=5898}
+
+do_test 4.2 {
+  list [catch { vfs_delete testme /home/dan/files } msg] $msg
+} {1 rc=1}
+
+set fname "/[string repeat abc 1000]/[string repeat def 1000]"
+do_test 4.3 {
+  list [catch { sqlite3 db $::fname -vfs testme } msg] $msg
+} {1 {unable to open database file}}
+
+do_test 4.4 {
+  $cmd config nrequest 5
+} {}
+do_test 4.5 {
+  list [catch { $cmd config invalid 123 } msg] $msg
+} {1 rc=12}
+
+$cmd destroy
+
+finish_test
+

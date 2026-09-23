@@ -1,0 +1,88 @@
+#
+# 11-June-2024
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix util_cleanup3
+
+bcv_mkdir testdir
+
+# Create new container. Ensure there are no old blob files within 
+# cloud storage.
+#
+bcv_create_container cont1
+set bcv [bcv_open cont1]
+$bcv cleanup 0
+$bcv close
+
+bcv_upload_new_db cont1 test.db {
+  CREATE TABLE t1(x, y);
+  WITH s(i) AS (
+    VALUES(1) UNION ALL SELECT i+1 FROM s WHERE i<500
+  )
+  INSERT INTO t1 SELECT hex(randomblob(1000)), hex(randomblob(1000)) FROM s;
+}
+
+bcv_upload_new_db cont1 test.db2 {
+  CREATE TABLE t1(x, y);
+  WITH s(i) AS (
+    VALUES(1) UNION ALL SELECT i+1 FROM s WHERE i<500
+  )
+  INSERT INTO t1 SELECT hex(randomblob(1000)), hex(randomblob(1000)) FROM s;
+}
+
+set cmd [bcvfs_create testdir "bcvfs"]
+bcvfs_attach $cmd cont1
+
+sqlite3 db /cont1/test.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  SELECT name, ncleanup FROM bcv_container
+} {cont1 0}
+
+
+$cmd delete cont1 test.db2
+do_execsql_test 1.1 {
+  SELECT name, ncleanup FROM bcv_container
+} {cont1 16}
+
+$cmd upload cont1
+
+proc xLog {args} {
+#  puts "LOG: $args"
+}
+
+do_test 1.2 {
+  set bcv [bcv_open cont1]
+  $bcv config log xLog
+  $bcv config loglevel 1
+  $bcv cleanup 60
+} {0}
+$bcv close
+
+$cmd poll cont1
+
+do_execsql_test 1.3 {
+  SELECT name, ncleanup FROM bcv_container
+} {cont1 16}
+
+wait_ms 2000
+do_test 1.4 {
+  set bcv [bcv_open cont1]
+  $bcv cleanup 1
+} {0}
+$bcv close
+
+$cmd poll cont1
+
+do_execsql_test 1.5 {
+  SELECT name, ncleanup FROM bcv_container
+} {cont1 0}
+
+db close
+$cmd destroy
+finish_test
+

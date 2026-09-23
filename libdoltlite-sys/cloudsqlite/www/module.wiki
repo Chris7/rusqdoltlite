@@ -1,0 +1,550 @@
+<title> Cloud Module Programming Tutorial </title>
+
+<h2>Page Contents</h2>
+
+<ul>
+  <li> <a href=#overview>Overview</a>
+  <li> <a href=#requirements>Cloud Storage System Requirements</a>
+  <li> <a href=#implementation>Cloud Module Implementation and Deployment</a>
+  <ul>
+    <li> <a href=#xOpen>The xOpen() method</a>
+    <li> <a href=#xClose>The xClose() method</a>
+    <li> <a href=#xOther>Other Cloud Module Methods Overview</a>
+    <li> <a href=#xOtherDetails>Other Cloud Module Methods Details</a>
+  </ul>
+</ul>
+
+<h1 id=overview>1. Overview </h1>
+
+Cloud Backed SQLite (CBS) contains built-in support for two cloud storage
+systems - Azure and Google Storage. This page describes APIs and techniques
+that may be used to extend support to other cloud storage systems. It should be
+read in concert with the documentation for each individual API within header
+file bcvmodule.h.
+
+Example code using these APIs, in the form of the built-in support for Azure
+and Google, may be found in source file bcvmodule.c.
+
+<h1 id=requirements>2. Cloud Storage System Requirements </h1>
+
+The requirements that a cloud storage system must fulfill in order to be
+used with CBS are relatively simple. The cloud storage system must provide
+primitives to:
+
+<ul>
+  <li> Store large numbers of objects (binary files or blobs of data) within a
+       container or folder, 
+  <li> Fetch previously stored objects by name,
+  <li> Delete named objects from cloud storage, and
+  <li> Return a list of objects within a cloud storage container or folder.
+</ul>
+
+These primitives must be accessible via a REST API - by making one or more
+HTTP(S) requests to some network resource.
+
+It is convenient if there are also REST APIs that can be used for the
+following:
+
+<ul>
+  <li> Creating new cloud storage containers or folders, and
+  <li> Deleting entire cloud storage containers or folders.
+</ul>
+
+If the above are not supported, then creation and deletion of cloud storage
+containers must be managed externally.
+
+<a name=conditional_put></a>
+Finally, it is highly advantageous if the cloud storage system supports
+<b>conditional PUT operations</b>, such as those provided by the 
+<a href="https://docs.microsoft.com/en-us/azure/storage/common/storage-concurrency?toc=/azure/storage/blobs/toc.json#optimistic-concurrency-for-blobs-and-containers">Azure "If-Match"</a> and <a href="https://cloud.google.com/storage/docs/xml-api/reference-headers#xgoogifgenerationmatch">Google Storage "x-goog-if-generation-match"</a> PUT request header fields. These work as follows:
+
+<ul>
+  <li> Each time an object is uploaded or downloaded from cloud storage, the
+       reply contains an identifier that identifies the specific version of
+       the object just uploaded or downloaded.
+  <li> Requests to upload an object may specify an identifier for an earlier
+       version of the same object. If the server finds that the upload would
+       clobber any version of the object other than that specified, the PUT
+       request fails.
+</ul>
+
+This feature is used by CBS to ensure that databases stored in cloud storage
+are not corrupted even if two or more cloud storage clients attempt to write 
+to the same container concurrently. Cloud storage clients, in this case, are
+CBS daemon or application processes, the users of bcvutil.h APIs that write to
+cloud storage, and their command line equivalents. CBS can work without support
+for conditional PUT operations, but databases may become corrupt or data
+permanently lost if multiple clients attempt to write to the same cloud storage
+container simultaneously.
+
+<h1 id=implementation>3. Cloud Module Implementation and Deployment </h1>
+
+Implementing a custom cloud module is in some ways similar to implementing
+a custom SQLite VFS or virtual table module. A cloud module is implemented by
+creating implementations of eight methods, with signatures as in the following
+structure:
+
+<verbatim>
+    struct sqlite3_bcv_module {
+      int (*xOpen)(
+        void *pCtx,
+        const char **azParam,
+        const char *zUser, const char *zAuth, 
+        const char *zContainer, sqlite3_bcv_container **pp,
+        char **pzErrmsg
+      );
+      void (*xClose)(sqlite3_bcv_container*);
+      
+      void (*xFetch)(
+        sqlite3_bcv_container*, sqlite3_bcv_job*, 
+        const char *zFile, 
+        const char *zETag
+      );
+      void (*xPut)(
+        sqlite3_bcv_container*, sqlite3_bcv_job*, 
+        const char *zFile, 
+        const unsigned char *zData, int nData,
+        const char *zETag
+      );
+      void (*xDelete)(sqlite3_bcv_container*, sqlite3_bcv_job*, const char *zFile);
+      void (*xList)(sqlite3_bcv_container*, sqlite3_bcv_job*);
+      void (*xCreate)(sqlite3_bcv_container*, sqlite3_bcv_job*);
+      void (*xDestroy)(sqlite3_bcv_container*, sqlite3_bcv_job*);
+    };
+</verbatim>
+
+An instance of sqlite3_bcv_module is populated with pointers to the eight
+method implementations and a call made to the following function:
+
+<verbatim>
+    int sqlite3_bcv_create_module(
+      const char *zName,              /* Name of module (e.g. "azure") */
+      sqlite3_bcv_module *pMod,       /* Method implementations for new module */
+      void *pArg                      /* First arg to pass to pMod->xOpen() */
+    );
+</verbatim>
+
+Once a cloud module implementation has been created, it cannot be replaced or
+removed. However, the following call:
+
+<verbatim>
+    void sqlite3_bcv_shutdown();
+</verbatim>
+
+may be used to deregister all registered cloud modules, including the built-in
+ones. This ensures that all memory allocations are freed, which may be useful
+when checking for memory leaks or running other tests.
+
+To be useful, a custom cloud module must be deployed:
+
+<ul>
+  <li> As part of applications that use the (sqlite3_bcv*) handle API made
+       available in bcvutil.h, and
+  <li> As part of the blockcachevfsd executable.
+</ul>
+
+In the first case, applications need simply call sqlite3_bcv_create_module()
+before attempting to use the custom module. In the second, the custom module
+code needs to be linked into the blockcachevfsd binary and a call to
+sqlite3_bcv_create_module() made as part of the blockcachevfsd application
+code. One way to do this is to define the symbol SQLITE_BCV_CUSTOM_INIT symbol
+to the name of a function with the following signature:
+
+<verbatim>
+    int custom_init_function(void);
+</verbatim>
+
+that will be invoked as part of blockcachevfsd initialization. If the function returns any value other than SQLITE_OK, a fatal error is assumed to have occurred and blockcachevfsd exits with an error message.
+
+Alternatively, the main() function of the blockcachevfsd application source
+code may be edited directly.
+
+<h2 id=xOpen>4.1. The xOpen() Method</h2>
+<verbatim>
+      int (*xOpen)(
+        void *pCtx,
+        const char **azParam,
+        const char *zUser, const char *zAuth,
+        const char *zContainer, sqlite3_bcv_container **pp,
+        char **pzErrmsg
+      );
+</verbatim>
+
+The xOpen() method is called by CBS to create a new cloud module connection. A
+single connection connects to a single remote cloud storage container, using a
+single user name and authentication value. The authentication value is a
+nul-terminated string containing the information required for authentication
+with the cloud storage system - for example an Azure access-key or SAS token. 
+
+The first parameter passed to the xOpen() method is a copy of the (void*)
+pointer passed to sqlite3_bcv_create_module() when the cloud module was
+registered. 
+
+If the second parameter - azParam - is not NULL, then it points
+to an array of alternating key and value strings representing the URI style
+parameters specified by the user along with the module name. The array is
+terminated by a NULL entry in this case. For example, if the user specifies 
+the following as a cloud module:
+
+<verbatim>
+    azure?emulator=127.0.0.1:10000&sas=1
+</verbatim>
+
+Then the azParam array passed to the xOpen() method of the "azure" module 
+contains the equivalent of:
+
+<verbatim>
+    {"emulator", "127.0.0.1:10000", "sas", "1", NULL}
+</verbatim>
+
+The third, fourth and fifth parameters - zUser, zAuth and zContainer - are
+passed strings containing the username, authentication value and container name
+that should be used by the new connection. The authentication value is never
+modified after the object is constructed by the xOpen() call, even if the
+authentication credentials used by a daemon process expire and new ones are
+supplied by a connected database client. In this case the existing cloud module
+connection object is destroyed using the xClose() method and a new one created.
+The buffers pointed to by the zUser, zAuth and zContainer parameters (and
+indirectly by the azParam parameter) are only valid for the duration of the
+xOpen() call. The xOpen() method should create copies of these values if
+required.
+
+The sixth parameter is an output parameter, used to return the connection
+object created by the xOpen() call. A pointer to any kind of object cast
+to (sqlite3_bcv_container*) may be returned via (*pp). There is no need, for
+example, to subclass an object as there is with SQLite virtual table instances
+or cursors.
+
+If the xOpen() call is successful, SQLITE_OK should be returned and output
+parameter (*pp) set to point to the new object. Or, if an error occurs, an
+SQLite error code should be returned and (*pp) left set to NULL. In this case,
+the other output parameter, (*pzErrmsg), may be set to point to a buffer
+allocated by sqlite3_malloc() or compatible containing an English language
+error message. BCV will eventually free such a buffer using a call to
+sqlite3_free().
+
+<h2 id=xClose>4.2. The xClose() Method</h2>
+<verbatim>
+    void (*xClose)(sqlite3_bcv_container*);
+</verbatim>
+
+The xClose() method is called by CBS to delete a cloud module connection. The
+argument passed is a pointer to an object returned by an earlier call to the
+corresponding xOpen() method. The implementation should free all resources
+associated with the object being deleted.
+
+Once this method has been called on an object, it is guaranteed that it will
+not be passed to any other method invocations, and that there are no
+outstanding HTTP(S) request callbacks.
+
+<h2 id=xOther>4.3. Other Cloud Module Methods Overview</h2>
+
+The other six methods required of a cloud module implementation are used to
+request primitive operations of the connected cloud storage container. Specifically:
+<table style="margin:0 5ex 0 5ex">
+  <tr><th align=left>xFetch <td width=50>
+  <td> Retreive a single object from cloud storage.
+  <tr><th align=left>xPut<td>
+  <td> Upload a single object to cloud storage.
+  <tr><th align=left>xDelete<td>
+  <td> Delete an object from cloud storage.
+  <tr><th align=left>xList<td>
+  <td> Return a list of the objects stored in the cloud storage container.
+  <tr><th align=left>xCreate<td>
+  <td> Create the cloud storage container (assuming it does not exist).
+  <tr><th align=left>xDestroy<td>
+  <td> Delete the entire cloud storage container.
+</table>
+
+The main difference between this and similar SQLite APIs is that methods do not
+invoke their corresponding primitive and immediately return results. Instead,
+methods invoke sqlite3_bcv_xxx() API functions to issue HTTP(S) requests to cloud
+storage, nominating callbacks to be invoked by CBS when request replies are
+received. Said callbacks may then return a result or error to CBS, or may issue
+further HTTP(S) requests.
+
+More formally, each call to one of the six methods above initiates a "job". 
+If the method returns and there are no outstanding HTTP(S) requests, the job 
+is finished. Or, if there are outstanding HTTP(S) requests, their associated
+callbacks are issued once replies are received. These callbacks may issue
+further HTTP(S) requests associated with the same job. Only once replies for
+all outstanding HTTP(S) requests have been receieved and all callbacks issued
+is the job considered finished.
+
+The following function is used to initiate a new HTTP(S) request from within 
+a cloud module method call or HTTP(S) reply callback:
+
+<verbatim>
+    sqlite3_bcv_request *sqlite3_bcv_job_request(sqlite3_bcv_job*, void*,
+      void (*xCallback)(sqlite3_bcv_job*, sqlite3_bcv_request*, void*)
+    );
+</verbatim>
+
+The first argument passed to sqlite3_bcv_job_request() is a context handle
+for the current job. This is supplied by CBS as the second argument to each
+cloud module method and as the first to each HTTP(S) reply callback. The third
+argument is a pointer to the callback function to invoke once the HTTP(S) 
+reply is received or an error occurs. The callback function will be passed a
+copy of the job handle, the request handle itself and a copy of the second
+argument passed to sqlite3_bcv_job_request().
+
+HTTP(S) requests created using sqlite3_bcv_job_request() are not sent until
+after the current cloud module method or HTTP(S) reply callback has returned.
+But before this happens, they must be configured using the following API
+functions:
+
+<verbatim>
+    void sqlite3_bcv_request_set_method(sqlite3_bcv_request*, int eMethod);
+    void sqlite3_bcv_request_set_uri(sqlite3_bcv_request*, const char *zUri);
+    void sqlite3_bcv_request_set_header(sqlite3_bcv_request*, const char *zHdr);
+    void sqlite3_bcv_request_set_body(sqlite3_bcv_request*, const unsigned char *aBody, int nBody);
+</verbatim>
+
+sqlite3_bcv_request_set_method() is used to set the HTTP(S) method of the
+request.  Currently GET, PUT and DELETE methods are supported. The default
+method, used if sqlite3_bcv_request_set_method() is not invoked on the request
+handle, is GET. The second argument passed to sqlite3_bcv_request_set_method()
+must be one of the following:
+
+<verbatim>
+    #define SQLITE_BCV_METHOD_GET     1
+    #define SQLITE_BCV_METHOD_PUT     2
+    #define SQLITE_BCV_METHOD_DELETE  3
+</verbatim>
+
+API function sqlite3_bcv_request_set_uri() is used to set the full URI of the
+request. Function sqlite3_bcv_request_set_body() is used to set the body of the
+request for PUT operations. Both of these methods, as well as
+sqlite3_bcv_request_set_header(), make copies of the buffers passed to them.
+
+sqlite3_bcv_request_set_header() is used to specify HTTP(S) headers to include
+with the request. The string passed as an argument should be in the usual
+"Name: Value" format for HTTP(S) headers, but should not include any trailing
+carriage return or newline characters. Each call to
+sqlite3_bcv_request_set_header() adds a new header to the request. By contrast,
+a call to sqlite3_bcv_request_set_method(), _uri() or _body() overwrites the
+effects of any previous call.
+
+Assuming that the xOpen() method constructs an instance of type BcvGoogle
+and returns a pointer to it cast to a container handle
+(sqlite3_bcv_container*), the following code block contains an implementation
+of the xFetch() method for Google Storage. It allocates and configures a single
+HTTP(S) request that will be issued by BCV after the xFetch() method returns.
+Not shown is the callback function bcvGoogleFetchCb() that will be invoked once
+a reply to the request has been received. Some error handling and resource
+management (sqlite3_free() calls) have been omitted for the sake of brevity.
+
+<verbatim>
+    typedef struct BcvGoogle BcvGoogle;
+    struct BcvGoogle {
+      const char *zUser;
+      const char *zAuth;
+      const char *zContainer;
+    };
+
+    /*
+    ** xFetch() implementation for Google Storage. To fetch an object with Google Storage, 
+    ** a GET request must be sent to a URI of the form:
+    **
+    **     https://storage.googleapis.com/<container>/<object>
+    **
+    ** There are two required headers - "Authorization" and "Content-Type". The value for 
+    ** the authorization header must be "Bearer " followed by the Google Cloud access token 
+    ** provided as the zAuth argument to xOpen().
+    */
+    static void bcvGoogleFetch(
+      sqlite3_bcv_container *pCont,         /* BcvGoogle object */
+      sqlite3_bcv_job *pJob,                /* Job context handle */
+      const char *zFile,                    /* Name of object to fetch */
+      const char *zETag                     /* Previous version of object */
+    ){
+      BcvGoogle *p = (BcvGoogle*)pCont;
+      char *zUri;
+      char *zAuthHdr;
+      char *zIfNoneMatch = 0;
+      sqlite3_bcv_request *pReq;
+
+      zUri = sqlite3_mprintf("https://storage.googleapis.com/%s/%s", p->zContainer, zFile);
+      zAuthHdr = sqlite3_mprintf("Authorization: Bearer %s", p->zAuth);
+      if( zETag ) zIfNoneMatch = sqlite3_mprintf("If-None-Match: %s", zETag);
+
+      pReq = sqlite3_bcv_job_request(pJob, 0, bcvGoogleFetchCb);
+      sqlite3_bcv_request_set_method(pReq, SQLITE_BCV_METHOD_GET);
+      sqlite3_bcv_request_set_uri(pReq, zUri);
+      sqlite3_bcv_request_set_header(pReq, zAuthHdr);
+      sqlite3_bcv_request_set_header(pReq, "Content-Type: application/octet-stream");
+      if( zETag ) sqlite3_bcv_request_set_header(pReq, zIfNoneMatch);
+    }
+</verbatim>
+
+In general, HTTP(S) reply callback functions extract information from the request
+reply and use this information to either issue further HTTP(S) requests or return
+a result to BCV. The following functions are used to extract information from
+HTTP(S) request replies:
+
+<verbatim>
+    int sqlite3_bcv_request_status(sqlite3_bcv_request*, const char **pzStatus);
+    const char *sqlite3_bcv_request_header(sqlite3_bcv_request*, const char *zHdr);
+    const unsigned char *sqlite3_bcv_request_body(sqlite3_bcv_request*, int *pn);
+</verbatim>
+
+sqlite3_bcv_request_status() returns SQLITE_OK if the request was successful,
+or an error code otherwise. The error code may be either a non-extended SQLite
+error code, or an HTTP result code that indicates an error (e.g. 404). If 
+parameter pzStatus is not NULL, then (*pzStatus) may be set to point to an
+English language status message as well.
+
+API function sqlite3_bcv_request_header() is used to extract HTTP(S) header
+values from the reply. The second argument passed is a case-independent HTTP(S)
+header name (e.g. "content-type"). If the reply contained a matching header,
+then a string containing the associated value is returned (e.g.
+"application/octet-stream"). If the reply did not contain the named header,
+NULL is returned.
+
+Finally, sqlite3_bcv_request_body() is used to retrieve the reply body. A
+pointer to a buffer containing the reply body is returned and output parameter
+(*pn) set to the size of the buffer in bytes.
+
+There are also three functions used to return results to CBS:
+
+<verbatim>
+    void sqlite3_bcv_job_error(sqlite3_bcv_job*, int eCode, const char *zErr);
+    void sqlite3_bcv_job_result(sqlite3_bcv_job*, const unsigned char *p, int n);
+    void sqlite3_bcv_job_etag(sqlite3_bcv_job*, const char *zETag);
+</verbatim>
+
+sqlite_bcv_job_error() is used to return an error to CBS. The error code passed
+as the second argument may be either an SQLite error code or an HTTP error code.
+An English language error message may optionally be provided via the zErr
+parameter.
+
+The sqlite3_bcv_job_result() API is used to return data to CBS. The second
+parameter is a pointer to a buffer of data to return, the third the size of
+that buffer in bytes. In the case of an xFetch() job, it should be called 
+exactly once with the contents of the downloaded file.
+
+The sqlite3_bcv_job_etag() API is used by xFetch() and xPut() jobs to return
+the string uniquely identifying the version of the object downloaded or 
+uploaded (see the discussion of "conditional PUT" operations in section 2
+above).
+
+The implementation of the reply callback below demonstrates the use of these
+APIs:
+
+<verbatim>
+    /*
+    ** Reply callback for the xFetch() job. If the HTTP(S) request encountered an error, return 
+    ** the error back to CBS. Otherwise, return the contents of the downloaded object via 
+    ** sqlite3_bcv_job_result() and the object version via sqlite3_bcv_job_etag().
+    */
+    static void bcvGoogleFetchCb(
+      sqlite3_bcv_job *pCtx, 
+      sqlite3_bcv_request *pReq, 
+      void *pApp
+    ){
+      int rc;
+      const char *zStatus = 0;
+
+      rc = sqlite3_bcv_request_status(pReq, &zStatus);
+      if( rc!=SQLITE_OK ){
+        sqlite3_bcv_job_error(pCtx, rc, zStatus);
+      }else{
+        int nBody;
+        const u8 *aBody;
+        const char *zETag;
+        aBody = sqlite3_bcv_request_body(pReq, &nBody);
+        zETag = sqlite3_bcv_request_header(pReq, "x-goog-generation");
+
+        sqlite3_bcv_job_result(pCtx, aBody, nBody);
+        sqlite3_bcv_job_etag(pCtx, zETag);
+      }
+    }
+</verbatim>
+
+<h2 id=xOtherDetails>4.4. Other Cloud Module Methods Details</h2>
+
+The section above outlines the way cloud module methods work as follows:
+
+<ol>
+  <li> CBS invokes one of the xFetch(), xPut(), xDelete(), xList(), xCreate()
+       or xDelete() methods to begin a job.
+  <li> The method implementation uses the API to initiate HTTP(S) requests
+       against the cloud storage endpoint, specifying callback functions
+       to be invoked when replies are received.
+  <li> Callback functions, when invoked, may return a result to CBS using
+       API functions sqlite3_bcv_job_result(), _job_error() and _job_etag(),
+       or may issue further HTTP(S) requests.
+  <li> A job is finished once there are no pending HTTP(S) requests for which
+       callbacks have not been issued.
+</ol>
+
+This section provides slightly more detail on each of the individual methods
+and API calls.
+
+Any type of job may invoke the sqlite3_bcv_job_error() API to return an error
+to CBS. Once an error has been returned by invoking this function, any
+outstanding HTTP(S) callbacks are still invoked, but subsequent calls to
+sqlite3_bcv_job_xxx() functions are no-ops. In particular, calls to
+sqlite3_bcv_job_request() return NULL.
+
+The following sections describe the action each job type should take, and the
+data, if any, that should be returned to CBS using the sqlite3_bcv_job_result()
+and _job_etag() API functions.
+
+<h3>void (*xFetch)(sqlite3_bcv_container*, sqlite3_bcv_job*, const char *zFile)</h3>
+
+This method should download file zFile from the cloud storage container.
+sqlite3_bcv_job_result() should be used to return the contents of the download file
+to CBS. If the cloud storage module supports <a href=#conditional_put>conditional
+PUT operations</a>, then sqlite3_bcv_job_etag() should be used to return the
+unique version identifier to the system.
+
+<h3>void (*xPut)(sqlite3_bcv_container*, sqlite3_bcv_job*, 
+        const char *zFile, 
+        const unsigned char *aData, int nData,
+        const char *zETag)
+</h3>
+
+This method should upload a new version of file zFile to cloud storage
+container. Parameter aData points to a buffer nData bytes in size containing
+the data for the new version of the file. If parameter zETag is not NULL, 
+then it is a unique version identifier for a previous version of the object
+returned by an earlier xFetch() or xPut() job. In this case the cloud module
+implementation should make a 
+<a href=#conditional_put>condition PUT request</a> such that the upload only
+succeeds if the version of the object being clobbered is that specified by
+parameter zETag. If the request would clobber a different version of the
+object, then an error (usually 403) should be returned to CBS using
+sqlite3_bcv_job_error().
+
+If the upload is successful, and if conditional PUT operations are supported,
+sqlite3_bcv_job_etag() should be used to provide the identifier of the version
+uploaded to CBS.
+
+<h3>void (*xList)(sqlite3_bcv_container*, sqlite3_bcv_job*)</h3>
+
+This method should retrieve a list of all files within the cloud storage
+container. API function sqlite3_bcv_job_result() should be invoked once for
+each such file with the name of the file passed as the "result" data.
+
+<h3>void (*xDelete)(sqlite3_bcv_container*, sqlite3_bcv_job*, const char *zFile)</h3>
+
+This method should delete file zFile from the cloud storage container.
+This method does not need to invoke sqlite3_bcv_job_result() or
+sqlite3_bcv_job_etag() to return a result to CBS. The job is considered
+successful provided that sqlite3_bcv_job_error() is not invoked.
+
+<h3>void (*xCreate)(sqlite3_bcv_container*, sqlite3_bcv_job*)</h3>
+
+This method should create the container named as part of the xOpen() invocation.
+This method does not need to invoke sqlite3_bcv_job_result() or
+sqlite3_bcv_job_etag() to return a result to CBS. The job is considered
+successful provided that sqlite3_bcv_job_error() is not invoked.
+
+<h3>void (*xDestroy)(sqlite3_bcv_container*, sqlite3_bcv_job*)</h3>
+
+This method should delete the container named as part of the xOpen() invocation.
+This method does not need to invoke sqlite3_bcv_job_result() or
+sqlite3_bcv_job_etag() to return a result to CBS. The job is considered
+successful provided that sqlite3_bcv_job_error() is not invoked.
+

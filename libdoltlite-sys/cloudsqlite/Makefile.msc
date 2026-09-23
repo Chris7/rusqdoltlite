@@ -1,0 +1,52 @@
+
+# This is an [nmake] makefile to build executable [blockcachevfsd.exe]
+# using command line MSVC compiler [cl.exe]. It is not yet possible
+# to run tests using this makefile alone, as it does not build the
+# Tcl components. But the generated blockcachevfsd.exe executable can
+# be tested by building the system with mingw, then copying this
+# blockcachevfsd.exe over the mingw version before running tests.
+#
+
+TOP = .
+
+CURL    = $(TOP)\..\curl-7.70.0-win32-mingw\ 
+OPENSSL = $(TOP)\..\openssl\ 
+
+# You should not have to edit below this point.
+#-------------------------------------------------------------------------
+
+CC = cl.exe
+
+COMPILE = $(CC) -I$(CURL)\include\ -I$(OPENSSL)\include\ 
+LINK = $(CC)
+
+
+HDR = $(TOP)\src\blockcachevfs.h \
+      $(TOP)\src\bcvutil.h \
+      $(TOP)\src\sqlite3.h \
+      $(TOP)\src\bcv_int.h
+
+BLOCKCACHEVFSD_OBJ = blockcachevfs.obj \
+                     bcvutil.obj \
+                     sqlite3.obj \
+                     simplexml.obj \
+                     blockcachevfsd.obj
+
+BLOCKCACHEVFSD_LIB = $(CURL)\lib\libcurl.dll.a    \
+                     $(OPENSSL)\lib\libcrypto.lib \
+                     $(OPENSSL)\lib\libssl.lib    \
+                     Ws2_32.lib
+
+blockcachevfsd.exe: $(BLOCKCACHEVFSD_OBJ)
+	$(LINK) $(BLOCKCACHEVFSD_OBJ) -o blockcachevfsd.exe $(BLOCKCACHEVFSD_LIB)
+
+{$(TOP)/src}.c{}.obj: 
+	$(COMPILE) -c $<
+
+clean:
+	del *.obj
+
+
+
+
+

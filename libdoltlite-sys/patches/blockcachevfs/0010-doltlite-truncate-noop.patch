@@ -1,0 +1,25 @@
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -1900,15 +1900,18 @@
+ 
+     default: {
+       sqlite3_bcvfs *pFs = pFile->pFs;
+-      int szBlk = pFile->pMan->szBlk;
+-      int nNew = (size + szBlk - 1) / szBlk;
++      int szBlk;
++      int nNew;
++      assert( pFile->pMan && pFile->pManDb );
++      szBlk = pFile->pMan->szBlk;
++      nNew = (size + szBlk - 1) / szBlk;
+       if( nNew<pFile->pManDb->nBlkLocal ){
++        assert( pFile->pManDb->nBlkLocalAlloc );
+         ENTER_VFS_MUTEX; {
+           bcvfsUndirtyBlocks(pFs, NAMEBYTES(pFile->pMan), pFile->pManDb, nNew);
+           pFile->pManDb->nBlkLocal = nNew;
+         } LEAVE_VFS_MUTEX;
+       }
+-      assert( pFile->pManDb && pFile->pManDb->nBlkLocalAlloc );
+       assert( bcvfsFileType(pFile)==BCVFS_DATABASE_FILE );
+       break;
+     }

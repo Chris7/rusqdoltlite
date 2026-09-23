@@ -1,0 +1,105 @@
+#
+# 13-January-2022
+#
+#-------------------------------------------------------------------------
+#
+# This file contains tests verifying that 403 errors are handled 
+# correctly in SAS mode - that the xAuth callback is invoked to obtain
+# a new SAS when required, and that the 403 error (and sometimes message) 
+# is propagated back to the user correctly.
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_auth2
+
+if {$C(use_sas)==0} {
+  finish_test
+  return
+}
+
+#
+# Test cases:
+#
+#   1.*: When reading from a database in an attached container.
+#   2.*: When attempting an upload using PRAGMA bcv_upload.
+#
+# In each case, it is tested that if a 403 is encountered, the authentication
+# callback is invoked and new credentials obtained. If these work, the 
+# SQL operation succeeds. If it continues to fail, an error is returned
+# to the user. The extended error code is SQLITE_IOERR_AUTH (7178).
+#
+
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  INSERT INTO x1 VALUES(1, 2);
+  INSERT INTO x1 VALUES(3, 4);
+}
+bcv_upload_new_db cont1 t2.db {
+  CREATE TABLE x1(x, y);
+  INSERT INTO x1 VALUES(5, 6);
+  INSERT INTO x1 VALUES(7, 8);
+}
+
+set ::nAuthCallback 0
+proc my_auth_callback {zStorage zAccount zContainer} {
+  if {$::nAuthCallback>0} {
+    return "thiswontwork"
+  }
+  incr ::nAuthCallback
+  set sas [make_sas $zContainer 2]
+  return $sas
+}
+
+
+proc do_auth_error_test {tn body} {
+  set ::nAuthCallback 1
+  set rc [catch { uplevel $body } msg]
+  if {[string match "HTTP/1.1 403*" $msg]} {
+    set msg "disk I/O error"
+  }
+  uplevel [list do_test $tn.1 "list {$rc} {$msg}" {1 {disk I/O error}}]
+  uplevel [list do_test $tn.2 "db errorcode" 10]
+  uplevel [list do_test $tn.3 "sqlite3_extended_errcode db" 7178]
+}
+
+set cmd [bcvfs_create testdir bcvfs]
+$cmd auth_callback my_auth_callback
+bcvfs_attach $cmd cont1
+
+wait_ms 3000
+sqlite3 db /cont1/t1.db -vfs bcvfs
+set nAuthCallback 0
+do_execsql_test 1.0 {
+  SELECT * FROM x1
+} {1 2 3 4}
+db close
+
+wait_ms 3000
+sqlite3 db /cont1/t2.db -vfs bcvfs
+set nAuthCallback 1
+do_auth_error_test 1.1 {
+  execsql { SELECT * FROM x1 }
+}
+db close
+
+wait_ms 3000
+sqlite3 db /cont1/t1.db -vfs bcvfs
+set nAuthCallback 1
+do_execsql_test 2.0 {
+  INSERT INTO x1 VALUES(5, 6);
+}
+do_auth_error_test 2.1 {
+  execsql { PRAGMA bcv_upload }
+}
+set nAuthCallback 0
+do_execsql_test 2.2 {
+  PRAGMA bcv_upload
+}
+db close
+
+$cmd destroy
+finish_test
+
+

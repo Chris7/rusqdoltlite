@@ -1,0 +1,96 @@
+#
+# 26-July-2021
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcv_proxy_retry1
+
+# This test is designed to run with the proxy.tcl/azurite combination 
+# only. Print an error message and exit if it cannot be found.
+if {[catch bcv_proxy_test msg]} { puts $msg ; exit }
+
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+}
+
+bcv_create_container cont
+
+#-------------------------------------------------------------------------
+# 1.1.*: Check that an http 500 error when writing a blob is 
+#        correctly propagated back to the caller by sqlite3_bcv_upload().
+#
+# 1.2.*: 500 error in the manifest upload request.
+#
+
+# Configure the proxy to fail the fourth PUT request with a 500 error.
+#
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+  INSERT INTO new_client_message(pattern, action) VALUES
+    ('PUT%', 'cnterror 3 404 "Internal Server Error" {}');
+}
+
+# Create a local database of around 10*128K blocks.
+#
+do_test 1.0 {
+  file delete -force x.db
+  sqlite3 db x.db
+  db eval {
+    CREATE TABLE x2(x, y);
+    WITH tmp(i) AS (
+      SELECT 1 UNION ALL SELECT i+1 FROM tmp WHERE i<1500
+    )
+    INSERT INTO x2 SELECT randomblob(400), randomblob(400) FROM tmp;
+  }
+  db close
+  set nBlk [expr [file size x.db] / (128*1024)]
+  expr {$nBlk>=8 && $nBlk<=12}
+} {1}
+
+# Upload the database, check that the injected 500 error is reported.
+#
+proc putslog {args} {
+  puts $args
+}
+do_test 1.1.1 {
+  set bcv [bcv_open cont]
+  # $bcv config log putslog
+  $bcv config nrequest 3
+  $bcv upload x.db x.db
+} {404}
+do_test 1.1.2 {
+  $bcv errcode
+} {404}
+do_test 1.1.3 {
+  $bcv errmsg
+} {HTTP/1.1 404 Internal Server Error}
+$bcv close
+
+# Configure the proxy to fail the manifest PUT request with a 404 error.
+#
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+  INSERT INTO new_client_message(pattern, action) VALUES
+    ('PUT%manifest%', 'error 404 "Internal Server Error" {}');
+}
+
+# Upload the database, check that the injected 404 error is reported.
+#
+do_test 1.2.1 {
+  set bcv [bcv_open cont]
+  $bcv config log putslog
+  $bcv config nrequest 3
+  $bcv upload x.db x.db
+} {404}
+do_test 1.2.2 {
+  $bcv errcode
+} {404}
+do_test 1.2.3 {
+  $bcv errmsg
+} {upload manifest failed (404) - HTTP/1.1 404 Internal Server Error}
+$bcv close
+
+finish_test
+

@@ -1,0 +1,47 @@
+#
+# 26-July-2021
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix proxy_hang3
+
+# This test is designed to run with the proxy.tcl/azurite combination 
+# only. Print an error message and exit if it cannot be found.
+if {[catch bcv_proxy_test msg]} { puts $msg ; exit }
+
+
+# Configure the proxy to pass everything straight through.
+#
+bcv_proxy_config {
+  DELETE FROM new_client_message;
+}
+
+bcv_create_container cont1
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  INSERT INTO x1 VALUES(1, 2);
+}
+
+file delete -force t1.db
+bcv_proxy_config {
+  INSERT INTO new_client_message(pattern, action) VALUES
+    ('GET%', 'delay 20000');
+}
+
+do_test 1.0 {
+  set bcv [bcv_open cont1]
+  $bcv config httptimeout 3
+  $bcv download t1.db t1.db
+} {1}
+
+do_test 1.1 {
+  $bcv errmsg
+} {download manifest failed (1) - Timeout was reached}
+
+$bcv close
+
+
+finish_test
+

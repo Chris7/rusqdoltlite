@@ -1,0 +1,848 @@
+--- a/bcvmodule.c
++++ b/bcvmodule.c
+@@ -20,6 +20,7 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ #include <ctype.h>
++#include <time.h>
+ #include <openssl/hmac.h>
+ #include <openssl/sha.h>
+ #include <openssl/md5.h>
+@@ -1426,9 +1427,9 @@
+ ){
+   const u8 *aBody;
+   int nBody;
++  int rc;
+   int iValue, iValueEnd;
+   char *zGeneration = 0;
+-  int rc;
+ 
+   aBody = sqlite3_bcv_request_body(pReq, &nBody);
+   rc = bcvJsonRootObject(aBody, nBody);
+@@ -2037,6 +2038,792 @@
+   }
+ }
+ 
++/*
++** Amazon S3 module.  The request signer lives here, next to the other
++** built-in cloud modules, so every request (including list/create/delete)
++** is signed before it is handed to the common curl dispatcher.
++*/
++typedef struct BcvS3 BcvS3;
++struct BcvS3 {
++  char *zAccessKey;
++  char *zSecretKey;
++  char *zSessionToken;
++  char *zRegion;
++  char *zBucket;
++  char *zPrefix;
++  char *zScheme;
++  char *zHost;
++  char *zBasePath;
++  char *zCreateBody;
++  int bPathStyle;
++  int nMaxResults;
++};
++
++static int bcvS3UrlSafe(unsigned char c){
++  return (c>='A' && c<='Z') || (c>='a' && c<='z')
++      || (c>='0' && c<='9') || c=='-' || c=='_' || c=='.' || c=='~';
++}
++
++/* Encode a path or query component using the AWS RFC3986 character set. */
++static char *bcvS3Encode(const char *zIn, int bSlash){
++  static const char aHex[] = "0123456789ABCDEF";
++  int nIn = zIn ? strlen(zIn) : 0;
++  int i;
++  int nOut = 0;
++  char *zOut;
++  for(i=0; i<nIn; i++){
++    unsigned char c = (unsigned char)zIn[i];
++    nOut += (bcvS3UrlSafe(c) || (bSlash && c=='/')) ? 1 : 3;
++  }
++  zOut = sqlite3_malloc(nOut+1);
++  if( zOut ){
++    int j = 0;
++    for(i=0; i<nIn; i++){
++      unsigned char c = (unsigned char)zIn[i];
++      if( bcvS3UrlSafe(c) || (bSlash && c=='/') ){
++        zOut[j++] = (char)c;
++      }else{
++        zOut[j++] = '%';
++        zOut[j++] = aHex[c>>4];
++        zOut[j++] = aHex[c&0x0F];
++      }
++    }
++    zOut[j] = '\0';
++  }
++  return zOut;
++}
++
++static int bcvS3ValidText(const char *z, int bSlash){
++  int i;
++  if( z==0 || z[0]=='\0' ) return 0;
++  for(i=0; z[i]; i++){
++    unsigned char c = (unsigned char)z[i];
++    if( c<0x20 || c==0x7F || (!bSlash && c=='/') ) return 0;
++  }
++  return 1;
++}
++
++/* Reject dot path segments. A path-style endpoint or an HTTP gateway may
++** normalize these segments even when CURLOPT_PATH_AS_IS preserves them on
++** the wire, which would let a configured bucket/prefix escape its scope. */
++static int bcvS3ValidPathSegments(const char *z){
++  const char *zStart = z;
++  int n;
++  if( z==0 ) return 0;
++  for(; ; z++){
++    if( z[0]=='/' || z[0]=='\0' ){
++      n = (int)(z-zStart);
++      if( (n==1 && zStart[0]=='.')
++       || (n==2 && zStart[0]=='.' && zStart[1]=='.')
++      ) return 0;
++      if( z[0]=='\0' ) break;
++      zStart = z+1;
++    }
++  }
++  return 1;
++}
++
++static int bcvS3ValidRegion(const char *z){
++  int i;
++  if( !bcvS3ValidText(z, 0) ) return 0;
++  for(i=0; z[i]; i++){
++    unsigned char c = (unsigned char)z[i];
++    if( !((c>='A' && c<='Z') || (c>='a' && c<='z')
++       || (c>='0' && c<='9') || c=='-' || c=='.') ) return 0;
++  }
++  return 1;
++}
++
++static int bcvS3ValidDnsBucket(const char *z){
++  int i;
++  int n = z ? strlen(z) : 0;
++  if( n<3 || n>63 || !bcvS3ValidText(z, 0) ) return 0;
++  if( !((z[0]>='a' && z[0]<='z') || (z[0]>='0' && z[0]<='9'))
++   || !((z[n-1]>='a' && z[n-1]<='z') || (z[n-1]>='0' && z[n-1]<='9'))
++  ) return 0;
++  for(i=0; i<n; i++){
++    unsigned char c = (unsigned char)z[i];
++    if( !((c>='a' && c<='z') || (c>='0' && c<='9')
++       || c=='-' || c=='.') ) return 0;
++    if( c=='.' && i+1<n && z[i+1]=='.' ) return 0;
++  }
++  return 1;
++}
++
++static void bcvS3Close(sqlite3_bcv_container *pCont){
++  BcvS3 *p = (BcvS3*)pCont;
++  if( p ){
++    sqlite3_free(p->zAccessKey);
++    sqlite3_free(p->zSecretKey);
++    sqlite3_free(p->zSessionToken);
++    sqlite3_free(p->zRegion);
++    sqlite3_free(p->zBucket);
++    sqlite3_free(p->zPrefix);
++    sqlite3_free(p->zScheme);
++    sqlite3_free(p->zHost);
++    sqlite3_free(p->zBasePath);
++    sqlite3_free(p->zCreateBody);
++    sqlite3_free(p);
++  }
++}
++
++static int bcvS3Open(
++  void *pCtx,
++  const char **azParam,
++  const char *zUser,
++  const char *zSecret,
++  const char *zContainer,
++  sqlite3_bcv_container **pp,
++  char **pzErrmsg
++){
++  const char *zEndpoint = 0;
++  const char *zRegion = "us-east-1";
++  int nMaxResults = 1000;
++  int i;
++  BcvS3 *p = 0;
++  const char *zSlash;
++  const char *zNewline;
++  int rc = SQLITE_OK;
++  (void)pCtx;
++  *pp = 0;
++
++  for(i=0; azParam && azParam[i]; i+=2){
++    const char *zKey = azParam[i];
++    const char *zVal = azParam[i+1];
++    if( zVal==0 ){
++      *pzErrmsg = sqlite3_mprintf("missing value for S3 parameter %s", zKey);
++      return SQLITE_ERROR;
++    }else if( 0==sqlite3_stricmp(zKey, "endpoint") ){
++      zEndpoint = zVal;
++    }else if( 0==sqlite3_stricmp(zKey, "region") ){
++      zRegion = zVal;
++    }else if( 0==sqlite3_stricmp(zKey, "maxresults") ){
++      nMaxResults = bcvParseInt((const u8*)zVal, -1);
++      if( nMaxResults<=0 ){
++        *pzErrmsg = sqlite3_mprintf("S3 maxresults must be positive");
++        return SQLITE_ERROR;
++      }
++    }else{
++      *pzErrmsg = sqlite3_mprintf(
++          "bad S3 parameter \"%s\" - must be \"endpoint\", \"region\" or \"maxresults\"",
++          zKey
++      );
++      return SQLITE_ERROR;
++    }
++  }
++  if( !bcvS3ValidText(zUser, 0) || strchr(zUser, '\n') ){
++    *pzErrmsg = sqlite3_mprintf("S3 access key may not be empty or contain control characters");
++    return SQLITE_ERROR;
++  }
++  if( !bcvS3ValidRegion(zRegion) ){
++    *pzErrmsg = sqlite3_mprintf("invalid S3 region");
++    return SQLITE_ERROR;
++  }
++  if( !bcvS3ValidText(zContainer, 1) || zContainer[0]=='/' ){
++    *pzErrmsg = sqlite3_mprintf("invalid S3 bucket/container");
++    return SQLITE_ERROR;
++  }
++  if( !bcvS3ValidPathSegments(zContainer) ){
++    *pzErrmsg = sqlite3_mprintf(
++        "S3 bucket/container may not contain '.' or '..' path segments"
++    );
++    return SQLITE_ERROR;
++  }
++  zSlash = strchr(zContainer, '/');
++  if( zSlash && zSlash==zContainer ){
++    *pzErrmsg = sqlite3_mprintf("S3 bucket may not be empty");
++    return SQLITE_ERROR;
++  }
++  if( zSlash && zSlash[1]=='/' ){
++    *pzErrmsg = sqlite3_mprintf("S3 prefix may not begin with a slash");
++    return SQLITE_ERROR;
++  }
++  if( zSecret==0 || zSecret[0]=='\0' ){
++    *pzErrmsg = sqlite3_mprintf("S3 secret key may not be empty");
++    return SQLITE_ERROR;
++  }
++  zNewline = strchr(zSecret, '\n');
++  if( zNewline && (zNewline==zSecret || zNewline[1]=='\0') ){
++    *pzErrmsg = sqlite3_mprintf("S3 temporary credentials require non-empty secret and session token");
++    return SQLITE_ERROR;
++  }
++  if( zNewline && strchr(zNewline+1, '\n') ){
++    *pzErrmsg = sqlite3_mprintf("S3 temporary credentials may contain only one newline");
++    return SQLITE_ERROR;
++  }
++  for(i=0; zSecret[i]; i++){
++    unsigned char c = (unsigned char)zSecret[i];
++    if( c=='\r' || c==0x7F || (c<0x20 && c!='\n') ){
++      *pzErrmsg = sqlite3_mprintf("S3 secret key may not contain control characters");
++      return SQLITE_ERROR;
++    }
++  }
++
++  p = (BcvS3*)sqlite3_malloc(sizeof(BcvS3));
++  if( p==0 ) return SQLITE_NOMEM;
++  memset(p, 0, sizeof(BcvS3));
++  p->nMaxResults = nMaxResults;
++  p->zAccessKey = sqlite3_mprintf("%s", zUser);
++  p->zSecretKey = zNewline
++      ? sqlite3_mprintf("%.*s", (int)(zNewline-zSecret), zSecret)
++      : sqlite3_mprintf("%s", zSecret);
++  p->zSessionToken = zNewline && zNewline[1]
++      ? sqlite3_mprintf("%s", zNewline+1) : 0;
++  p->zRegion = sqlite3_mprintf("%s", zRegion);
++  p->zBucket = zSlash
++      ? sqlite3_mprintf("%.*s", (int)(zSlash-zContainer), zContainer)
++      : sqlite3_mprintf("%s", zContainer);
++  if( zSlash && zSlash[1] ){
++    p->zPrefix = sqlite3_mprintf("%s", zSlash+1);
++    if( p->zPrefix && p->zPrefix[strlen(p->zPrefix)-1]!='/' ){
++      char *zNew = sqlite3_mprintf("%s/", p->zPrefix);
++      sqlite3_free(p->zPrefix);
++      p->zPrefix = zNew;
++    }
++  }else{
++    p->zPrefix = sqlite3_mprintf("");
++  }
++  if( p->zBucket==0 || p->zBucket[0]=='\0' ){
++    *pzErrmsg = sqlite3_mprintf("S3 bucket may not be empty");
++    rc = SQLITE_ERROR;
++  }else if( zEndpoint==0 && !bcvS3ValidDnsBucket(p->zBucket) ){
++    *pzErrmsg = sqlite3_mprintf("invalid AWS virtual-hosted S3 bucket name");
++    rc = SQLITE_ERROR;
++  }
++
++  if( rc==SQLITE_OK && zEndpoint==0 ){
++    p->zScheme = sqlite3_mprintf("https");
++    p->zHost = sqlite3_mprintf("%s.s3.%s.amazonaws.com", p->zBucket, p->zRegion);
++    p->zBasePath = sqlite3_mprintf("");
++    p->bPathStyle = 0;
++  }else if( rc==SQLITE_OK ){
++    const char *zSep = strstr(zEndpoint, "://");
++    const char *zAuthority;
++    const char *zPath;
++    const char *zEnd;
++    int nScheme;
++    int nEndpoint;
++    if( !bcvS3ValidText(zEndpoint, 1) || strchr(zEndpoint, ' ') ){
++      *pzErrmsg = sqlite3_mprintf("S3 endpoint may not contain control characters");
++      rc = SQLITE_ERROR;
++    }else if( zSep==0
++     || (((nEndpoint=(int)(zSep-zEndpoint))!=4
++          || strncmp(zEndpoint, "http", 4)!=0)
++         && (nEndpoint!=5 || strncmp(zEndpoint, "https", 5)!=0))
++     || strchr(zEndpoint, '?') || strchr(zEndpoint, '#')
++    ){
++      *pzErrmsg = sqlite3_mprintf("S3 endpoint must be an http(s) URL without a query");
++      rc = SQLITE_ERROR;
++    }else{
++      nScheme = (int)(zSep-zEndpoint);
++      zAuthority = zSep+3;
++      zPath = strchr(zAuthority, '/');
++      zEnd = zPath ? zPath : zAuthority+strlen(zAuthority);
++      if( zEnd==zAuthority || memchr(zAuthority, '@', (size_t)(zEnd-zAuthority)) ){
++        *pzErrmsg = sqlite3_mprintf("S3 endpoint must include a host and no credentials");
++        rc = SQLITE_ERROR;
++      }else{
++        p->zScheme = sqlite3_mprintf("%.*s", nScheme, zEndpoint);
++        p->zHost = sqlite3_mprintf("%.*s", (int)(zEnd-zAuthority), zAuthority);
++        p->zBasePath = zPath ? sqlite3_mprintf("%s", zPath) : sqlite3_mprintf("");
++        if( p->zBasePath ){
++          int n = strlen(p->zBasePath);
++          while( n>1 && p->zBasePath[n-1]=='/' ) p->zBasePath[--n] = '\0';
++          if( n==1 && p->zBasePath[0]=='/' ) p->zBasePath[0] = '\0';
++        }
++        p->bPathStyle = 1;
++      }
++    }
++  }
++  if( p->zAccessKey==0 || p->zSecretKey==0
++   || (zNewline && p->zSessionToken==0) || p->zRegion==0
++   || p->zBucket==0 || p->zPrefix==0 || p->zScheme==0
++   || p->zHost==0 || p->zBasePath==0
++  ) rc = SQLITE_NOMEM;
++  if( rc!=SQLITE_OK ){
++    bcvS3Close((sqlite3_bcv_container*)p);
++    p = 0;
++  }
++  *pp = (sqlite3_bcv_container*)p;
++  return rc;
++}
++
++static char *bcvS3Object(BcvS3 *p, const char *zFile){
++  if( zFile==0 || zFile[0]=='/' ) return 0;
++  return sqlite3_mprintf("%s%s", p->zPrefix, zFile);
++}
++
++static char *bcvS3Path(BcvS3 *p, const char *zObject){
++  char *zBucket = bcvS3Encode(p->zBucket, 0);
++  char *zFile = bcvS3Encode(zObject, 1);
++  char *zPath;
++  if( zBucket==0 || zFile==0 ){
++    sqlite3_free(zBucket);
++    sqlite3_free(zFile);
++    return 0;
++  }
++  if( p->bPathStyle ){
++    zPath = sqlite3_mprintf("%s/%s%s%s", p->zBasePath, zBucket,
++        zFile[0] ? "/" : "", zFile);
++  }else{
++    zPath = sqlite3_mprintf("/%s", zFile);
++  }
++  sqlite3_free(zBucket);
++  sqlite3_free(zFile);
++  return zPath;
++}
++
++static void bcvS3Hmac(
++  const u8 *aKey, int nKey, const u8 *aData, int nData, u8 *aOut
++){
++  unsigned int nOut = 0;
++  HMAC(EVP_sha256(), aKey, nKey, aData, nData, aOut, &nOut);
++  assert( nOut==SHA256_DIGEST_LENGTH );
++}
++
++static int bcvS3Sign(
++  BcvS3 *p, sqlite3_bcv_job *pCtx, sqlite3_bcv_request *pReq,
++  int eMethod, const char *zPath, const char *zQuery,
++  const char *zMatchName, const char *zMatch, const char *zContentType,
++  const unsigned char *aBody, int nBody
++){
++  static const unsigned char aEmpty = 0;
++  unsigned char aPayload[SHA256_DIGEST_LENGTH];
++  unsigned char aCanonical[SHA256_DIGEST_LENGTH];
++  unsigned char aKDate[SHA256_DIGEST_LENGTH];
++  unsigned char aKRegion[SHA256_DIGEST_LENGTH];
++  unsigned char aKService[SHA256_DIGEST_LENGTH];
++  unsigned char aKSigning[SHA256_DIGEST_LENGTH];
++  unsigned char aSig[SHA256_DIGEST_LENGTH];
++  char zPayload[2*SHA256_DIGEST_LENGTH+1];
++  char zCanonicalHash[2*SHA256_DIGEST_LENGTH+1];
++  char zSignature[2*SHA256_DIGEST_LENGTH+1];
++  char zDate[17];
++  char zDate8[9];
++  char *zCanonicalHeaders = 0;
++  char *zSignedHeaders = 0;
++  char *zCanonical = 0;
++  char *zToSign = 0;
++  char *zUri = 0;
++  char *zAuth = 0;
++  time_t t;
++  struct tm tm;
++  const char *zMethod;
++  int rc = SQLITE_OK;
++  if( aBody==0 ) aBody = &aEmpty;
++  if( nBody<0 ) nBody = 0;
++  SHA256(aBody, (size_t)nBody, aPayload);
++  hex_encode(aPayload, SHA256_DIGEST_LENGTH, zPayload, 0);
++
++  t = time(0);
++  memset(&tm, 0, sizeof(tm));
++  osGmtime(&t, &tm);
++  sqlite3_snprintf(sizeof(zDate), zDate, "%04d%02d%02dT%02d%02d%02dZ", tm.tm_year+1900,
++      tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
++  memcpy(zDate8, zDate, 8);
++  zDate8[8] = '\0';
++  zMethod = eMethod==SQLITE_BCV_METHOD_GET ? "GET" :
++      eMethod==SQLITE_BCV_METHOD_PUT ? "PUT" :
++      eMethod==SQLITE_BCV_METHOD_POST ? "POST" : "DELETE";
++  if( zContentType ){
++    zCanonicalHeaders = sqlite3_mprintf("content-type:%s\nhost:%s",
++        zContentType, p->zHost);
++    zSignedHeaders = sqlite3_mprintf("content-type;host");
++  }else{
++    zCanonicalHeaders = sqlite3_mprintf("host:%s", p->zHost);
++    zSignedHeaders = sqlite3_mprintf("host");
++  }
++  if( rc==SQLITE_OK && zMatchName ){
++    char *zOld = zCanonicalHeaders;
++    char *zOldSigned = zSignedHeaders;
++    zCanonicalHeaders = sqlite3_mprintf("%s\n%s:%s", zOld, zMatchName, zMatch);
++    zSignedHeaders = sqlite3_mprintf("%s;%s", zOldSigned, zMatchName);
++    sqlite3_free(zOld);
++    sqlite3_free(zOldSigned);
++    if( zCanonicalHeaders==0 || zSignedHeaders==0 ) rc = SQLITE_NOMEM;
++  }
++  if( rc==SQLITE_OK ){
++    char *zOld = zCanonicalHeaders;
++    char *zOldSigned = zSignedHeaders;
++    zCanonicalHeaders = sqlite3_mprintf("%s\nx-amz-content-sha256:%s\n"
++        "x-amz-date:%s%s%s", zOld, zPayload, zDate,
++        p->zSessionToken ? "\nx-amz-security-token:" : "",
++        p->zSessionToken ? p->zSessionToken : "");
++    zSignedHeaders = sqlite3_mprintf("%s;x-amz-content-sha256;x-amz-date%s",
++        zOldSigned, p->zSessionToken ? ";x-amz-security-token" : "");
++    sqlite3_free(zOld);
++    sqlite3_free(zOldSigned);
++  }
++  if( zCanonicalHeaders==0 || zSignedHeaders==0 ){
++    rc = SQLITE_NOMEM;
++  }
++  zCanonical = rc==SQLITE_OK ? sqlite3_mprintf("%s\n%s\n%s\n%s\n\n%s\n%s",
++      zMethod, zPath, zQuery ? zQuery : "", zCanonicalHeaders,
++      zSignedHeaders, zPayload) : 0;
++  if( zCanonical==0 ) rc = SQLITE_NOMEM;
++  if( rc==SQLITE_OK ){
++    SHA256((const unsigned char*)zCanonical, strlen(zCanonical), aCanonical);
++    hex_encode(aCanonical, SHA256_DIGEST_LENGTH, zCanonicalHash, 0);
++    zToSign = sqlite3_mprintf("AWS4-HMAC-SHA256\n%s\n%s/%s/s3/aws4_request\n%s",
++        zDate, zDate8, p->zRegion, zCanonicalHash);
++    if( zToSign==0 ) rc = SQLITE_NOMEM;
++  }
++  if( rc==SQLITE_OK ){
++    char *zKey = sqlite3_mprintf("AWS4%s", p->zSecretKey);
++    if( zKey==0 ) rc = SQLITE_NOMEM;
++    if( rc==SQLITE_OK ){
++      bcvS3Hmac((const u8*)zKey, strlen(zKey), (const u8*)zDate8, 8, aKDate);
++      bcvS3Hmac(aKDate, sizeof(aKDate), (const u8*)p->zRegion,
++          strlen(p->zRegion), aKRegion);
++      bcvS3Hmac(aKRegion, sizeof(aKRegion), (const u8*)"s3", 2, aKService);
++      bcvS3Hmac(aKService, sizeof(aKService), (const u8*)"aws4_request", 12,
++          aKSigning);
++      bcvS3Hmac(aKSigning, sizeof(aKSigning), (const u8*)zToSign,
++          strlen(zToSign), aSig);
++      hex_encode(aSig, SHA256_DIGEST_LENGTH, zSignature, 0);
++      zAuth = sqlite3_mprintf("AWS4-HMAC-SHA256 Credential=%s/%s/%s/s3/aws4_request, SignedHeaders=%s, Signature=%s",
++          p->zAccessKey, zDate8, p->zRegion, zSignedHeaders, zSignature);
++      if( zAuth==0 ) rc = SQLITE_NOMEM;
++    }
++    sqlite3_free(zKey);
++  }
++  zUri = rc==SQLITE_OK ? sqlite3_mprintf("%s://%s%s%s%s", p->zScheme,
++      p->zHost, zPath, zQuery ? "?" : "", zQuery ? zQuery : "") : 0;
++  if( zUri==0 && rc==SQLITE_OK ) rc = SQLITE_NOMEM;
++  if( rc==SQLITE_OK ){
++    sqlite3_bcv_request_set_method(pReq, eMethod);
++    sqlite3_bcv_request_set_uri(pReq, zUri);
++    bcvUriLogPrintf(pCtx, pReq, "%s://%s%s%s%s", p->zScheme, p->zHost,
++        zPath, zQuery ? "?" : "", zQuery ? zQuery : "");
++    bcvHdrPrintf(pCtx, pReq, "Host: %s", p->zHost);
++    bcvHdrPrintf(pCtx, pReq, "x-amz-content-sha256: %s", zPayload);
++    bcvHdrPrintf(pCtx, pReq, "x-amz-date: %s", zDate);
++    if( p->zSessionToken ) bcvHdrPrintf(pCtx, pReq,
++        "x-amz-security-token: %s", p->zSessionToken);
++    if( zContentType ) bcvHdrPrintf(pCtx, pReq, "Content-Type: %s", zContentType);
++    if( zMatchName ) bcvHdrPrintf(pCtx, pReq, "%s: %s", zMatchName, zMatch);
++    bcvHdrPrintf(pCtx, pReq, "Authorization: %s", zAuth);
++  }else{
++    sqlite3_bcv_job_error(pCtx, rc, 0);
++  }
++  sqlite3_free(zCanonicalHeaders);
++  sqlite3_free(zSignedHeaders);
++  sqlite3_free(zCanonical);
++  sqlite3_free(zToSign);
++  sqlite3_free(zUri);
++  sqlite3_free(zAuth);
++  return rc;
++}
++
++static char *bcvS3Md5Tag(const void *pData, int nData){
++  char *zTag;
++  if( pData==0 || nData!=MD5_DIGEST_LENGTH ) return 0;
++  zTag = sqlite3_malloc(2*MD5_DIGEST_LENGTH+3);
++  if( zTag ){
++    zTag[0] = '"';
++    hex_encode((const unsigned char*)pData, MD5_DIGEST_LENGTH, &zTag[1], 0);
++    zTag[2*MD5_DIGEST_LENGTH+1] = '"';
++    zTag[2*MD5_DIGEST_LENGTH+2] = '\0';
++  }
++  return zTag;
++}
++
++static void bcvS3Fetch(
++  sqlite3_bcv_container *pCont, sqlite3_bcv_job *pCtx, const char *zFile,
++  int flags, const void *zCond, int nCond
++){
++  BcvS3 *p = (BcvS3*)pCont;
++  sqlite3_bcv_request *pReq;
++  char *zObject = bcvS3Object(p, zFile);
++  char *zPath = zObject ? bcvS3Path(p, zObject) : 0;
++  char *zTag = 0;
++  const char *zMatch = 0;
++  if( (flags & BCV_MODULE_CONDITION_MD5)
++   && (zCond==0 || nCond!=MD5_DIGEST_LENGTH)
++  ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_MISUSE, "invalid S3 MD5 condition");
++    sqlite3_free(zObject);
++    sqlite3_free(zPath);
++    return;
++  }
++  if( (flags & BCV_MODULE_CONDITION_ETAG) && zCond==0 ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_MISUSE, "invalid S3 ETag condition");
++    sqlite3_free(zObject);
++    sqlite3_free(zPath);
++    return;
++  }
++  if( flags & BCV_MODULE_CONDITION_MD5 ){
++    zTag = bcvS3Md5Tag(zCond, nCond);
++    zMatch = zTag;
++  }else if( flags & BCV_MODULE_CONDITION_ETAG ){
++    zMatch = (const char*)zCond;
++  }
++  pReq = sqlite3_bcv_job_request(pCtx, (void*)"ETag", bcvModuleFetchCb);
++  if( pReq && zObject && zPath && (!(flags & BCV_MODULE_CONDITION_MD5) || zTag) ){
++    bcvS3Sign(p, pCtx, pReq, SQLITE_BCV_METHOD_GET, zPath, 0,
++        zMatch ? "if-none-match" : 0, zMatch, 0, 0, 0);
++  }else if( pReq ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++  }
++  sqlite3_free(zObject);
++  sqlite3_free(zPath);
++  sqlite3_free(zTag);
++}
++
++static void bcvS3Put(
++  sqlite3_bcv_container *pCont, sqlite3_bcv_job *pCtx, const char *zFile,
++  const unsigned char *aData, int nData, const char *zETag
++){
++  BcvS3 *p = (BcvS3*)pCont;
++  sqlite3_bcv_request *pReq;
++  char *zObject = bcvS3Object(p, zFile);
++  char *zPath = zObject ? bcvS3Path(p, zObject) : 0;
++  const char *zMatchName = zETag ? (zETag[0]=='*' && zETag[1]=='\0'
++      ? "if-none-match" : "if-match") : 0;
++  if( nData<0 ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_MISUSE, "invalid S3 upload length");
++    sqlite3_free(zObject);
++    sqlite3_free(zPath);
++    return;
++  }
++  pReq = sqlite3_bcv_job_request(pCtx, (void*)"ETag", bcvModulePutCb);
++  if( pReq && zObject && zPath ){
++    bcvS3Sign(p, pCtx, pReq, SQLITE_BCV_METHOD_PUT, zPath, 0,
++        zMatchName, zETag, "application/octet-stream", aData, nData);
++    sqlite3_bcv_request_set_body(pReq, aData, nData);
++  }else if( pReq ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++  }
++  sqlite3_free(zObject);
++  sqlite3_free(zPath);
++}
++
++static void bcvS3Delete(
++  sqlite3_bcv_container *pCont, sqlite3_bcv_job *pCtx, const char *zFile,
++  const char *zETag
++){
++  BcvS3 *p = (BcvS3*)pCont;
++  sqlite3_bcv_request *pReq;
++  char *zObject = bcvS3Object(p, zFile);
++  char *zPath = zObject ? bcvS3Path(p, zObject) : 0;
++  pReq = sqlite3_bcv_job_request(pCtx, 0, bcvModuleGenericCb);
++  if( pReq && zObject && zPath ){
++    bcvS3Sign(p, pCtx, pReq, SQLITE_BCV_METHOD_DELETE, zPath, 0,
++        zETag ? "if-match" : 0, zETag, 0, 0, 0);
++  }else if( pReq ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++  }
++  sqlite3_free(zObject);
++  sqlite3_free(zPath);
++}
++
++typedef struct BcvS3ListCtx BcvS3ListCtx;
++struct BcvS3ListCtx {
++  sqlite3_bcv_job *pCtx;
++  BcvS3 *p;
++  char *zNext;
++  int rc;
++  int bRootSeen;
++};
++
++static void *bcvS3ListValue(
++  SimpleXmlParser parser, SimpleXmlEvent event, const char *zName,
++  const char *zAttribute, const char *zValue
++){
++  BcvS3ListCtx *p = (BcvS3ListCtx*)simpleXmlGetUserData(parser);
++  (void)zName;
++  (void)zAttribute;
++  if( event==ADD_CONTENT && p->rc==SQLITE_OK ){
++    if( zValue[0]=='\0' || (p->p->zPrefix[0]
++       && strncmp(zValue, p->p->zPrefix, strlen(p->p->zPrefix))!=0) ){
++      p->rc = SQLITE_ERROR;
++    }else if( p->p->zPrefix[0] && strlen(zValue)==strlen(p->p->zPrefix) ){
++      p->rc = SQLITE_ERROR;
++    }else if( p->p->zPrefix[0] ){
++      sqlite3_bcv_job_result(p->pCtx,
++          (const u8*)&zValue[strlen(p->p->zPrefix)], -1);
++    }else{
++      sqlite3_bcv_job_result(p->pCtx, (const u8*)zValue, -1);
++    }
++  }
++  return bcvS3ListValue;
++}
++
++static void *bcvS3ListNext(
++  SimpleXmlParser parser, SimpleXmlEvent event, const char *zName,
++  const char *zAttribute, const char *zValue
++){
++  BcvS3ListCtx *p = (BcvS3ListCtx*)simpleXmlGetUserData(parser);
++  (void)zName;
++  (void)zAttribute;
++  if( event==ADD_CONTENT && p->zNext==0 ) p->zNext = bcvStrdupRc(&p->rc, zValue);
++  return bcvS3ListNext;
++}
++
++static void *bcvS3ListContents(
++  SimpleXmlParser parser, SimpleXmlEvent event, const char *zName,
++  const char *zAttribute, const char *zValue
++){
++  (void)parser;
++  (void)zAttribute;
++  (void)zValue;
++  if( event==ADD_SUBTAG ){
++    if( 0==bcvStrcmp(zName, "Key") ) return bcvS3ListValue;
++    return 0;
++  }
++  return bcvS3ListContents;
++}
++
++static void *bcvS3ListRoot(
++  SimpleXmlParser parser, SimpleXmlEvent event, const char *zName,
++  const char *zAttribute, const char *zValue
++){
++  BcvS3ListCtx *p = (BcvS3ListCtx*)simpleXmlGetUserData(parser);
++  (void)zAttribute;
++  (void)zValue;
++  if( event==ADD_SUBTAG ){
++    if( !p->bRootSeen ){
++      if( 0!=bcvStrcmp(zName, "ListBucketResult") ) p->rc = SQLITE_ERROR;
++      p->bRootSeen = 1;
++      return p->rc==SQLITE_OK ? bcvS3ListRoot : 0;
++    }
++    if( 0==bcvStrcmp(zName, "Contents") ) return bcvS3ListContents;
++    if( 0==bcvStrcmp(zName, "NextContinuationToken") ) return bcvS3ListNext;
++    return 0;
++  }
++  return bcvS3ListRoot;
++}
++
++static void bcvS3ListCb(
++  sqlite3_bcv_job*, sqlite3_bcv_request*, void*
++);
++
++static void bcvS3ListFiles(
++  sqlite3_bcv_container *pCont, sqlite3_bcv_job *pCtx, const char *zMarker
++){
++  BcvS3 *p = (BcvS3*)pCont;
++  sqlite3_bcv_request *pReq;
++  const char *zJobPrefix = sqlite3_bcv_job_prefix(pCtx);
++  char *zPrefix = bcvS3Object(p, zJobPrefix ? zJobPrefix : "");
++  char *zPrefixEnc = zPrefix ? bcvS3Encode(zPrefix, 0) : 0;
++  char *zMarkerEnc = zMarker ? bcvS3Encode(zMarker, 0) : 0;
++  char *zQuery = 0;
++  char *zPath = 0;
++  if( zPrefix==0 || zPrefixEnc==0 || (zMarker && zMarkerEnc==0) ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++    goto list_done;
++  }
++  if( zMarker ) zQuery = sqlite3_mprintf(
++      "continuation-token=%s&list-type=2&max-keys=%d&prefix=%s",
++      zMarkerEnc, p->nMaxResults, zPrefixEnc);
++  else zQuery = sqlite3_mprintf(
++      "list-type=2&max-keys=%d&prefix=%s", p->nMaxResults, zPrefixEnc);
++  zPath = bcvS3Path(p, "");
++  pReq = sqlite3_bcv_job_request(pCtx, (void*)p, bcvS3ListCb);
++  if( pReq && zQuery && zPath ){
++    bcvS3Sign(p, pCtx, pReq, SQLITE_BCV_METHOD_GET, zPath, zQuery,
++        0, 0, 0, 0, 0);
++  }else if( pReq ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++  }
++list_done:
++  sqlite3_free(zPrefix);
++  sqlite3_free(zPrefixEnc);
++  sqlite3_free(zMarkerEnc);
++  sqlite3_free(zQuery);
++  sqlite3_free(zPath);
++}
++
++static void bcvS3ListCb(
++  sqlite3_bcv_job *pCtx, sqlite3_bcv_request *pReq, void *pApp
++){
++  BcvS3ListCtx ctx;
++  const char *zStatus = 0;
++  SimpleXmlParser x;
++  const u8 *aBody;
++  int nBody;
++  int rc;
++  memset(&ctx, 0, sizeof(ctx));
++  ctx.pCtx = pCtx;
++  ctx.p = (BcvS3*)pApp;
++  rc = sqlite3_bcv_request_status(pReq, &zStatus);
++  if( rc!=SQLITE_OK ){
++    sqlite3_bcv_job_error(pCtx, rc, zStatus);
++  }else{
++    aBody = sqlite3_bcv_request_body(pReq, &nBody);
++    x = simpleXmlCreateParser((const char*)aBody, nBody);
++    if( x==0 || !simpleXmlPushUserData(x, &ctx)
++     || simpleXmlParse(x, bcvS3ListRoot)!=0 || !ctx.bRootSeen
++    ) ctx.rc = SQLITE_ERROR;
++    if( x ) simpleXmlDestroyParser(x);
++    if( ctx.rc!=SQLITE_OK ) sqlite3_bcv_job_error(pCtx, ctx.rc, 0);
++    else if( ctx.zNext && ctx.zNext[0] ) bcvS3ListFiles(pApp, pCtx, ctx.zNext);
++  }
++  sqlite3_free(ctx.zNext);
++}
++
++static void bcvS3Create(
++  sqlite3_bcv_container *pCont, sqlite3_bcv_job *pCtx
++){
++  BcvS3 *p = (BcvS3*)pCont;
++  sqlite3_bcv_request *pReq;
++  char *zPath = bcvS3Path(p, "");
++  const unsigned char *aBody = 0;
++  int nBody = 0;
++  int bLocationBody = 0;
++  if( 0!=strcmp(p->zRegion, "us-east-1") ){
++    bLocationBody = 1;
++    if( p->zCreateBody==0 ){
++      p->zCreateBody = sqlite3_mprintf(
++          "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
++          "<LocationConstraint>%s</LocationConstraint>"
++          "</CreateBucketConfiguration>", p->zRegion
++      );
++    }
++    if( p->zCreateBody ){
++      aBody = (const unsigned char*)p->zCreateBody;
++      nBody = strlen(p->zCreateBody);
++    }
++  }
++  pReq = sqlite3_bcv_job_request(pCtx, 0, bcvModuleCreateCb);
++  if( pReq && zPath && (!bLocationBody || p->zCreateBody) ){
++    bcvS3Sign(p, pCtx, pReq, SQLITE_BCV_METHOD_PUT, zPath, 0,
++        0, 0, p->zCreateBody ? "application/xml" : 0, aBody, nBody);
++    if( p->zCreateBody ) sqlite3_bcv_request_set_body(pReq, aBody, nBody);
++  }else if( pReq ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++  }
++  sqlite3_free(zPath);
++}
++
++static void bcvS3Destroy(
++  sqlite3_bcv_container *pCont, sqlite3_bcv_job *pCtx
++){
++  BcvS3 *p = (BcvS3*)pCont;
++  sqlite3_bcv_request *pReq;
++  char *zPath;
++  if( p->zPrefix[0] ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_MISUSE,
++        "refusing to delete an S3 bucket while a prefix is configured");
++    return;
++  }
++  zPath = bcvS3Path(p, "");
++  pReq = sqlite3_bcv_job_request(pCtx, 0, bcvModuleGenericCb);
++  if( pReq && zPath ){
++    bcvS3Sign(p, pCtx, pReq, SQLITE_BCV_METHOD_DELETE, zPath, 0,
++        0, 0, 0, 0, 0);
++  }else if( pReq ){
++    sqlite3_bcv_job_error(pCtx, SQLITE_NOMEM, 0);
++  }
++  sqlite3_free(zPath);
++}
++
++static void bcvS3List(
++  sqlite3_bcv_container *pCont, sqlite3_bcv_job *pCtx
++){
++  bcvS3ListFiles(pCont, pCtx, 0);
++}
++
+ int bcvInstallBuiltinModules(void){
+   static sqlite3_bcv_module mAzure = {
+     bcvAzureOpen,
+@@ -2064,5 +2825,18 @@
+   if( rc==SQLITE_OK ){
+     rc = bcvCreateModuleUnsafe("google", &mGoogle, 0);
+   }
++  if( rc==SQLITE_OK ){
++    static sqlite3_bcv_module mS3 = {
++      bcvS3Open,
++      bcvS3Close,
++      bcvS3Fetch,
++      bcvS3Put,
++      bcvS3Delete,
++      bcvS3List,
++      bcvS3Create,
++      bcvS3Destroy
++    };
++    rc = bcvCreateModuleUnsafe("s3", &mS3, 0);
++  }
+   return rc;
+ }
+--- a/bcvutil.c
++++ b/bcvutil.c
+@@ -3092,6 +3092,7 @@
+ 
+     curl_easy_setopt(pCurl, CURLOPT_PRIVATE, (void*)pReq);
+     curl_easy_setopt(pCurl, CURLOPT_URL, pReq->zUri);
++    curl_easy_setopt(pCurl, CURLOPT_PATH_AS_IS, 1L);
+     curl_easy_setopt(pCurl, CURLOPT_HTTPHEADER, pReq->pList);
+     curl_easy_setopt(pCurl, CURLOPT_TIMEOUT, (long)p->nHttpTimeout);
+     curl_easy_setopt(pCurl, CURLOPT_NOSIGNAL, (long)1);
+@@ -4158,4 +4159,3 @@
+   aLocal[1] ^= (u64)iNonce;
+   return bcvEncrypt(pKey->pKey, (const u8*)aLocal, aData, nData);
+ }
+-

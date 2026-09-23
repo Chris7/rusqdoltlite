@@ -1,0 +1,54 @@
+#
+# 19-July-2020
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_delete1
+
+# Test that the VFS uses existing blocks if possible.
+set CNAME cont1
+bcv_create_container $CNAME
+
+bcv_upload_empty_database $CNAME x.db
+bcv_upload_empty_database $CNAME test.db
+bcv_upload_empty_database $CNAME abc.db
+
+bcv_mkdir testdir
+set bcvfs [bcvfs_create testdir bcvfs]
+bcvfs_attach $bcvfs $CNAME
+
+sqlite3 db /$CNAME/test.db -vfs bcvfs
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a, b);
+  INSERT INTO t1 VALUES(1, 2);
+  INSERT INTO t1 VALUES(3, 4);
+  PRAGMA bcv_upload;
+}
+
+do_test 1.1 {
+  bcv_delete_database -container $CNAME test.db
+} {}
+
+do_catchsql_test 1.2 {
+  SELECT * FROM t1
+} {0 {1 2 3 4}}
+
+do_test 1.3 {
+  $bcvfs poll $CNAME
+} {}
+
+do_catchsql_test 1.2 {
+  SELECT * FROM t1
+} {1 {disk I/O error}}
+
+do_catchsql_test 1.3 {
+  PRAGMA bcv_upload
+} {0 {}}
+
+db close
+$bcvfs destroy
+
+finish_test
+

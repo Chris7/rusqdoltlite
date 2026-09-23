@@ -1,0 +1,65 @@
+
+# This file contains tests for the blockcachevfs system.
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcv_copy
+
+bcv_mkdir testdir
+bcv_create_container cont1
+bcv_upload_empty_database cont1 test.db1
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd cont1
+
+set nRow [expr 5000]
+set nCopy [expr  50]
+
+sqlite3 db /cont1/test.db1 -vfs bcvfs
+do_test 1.0 {
+  db eval {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b, c);
+    CREATE INDEX t1b ON t1(b);
+    CREATE INDEX t1c ON t1(c);
+    WITH s(i) AS (
+      SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<$nRow
+    )
+    INSERT INTO t1 SELECT NULL, randomblob(500), randomblob(500) FROM s;
+    PRAGMA bcv_upload;
+  }
+  set {} {}
+} {}
+
+do_test 1.1 {
+  set pgsz [db one { PRAGMA page_size }]
+  set pgcnt [db one { PRAGMA page_count }]
+  expr {($pgsz*$pgcnt) > 10*1024*1024}
+} 1
+
+set to "test.db1"
+for {set i 0} {$i < $nCopy} {incr i} {
+  set from $to
+  set to "test.db1-copy-$i"
+
+  set bcv [bcv_open cont1]
+  $bcv copy $from $to
+  $bcv close
+
+  $cmd poll cont1
+
+  sqlite3 dbX /cont1/$to -vfs bcvfs
+  do_test 1.2.$i {
+    set iKey [expr 1 + int(rand()*$nRow)]
+    dbX eval {
+      UPDATE t1 SET b=randomblob(500), c=randomblob(500) WHERE a=$iKey;
+      PRAGMA bcv_upload;
+    }
+  } {}
+
+  dbX close
+}
+
+db close
+$cmd destroy
+
+finish_test
+

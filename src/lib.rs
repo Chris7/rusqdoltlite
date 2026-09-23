@@ -122,6 +122,11 @@ pub mod backup;
 mod bind;
 #[cfg(feature = "blob")]
 pub mod blob;
+#[cfg(all(
+    feature = "blockcachevfs",
+    not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub mod blockcachevfs;
 mod busy;
 #[cfg(feature = "cache")]
 mod cache;

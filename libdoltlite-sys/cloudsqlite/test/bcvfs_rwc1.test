@@ -1,0 +1,92 @@
+#
+# 18-February-2022
+#
+#-------------------------------------------------------------------------
+#
+# Check that it is possible to open databases with all three valid
+# permission modes:
+#
+#   SQLITE_OPEN_READONLY
+#   SQLITE_OPEN_READWRITE
+#   SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE
+# 
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_rwc1
+
+set CNAME sillyname
+
+bcv_create_container $CNAME
+bcv_upload_new_db $CNAME xyz.db {
+  CREATE TABLE t1(x);
+  CREATE INDEX i1 ON t1(x);
+  INSERT INTO t1 VALUES(2), (4), (6);
+}
+
+#
+#   SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE
+#
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd $CNAME
+
+do_test 1.0 {
+  sqlite3 db /$CNAME/xyz.db -vfs bcvfs 
+} {}
+do_execsql_test 1.1 {
+  SELECT * FROM t1
+} {2 4 6}
+
+do_execsql_test 1.2 {
+  INSERT INTO t1 VALUES(8);
+  PRAGMA bcv_upload;
+} {}
+
+catch { db close }
+$cmd destroy
+
+#
+#   SQLITE_OPEN_READWRITE
+#
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd $CNAME
+
+do_test 2.0 {
+  sqlite3 db /$CNAME/xyz.db -vfs bcvfs -create 0
+} {}
+do_execsql_test 2.1 {
+  SELECT * FROM t1
+} {2 4 6 8}
+
+do_execsql_test 2.2 {
+  INSERT INTO t1 VALUES(10);
+  PRAGMA bcv_upload;
+} {}
+
+catch { db close }
+$cmd destroy
+
+#
+#   SQLITE_OPEN_READONLY
+#
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd $CNAME
+
+do_test 3.0 {
+  sqlite3 db /$CNAME/xyz.db -vfs bcvfs -readonly 1
+} {}
+do_execsql_test 3.1 {
+  SELECT * FROM t1
+} {2 4 6 8 10}
+
+do_catchsql_test 3.2 {
+  INSERT INTO t1 VALUES(12);
+} {1 {attempt to write a readonly database}}
+
+catch { db close }
+$cmd destroy
+
+finish_test
+

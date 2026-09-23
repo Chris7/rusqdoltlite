@@ -1,0 +1,147 @@
+#
+# 09-May-2022
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_prefetch1
+
+bcv_create_container cont1
+
+bcv_upload_new_db cont1 t1.db {
+  CREATE TABLE x1(x, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<5000
+  )
+  INSERT INTO x1 SELECT randomblob(100), randomblob(100) FROM s;
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+
+bcvfs_attach $cmd cont1
+sqlite3 db /cont1/t1.db -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+
+do_execsql_test 1.0 {
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {
+  cont1 t1.db 9 1
+}
+
+do_test 1.1 {
+  $cmd prefetch_new pf cont1 t1.db
+  pf run 4 10000
+} {0}
+
+do_execsql_test 1.2 {
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {
+  cont1 t1.db 9 2
+}
+
+do_test 1.3a { pf run 0 1000 } {0}
+do_execsql_test 1.3b {
+  SELECT container, database, nblock, 
+    ncache BETWEEN 3 AND 5
+  FROM bcv_database
+} {
+  cont1 t1.db 9 1
+}
+
+do_test 1.4a { pf run 0 1000 } {0}
+do_execsql_test 1.4b {
+  SELECT container, database, nblock,
+    ncache BETWEEN 3 AND 5
+  FROM bcv_database
+} {
+  cont1 t1.db 9 1
+}
+
+do_test 1.5a { pf run 0 1000 } {0}
+do_execsql_test 1.5b {
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {
+  cont1 t1.db 9 5
+}
+
+do_test 1.6a { pf run 0 1000 } {0}
+do_execsql_test 1.6b {
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {
+  cont1 t1.db 9 5
+}
+
+do_test 1.7a { pf run 10 1000 } {0}
+do_execsql_test 1.7b {
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {
+  cont1 t1.db 9 6
+}
+pf destroy
+
+do_execsql_test 1.8 {
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {
+  cont1 t1.db 9 6
+}
+
+do_execsql_test 1.9 {
+  PRAGMA bcv_client = 'icheck';
+  PRAGMA integrity_check;
+  SELECT container, database, nblock, ncache FROM bcv_database
+} {
+  icheck
+  ok cont1 t1.db 9 9
+}
+
+do_execsql_test 1.9b {
+  SELECT id, uri LIKE '%manifest%', client, logmsg FROM bcv_http_log
+  WHERE end_time IS NOT NULL;
+} {
+  1 1 "" ""
+  2 0 "" "demand 0 of t1.db"
+  3 0 prefetch "prefetch 1 of t1.db"
+  4 0 prefetch "prefetch 2 of t1.db"
+  5 0 prefetch "prefetch 3 of t1.db"
+  6 0 prefetch "prefetch 4 of t1.db"
+  8 0 prefetch "prefetch 6 of t1.db"
+  11 0 icheck  "demand 8 of t1.db"
+  12 0 icheck  "demand 7 of t1.db"
+  13 0 icheck  "demand 5 of t1.db"
+}
+
+bcv_upload_new_db cont1 t2.db {
+  CREATE TABLE x1(x, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<5000
+  )
+  INSERT INTO x1 SELECT randomblob(100), randomblob(100) FROM s;
+}
+$cmd poll cont1
+
+do_test 1.10 {
+  $cmd prefetch_new pf cont1 t2.db
+  while { 0==[pf run 1 1000] } { expr 0 }
+  pf errcode
+} 101
+pf destroy
+
+do_test 1.11 {
+  $cmd prefetch_new pf cont1 t3.db
+  list [pf errcode] [pf errmsg]
+} {1 {no such database: t3.db}}
+pf destroy
+
+do_test 1.12 {
+  $cmd prefetch_new pf cont4 t3.db
+  list [pf errcode] [pf errmsg]
+} {1 {no such container: cont4}}
+pf destroy
+
+
+db close
+$cmd destroy
+finish_test
+

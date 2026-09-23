@@ -1,0 +1,54 @@
+#
+# 20-November-2024
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_poll2
+
+
+bcv_create_container mycont
+bcv_upload_new_db mycont xyz.db {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1), (2), (3);
+}
+
+bcv_mkdir testdir1
+bcv_mkdir testdir2
+set cmd1 [bcvfs_create testdir1 bcvfs1]
+bcvfs_attach $cmd1 mycont
+set cmd2 [bcvfs_create testdir2 bcvfs2]
+bcvfs_attach $cmd2 mycont
+
+
+sqlite3 db  /mycont/xyz.db -vfs bcvfs1
+sqlite3 db2 /mycont/xyz.db -vfs bcvfs2
+
+do_execsql_test  1.0a { SELECT * FROM t1 } {1 2 3}
+do_execsql2_test 1.0b { SELECT * FROM t1 } {1 2 3}
+
+do_execsql_test 1.1 {
+  INSERT INTO t1 VALUES(4);
+}
+
+do_execsql_test  1.2a { SELECT * FROM t1 } {1 2 3 4}
+do_execsql2_test 1.2b { SELECT * FROM t1 } {1 2 3}
+
+$cmd1 upload mycont
+
+do_execsql_test  1.3a { SELECT * FROM t1 } {1 2 3 4}
+do_execsql2_test 1.3b { SELECT * FROM t1 } {1 2 3}
+
+$cmd2 poll mycont
+
+do_execsql_test  1.4a { SELECT * FROM t1 } {1 2 3 4}
+do_execsql2_test 1.4b { SELECT * FROM t1 } {1 2 3 4}
+
+db close
+db2 close
+$cmd1 destroy
+$cmd2 destroy
+
+finish_test
+

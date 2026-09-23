@@ -1,0 +1,41 @@
+diff --git a/doltlite.c b/doltlite.c
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -493179,4 +493179,37 @@
+   return &p->pBt->store;
+ }
+ 
++/* CBS calls these hooks around its upload checkpoint and remote transfer.
++** Keep the graph lock held until CBS has installed the new manifest so a
++** concurrent DoltLite writer cannot change the block set being uploaded. */
++SQLITE_API int SQLITE_APICALL sqlite3_doltlite_bcvfs_upload_lock(
++  sqlite3 *db,
++  const char *zDb,
++  void **ppLock
++){
++  Btree *pBtree;
++  ChunkStore *pStore;
++  int rc;
++  if( ppLock ) *ppLock = 0;
++  if( !db || !ppLock ) return ppLock ? SQLITE_NOTFOUND : SQLITE_MISUSE;
++
++  sqlite3_mutex_enter(db->mutex);
++  pBtree = sqlite3DbNameToBtree(db, zDb);
++  pStore = doltliteBtreeChunkStore(pBtree);
++  if( !pStore ){
++    sqlite3_mutex_leave(db->mutex);
++    return SQLITE_NOTFOUND;
++  }
++  do {
++    rc = chunkStoreLockAndRefresh(pStore);
++  }while( rc==SQLITE_BUSY && sqlite3InvokeBusyHandler(&db->busyHandler) );
++  if( rc==SQLITE_OK ) *ppLock = pStore;
++  sqlite3_mutex_leave(db->mutex);
++  return rc;
++}
++
++SQLITE_API void SQLITE_APICALL sqlite3_doltlite_bcvfs_upload_unlock(void *pLock){
++  if( pLock ) chunkStoreUnlock((ChunkStore*)pLock);
++}
++
+ int doltliteBtreeSerialize(

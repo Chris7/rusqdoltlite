@@ -1,0 +1,76 @@
+--- a/bcvmodule.c
++++ b/bcvmodule.c
+@@ -1014,6 +1014,7 @@
+   const char *zSecret;
+   const char *zCont;
+   const char *zBase;
++  int nMaxResults;
+ };
+ 
+ static void bcvGoogleClose(sqlite3_bcv_container *pCont){
+@@ -1031,11 +1032,43 @@
+ ){
+   BcvGoogle *pNew;
+   int rc = SQLITE_OK;
++  const char *zEndpoint = "https://storage.googleapis.com";
++  int nMaxResults = GOOGLE_MAX_RESULTS;
++  int i;
++
++  /* Keep maxresults accepted for compatibility with generic CBS callers,
++  ** and permit local Google-compatible endpoints for tests and gateways. */
++  for(i=0; azParam[i]; i+=2){
++    const char *zKey = azParam[i];
++    const char *zVal = azParam[i+1];
++    if( 0==sqlite3_stricmp(zKey, "maxresults") ){
++      int nValue = bcvParseInt((const u8*)zVal, -1);
++      if( nValue>0 ) nMaxResults = nValue;
++    }else if( 0==sqlite3_stricmp(zKey, "endpoint") ){
++      if( zVal==0 || zVal[0]=='\0' ){
++        *pzErrmsg = sqlite3_mprintf("endpoint parameter may not be empty");
++        return SQLITE_ERROR;
++      }
++      zEndpoint = zVal;
++    }else{
++      *pzErrmsg = sqlite3_mprintf(
++          "bad parameter \"%s\" - must be \"endpoint\" or \"maxresults\"",
++          zKey
++      );
++      return SQLITE_ERROR;
++    }
++  }
+ 
+   int nUser = bcvStrlen(zUser);
+   int nSecret = bcvStrlen(zSecret);
+   int nContainer = bcvStrlen(zContainer);
+-  int nBase = bcvStrlen("https://storage.googleapis.com/") + nContainer;
++  int nEndpoint = bcvStrlen(zEndpoint);
++  while( nEndpoint>0 && zEndpoint[nEndpoint-1]=='/' ) nEndpoint--;
++  if( nEndpoint==0 ){
++    *pzErrmsg = sqlite3_mprintf("endpoint parameter may not be empty");
++    return SQLITE_ERROR;
++  }
++  int nBase = nEndpoint + 1 + nContainer;
+   int nByte = sizeof(BcvGoogle) + nUser + nSecret + nContainer + nBase + 4;
+ 
+   pNew = (BcvGoogle*)bcvMallocRc(&rc, nByte);
+@@ -1051,8 +1084,9 @@
+     memcpy(zCsr, zContainer, nContainer);
+     pNew->zCont = zCsr;
+     zCsr += nContainer+1;
++    pNew->nMaxResults = nMaxResults;
+     sqlite3_snprintf(
+-        nBase+1, zCsr, "https://storage.googleapis.com/%s", zContainer
++        nBase+1, zCsr, "%.*s/%s", nEndpoint, zEndpoint, zContainer
+     );
+     pNew->zBase = zCsr;
+   }
+@@ -1129,8 +1163,8 @@
+   sqlite3_bcv_job *pCtx, 
+   const char *zMarker
+ ){
+-  const int nMax = GOOGLE_MAX_RESULTS;
+   BcvGoogle *p = (BcvGoogle*)pCont;
++  const int nMax = p->nMaxResults;
+   sqlite3_bcv_request *pReq = 0;
+ 
+   pReq = sqlite3_bcv_job_request(pCtx, (void*)p, bcvGoogleListCb);

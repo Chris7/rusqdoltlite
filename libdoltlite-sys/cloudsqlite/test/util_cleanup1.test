@@ -1,0 +1,134 @@
+#
+# 19-July-2020
+#
+#-------------------------------------------------------------------------
+#
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix util_cleanup1
+
+bcv_create_container zzzz
+bcv_upload_empty_database zzzz zzz
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd zzzz
+
+sqlite3 db /zzzz/zzz -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+do_execsql_test 0.1 {
+  DELETE FROM bcv_tfs
+}
+do_execsql_test 0.2 {
+  SELECT name FROM bcv_tfs
+}
+db close
+$cmd detach zzzz
+
+bcv_create_container zzzz
+bcv_upload_empty_database zzzz zzz
+bcvfs_attach $cmd zzzz
+sqlite3 db /zzzz/zzz -vfs bcvfs
+
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a, b);
+  PRAGMA bcv_upload;
+}
+do_execsql_test 1.1 {
+  CREATE TABLE t2(a, b);
+  PRAGMA bcv_upload;
+}
+do_execsql_test 1.3 {
+  CREATE TABLE t3(a, b);
+  PRAGMA bcv_upload;
+}
+
+sqlite3_bcvfs_register_vtab db
+do_execsql_test 1.4 {
+  SELECT count(*) FROM bcv_tfs
+} 6
+
+set bcv [bcv_open zzzz]
+
+do_execsql_test 1.5 {
+  SELECT name, ncleanup FROM bcv_container;
+} {zzzz 3}
+
+proc xPut {str} {puts $str}
+do_test 1.6 {
+  #$bcv config log xPut
+  #$bcv config loglevel 1
+  $bcv cleanup 0
+  db eval { SELECT count(*) FROM bcv_tfs } 
+} 3
+
+$cmd poll zzzz
+do_execsql_test 1.7 {
+  SELECT name, ncleanup FROM bcv_container;
+} {zzzz 0}
+
+#-------------------------------------------------------------------------
+
+set n1 [string repeat JJ 24].xyz
+set n2 [string repeat JJ 16].xyz
+set n3 [string repeat JJ 24].bcv
+set n4 [string repeat JJ 16].bcv
+
+do_execsql_test 1.6 {
+  INSERT INTO bcv_tfs VALUES($n1, $n1);
+  INSERT INTO bcv_tfs VALUES($n2, $n2);
+  INSERT INTO bcv_tfs VALUES($n3, $n3);
+  INSERT INTO bcv_tfs VALUES($n4, $n4);
+}
+do_execsql_test 1.7 {
+  SELECT count(*) FROM bcv_tfs;
+} 7
+
+do_test 1.8 {
+  $bcv cleanup 0
+  db eval { SELECT count(*) FROM bcv_tfs } 
+} 7
+
+db close
+$cmd destroy
+$bcv close
+
+#-------------------------------------------------------------------------
+
+bcv_create_container yyyy
+bcv_upload_empty_database yyyy zzz
+
+set bcv [bcv_open yyyy]
+$bcv cleanup 0
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir bcvfs]
+bcvfs_attach $cmd yyyy
+
+sqlite3 db /yyyy/zzz -vfs bcvfs
+sqlite3_bcvfs_register_vtab db
+do_execsql_test 2.0 {
+  CREATE TABLE y1(y);
+  PRAGMA bcv_upload;
+}
+
+do_test 2.1 {
+  $bcv cleanup 2
+} {0}
+
+set nFile [db one { SELECT count(*) FROM bcv_tfs }]
+do_test 2.2 {
+  after 3000
+  $bcv cleanup 2
+  $bcv cleanup 2
+  db eval {
+    SELECT count(*) FROM bcv_tfs
+  }
+} [expr $nFile-1]
+
+db close
+$cmd destroy
+$bcv close
+
+finish_test
+
