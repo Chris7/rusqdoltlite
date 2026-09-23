@@ -829,6 +829,40 @@ mod tests {
     }
 
     #[test]
+    fn s3_rejects_dot_segments_in_configured_prefix() {
+        let module = CString::new("s3?endpoint=http://127.0.0.1:14567").unwrap();
+        let account = CString::new("access").unwrap();
+        let auth = CString::new("secret").unwrap();
+
+        for container in [
+            "bucket/.",
+            "bucket/..",
+            "bucket/tenant/../other",
+            "bucket/tenant/../../other",
+        ] {
+            let container = CString::new(container).unwrap();
+            let mut handle = ptr::null_mut();
+            let rc = unsafe {
+                raw_util::sqlite3_bcv_open(
+                    module.as_ptr(),
+                    account.as_ptr(),
+                    auth.as_ptr(),
+                    container.as_ptr(),
+                    &mut handle,
+                )
+            };
+            assert_ne!(
+                rc,
+                crate::ffi::SQLITE_OK,
+                "dot-segment prefix {container:?} must not be accepted"
+            );
+            if !handle.is_null() {
+                unsafe { raw_util::sqlite3_bcv_close(handle) };
+            }
+        }
+    }
+
+    #[test]
     fn config_maps_to_cbs_constants() {
         assert_eq!(Config::CacheSize(42).raw(), (raw::SQLITE_BCV_CACHESIZE, 42));
         assert_eq!(

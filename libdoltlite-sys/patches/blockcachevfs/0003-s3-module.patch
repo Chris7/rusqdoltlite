@@ -19,7 +19,7 @@
  
    aBody = sqlite3_bcv_request_body(pReq, &nBody);
    rc = bcvJsonRootObject(aBody, nBody);
-@@ -2037,6 +2038,766 @@
+@@ -2037,6 +2038,792 @@
    }
  }
  
@@ -84,6 +84,26 @@
 +  for(i=0; z[i]; i++){
 +    unsigned char c = (unsigned char)z[i];
 +    if( c<0x20 || c==0x7F || (!bSlash && c=='/') ) return 0;
++  }
++  return 1;
++}
++
++/* Reject dot path segments. A path-style endpoint or an HTTP gateway may
++** normalize these segments even when CURLOPT_PATH_AS_IS preserves them on
++** the wire, which would let a configured bucket/prefix escape its scope. */
++static int bcvS3ValidPathSegments(const char *z){
++  const char *zStart = z;
++  int n;
++  if( z==0 ) return 0;
++  for(; ; z++){
++    if( z[0]=='/' || z[0]=='\0' ){
++      n = (int)(z-zStart);
++      if( (n==1 && zStart[0]=='.')
++       || (n==2 && zStart[0]=='.' && zStart[1]=='.')
++      ) return 0;
++      if( z[0]=='\0' ) break;
++      zStart = z+1;
++    }
 +  }
 +  return 1;
 +}
@@ -186,6 +206,12 @@
 +  }
 +  if( !bcvS3ValidText(zContainer, 1) || zContainer[0]=='/' ){
 +    *pzErrmsg = sqlite3_mprintf("invalid S3 bucket/container");
++    return SQLITE_ERROR;
++  }
++  if( !bcvS3ValidPathSegments(zContainer) ){
++    *pzErrmsg = sqlite3_mprintf(
++        "S3 bucket/container may not contain '.' or '..' path segments"
++    );
 +    return SQLITE_ERROR;
 +  }
 +  zSlash = strchr(zContainer, '/');
