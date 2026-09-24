@@ -876,10 +876,19 @@ impl Connection {
     /// This is functionally equivalent to the `Drop` implementation for
     /// `Connection` except that on failure, it returns an error and the
     /// connection itself (presumably so closing can be attempted again).
-    /// For CBS connections, call [`Connection::upload`] before closing when
-    /// changes should be published. If pending local changes prevent detaching,
-    /// SQLite is closed and this method returns the connection so it can still
-    /// upload and retry close; other SQL operations are no longer available.
+    #[cfg_attr(
+        all(
+            feature = "blockcachevfs",
+            not(all(target_family = "wasm", target_os = "unknown"))
+        ),
+        doc = concat!(
+            "For CBS connections, call [`Connection::upload`] before closing when ",
+            "changes should be published. If pending local changes prevent ",
+            "detaching, SQLite is closed and this method returns the connection ",
+            "so it can still upload and retry close; other SQL operations are ",
+            "no longer available."
+        )
+    )]
     ///
     /// # Failure
     ///
