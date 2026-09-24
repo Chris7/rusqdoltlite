@@ -87,6 +87,8 @@ git -C "$tmp/src" apply \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0012-s3-tls-and-verbose-logging.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0013-streaming-and-serverless.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0014-streaming-and-serverless-tests.patch"
+git -C "$tmp/src" apply --include=blockcachevfs.c \
+  "$repo_root/libdoltlite-sys/patches/0005-cbs-create-upload.patch"
 
 export BLOCKCACHEVFS_CBS_BASE_CONFIG="$checkout/test/config.tcl"
 cp "$repo_root/tools/blockcachevfs-cbs-config.tcl" "$tmp/test/config.tcl"

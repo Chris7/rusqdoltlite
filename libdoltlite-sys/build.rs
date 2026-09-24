@@ -416,6 +416,11 @@ mod build_bundled {
             .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
             .collect::<Vec<_>>();
         patches.sort();
+        let combined_patch = patch_dir
+            .parent()
+            .expect("CBS patch directory must have a parent")
+            .join("0005-cbs-create-upload.patch");
+        patches.push(combined_patch);
         for patch in &patches {
             println!("cargo:rerun-if-changed={}", patch.display());
         }
@@ -425,6 +430,8 @@ mod build_bundled {
         let ceiling = stage.parent().unwrap_or(stage);
         let output = Command::new("git")
             .arg("apply")
+            // The combined patch's DoltLite files were applied to their own stage.
+            .arg("--exclude=doltlite*")
             .args(&patches)
             .current_dir(stage)
             .env("GIT_CEILING_DIRECTORIES", ceiling)
@@ -629,6 +636,8 @@ mod build_bundled {
             .expect("DoltLite patch output directory must have a parent");
         let output = Command::new("git")
             .arg("apply")
+            // The combined patch also has a CBS hunk applied to its CBS stage.
+            .arg("--exclude=blockcachevfs.c")
             .args(&patches)
             .current_dir(output_dir)
             .env("GIT_CEILING_DIRECTORIES", ceiling)

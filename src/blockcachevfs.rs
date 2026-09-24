@@ -2,6 +2,8 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1431,34 +1433,29 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
     } else {
         format!("{}/{}", uri.bucket, uri.prefix)
     };
-    let storage = match (&uri.storage, uri.endpoint.as_deref()) {
-        (CloudStorageUri::Google { project, .. }, Some(endpoint)) => {
-            Storage::google_json_with_endpoint(project, &container, endpoint)
-        }
-        (CloudStorageUri::Google { project, .. }, None) => {
-            Storage::google_json(project, &container)
-        }
-        (
-            CloudStorageUri::S3 {
-                region, access_id, ..
-            },
-            Some(endpoint),
-        ) => Storage::s3_with_endpoint(access_id, &container, region, endpoint),
-        (
-            CloudStorageUri::S3 {
-                region, access_id, ..
-            },
-            None,
-        ) => Storage::s3(access_id, &container, region),
-    };
+    let storage = uri.storage_for_container(&container);
     let alias = format!("cbs_{}_{}", std::process::id(), id);
     let path = format!("/{alias}/{}", uri.database);
     let directory = format!("/{alias}");
-    if let Err(error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
-        return Err(sanitize_cloud_error(
-            normalize_container_not_found(error),
-            &credentials_to_redact,
-        ));
+    let create = flags.contains(OpenFlags::SQLITE_OPEN_CREATE)
+        && !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY);
+    if let Err(error) = vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias)) {
+        let error = normalize_container_not_found(error);
+        let missing = matches!(
+            &error,
+            Error::SqliteFailure(native, _)
+                if native.extended_code == crate::ffi::SQLITE_NOTFOUND
+        );
+        if !create || !missing {
+            return Err(sanitize_cloud_error(error, &credentials_to_redact));
+        }
+
+        let initialization_error = vfs.initialize_container(&storage).err();
+        if let Err(attach_error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
+            let error =
+                initialization_error.unwrap_or_else(|| normalize_container_not_found(attach_error));
+            return Err(sanitize_cloud_error(error, &credentials_to_redact));
+        }
     }
     let control = match vfs.open(&directory) {
         Ok(control) => control,
@@ -1485,14 +1482,13 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
         let _ = vfs.detach(&alias);
         return Err(sanitize_cloud_error(error, &credentials_to_redact));
     }
-    if !database_exists {
+    if !database_exists && !create {
         let _ = vfs.detach(&alias);
         return Err(Error::SqliteFailure(
             crate::ffi::Error::new(crate::ffi::SQLITE_NOTFOUND),
             Some("CBS database not found".into()),
         ));
     }
-    let flags = flags & !OpenFlags::SQLITE_OPEN_CREATE;
     let mut connection = match vfs.open_with_flags(&path, flags) {
         Ok(connection) => connection,
         Err(error) => {
@@ -1538,15 +1534,22 @@ impl CloudConnectionUri {
         {
             return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
         }
-        let prefix = prefix.trim_end_matches('/');
-        if prefix.contains(['\\', '\0', '?', '#'])
-            || (!prefix.is_empty()
-                && prefix
+        let has_trailing_slash = prefix.ends_with('/');
+        let prefix_without_trailing_slash = prefix.strip_suffix('/').unwrap_or(&prefix);
+        if prefix_without_trailing_slash.ends_with('/')
+            || prefix_without_trailing_slash.contains(['\\', '\0', '?', '#'])
+            || (!prefix_without_trailing_slash.is_empty()
+                && prefix_without_trailing_slash
                     .split('/')
                     .any(|component| component.is_empty() || component == "." || component == ".."))
         {
             return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
         }
+        let prefix = if has_trailing_slash && !prefix_without_trailing_slash.is_empty() {
+            format!("{prefix_without_trailing_slash}/")
+        } else {
+            prefix_without_trailing_slash.to_owned()
+        };
 
         let mut options = std::collections::BTreeMap::new();
         for parameter in query.split('&') {
@@ -1632,6 +1635,11 @@ impl CloudConnectionUri {
         {
             return Err(cbs_uri_error("invalid CBS database name"));
         }
+        if database.starts_with('.') && database.ends_with("-lock") {
+            return Err(cbs_uri_error(
+                "CBS database names matching .<name>-lock are reserved for lock files",
+            ));
+        }
         let endpoint = options.remove("endpoint");
         if endpoint
             .as_deref()
@@ -1646,11 +1654,34 @@ impl CloudConnectionUri {
         }
         Ok(Self {
             bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
+            prefix,
             database,
             storage,
             endpoint,
         })
+    }
+
+    fn storage_for_container(&self, container: &str) -> Storage {
+        match (&self.storage, self.endpoint.as_deref()) {
+            (CloudStorageUri::Google { project, .. }, Some(endpoint)) => {
+                Storage::google_json_with_endpoint(project, container, endpoint)
+            }
+            (CloudStorageUri::Google { project, .. }, None) => {
+                Storage::google_json(project, container)
+            }
+            (
+                CloudStorageUri::S3 {
+                    region, access_id, ..
+                },
+                Some(endpoint),
+            ) => Storage::s3_with_endpoint(access_id, container, region, endpoint),
+            (
+                CloudStorageUri::S3 {
+                    region, access_id, ..
+                },
+                None,
+            ) => Storage::s3(access_id, container, region),
+        }
     }
 }
 
@@ -1807,7 +1838,10 @@ fn create_cache_directory(id: u64) -> Result<std::path::PathBuf> {
             std::process::id(),
             id.wrapping_add(attempt)
         ));
-        match std::fs::create_dir(&directory) {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&directory) {
             Ok(()) => return Ok(directory),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return Err(cbs_uri_error("cannot create CBS cache directory")),
@@ -2023,6 +2057,19 @@ unsafe extern "C" fn auth_trampoline(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn cache_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = CacheDirectoryGuard::new(
+            create_cache_directory(0).expect("CBS cache directory should be created"),
+        );
+        let metadata = std::fs::metadata(directory.path()).expect("cache directory metadata");
+
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+    }
+
     #[test]
     fn cleanup_age_seconds_rounds_up_and_checks_native_range() {
         assert_eq!(cleanup_age_seconds(Duration::ZERO).unwrap(), 0);
@@ -2222,7 +2269,7 @@ mod tests {
         )
         .expect("valid encoded S3 URI");
         assert_eq!(uri.bucket, "bucket");
-        assert_eq!(uri.prefix, "path/tenant");
+        assert_eq!(uri.prefix, "path/tenant/");
         assert_eq!(uri.endpoint.as_deref(), Some("http://127.0.0.1:4566"));
         let CloudStorageUri::S3 {
             region,
@@ -2239,12 +2286,56 @@ mod tests {
     }
 
     #[test]
+    fn cloud_connection_uris_use_provider_defaults_and_allow_endpoint_overrides() {
+        let gcs = CloudConnectionUri::parse(
+            "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token",
+        )
+        .expect("valid GCS URI without endpoint");
+        assert!(gcs.endpoint.is_none());
+        let gcs_storage = gcs.storage_for_container("bucket/repository");
+        assert_eq!(gcs_storage.provider, "google?api=json");
+        assert_eq!(gcs_storage.account, "project");
+
+        let s3 = CloudConnectionUri::parse(
+            "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret",
+        )
+        .expect("valid S3 URI without endpoint");
+        assert!(s3.endpoint.is_none());
+        let s3_storage = s3.storage_for_container("bucket/repository");
+        assert_eq!(s3_storage.provider, "s3?region=us-west-2");
+        assert_eq!(s3_storage.account, "access");
+
+        let gcs_override = CloudConnectionUri::parse(
+            "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&endpoint=http://127.0.0.1:4443",
+        )
+        .expect("valid GCS URI with endpoint override");
+        assert_eq!(
+            gcs_override
+                .storage_for_container("bucket/repository")
+                .provider,
+            "google?api=json&endpoint=http://127.0.0.1:4443"
+        );
+
+        let s3_override = CloudConnectionUri::parse(
+            "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret&endpoint=http://127.0.0.1:4566",
+        )
+        .expect("valid S3 URI with endpoint override");
+        assert_eq!(
+            s3_override
+                .storage_for_container("bucket/repository")
+                .provider,
+            "s3?region=us-west-2&endpoint=http://127.0.0.1:4566"
+        );
+    }
+
+    #[test]
     fn s3_connection_uri_rejects_selector_injection() {
         for uri in [
             "s3://bucket/path?vfs=blockcachevfs&region=us-east-1%26evil&access_id=test&secret_access_key=test",
             "s3://bucket/path?vfs=blockcachevfs&region=us-east-1&access_id=test&secret_access_key=test&endpoint=http%3A%2F%2F127.0.0.1%3A4566%26evil",
             "s3://bucket/path?vfs=blockcachevfs&region=us-east-1&access_id=test&secret_access_key=test&endpoint=http%3A%2F%2F127.0.0.1%3A4566%25evil",
             "s3://bucket/path?vfs=blockcachevfs&region=us-east-1&access_id=test&secret_access_key=test&endpoint=http%3A%2F%2F127.0.0.1%3A4566%0A",
+            "gcs://bucket/path?vfs=blockcachevfs&project=project&access_token=token&database=%2Edefault.db-lock",
         ] {
             assert!(CloudConnectionUri::parse(uri).is_err(), "accepted {uri}");
         }

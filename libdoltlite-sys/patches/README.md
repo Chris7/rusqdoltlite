@@ -88,3 +88,9 @@ The CBS test-only changes live in the separate
 `blockcachevfs-tests/0014-streaming-and-serverless-tests.patch`; the emulator
 runner applies it after the production patch so `build.rs` never stages test
 sources into the library build.
+
+`0005-cbs-create-upload.patch` lets CBS create and upload a new local database
+before remote blocks exist. Its DoltLite hunk skips the initial seed commit for
+CBS checkpoint-only opens; ordinary application opens keep their seed behavior.
+The Rust build applies the DoltLite hunk after the remote-server patch and only
+the `blockcachevfs.c` hunk after the existing CBS patch series.

@@ -16,16 +16,16 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::ptr;
-use std::sync::OnceLock;
 #[cfg(feature = "remote")]
 use std::sync::{
     atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
-    Arc, Barrier, Mutex,
+    Mutex,
 };
-#[cfg(feature = "remote")]
+use std::sync::{mpsc, Arc, Barrier, OnceLock};
 use std::thread;
+use std::time::Duration;
 #[cfg(feature = "remote")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::blockcachevfs::{
@@ -49,6 +49,287 @@ fn unique_suffix() -> String {
             .expect("system clock is before Unix epoch")
             .as_nanos()
     )
+}
+
+fn no_create_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
+}
+
+fn uri_for_container(backend: &str, endpoint: &str, bucket: &str, prefix: &str) -> String {
+    match backend {
+        "google" => format!(
+            "gcs://{bucket}/{prefix}?vfs=blockcachevfs&project=test-project&access_token=test-token&endpoint={endpoint}"
+        ),
+        "s3" => format!(
+            "s3://{bucket}/{prefix}?vfs=blockcachevfs&region=us-east-1&access_id=test&secret_access_key=test&endpoint={endpoint}"
+        ),
+        _ => unreachable!(),
+    }
+}
+
+fn assert_empty_sqlite_database(database: &Connection) {
+    let schema_entries: i64 = database
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+        .expect("read empty SQLite schema");
+    let user_version: i64 = database
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read empty SQLite user_version");
+
+    assert_eq!(schema_entries, 0);
+    assert_eq!(user_version, 0);
+}
+
+fn attached_database_state(vfs: &BlockCacheVfs, alias: &str, database: &str) -> (i64, String) {
+    let control = vfs
+        .open(format!("/{alias}"))
+        .expect("open CBS control connection");
+    let state = control
+        .query_row(
+            "SELECT nblock, state FROM bcv_database WHERE container = ?1 AND database = ?2",
+            params![alias, database],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read CBS database metadata");
+    control.close().expect("close CBS control connection");
+    state
+}
+
+fn run_uri_auto_create(backend: &str) {
+    let endpoint = match backend {
+        "google" => std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+            .unwrap_or_else(|_| "http://127.0.0.1:4443".into()),
+        "s3" => std::env::var("BLOCKCACHEVFS_S3_EMULATOR")
+            .unwrap_or_else(|_| "http://127.0.0.1:4566".into()),
+        _ => unreachable!(),
+    };
+    let suffix = unique_suffix();
+    let bucket = if backend == "google" {
+        ensure_google_bucket(&endpoint, "app_storage");
+        "app_storage".to_owned()
+    } else {
+        format!("rust-create-{suffix}")
+    };
+    let prefix = format!("{suffix}/uri/create/");
+    let uri = uri_for_container(backend, &endpoint, &bucket, &prefix);
+
+    let empty_prefix = format!("{suffix}/uri/read-only/");
+    let empty_container = format!("{bucket}/{empty_prefix}");
+    let empty_storage = if backend == "google" {
+        Storage::google_json_with_endpoint("test-project", &empty_container, &endpoint)
+    } else {
+        Storage::s3_with_endpoint("test", &empty_container, "us-east-1", &endpoint)
+    };
+    let cache = tempfile::tempdir().expect("empty database VFS cache directory");
+    let vfs = BlockCacheVfs::builder(cache.path())
+        .expect("empty database VFS builder")
+        .auth_callback(|provider, _, _| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init_owned()
+        .expect("initialize empty database VFS");
+    vfs.initialize_container(&empty_storage)
+        .expect("initialize empty database container");
+    let empty_alias = format!("empty_{}", std::process::id());
+    vfs.attach(&AttachSpec::new(empty_storage.clone()).alias(&empty_alias))
+        .expect("attach empty database container");
+    let empty_path = format!("/{empty_alias}/empty.sqlite");
+    let empty = vfs
+        .open_with_flags(
+            &empty_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("create an empty SQLite database");
+    empty.close().expect("close created empty database");
+    assert_eq!(
+        attached_database_state(&vfs, &empty_alias, "empty.sqlite"),
+        (1, "copied".to_owned()),
+        "SQLite CREATE should write its standard header page without a schema"
+    );
+
+    let read_only = vfs
+        .open_with_flags(
+            &empty_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("open empty database read-only before upload");
+    read_only
+        .close()
+        .expect("close pre-upload read-only database");
+    assert_eq!(
+        attached_database_state(&vfs, &empty_alias, "empty.sqlite"),
+        (1, "copied".to_owned()),
+        "read-only open without CREATE must find the pending empty database"
+    );
+
+    vfs.upload(&empty_alias)
+        .expect("persist empty database metadata");
+    assert_eq!(
+        attached_database_state(&vfs, &empty_alias, "empty.sqlite"),
+        (1, String::new()),
+        "upload should persist the empty SQLite database"
+    );
+    vfs.detach(&empty_alias)
+        .expect("detach uploaded empty database");
+    vfs.attach(&AttachSpec::new(empty_storage).alias(&empty_alias))
+        .expect("reattach uploaded empty database");
+    assert_eq!(
+        attached_database_state(&vfs, &empty_alias, "empty.sqlite"),
+        (1, String::new()),
+        "the CBS manifest should retain the empty database after reattach"
+    );
+    let read_only = vfs
+        .open_with_flags(
+            &empty_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("open uploaded empty database read-only without CREATE");
+    assert_empty_sqlite_database(&read_only);
+    read_only
+        .close()
+        .expect("close post-upload read-only database");
+    vfs.detach(&empty_alias)
+        .expect("detach re-opened empty database");
+
+    let no_sql_uri = uri_for_container(
+        backend,
+        &endpoint,
+        &bucket,
+        &format!("{suffix}/uri/create-no-sql/"),
+    );
+    let no_sql = Connection::open(&no_sql_uri)
+        .expect("CREATE should open an empty database without caller SQL");
+    no_sql
+        .upload()
+        .expect("upload an empty database without caller SQL");
+    no_sql.close().expect("close no-SQL empty database");
+    let no_sql = Connection::open_with_flags(&no_sql_uri, no_create_flags())
+        .expect("reopen no-SQL upload without CREATE");
+    assert_empty_sqlite_database(&no_sql);
+    no_sql.close().expect("close reopened no-SQL database");
+
+    let database = Connection::open(&uri).expect("CREATE should initialize an empty CBS database");
+    let journal_mode: String = database
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("CBS should report its forced WAL journal mode");
+    assert_eq!(journal_mode, "wal");
+    let journal_mode: String = database
+        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        .expect("requesting the already-active WAL mode should be a no-op");
+    assert_eq!(journal_mode, "wal");
+    let error = database
+        .query_row::<String, _, _>("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .expect_err("CBS must reject unsupported journal mode changes");
+    assert!(error
+        .to_string()
+        .contains("blockcachevfs supports only journal_mode=WAL"));
+    let schema_entries: i64 = database
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+        .expect("new CBS database should be a valid empty SQLite database");
+    assert_eq!(schema_entries, 0);
+    let user_version: i64 = database
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read the empty database user_version");
+    assert_eq!(user_version, 0);
+    database.upload().expect("upload the empty SQLite database");
+    database.close().expect("close uploaded empty database");
+
+    let database = Connection::open_with_flags(&uri, no_create_flags())
+        .expect("reopen uploaded empty database without CREATE");
+    let schema_entries: i64 = database
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+        .expect("reopened database should remain empty");
+    assert_eq!(schema_entries, 0);
+    let user_version: i64 = database
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read the persisted empty database user_version");
+    assert_eq!(user_version, 0);
+    database.close().expect("close re-opened empty database");
+
+    let database = Connection::open_with_flags(&uri, no_create_flags())
+        .expect("reopen empty database before adding application data");
+    database
+        .execute_batch(
+            "CREATE TABLE mutation(value TEXT NOT NULL); INSERT INTO mutation VALUES ('saved');",
+        )
+        .expect("write application data to the new SQLite database");
+    database.upload().expect("upload the new SQLite database");
+    database.close().expect("close uploaded database");
+
+    let reopened = Connection::open_with_flags(&uri, no_create_flags())
+        .expect("reopen uploaded SQLite database without CREATE");
+    let value: String = reopened
+        .query_row("SELECT value FROM mutation", [], |row| row.get(0))
+        .expect("read uploaded application data");
+    assert_eq!(value, "saved");
+    reopened.close().expect("close re-opened database");
+
+    let race_prefix = format!("{suffix}/uri/create-race/");
+    let race_uri = uri_for_container(backend, &endpoint, &bucket, &race_prefix);
+    let start = Arc::new(Barrier::new(3));
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let mut release_senders = Vec::new();
+    let writers = ["left", "right"].map(|value| {
+        let uri = race_uri.clone();
+        let start = Arc::clone(&start);
+        let opened_tx = opened_tx.clone();
+        let (release_tx, release_rx) = mpsc::channel();
+        release_senders.push(release_tx);
+        std::thread::spawn(move || {
+            start.wait();
+            let database = match Connection::open(&uri) {
+                Ok(database) => database,
+                Err(_) => {
+                    let _ = opened_tx.send(false);
+                    return false;
+                }
+            };
+            let _ = opened_tx.send(true);
+            if release_rx.recv_timeout(Duration::from_secs(15)).is_err() {
+                return false;
+            }
+            database
+                .execute_batch("CREATE TABLE race(value TEXT NOT NULL);")
+                .expect("create race table in each local database");
+            database
+                .execute("INSERT INTO race VALUES (?1)", [value])
+                .expect("write independent local race value");
+            let uploaded = database.upload().is_ok();
+            if let Err((database, _error)) = database.close() {
+                drop(database);
+            }
+            uploaded
+        })
+    });
+    drop(opened_tx);
+    start.wait();
+    for _ in 0..writers.len() {
+        if opened_rx.recv_timeout(Duration::from_secs(15)).is_err() {
+            break;
+        }
+    }
+    for release in release_senders {
+        let _ = release.send(());
+    }
+    let outcomes = writers.map(|writer| writer.join().expect("join concurrent CBS writer"));
+    assert_eq!(
+        outcomes.into_iter().filter(|uploaded| *uploaded).count(),
+        1,
+        "conditional manifest update must accept one creator and reject the other"
+    );
+
+    let winner = Connection::open_with_flags(&race_uri, no_create_flags())
+        .expect("open the winning concurrent database without CREATE");
+    let value: String = winner
+        .query_row("SELECT value FROM race", [], |row| row.get(0))
+        .expect("read the winner's persisted row");
+    assert!(value == "left" || value == "right");
+    winner.close().expect("close the winning database");
 }
 
 fn encode_query_value(value: &str) -> String {
@@ -6121,4 +6402,122 @@ fn google_json_emulator_session_generic_process_flow() {
 #[ignore = "requires the pinned local emulator containers"]
 fn s3_emulator_session_generic_process_flow() {
     run_generic_process_flow("s3");
+}
+
+#[cfg(feature = "remote")]
+fn remote_request(port: u16, method: &str, path: &str, body: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to remote server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set remote server read timeout");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .expect("write remote request headers");
+    stream.write_all(body).expect("write remote request body");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read remote server response");
+    response
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_upload_of_direct_remote_chunks_does_not_create_refs() {
+    const EMPTY_PROLLY_HASH_HEX: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9";
+    // DoltLite's ProllyHash stores the first 20 bytes of BLAKE3(empty).
+    const EMPTY_PROLLY_HASH: [u8; 20] = [
+        0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc, 0xc9,
+        0x49, 0x9b, 0xcb, 0x25, 0xc9,
+    ];
+
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    let prefix = format!("{}/uri/remote-upload/", unique_suffix());
+    ensure_google_bucket(&endpoint, bucket);
+    let storage =
+        Storage::google_json_with_endpoint("test-project", format!("{bucket}/{prefix}"), &endpoint);
+
+    let cache = tempfile::tempdir().expect("CBS cache directory");
+    let vfs = BlockCacheVfs::builder(cache.path())
+        .expect("CBS VFS builder")
+        .auth_callback(|_, _, _| Ok("test-token".to_owned()))
+        .init_owned()
+        .expect("initialize CBS VFS");
+    vfs.initialize_container(&storage)
+        .expect("initialize remote CBS container");
+    let alias = format!("remote_{}", std::process::id());
+    vfs.attach(&AttachSpec::new(storage).alias(&alias))
+        .expect("attach remote CBS container");
+    let directory = format!("/{alias}");
+    let options = RemoteServerOptions::new().vfs_name(vfs.name());
+
+    let server = RemoteServer::start_with_options(&directory, &options)
+        .expect("start CBS-backed remote server");
+    let response = remote_request(server.port(), "GET", "/default.db/refs", &[]);
+    assert!(
+        response.starts_with(b"HTTP/1.1 404 "),
+        "uninitialized graph refs should be absent before upload: {}",
+        String::from_utf8_lossy(&response[..response.len().min(160)])
+    );
+
+    let mut chunk_body = EMPTY_PROLLY_HASH.to_vec();
+    chunk_body.extend_from_slice(&0_u32.to_le_bytes());
+    let response = remote_request(server.port(), "POST", "/default.db/chunks", &chunk_body);
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 "),
+        "direct remote chunk upload should succeed: {}",
+        String::from_utf8_lossy(&response[..response.len().min(160)])
+    );
+    let chunk_path = format!("/default.db/chunk/{EMPTY_PROLLY_HASH_HEX}");
+    let response = remote_request(server.port(), "GET", &chunk_path, &[]);
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 "),
+        "the direct upload should make its chunk readable: {}",
+        String::from_utf8_lossy(&response[..response.len().min(160)])
+    );
+    let response = remote_request(server.port(), "GET", "/default.db/refs", &[]);
+    assert!(
+        response.starts_with(b"HTTP/1.1 404 "),
+        "chunk upload should not create refs before CBS checkpoint: {}",
+        String::from_utf8_lossy(&response[..response.len().min(160)])
+    );
+    drop(server);
+
+    vfs.upload(&alias)
+        .expect("upload the remotely received chunk through CBS");
+
+    let server = RemoteServer::start_with_options(&directory, &options)
+        .expect("restart CBS-backed remote server after upload");
+    let response = remote_request(server.port(), "GET", &chunk_path, &[]);
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 "),
+        "CBS upload should persist the received chunk: {}",
+        String::from_utf8_lossy(&response[..response.len().min(160)])
+    );
+    let response = remote_request(server.port(), "GET", "/default.db/refs", &[]);
+    assert!(
+        response.starts_with(b"HTTP/1.1 404 "),
+        "CBS checkpoint must not create refs before refs-if: {}",
+        String::from_utf8_lossy(&response[..response.len().min(160)])
+    );
+    drop(server);
+    vfs.detach(&alias).expect("detach uploaded CBS container");
+}
+
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_connection_creates_empty_database_and_resolves_races() {
+    run_uri_auto_create("google");
+}
+
+#[test]
+#[ignore = "requires the pinned local S3 emulator container"]
+fn s3_uri_connection_creates_empty_database_and_resolves_races() {
+    run_uri_auto_create("s3");
 }

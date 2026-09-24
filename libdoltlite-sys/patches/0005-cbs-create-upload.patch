@@ -1,0 +1,241 @@
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+index 61cd8e0..27ee4b3 100644
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -23,6 +23,7 @@ extern int bcv_test_event(int);
+ #endif
+ 
+ #ifdef BCV_DOLTLITE_INTEGRATION
++#define SQLITE_OPEN_DOLTLITE_NO_SEED 0x00800000
+ SQLITE_API int SQLITE_APICALL sqlite3_doltlite_bcvfs_upload_lock(sqlite3*,const char*,void**);
+ SQLITE_API void SQLITE_APICALL sqlite3_doltlite_bcvfs_upload_unlock(void*);
+ #endif
+@@ -2204,8 +2205,22 @@ static int bcvfsMakeBlockWritable(
+       pNew->pCont = pFile->pCont;
+       pNew->iDbId = pFile->iFileDbId;
+       pNew->iDbPos = iBlk;
+-      sqlite3_randomness(pNew->nName, pNew->aName);
+-      rc = bcvfsManifestWrite(pManDb, iBlk, pNew->aName, pNew->nName);
++      if( iBlk>=pManDb->nBlkLocal ){
++        static const u8 aZero[32*1024] = {0};
++        i64 iOff = (i64)pNew->iPos * pCommon->szBlk;
++        i64 iEnd = iOff + pCommon->szBlk;
++        while( rc==SQLITE_OK && iOff<iEnd ){
++          int nWrite = (int)MIN((i64)sizeof(aZero), iEnd-iOff);
++          rc = pFile->pCacheFile->pMethods->xWrite(
++              pFile->pCacheFile, aZero, nWrite, iOff
++          );
++          iOff += nWrite;
++        }
++      }
++      if( rc==SQLITE_OK ){
++        sqlite3_randomness(pNew->nName, pNew->aName);
++        rc = bcvfsManifestWrite(pManDb, iBlk, pNew->aName, pNew->nName);
++      }
+       if( rc==SQLITE_OK ){
+         pNew->bDirty = 1;
+         pNew->bStaged = 0;
+@@ -2268,8 +2283,9 @@ static int bcvfsReadWriteDatabase(
+   ** database header without first taking a read-lock. This is an 
+   ** optimization only - the header has to be reread when the first
+   ** transaction is opened anyway. So effectively ignore this read. */
+-  if( iOfst==0 && iAmt==100 ){
++  if( iOfst==0 && iAmt==100 && pFile->iFileDbId<BCVFS_FIRST_LOCAL_ID ){
+     assert( bWrite==0 );
++    memset(pBuf, 0, iAmt);
+     return SQLITE_IOERR_SHORT_READ;
+   }
+ 
+@@ -2307,7 +2323,10 @@ retry:
+     szBlk = pCommon->szBlk;
+     iBlk = iOfst / szBlk;
+     rc = bcvfsGetManifestRef(pFile, ioerr);
+-    if( rc==SQLITE_OK ){
++    if( rc==SQLITE_OK && !bWrite && iBlk>=pFile->pManDb->nBlkLocal ){
++      memset(pBuf, 0, iAmt);
++      rc = SQLITE_IOERR_SHORT_READ;
++    }else if( rc==SQLITE_OK ){
+       int nName = NAMEBYTES(pFile->pMan);
+       rc = bcvfsFindBlockForIO(pFs, pFile->pManDb, nName, iBlk, &pEntry);
+     }
+@@ -4156,8 +4175,19 @@ static int bcvfsPragma(BcvfsFile *pFile, void *pArg){
+     rc = (zErr ? SQLITE_OK : SQLITE_NOMEM);
+   }
+   if( 0==sqlite3_stricmp("journal_mode", zPragma) ){
++#ifdef BCV_DOLTLITE_INTEGRATION
++    const char *zMode = azArg[2];
++    if( zMode==0 || 0==sqlite3_stricmp("wal", zMode) ){
++      zErr = sqlite3_mprintf("wal");
++      rc = (zErr ? SQLITE_OK : SQLITE_NOMEM);
++    }else{
++      rc = SQLITE_ERROR;
++      zErr = sqlite3_mprintf("blockcachevfs supports only journal_mode=WAL");
++    }
++#else
+     rc = SQLITE_ERROR;
+     zErr = sqlite3_mprintf("cannot use \"PRAGMA journal_mode\" with bcvfs");
++#endif
+   }
+ 
+   if( 0==sqlite3_stricmp("bcv_client", zPragma) ){
+@@ -4529,6 +4559,39 @@ static int bcvfsSessionDatabasePathAllowed(
+   return 0;
+ }
+ 
++static int bcvfsCreateLocalDatabase(
++  sqlite3_bcvfs *pFs,
++  Container *pCont,
++  const char *zName,
++  int nName
++){
++  int rc = SQLITE_OK;
++  Manifest *pMan = 0;
++
++  if( nName<=0 || nName>=BCV_DBNAME_SIZE ){
++    return SQLITE_CANTOPEN;
++  }
++
++  bcvfsEnterState(pFs, pCont, CONTAINER_STATE_COPY);
++  if( bcvfsFindDatabase(pCont->pMan, zName, nName) ){
++    rc = SQLITE_CANTOPEN;
++  }else{
++    rc = bcvManifestDup(pCont->pMan, &pMan);
++    if( rc==SQLITE_OK ){
++      ManifestDb *pDb = &pMan->aDb[pMan->nDb++];
++      memset(pDb, 0, sizeof(ManifestDb));
++      pDb->iDbId = pFs->iNextLocalId++;
++      pDb->iVersion = 1;
++      memcpy(pDb->zDName, zName, nName);
++      rc = bcvManifestInstall(&pFs->c, pCont, pMan);
++      pMan = 0;
++    }
++  }
++  bcvManifestDeref(pMan);
++  bcvfsLeaveState(pFs, pCont);
++  return rc;
++}
++
+ /*
+ ** Open an bcv file handle.
+ */
+@@ -4628,7 +4691,11 @@ static int bcvfsOpen(
+                 pDb = bcvfsFindDatabase(
+                     pCont->pMan, &pPath->zDatabase[1], nDb-6
+                 );
+-                if( pDb && pDb->nBlkLocal>0 ){
++                if( (pDb && (pDb->nBlkLocal>0
++                          || pDb->iDbId>=BCVFS_FIRST_LOCAL_ID))
++                 || (!pDb && (flags & SQLITE_OPEN_CREATE)
++                          && !(flags & SQLITE_OPEN_READONLY))
++                ){
+                   bIsLock = 1;
+                   bIsMain = 0;
+                   pRet->bIsMain = 0;
+@@ -4638,9 +4705,25 @@ static int bcvfsOpen(
+               if( rc==SQLITE_OK && !bIsLock ){
+                 pDb = bcvfsFindDatabase(pCont->pMan, pPath->zDatabase, nDb);
+               }
+-              if( rc==SQLITE_OK && (pDb==0 || pDb->nBlkLocal==0) ){
++              if( rc==SQLITE_OK && pDb==0
++               && !bIsLock
++               && bIsMain
++               && (flags & SQLITE_OPEN_CREATE)
++               && !(flags & SQLITE_OPEN_READONLY)
++              ){
++                rc = bcvfsCreateLocalDatabase(pFs, pCont, pPath->zDatabase, nDb);
++                if( rc==SQLITE_OK ){
++                  pDb = bcvfsFindDatabase(pCont->pMan, pPath->zDatabase, nDb);
++                }
++              }
++              if( rc==SQLITE_OK && !bIsLock && (pDb==0
++               || (pDb->nBlkLocal==0
++                && !((flags & SQLITE_OPEN_CREATE)
++                  && !(flags & SQLITE_OPEN_READONLY)
++                  && pDb->iDbId>=BCVFS_FIRST_LOCAL_ID)))
++              ){
+                 rc = BCVFS_CANTOPEN;
+-              }else if( rc==SQLITE_OK ){
++              }else if( rc==SQLITE_OK && !bIsLock ){
+                 pRet->iFileDbId = pDb->iDbId;
+               }
+             }
+@@ -7073,7 +7156,7 @@ static int bcvfsUpload(
+             /* This database looks dirty. Add it to the ctx.aDb[] array. */
+             if( dbPragma==0 || pDb->iDbId==pFilePragma->iFileDbId ){
+               UploadDb *pUp = &ctx.aDb[ctx.nDb++];
+-              if( pDb->nBlkLocal>0 ){
++              if( pDb->nBlkLocal>0 || pDb->iDbId>=BCVFS_FIRST_LOCAL_ID ){
+                 pUp->zPath = bcvMprintfRc(&rc, "/%s/%s", zCont, pDb->zDName);
+               }
+               pUp->iDbId = pDb->iDbId;
+@@ -7105,7 +7188,11 @@ static int bcvfsUpload(
+           assert( iDb==0 );
+           pUp->db = dbPragma;
+         }else{
+-          const int f = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
++          const int f = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
++#ifdef BCV_DOLTLITE_INTEGRATION
++            | SQLITE_OPEN_DOLTLITE_NO_SEED
++#endif
++            ;
+           rc = sqlite3_open_v2(pUp->zPath, &pUp->db, f, pFs->zName);
+           if( rc==SQLITE_OK ){
+             sqlite3_busy_handler(pUp->db, xBusy, pBusyArg);
+@@ -7189,7 +7276,7 @@ static int bcvfsUpload(
+           pDb->iDbId = ++ctx.pMan->iMaxDbId;
+         }
+         if( pDb->nBlkLocalAlloc ){
+-          assert( pDb->nBlkOrigAlloc );
++          assert( pDb->nBlkOrigAlloc || pDb->aBlkOrig==0 );
+           sqlite3_free(pDb->aBlkOrig);
+           pDb->aBlkOrig = pDb->aBlkLocal;
+           pDb->nBlkOrig = pDb->nBlkLocal;
+diff --git a/doltlite.c b/doltlite.c
+index 2393b15..4a518d1 100644
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -1076,6 +1076,8 @@ SQLITE_API int sqlite3_exec(
+ #define SQLITE_OPEN_WAL              0x00080000  /* VFS only */
+ #define SQLITE_OPEN_NOFOLLOW         0x01000000  /* Ok for sqlite3_open_v2() */
+ #define SQLITE_OPEN_EXRESCODE        0x02000000  /* Extended result codes */
++/* Private flag used by CBS's checkpoint connection to avoid graph seeding. */
++#define SQLITE_OPEN_DOLTLITE_NO_SEED 0x00800000
+ 
+ /* Reserved:                         0x00F00000 */
+ /* Legacy compatibility: */
+@@ -19121,6 +19123,7 @@ struct sqlite3 {
+   i64 szMmap;                   /* Default mmap_size setting */
+   u32 nSchemaLock;              /* Do not reset the schema when non-zero */
+   unsigned int openFlags;       /* Flags passed to sqlite3_vfs.xOpen() */
++  u8 bSkipDoltSeed;             /* Skip opening-time graph seed for CBS upload. */
+   int errCode;                  /* Most recent error code (SQLITE_*) */
+   int errByteOffset;            /* Byte offset of error in SQL statement */
+   int errMask;                  /* & result codes with this before returning */
+@@ -197671,6 +197674,8 @@ static int openDatabase(
+   **  2:  SQLITE_OPEN_READWRITE
+   **  6:  SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+   */
++  db->bSkipDoltSeed = (flags & SQLITE_OPEN_DOLTLITE_NO_SEED)!=0;
++  flags &= ~SQLITE_OPEN_DOLTLITE_NO_SEED;
+   db->openFlags = flags;
+   assert( SQLITE_OPEN_READONLY  == 0x01 );
+   assert( SQLITE_OPEN_READWRITE == 0x02 );
+@@ -491971,6 +491976,7 @@ SQLITE_PRIVATE int sqlite3BtreeOpen(
+   pBt->store.corruptMidStream = poisonAfterOpen;
+   if( hasMainBtree
+    && !p->isDetached
++   && !db->bSkipDoltSeed
+    && !pBt->store.notADatabase
+    && !pBt->store.corruptMidStream ){
+     ProllyHash seedHash;
+@@ -520830,7 +520836,9 @@ static void doltliteInternalMaterializeDefaultColumnFunc(
+ }
+ 
+ int doltliteMaybeSeedRepo(sqlite3 *db){
+-  ChunkStore *cs = doltliteGetChunkStore(db);
++  ChunkStore *cs;
++  if( db->bSkipDoltSeed ) return SQLITE_OK;
++  cs = doltliteGetChunkStore(db);
+   const char *zBranch;
+   ProllyHash emptyParent;
+   ProllyHash emptyCatalog;
