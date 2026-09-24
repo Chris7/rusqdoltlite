@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct RemoteServerOptions {
     bind_address: String,
     port: u16,
+    vfs_name: Option<String>,
     certificate_file: Option<PathBuf>,
     private_key_file: Option<PathBuf>,
     authorized_keys_directory: Option<PathBuf>,
@@ -43,6 +44,15 @@ impl RemoteServerOptions {
     #[must_use]
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// Selects the SQLite VFS used by the remote server for database access.
+    ///
+    /// The VFS must remain registered for the lifetime of the running server.
+    #[must_use]
+    pub fn vfs_name(mut self, vfs_name: impl Into<String>) -> Self {
+        self.vfs_name = Some(vfs_name.into());
         self
     }
 
@@ -91,6 +101,7 @@ impl Default for RemoteServerOptions {
         Self {
             bind_address: "127.0.0.1".to_owned(),
             port: 0,
+            vfs_name: None,
             certificate_file: None,
             private_key_file: None,
             authorized_keys_directory: None,
@@ -240,6 +251,7 @@ impl RemoteServer {
 
         let directory = path_to_cstring(directory.as_ref())?;
         let bind_address = CString::new(options.bind_address.as_str())?;
+        let vfs_name = options.vfs_name.as_deref().map(CString::new).transpose()?;
         let certificate_file = options
             .certificate_file
             .as_deref()
@@ -296,6 +308,9 @@ impl RemoteServer {
                 .as_ref()
                 .map_or(ptr::null(), |value| value.as_ptr()),
             timeoutMs: timeout_ms,
+            zVfsName: vfs_name
+                .as_ref()
+                .map_or(ptr::null(), |value| value.as_ptr()),
         };
         let raw = unsafe { ffi::doltliteServeAsyncOpts(&native_options) };
         let raw = NonNull::new(raw).ok_or_else(|| {

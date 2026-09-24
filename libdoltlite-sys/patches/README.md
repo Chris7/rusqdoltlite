@@ -27,7 +27,10 @@ matches. A failed build is an upgrade-review signal, not permission to silently
 skip a local change.
 
 Each patch owns one independently removable behavior. Currently,
-`0001-support-remote-set-url.patch` adds `dolt_remote('set-url', ...)`.
+`0001` and `0002` add `dolt_remote('set-url', ...)`, `0003` adds the CBS upload
+lock hooks, and `0004-remote-server-vfs.patch` lets the native remote server
+select a registered SQLite VFS. The build copies pristine remote-server
+sidecars into `OUT_DIR` before applying `0004`; it does not edit vendored source.
 
 Keep new behavior isolated the same way so an upstreamed fix can be removed
 without rebasing unrelated changes.
