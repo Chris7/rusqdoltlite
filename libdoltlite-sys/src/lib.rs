@@ -161,6 +161,7 @@ mod remote {
         pub authKeysDir: *const c_char,
         pub audience: *const c_char,
         pub timeoutMs: c_int,
+        pub zVfsName: *const c_char,
     }
 
     unsafe extern "C" {

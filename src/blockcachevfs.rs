@@ -4,6 +4,7 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{check, Error};
@@ -370,6 +371,36 @@ impl Builder {
         if let Some(existing) = INSTANCE.get() {
             return Ok(existing);
         }
+        let vfs = self.build()?;
+        if let Err(vfs) = INSTANCE.set(vfs) {
+            // INIT_LOCK makes this unreachable for ordinary callers, but do
+            // not drop a native VFS and its callback context if initialization
+            // ever races with another path that sets the OnceLock.
+            let _leaked = Box::leak(Box::new(vfs));
+            return Ok(INSTANCE
+                .get()
+                .expect("CBS VFS singleton was initialized concurrently"));
+        }
+        Ok(INSTANCE
+            .get()
+            .expect("CBS VFS singleton was just initialized"))
+    }
+
+    /// Initialize and return an independently owned CBS VFS instance.
+    ///
+    /// The caller is responsible for keeping the returned handle alive while
+    /// database connections use it. Dropping the handle unregisters and
+    /// destroys the native VFS after its database clients have closed.
+    pub fn init_owned(mut self) -> Result<BlockCacheVfs> {
+        if self.name.as_bytes() == b"rusqdoltlite-bcvfs" {
+            let id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+            self.name = CString::new(format!("rusqdoltlite-bcvfs-{}-{id}", std::process::id()))
+                .map_err(Error::NulError)?;
+        }
+        self.build()
+    }
+
+    fn build(self) -> Result<BlockCacheVfs> {
         check(crate::ffi::initialize_doltlite())?;
         let directory = cstring_path(&self.directory)?;
         let mut fs = ptr::null_mut();
@@ -399,23 +430,11 @@ impl Builder {
                 return Err(destroy_failed(fs, auth, error));
             }
         }
-        let vfs = BlockCacheVfs {
+        Ok(BlockCacheVfs {
             fs,
             name: self.name,
-            _auth: auth,
-        };
-        if let Err(vfs) = INSTANCE.set(vfs) {
-            // INIT_LOCK makes this unreachable for ordinary callers, but do
-            // not drop a native VFS and its callback context if initialization
-            // ever races with another path that sets the OnceLock.
-            let _leaked = Box::leak(Box::new(vfs));
-            return Ok(INSTANCE
-                .get()
-                .expect("CBS VFS singleton was initialized concurrently"));
-        }
-        Ok(INSTANCE
-            .get()
-            .expect("CBS VFS singleton was just initialized"))
+            _auth: Some(auth),
+        })
     }
 }
 
@@ -423,7 +442,7 @@ impl Builder {
 pub struct BlockCacheVfs {
     fs: *mut raw::sqlite3_bcvfs,
     name: CString,
-    _auth: Box<AuthState>,
+    _auth: Option<Box<AuthState>>,
 }
 
 unsafe impl Send for BlockCacheVfs {}
@@ -431,6 +450,28 @@ unsafe impl Sync for BlockCacheVfs {}
 
 static INSTANCE: OnceLock<BlockCacheVfs> = OnceLock::new();
 static INIT_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+impl Drop for BlockCacheVfs {
+    fn drop(&mut self) {
+        if self.fs.is_null() {
+            return;
+        }
+        let rc = unsafe { raw::sqlite3_bcvfs_destroy(self.fs) };
+        if rc == crate::ffi::SQLITE_OK {
+            self.fs = ptr::null_mut();
+            self._auth.take();
+        } else if let Some(auth) = self._auth.take() {
+            // Native code could still invoke the callback if a client remains
+            // open after a failed destroy. Leak the callback context rather
+            // than leave a dangling pointer.
+            let _leaked = Box::leak(auth);
+            eprintln!(
+                "rusqdoltlite: failed to destroy a CBS VFS (SQLite result {rc}); native resources were retained"
+            );
+        }
+    }
+}
 
 impl BlockCacheVfs {
     /// Start building a process-lifetime VFS.
@@ -611,7 +652,11 @@ impl BlockCacheVfs {
 
     fn auth_for(&self, storage: &Storage) -> Result<CString> {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (self._auth.callback)(
+            (self
+                ._auth
+                .as_ref()
+                .expect("CBS VFS auth context is present while the VFS is alive")
+                .callback)(
                 storage.provider.as_str(),
                 storage.account.as_str(),
                 storage.container.as_str(),
@@ -642,6 +687,544 @@ impl BlockCacheVfs {
         let container = CString::new(name).map_err(Error::NulError)?;
         let mut err = ptr::null_mut();
         result_with_err(call(&container, &mut err), &mut err)
+    }
+}
+
+/// CBS resources retained for the lifetime of a URI-opened connection.
+pub(crate) struct ConnectionVfs {
+    vfs: BlockCacheVfs,
+    alias: String,
+    path: String,
+    directory: String,
+    attached: bool,
+    cache_directory: std::path::PathBuf,
+}
+
+impl ConnectionVfs {
+    pub(crate) fn close(&mut self) -> Result<()> {
+        if self.attached {
+            self.vfs.detach(&self.alias)?;
+            self.attached = false;
+        }
+        let rc = unsafe { raw::sqlite3_bcvfs_destroy(self.vfs.fs) };
+        if rc != crate::ffi::SQLITE_OK {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(rc),
+                Some("cannot destroy CBS VFS while it has open clients".into()),
+            ));
+        }
+        self.vfs.fs = ptr::null_mut();
+        self.vfs._auth.take();
+        let _ = std::fs::remove_dir_all(&self.cache_directory);
+        Ok(())
+    }
+}
+
+impl Drop for ConnectionVfs {
+    fn drop(&mut self) {
+        // Dropping never uploads changes. After SQLite drops its DB field, a
+        // dirty connection can destroy its VFS and discard its local cache.
+        // Explicit close reports detach failures so callers can upload first.
+        if self.close().is_err() && !self.vfs.fs.is_null() {
+            let rc = unsafe { raw::sqlite3_bcvfs_destroy(self.vfs.fs) };
+            if rc == crate::ffi::SQLITE_OK {
+                self.vfs.fs = ptr::null_mut();
+                self.vfs._auth.take();
+                let _ = std::fs::remove_dir_all(&self.cache_directory);
+            }
+        }
+    }
+}
+
+struct CloudConnectionUri {
+    bucket: String,
+    prefix: String,
+    database: String,
+    storage: CloudStorageUri,
+    endpoint: Option<String>,
+}
+
+enum CloudStorageUri {
+    Google {
+        project: String,
+        access_token: String,
+    },
+    S3 {
+        region: String,
+        access_id: String,
+        auth_secret: String,
+        credentials_to_redact: Vec<String>,
+    },
+}
+
+pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connection> {
+    let uri = CloudConnectionUri::parse(uri)?;
+    let id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let mut cache_directory = CacheDirectoryGuard::new(create_cache_directory(id)?);
+
+    let (auth_secret, credentials_to_redact) = match &uri.storage {
+        CloudStorageUri::Google { access_token, .. } => {
+            (access_token.clone(), vec![access_token.clone()])
+        }
+        CloudStorageUri::S3 {
+            auth_secret,
+            credentials_to_redact,
+            ..
+        } => (auth_secret.clone(), credentials_to_redact.clone()),
+    };
+
+    let name = format!("rusqdoltlite-bcvfs-{}-{id}", std::process::id());
+    let vfs = BlockCacheVfs::builder(cache_directory.path())?
+        .name(&name)?
+        .auth_callback(move |_storage, _account, _container| Ok(auth_secret.clone()))
+        .build()?;
+
+    let container = if uri.prefix.is_empty() {
+        uri.bucket.clone()
+    } else {
+        format!("{}/{}", uri.bucket, uri.prefix)
+    };
+    let storage = match (&uri.storage, uri.endpoint.as_deref()) {
+        (CloudStorageUri::Google { project, .. }, Some(endpoint)) => {
+            Storage::google_json_with_endpoint(project, &container, endpoint)
+        }
+        (CloudStorageUri::Google { project, .. }, None) => {
+            Storage::google_json(project, &container)
+        }
+        (
+            CloudStorageUri::S3 {
+                region, access_id, ..
+            },
+            Some(endpoint),
+        ) => Storage::s3_with_endpoint(access_id, &container, region, endpoint),
+        (
+            CloudStorageUri::S3 {
+                region, access_id, ..
+            },
+            None,
+        ) => Storage::s3(access_id, &container, region),
+    };
+    let alias = format!("cbs_{}_{}", std::process::id(), id);
+    let path = format!("/{alias}/{}", uri.database);
+    let directory = format!("/{alias}");
+    if let Err(error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
+        return Err(sanitize_cloud_error(
+            normalize_container_not_found(error),
+            &credentials_to_redact,
+        ));
+    }
+    let control = match vfs.open(&directory) {
+        Ok(control) => control,
+        Err(error) => {
+            let _ = vfs.detach(&alias);
+            return Err(sanitize_cloud_error(error, &credentials_to_redact));
+        }
+    };
+    let database_exists = control.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bcv_database WHERE container = ?1 AND database = ?2)",
+        crate::params![&alias, &uri.database],
+        |row| row.get(0),
+    );
+    let database_exists: bool = match database_exists {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = control.close();
+            let _ = vfs.detach(&alias);
+            return Err(sanitize_cloud_error(error, &credentials_to_redact));
+        }
+    };
+    if let Err((control, error)) = control.close() {
+        drop(control);
+        let _ = vfs.detach(&alias);
+        return Err(sanitize_cloud_error(error, &credentials_to_redact));
+    }
+    if !database_exists {
+        let _ = vfs.detach(&alias);
+        return Err(Error::SqliteFailure(
+            crate::ffi::Error::new(crate::ffi::SQLITE_NOTFOUND),
+            Some("CBS database not found".into()),
+        ));
+    }
+    let flags = flags & !OpenFlags::SQLITE_OPEN_CREATE;
+    let mut connection = match vfs.open_with_flags(&path, flags) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let _ = vfs.detach(&alias);
+            return Err(sanitize_cloud_error(error, &credentials_to_redact));
+        }
+    };
+    connection.cbs = Some(ConnectionVfs {
+        vfs,
+        alias,
+        path,
+        directory,
+        attached: true,
+        cache_directory: cache_directory.take(),
+    });
+    Ok(connection)
+}
+
+impl CloudConnectionUri {
+    fn parse(uri: &str) -> Result<Self> {
+        let (scheme, rest) = uri
+            .split_once("://")
+            .ok_or_else(|| cbs_uri_error("expected a gcs:// or s3:// URI"))?;
+        if !matches!(scheme, "gcs" | "s3") {
+            return Err(cbs_uri_error("expected a gcs:// or s3:// URI"));
+        }
+        let (location, query) = rest
+            .split_once('?')
+            .ok_or_else(|| cbs_uri_error("CBS URI query is required"))?;
+        if query.contains('#') || location.contains('#') {
+            return Err(cbs_uri_error("CBS URI fragments are not supported"));
+        }
+        let (bucket, prefix) = match location.split_once('/') {
+            Some((bucket, prefix)) => (bucket, decode_uri_component(prefix)?),
+            None => (location, String::new()),
+        };
+        if bucket.is_empty()
+            || !bucket
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || bucket == "."
+            || bucket == ".."
+        {
+            return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
+        }
+        let prefix = prefix.trim_end_matches('/');
+        if prefix.contains(['\\', '\0', '?', '#'])
+            || (!prefix.is_empty()
+                && prefix
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "." || component == ".."))
+        {
+            return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
+        }
+
+        let mut options = std::collections::BTreeMap::new();
+        for parameter in query.split('&') {
+            if parameter.is_empty() {
+                continue;
+            }
+            let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+            let key = decode_uri_component(key)?;
+            let value = decode_uri_component(value)?;
+            if options.insert(key, value).is_some() {
+                return Err(cbs_uri_error("duplicate CBS URI option"));
+            }
+        }
+
+        let vfs = options
+            .remove("vfs")
+            .ok_or_else(|| cbs_uri_error("CBS URI must select vfs=blockcachevfs"))?;
+        if vfs != "blockcachevfs" {
+            return Err(cbs_uri_error("CBS URI must select vfs=blockcachevfs"));
+        }
+        let storage = if scheme == "gcs" {
+            let project = options
+                .remove("project")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| cbs_uri_error("GCS URI requires a non-empty project"))?;
+            let access_token = options
+                .remove("access_token")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| cbs_uri_error("GCS URI requires a non-empty access_token"))?;
+            CloudStorageUri::Google {
+                project,
+                access_token,
+            }
+        } else {
+            let region = options
+                .remove("region")
+                .filter(|value| valid_s3_region(value))
+                .ok_or_else(|| cbs_uri_error("S3 URI requires a valid region"))?;
+            let access_id = options
+                .remove("access_id")
+                .filter(|value| valid_credential_component(value))
+                .ok_or_else(|| cbs_uri_error("S3 URI requires a non-empty access_id"))?;
+            let secret_access_key = options
+                .remove("secret_access_key")
+                .filter(|value| valid_credential_component(value))
+                .ok_or_else(|| cbs_uri_error("S3 URI requires a non-empty secret_access_key"))?;
+            let session_token = options
+                .remove("session_token")
+                .map(|value| {
+                    if valid_credential_component(&value) {
+                        Ok(value)
+                    } else {
+                        Err(cbs_uri_error("invalid S3 session_token"))
+                    }
+                })
+                .transpose()?;
+            let auth_secret = match session_token.as_deref() {
+                Some(session_token) => {
+                    s3_secret_with_session_token(&secret_access_key, session_token)
+                        .map_err(|_| cbs_uri_error("invalid S3 credentials"))?
+                }
+                None => secret_access_key.clone(),
+            };
+            let mut credentials_to_redact = vec![access_id.clone(), secret_access_key];
+            if let Some(session_token) = session_token {
+                credentials_to_redact.push(session_token);
+            }
+            credentials_to_redact.push(auth_secret.clone());
+            CloudStorageUri::S3 {
+                region,
+                access_id,
+                auth_secret,
+                credentials_to_redact,
+            }
+        };
+        let database = options
+            .remove("database")
+            .unwrap_or_else(|| "default.db".to_owned());
+        if database.is_empty()
+            || database.contains(['/', '\\', '\0', '?', '#'])
+            || database == "."
+            || database == ".."
+        {
+            return Err(cbs_uri_error("invalid CBS database name"));
+        }
+        let endpoint = options.remove("endpoint");
+        if endpoint
+            .as_deref()
+            .is_some_and(|endpoint| !valid_endpoint(endpoint))
+        {
+            return Err(cbs_uri_error(
+                "CBS endpoint must be an HTTP(S) base URL without credentials, query, or fragment",
+            ));
+        }
+        if !options.is_empty() {
+            return Err(cbs_uri_error("unsupported CBS URI option"));
+        }
+        Ok(Self {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+            database,
+            storage,
+            endpoint,
+        })
+    }
+}
+
+fn valid_s3_region(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !region.starts_with('-')
+        && !region.ends_with('-')
+}
+
+fn valid_credential_component(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+}
+
+fn sanitize_cloud_error(error: Error, credentials: &[String]) -> Error {
+    let (code, message) = match error {
+        Error::SqliteFailure(code, message) => {
+            let fallback = code.to_string();
+            (code, message.unwrap_or(fallback))
+        }
+        error => (
+            crate::ffi::Error::new(crate::ffi::SQLITE_ERROR),
+            error.to_string(),
+        ),
+    };
+    let mut credentials = credentials
+        .iter()
+        .filter(|credential| !credential.is_empty())
+        .collect::<Vec<_>>();
+    credentials
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    credentials.dedup();
+    let message = credentials.iter().fold(message, |message, credential| {
+        message.replace(credential.as_str(), "[redacted]")
+    });
+    Error::SqliteFailure(code, Some(message))
+}
+
+fn decode_uri_component(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hi = hex_digit(bytes[index + 1])?;
+                let lo = hex_digit(bytes[index + 2])?;
+                decoded.push((hi << 4) | lo);
+                index += 3;
+            }
+            b'%' => return Err(cbs_uri_error("invalid percent escape in CBS URI")),
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| cbs_uri_error("CBS URI contains invalid UTF-8"))
+}
+
+fn hex_digit(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(cbs_uri_error("invalid percent escape in CBS URI")),
+    }
+}
+
+fn cbs_uri_error(message: &str) -> Error {
+    Error::SqliteFailure(
+        crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
+        Some(message.into()),
+    )
+}
+
+fn normalize_container_not_found(error: Error) -> Error {
+    match error {
+        Error::SqliteFailure(native, _)
+            if native.extended_code == 404 || native.code == crate::ffi::ErrorCode::NotFound =>
+        {
+            Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_NOTFOUND),
+                Some("CBS container or manifest not found".into()),
+            )
+        }
+        error => error,
+    }
+}
+
+fn valid_endpoint(endpoint: &str) -> bool {
+    if endpoint.contains(['@', '?', '#', '&', '%', '\\'])
+        || endpoint
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let authority = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"));
+    let Some(authority) = authority else {
+        return false;
+    };
+    let authority = authority.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return false;
+    }
+    if let Some(ipv6) = authority.strip_prefix('[') {
+        let Some((address, rest)) = ipv6.split_once(']') else {
+            return false;
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        rest.is_empty()
+            || rest.strip_prefix(':').is_some_and(|port| {
+                !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    } else {
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            Some(_) => return false,
+            None => (authority, None),
+        };
+        !host.is_empty()
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            && port.is_none_or(|port| {
+                !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    }
+}
+
+fn create_cache_directory(id: u64) -> Result<std::path::PathBuf> {
+    let temp_dir = std::env::temp_dir();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| cbs_uri_error("system clock is before the Unix epoch"))?
+        .as_nanos();
+    for attempt in 0..128_u64 {
+        let directory = temp_dir.join(format!(
+            "rusqdoltlite-bcvfs-{}-{timestamp}-{}",
+            std::process::id(),
+            id.wrapping_add(attempt)
+        ));
+        match std::fs::create_dir(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(cbs_uri_error("cannot create CBS cache directory")),
+        }
+    }
+    Err(cbs_uri_error(
+        "cannot allocate a unique CBS cache directory",
+    ))
+}
+
+struct CacheDirectoryGuard(Option<std::path::PathBuf>);
+
+impl CacheDirectoryGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn path(&self) -> &Path {
+        self.0
+            .as_deref()
+            .expect("CBS cache directory has not been transferred")
+    }
+
+    fn take(&mut self) -> std::path::PathBuf {
+        self.0
+            .take()
+            .expect("CBS cache directory has not been transferred")
+    }
+}
+
+impl Drop for CacheDirectoryGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+impl Connection {
+    /// Upload changes made through this CBS-backed connection.
+    ///
+    /// Local SQLite connections do not have a CBS container and return a
+    /// misuse error. Dropping a CBS connection never uploads implicitly.
+    pub fn upload(&self) -> Result<()> {
+        let cbs = self
+            .cbs
+            .as_ref()
+            .ok_or_else(|| cbs_uri_error("connection is not backed by blockcachevfs"))?;
+        cbs.vfs.upload(&cbs.alias)
+    }
+
+    /// Return the attached CBS database path for use by an in-process remote server.
+    pub fn blockcachevfs_path(&self) -> Option<&str> {
+        self.cbs.as_ref().map(|cbs| cbs.path.as_str())
+    }
+
+    /// Return the attached CBS directory for use by an in-process remote server.
+    pub fn blockcachevfs_directory(&self) -> Option<&str> {
+        self.cbs.as_ref().map(|cbs| cbs.directory.as_str())
+    }
+
+    /// Return the registered CBS VFS name for use by an in-process remote server.
+    pub fn blockcachevfs_name(&self) -> Option<&str> {
+        self.cbs.as_ref().map(|cbs| cbs.vfs.name())
     }
 }
 
@@ -830,6 +1413,52 @@ mod tests {
         );
         assert!(s3_secret_with_session_token("", "session").is_err());
         assert!(s3_secret_with_session_token("secret", "bad\ntoken").is_err());
+    }
+
+    #[test]
+    fn s3_connection_uri_decodes_credentials_and_prefix() {
+        let uri = CloudConnectionUri::parse(
+            "s3://bucket/path%2Ftenant%2F?vfs=blockcachevfs&region=us-east-1&access_id=t%65st&secret_access_key=s%2Fecret%2Bkey&session_token=session%2F%2Btoken%3D&endpoint=http://127.0.0.1:4566",
+        )
+        .expect("valid encoded S3 URI");
+        assert_eq!(uri.bucket, "bucket");
+        assert_eq!(uri.prefix, "path/tenant");
+        assert_eq!(uri.endpoint.as_deref(), Some("http://127.0.0.1:4566"));
+        let CloudStorageUri::S3 {
+            region,
+            access_id,
+            auth_secret,
+            ..
+        } = uri.storage
+        else {
+            panic!("S3 URI should select S3 storage");
+        };
+        assert_eq!(region, "us-east-1");
+        assert_eq!(access_id, "test");
+        assert_eq!(auth_secret, "s/ecret+key\nsession/+token=");
+    }
+
+    #[test]
+    fn s3_connection_uri_rejects_selector_injection() {
+        for uri in [
+            "s3://bucket/path?vfs=blockcachevfs&region=us-east-1%26evil&access_id=test&secret_access_key=test",
+            "s3://bucket/path?vfs=blockcachevfs&region=us-east-1&access_id=test&secret_access_key=test&endpoint=http%3A%2F%2F127.0.0.1%3A4566%26evil",
+            "s3://bucket/path?vfs=blockcachevfs&region=us-east-1&access_id=test&secret_access_key=test&endpoint=http%3A%2F%2F127.0.0.1%3A4566%25evil",
+            "s3://bucket/path?vfs=blockcachevfs&region=us-east-1&access_id=test&secret_access_key=test&endpoint=http%3A%2F%2F127.0.0.1%3A4566%0A",
+        ] {
+            assert!(CloudConnectionUri::parse(uri).is_err(), "accepted {uri}");
+        }
+    }
+
+    #[test]
+    fn cloud_errors_redact_overlapping_credentials_longest_first() {
+        let error = Error::SqliteFailure(
+            crate::ffi::Error::new(crate::ffi::SQLITE_IOERR),
+            Some("request failed: abc".into()),
+        );
+        let sanitized = sanitize_cloud_error(error, &["a".into(), "abc".into()]);
+        assert!(!sanitized.to_string().contains("abc"));
+        assert!(sanitized.to_string().contains("[redacted]"));
     }
 
     #[test]
