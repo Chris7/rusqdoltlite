@@ -75,6 +75,9 @@ cp -R "$SOURCE_DIR/ext/mbedtls/include" \
 PATCH_CHECK_DIR="$WORK_DIR/patch-check"
 mkdir -p "$PATCH_CHECK_DIR"
 cp "$DOLTLITE_LIB_DIR/doltlite.c" "$PATCH_CHECK_DIR/doltlite.c"
+cp "$DOLTLITE_LIB_DIR/remote/doltlite_remotesrv.c" \
+  "$DOLTLITE_LIB_DIR/remote/doltlite_remotesrv.h" \
+  "$PATCH_CHECK_DIR/"
 (
   cd "$PATCH_CHECK_DIR" || exit 1
   git apply --check "$SCRIPT_DIR"/patches/*.patch

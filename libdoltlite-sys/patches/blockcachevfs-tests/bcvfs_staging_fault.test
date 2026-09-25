@@ -1,0 +1,162 @@
+# Deterministic power-loss coverage for bounded/staged cache writes.
+#
+# This test is run by tools/run_blockcachevfs_cbs_tests in a disposable CBS
+# checkout. The child process uses the patched bcvTest VFS: metadata writes
+# are forwarded only at xSync, so _exit() drops writes that were not synced.
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_staging_fault
+
+if {$::tcl_platform(platform)=="windows"} {
+  finish_test
+  return
+}
+
+bcv_install_vfs_wrapper
+
+proc staging_fault_child {} {
+  global C
+  set container $::env(BCV_STAGING_CONTAINER)
+  set testdir $::env(BCV_STAGING_DIR)
+  set event $::env(BCV_STAGING_EVENT)
+  set cmd [bcvfs_create $testdir "bcvfs"]
+  $cmd config cachesize [expr 2*$::D(blocksize)]
+  bcvfs_attach -alias child $cmd $container
+  sqlite3 db /child/staging.db -vfs bcvfs
+
+  # The remote seed already contains a committed working state. The crash
+  # below is therefore isolated to one unpublished transaction.
+  bcv_metadata_sync_reset
+  bcv_test_crash_event 0
+  if {$event==4} {
+    # A BLOB cast is intentional: concatenating a zero BLOB with X'01'
+    # otherwise produces TEXT containing an embedded NUL, for which SQLite's
+    # length()/substr() semantics hide the bytes after the first zero.
+    db eval {
+      BEGIN IMMEDIATE;
+      UPDATE payload SET body=CAST(zeroblob(4095)||X'01' AS BLOB) WHERE id=1;
+      WITH RECURSIVE c(i) AS (
+        SELECT 1001 UNION ALL SELECT i+1 FROM c WHERE i<2000
+      ) INSERT INTO payload(id, body)
+        SELECT i, CAST(zeroblob(4095)||X'01' AS BLOB) FROM c;
+      COMMIT;
+    }
+    puts stderr "staging event4 child before upload: [db eval {
+      SELECT count(*), hex(substr(body,1,4)), hex(substr(body,-1)), length(body)
+      FROM payload WHERE id=1
+    }]"
+    bcv_test_crash_event $event
+    $cmd upload child
+  } else {
+    bcv_test_crash_event $event
+    db eval {
+      BEGIN IMMEDIATE;
+      UPDATE payload SET body=CAST(zeroblob(4095)||X'01' AS BLOB) WHERE id=1;
+      WITH RECURSIVE c(i) AS (
+        SELECT 1001 UNION ALL SELECT i+1 FROM c WHERE i<2000
+      ) INSERT INTO payload(id, body)
+        SELECT i, CAST(zeroblob(4095)||X'01' AS BLOB) FROM c;
+      COMMIT;
+    }
+  }
+  db close
+  $cmd destroy
+}
+
+if {[info exists ::env(BCV_STAGING_CHILD)]} {
+  staging_fault_child
+  finish_test
+  return
+}
+
+# Keep each invocation isolated from a previous emulator run. The runner
+# supplies a unique suffix for the backend matrix; the pid covers direct
+# invocations which do not set one.
+set run_suffix [expr {
+  [info exists ::env(BLOCKCACHEVFS_TEST_SUFFIX)]
+    ? $::env(BLOCKCACHEVFS_TEST_SUFFIX)
+    : "[pid]"
+}]
+foreach event {1 2 3 4} {
+  set container "bcv-staging-fault-$run_suffix-$event"
+  set testdir "staging-fault-testdir-$run_suffix-$event"
+  bcv_mkdir $testdir
+  bcv_create_container $container
+  bcv_upload_new_db $container staging.db {
+    CREATE TABLE payload(id INTEGER PRIMARY KEY, body BLOB NOT NULL);
+    INSERT INTO payload VALUES(0, zeroblob(4096));
+    WITH RECURSIVE c(i) AS (
+      SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<1000
+    ) INSERT INTO payload(id, body) SELECT i, zeroblob(4096) FROM c;
+  }
+
+  set envcmd [list env \
+      BCV_STAGING_CHILD=1 \
+      BCV_STAGING_CONTAINER=$container \
+      BCV_STAGING_DIR=$testdir \
+      BCV_STAGING_EVENT=$event]
+  set child [file normalize [info nameofexecutable]]
+  # Keep both executable and script paths explicit so the child reuses this
+  # test's backend config regardless of how the runner invoked bcvtclsqlite.
+  set script [file normalize [info script]]
+  set status [catch {exec {*}$envcmd $child $script} message options]
+  set observed [list $status {} {}]
+  if {$status} {
+    set errorcode [dict get $options -errorcode]
+    set observed [list $status [lindex $errorcode 0] [lindex $errorcode 2]]
+    puts stderr "staging fault child failed: $message"
+  }
+  do_test $event.1 {
+    set observed
+  } [list 1 CHILDSTATUS [expr 200+$event]]
+
+  sqlite3 metadata [file join $testdir blocksdb.bcv]
+  set nStaged [metadata eval {SELECT count(*) FROM staged}]
+  set stagedObjects [metadata eval {
+    SELECT hex(blockid) || '.bcv' FROM staged
+  }]
+  set nObjectBytes 0
+  set object ""
+  metadata close
+  do_test $event.2.staged {
+    expr {$event==1 ? $nStaged==0 : $nStaged>0}
+  } 1
+  set cmd [bcvfs_create $testdir "bcvfs"]
+  $cmd config cachesize [expr 2*$::D(blocksize)]
+  bcvfs_attach -alias after $cmd $container
+
+  # bcv_tfs fetches an individual cloud object through the same dispatch
+  # layer as the VFS. This verifies that a staged block PUT really produced
+  # a readable object, rather than merely leaving a metadata row behind.
+  if {$nStaged>0} {
+    sqlite3 objects /after -vfs bcvfs
+    sqlite3_bcvfs_register_vtab objects
+    set cloudObjects [objects eval {SELECT name FROM bcv_tfs}]
+    foreach candidate $stagedObjects {
+      if {[lsearch -exact $cloudObjects $candidate]>=0} {
+        set object $candidate
+        break
+      }
+    }
+    if {$object!=""} {
+      set nObjectBytes [objects eval {
+        SELECT IFNULL(length(content),0) FROM bcv_tfs WHERE name=$object
+      }]
+    }
+    objects close
+  }
+  do_test $event.2.object {
+    expr {$event==1 ? $nObjectBytes==0 : $nObjectBytes==$::D(blocksize)}
+  } 1
+
+  sqlite3 db /after/staging.db -vfs bcvfs
+  do_execsql_test $event.3 {
+    PRAGMA integrity_check;
+    SELECT count(*) FROM payload;
+    SELECT hex(substr(body,1,4)), hex(substr(body,-1)) FROM payload WHERE id=1;
+  } [expr {$event==4 ? {ok 2001 00000000 01} : {ok 1001 00000000 00}}]
+  db close
+  $cmd destroy
+}
+
+finish_test

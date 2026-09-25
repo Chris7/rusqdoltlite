@@ -1,0 +1,82 @@
+Subject: [PATCH] Allow remote server to select its SQLite VFS
+Base: DoltLite v0.50.8
+
+Resolve an optional VFS name once when starting the native remote server and
+use the selected VFS for both database existence checks and ChunkStore opens.
+
+diff --git a/doltlite_remotesrv.c b/doltlite_remotesrv.c
+--- a/doltlite_remotesrv.c
++++ b/doltlite_remotesrv.c
+@@ -70,5 +70,6 @@ struct DoltliteServer {
+   int activeFd[SERVER_WORKERS];
+   int timeoutMs;
++  sqlite3_vfs *pVfs;
+
+   DoltliteTlsServer *tls;
+   char *authKeysDir;
+@@ -943,10 +943,11 @@ static void remoteDbHandleCloseStore(RemoteDbHandle *h){
+
+ static int remoteDbHandleOpenStore(
++  DoltliteServer *pSrv,
+   RemoteDbHandle *h,
+   const char *zPath,
+   int bWritable
+ ){
+-  sqlite3_vfs *pVfs = sqlite3_vfs_find(0);
++  sqlite3_vfs *pVfs = pSrv->pVfs;
+   int flags;
+   int rc;
+
+@@ -1071,6 +1071,6 @@ static int remoteDbAcquire(
+   }
+
+   if( !h->bOpen ){
+-    rc = remoteDbHandleOpenStore(h, zPath, bWritable);
++    rc = remoteDbHandleOpenStore(pSrv, h, zPath, bWritable);
+     if( rc!=SQLITE_OK ) goto acquire_error;
+   }else if( bWritable ){
+@@ -1077,6 +1077,6 @@ static int remoteDbAcquire(
+       chunkStoreUnlock(&h->store);
+     }else if( h->store.movedReadOnly ){
+       remoteDbHandleCloseStore(h);
+-      rc = remoteDbHandleOpenStore(h, zPath, bWritable);
++      rc = remoteDbHandleOpenStore(pSrv, h, zPath, bWritable);
+       if( rc!=SQLITE_OK ) goto acquire_error;
+     }else{
+@@ -1087,6 +1087,6 @@ static int remoteDbAcquire(
+     rc = chunkStoreRefreshIfChanged(&h->store, &changed);
+     if( rc!=SQLITE_OK || h->store.movedReadOnly ){
+       remoteDbHandleCloseStore(h);
+-      rc = remoteDbHandleOpenStore(h, zPath, bWritable);
++      rc = remoteDbHandleOpenStore(pSrv, h, zPath, bWritable);
+       if( rc!=SQLITE_OK ) goto acquire_error;
+     }
+@@ -1176,5 +1176,5 @@ static void handleRequest(DoltliteServer *pSrv, DoltliteConn *fd){
+   isReadOnlyEndpoint = strcmp(zMethod, "GET")==0
+                      || isHasChunksEndpoint || isGetChunksEndpoint;
+-  pVfs = sqlite3_vfs_find(0);
++  pVfs = pSrv->pVfs;
+   rc = pVfs->xAccess(pVfs, zDbPath, SQLITE_ACCESS_EXISTS, &exists);
+   if( rc!=SQLITE_OK ){
+@@ -1355,5 +1355,7 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+
+   memset(pSrv, 0, sizeof(*pSrv));
+   pSrv->listenFd = -1;
++  pSrv->pVfs = sqlite3_vfs_find(o->zVfsName);
++  if( !pSrv->pVfs ) return SQLITE_ERROR;
+   pSrv->timeoutMs = o->timeoutMs>0 ? o->timeoutMs
+                                    : SERVER_DEFAULT_TIMEOUT_MS;
+diff --git a/doltlite_remotesrv.h b/doltlite_remotesrv.h
+--- a/doltlite_remotesrv.h
++++ b/doltlite_remotesrv.h
+@@ -7,9 +7,10 @@ typedef struct DoltliteServeOpts {
+   const char *zDir;
+   int port;
+   const char *zBindAddr;
+   const char *certFile;
+   const char *keyFile;
+   const char *authKeysDir;
+   const char *audience;
+   int timeoutMs;
++  const char *zVfsName;
+ } DoltliteServeOpts;

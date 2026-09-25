@@ -125,6 +125,8 @@ jobs:
           fi
       - name: Rust blockcachevfs feature tests
         run: cargo test --workspace --features blockcachevfs --all-targets --verbose
+      - name: Rust remote server VFS tests
+        run: cargo test --features 'blockcachevfs remote' --test remote_server --verbose
       - name: Start pinned emulator containers
         run: |
           set -euo pipefail

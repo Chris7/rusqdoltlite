@@ -55,6 +55,8 @@ pub mod blockcachevfs {
     pub const SQLITE_BCV_CURLVERBOSE: c_int = 4;
     pub const SQLITE_BCV_HTTPLOG_TIMEOUT: c_int = 5;
     pub const SQLITE_BCV_HTTPLOG_NENTRY: c_int = 6;
+    /// Proactively stage dirty blocks once this percentage of the cache is occupied.
+    pub const SQLITE_BCV_STAGEWATERMARK: c_int = 7;
 
     pub const SQLITE_BCV_ATTACH_SECURE: c_int = 0x0001;
     pub const SQLITE_BCV_ATTACH_IFNOT: c_int = 0x0002;
@@ -103,6 +105,12 @@ pub mod blockcachevfs {
             z_container: *const c_char,
             busy: Option<sqlite3_bcvfs_busy_callback>,
             busy_ctx: *mut c_void,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_delete(
+            fs: *mut sqlite3_bcvfs,
+            z_container: *const c_char,
+            z_database: *const c_char,
             pz_err: *mut *mut c_char,
         ) -> c_int;
     }
@@ -161,6 +169,7 @@ mod remote {
         pub authKeysDir: *const c_char,
         pub audience: *const c_char,
         pub timeoutMs: c_int,
+        pub zVfsName: *const c_char,
     }
 
     unsafe extern "C" {

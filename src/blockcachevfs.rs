@@ -293,6 +293,11 @@ pub enum Config {
     HttpLogTimeout(i64),
     /// Maximum HTTP-log entries; negative means unlimited.
     HttpLogEntries(i64),
+    /// Cache occupancy percentage at which dirty blocks are proactively
+    /// staged. The native VFS accepts values from 1 through 100, inclusive;
+    /// its default is 90. Values outside that range make VFS initialization
+    /// fail with `SQLITE_MISUSE`.
+    StageWatermark(i64),
 }
 
 impl Config {
@@ -304,6 +309,7 @@ impl Config {
             Self::CurlVerbose(v) => (raw::SQLITE_BCV_CURLVERBOSE, i64::from(v)),
             Self::HttpLogTimeout(v) => (raw::SQLITE_BCV_HTTPLOG_TIMEOUT, v),
             Self::HttpLogEntries(v) => (raw::SQLITE_BCV_HTTPLOG_NENTRY, v),
+            Self::StageWatermark(v) => (raw::SQLITE_BCV_STAGEWATERMARK, v),
         }
     }
 }
@@ -513,6 +519,17 @@ impl BlockCacheVfs {
     pub fn upload(&self, container: &str) -> Result<()> {
         self.with_container(container, |container, err| unsafe {
             raw::sqlite3_bcvfs_upload(self.fs, container.as_ptr(), None, ptr::null_mut(), err)
+        })
+    }
+
+    /// Delete a database from an attached container locally.
+    ///
+    /// The remote database is deleted only after [`Self::upload`] is called
+    /// for the same container.
+    pub fn delete_database(&self, container: &str, database: &str) -> Result<()> {
+        let database = CString::new(database).map_err(Error::NulError)?;
+        self.with_container(container, |container, err| unsafe {
+            raw::sqlite3_bcvfs_delete(self.fs, container.as_ptr(), database.as_ptr(), err)
         })
     }
 
@@ -873,6 +890,129 @@ mod tests {
             Config::CurlVerbose(true).raw(),
             (raw::SQLITE_BCV_CURLVERBOSE, 1)
         );
+        assert_eq!(
+            Config::StageWatermark(75).raw(),
+            (raw::SQLITE_BCV_STAGEWATERMARK, 75)
+        );
+    }
+
+    #[test]
+    fn stage_watermark_accepts_one_through_one_hundred_only() -> Result<()> {
+        let directory = tempfile::tempdir().expect("temporary CBS directory");
+        let directory = CString::new(directory.path().to_str().expect("UTF-8 temp path"))
+            .expect("path has no NUL");
+        let name = CString::new("stage-watermark-test").expect("name has no NUL");
+
+        let mut fs = ptr::null_mut();
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_create(directory.as_ptr(), name.as_ptr(), &mut fs, &mut err)
+        };
+        result_with_err(rc, &mut err)?;
+        assert!(!fs.is_null());
+
+        for value in [1, 90, 100] {
+            assert_eq!(
+                unsafe { raw::sqlite3_bcvfs_config(fs, raw::SQLITE_BCV_STAGEWATERMARK, value) },
+                crate::ffi::SQLITE_OK,
+                "watermark {value} should be accepted"
+            );
+        }
+        for value in [0, 101, i64::MAX] {
+            assert_eq!(
+                unsafe { raw::sqlite3_bcvfs_config(fs, raw::SQLITE_BCV_STAGEWATERMARK, value) },
+                crate::ffi::SQLITE_MISUSE,
+                "watermark {value} should be rejected"
+            );
+        }
+
+        assert_eq!(
+            unsafe { raw::sqlite3_bcvfs_destroy(fs) },
+            crate::ffi::SQLITE_OK
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cache_size_validation_rejects_invalid_values_after_block_size_is_known() -> Result<()> {
+        const BLOCK_BYTES: i64 = 4 * 1024 * 1024;
+        const MANIFEST_VERSION: u32 = 4;
+        const NAME_BYTES: u32 = 16;
+        const MANIFEST_HEADER_BYTES: usize = 6 * std::mem::size_of::<u32>();
+        const DATABASE_HEADER_BYTES: usize = 6 * std::mem::size_of::<u32>() + 128;
+
+        fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        }
+
+        // A minimal valid manifest is enough to make bcvfsCacheInit learn the
+        // provider block size without contacting a remote backend.  The
+        // database has no blocks; this test only exercises configuration.
+        let manifest_len = MANIFEST_HEADER_BYTES + DATABASE_HEADER_BYTES;
+        let mut manifest = vec![0_u8; manifest_len];
+        put_u32(&mut manifest, 0, MANIFEST_VERSION);
+        put_u32(&mut manifest, 4, BLOCK_BYTES as u32);
+        put_u32(&mut manifest, 8, 1); // one database
+        put_u32(&mut manifest, 12, 0); // no delete entries
+        put_u32(&mut manifest, 16, NAME_BYTES);
+        put_u32(&mut manifest, 20, 1); // largest database id
+        let db = MANIFEST_HEADER_BYTES;
+        put_u32(&mut manifest, db, 1); // database id
+        put_u32(&mut manifest, db + 12, manifest_len as u32);
+        let db_name = b"streaming.sqlite";
+        manifest[db + 24..db + 24 + db_name.len()].copy_from_slice(db_name);
+
+        let directory = tempfile::tempdir().expect("temporary CBS directory");
+        let path = CString::new(directory.path().to_str().expect("UTF-8 temp path"))
+            .expect("path has no NUL");
+        let name = CString::new(format!("cache-size-boundary-{}", std::process::id()))
+            .expect("name has no NUL");
+        let mut fs = ptr::null_mut();
+        let mut err = ptr::null_mut();
+        let rc =
+            unsafe { raw::sqlite3_bcvfs_create(path.as_ptr(), name.as_ptr(), &mut fs, &mut err) };
+        result_with_err(rc, &mut err)?;
+        assert!(!fs.is_null());
+        assert_eq!(
+            unsafe { raw::sqlite3_bcvfs_destroy(fs) },
+            crate::ffi::SQLITE_OK
+        );
+
+        let metadata = Connection::open(directory.path().join("blocksdb.bcv"))?;
+        metadata.execute(
+            "INSERT INTO container(name, storage, user, container, manifest, etag) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            crate::params!["alias", "s3", "account", "bucket/prefix", manifest, "etag"],
+        )?;
+        drop(metadata);
+
+        fs = ptr::null_mut();
+        err = ptr::null_mut();
+        let rc =
+            unsafe { raw::sqlite3_bcvfs_create(path.as_ptr(), name.as_ptr(), &mut fs, &mut err) };
+        result_with_err(rc, &mut err)?;
+        assert!(!fs.is_null());
+
+        for value in [0, -1, BLOCK_BYTES - 1, BLOCK_BYTES + 1] {
+            assert_eq!(
+                unsafe { raw::sqlite3_bcvfs_config(fs, raw::SQLITE_BCV_CACHESIZE, value) },
+                crate::ffi::SQLITE_MISUSE,
+                "cache size {value} should be rejected"
+            );
+        }
+        for value in [BLOCK_BYTES, 2 * BLOCK_BYTES] {
+            assert_eq!(
+                unsafe { raw::sqlite3_bcvfs_config(fs, raw::SQLITE_BCV_CACHESIZE, value) },
+                crate::ffi::SQLITE_OK,
+                "cache size {value} should be accepted"
+            );
+        }
+
+        assert_eq!(
+            unsafe { raw::sqlite3_bcvfs_destroy(fs) },
+            crate::ffi::SQLITE_OK
+        );
+        Ok(())
     }
 
     #[test]

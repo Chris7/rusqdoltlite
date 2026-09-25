@@ -1,0 +1,2353 @@
+--- a/bcv_int.h
++++ b/bcv_int.h
+@@ -166,6 +166,47 @@
+ 
+ #define BCVFS_INSERT_BLOCK    "REPLACE INTO block VALUES(?,?,?,?,?,?)"
+ #define BCVFS_INSERT_CONT     "REPLACE INTO container VALUES(?,?,?,?,?,?)"
++#define BCVFS_INSERT_STAGED   \
++    "REPLACE INTO staged VALUES(?,?,?,?,?,?)"
++#define BCVFS_INSERT_STAGE_SEQ \
++    "INSERT OR IGNORE INTO staged_sequence VALUES(?,0)"
++#define BCVFS_UPDATE_STAGE_SEQ \
++    "UPDATE staged_sequence SET sequence=sequence+1 WHERE container=?"
++#define BCVFS_FIND_STAGE_SEQ \
++    "SELECT sequence FROM staged_sequence WHERE container=?"
++#define BCVFS_DELETE_STAGED   \
++    "INSERT OR IGNORE INTO staged_gc(container,db,dbpos,generation,blockid,sequence) " \
++    "SELECT container,db,dbpos,generation,blockid,sequence FROM staged " \
++    "WHERE container=? AND db=? AND dbpos=?"
++#define BCVFS_DELETE_STAGED_CONT \
++    "DELETE FROM staged WHERE container=?"
++#define BCVFS_DELETE_STAGED_GC_CONT \
++    "DELETE FROM staged_gc WHERE container=?"
++#define BCVFS_FIND_STAGED     \
++    "SELECT s.blockid FROM staged AS s WHERE s.container=? AND s.db=? " \
++    "AND s.dbpos=? AND s.generation=? " \
++    "AND NOT EXISTS (" \
++    "  SELECT 1 FROM staged_gc AS g " \
++    "  WHERE g.container=s.container AND g.db=s.db " \
++    "    AND g.dbpos=s.dbpos AND g.generation=s.generation " \
++    "    AND g.sequence=s.sequence" \
++    ")"
++#define BCVFS_DELETE_BLOCK    \
++    "DELETE FROM block WHERE cachefilepos=?"
++#define BCVFS_INSERT_PENDING  \
++    "REPLACE INTO pending_publish VALUES(?,?,?)"
++#define BCVFS_DELETE_PENDING \
++    "DELETE FROM pending_publish WHERE container=?"
++#define BCVFS_FIND_PENDING   \
++    "SELECT manifest, maxseq FROM pending_publish WHERE container=?"
++#define BCVFS_DELETE_STAGED_BEFORE \
++    "DELETE FROM staged WHERE container=? AND sequence<=?"
++#define BCVFS_DELETE_STAGED_GC_BEFORE \
++    "DELETE FROM staged_gc WHERE container=? AND sequence<=?"
++#define BCVFS_FIND_STAGED_MAX \
++    "SELECT IFNULL(MAX(sequence),0) FROM staged WHERE container=?"
++#define BCVFS_FIND_STAGED_AFTER \
++    "SELECT 1 FROM staged WHERE container=? AND sequence>? LIMIT 1"
+ 
+ /*
+ ** bDaemon:
+@@ -206,6 +247,7 @@
+   char *zDir;                     /* Full path for directory to use */
+   i64 szBlk;                      /* Block size for this cache file */
+   i64 nMaxCache;                  /* SQLITE_BCV_CACHESIZE value */
++  int nStageWatermark;            /* Proactive staging occupancy percent */
+   Container *pCList;              /* List of all "attached" containers */
+   CacheEntry **aHash;
+   CacheEntry *pUnused;
+@@ -222,6 +264,22 @@
+   sqlite3 *bdb;                   /* Open database handle */
+   sqlite3_stmt *pInsertBlock;     /* REPLACE INTO blocks... */
+   sqlite3_stmt *pInsertCont;      /* REPLACE INTO container... */
++  sqlite3_stmt *pInsertStaged;    /* REPLACE INTO staged... */
++  sqlite3_stmt *pInsertStageSeq;  /* INSERT staged sequence row... */
++  sqlite3_stmt *pUpdateStageSeq;  /* Bump staged sequence... */
++  sqlite3_stmt *pFindStageSeq;    /* Read staged sequence... */
++  sqlite3_stmt *pDeleteStaged;    /* DELETE FROM staged... */
++  sqlite3_stmt *pDeleteStagedCont;/* DELETE all staged rows for container */
++  sqlite3_stmt *pDeleteStagedGcCont; /* DELETE staged GC rows for container */
++  sqlite3_stmt *pFindStaged;      /* SELECT from staged... */
++  sqlite3_stmt *pDeleteBlock;     /* DELETE cache slot metadata */
++  sqlite3_stmt *pInsertPending;   /* REPLACE pending publication... */
++  sqlite3_stmt *pDeletePending;   /* DELETE pending publication... */
++  sqlite3_stmt *pFindPending;     /* SELECT pending publication... */
++  sqlite3_stmt *pDeleteStagedBefore; /* DELETE staged through sequence... */
++  sqlite3_stmt *pDeleteStagedGcBefore; /* DELETE staged GC through sequence */
++  sqlite3_stmt *pFindStagedMax;   /* SELECT staged high-water sequence... */
++  sqlite3_stmt *pFindStagedAfter; /* SELECT staged rows after high-water... */
+ };
+ 
+ /*
+@@ -264,6 +322,7 @@
+ #define CONTAINER_STATE_COPY          2
+ #define CONTAINER_STATE_POLL          3
+ #define CONTAINER_STATE_DELETE        4
++#define CONTAINER_STATE_STAGE         5
+ 
+ /*
+ ** Each blocks in the cache-file is represented by an instance of the 
+@@ -282,12 +341,18 @@
+   int iPos;                       /* Position of block in cache file */
+   int nRef;                       /* Current number of client refs */
+   int iEnc;                       /* Encryption index, if any */
++  Container *pCont;               /* Container owning this logical block */
++  i64 iDbId;                      /* Database id owning this logical block */
++  int iDbPos;                     /* Logical block position */
+   i64 iLruTick;                   /* Logic clock when last added to LRU list */
+   CacheEntry *pHashNext;          /* Hash collision list */
+   CacheEntry *pLruPrev;           /* Previous entry in LRU list */
+   CacheEntry *pLruNext;           /* Next entry in LRU list */
+   u8 bValid;                      /* True if cache entry is valid */
+   u8 bDirty;                      /* True if cache entry is a dirty block */
++  u8 bStaged;                     /* True if block is uploaded but unpublished */
++  u8 bStaging;                    /* True while an upload is in progress */
++  u8 bStageReuse;                 /* Slot was reused after a staged block */
+   u8 nName;                       /* Size of aName[] in bytes */
+   u8 aName[BCV_MAX_NAMEBYTES];    /* Block identifier */
+ };
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -15,6 +15,13 @@
+ #include <openssl/sha.h>
+ #include <openssl/md5.h>
+ 
++#ifdef SQLITE_BCVFS_TESTING
++extern int bcv_test_event(int);
++# define BCVFS_TEST_EVENT(e) bcv_test_event(e)
++#else
++# define BCVFS_TEST_EVENT(e) ((void)0)
++#endif
++
+ #ifdef BCV_DOLTLITE_INTEGRATION
+ SQLITE_API int SQLITE_APICALL sqlite3_doltlite_bcvfs_upload_lock(sqlite3*,const char*,void**);
+ SQLITE_API void SQLITE_APICALL sqlite3_doltlite_bcvfs_upload_unlock(void*);
+@@ -268,6 +275,33 @@
+   "    dbversion INTEGER,\n"                            \
+   "    CHECK (blockid IS NOT NULL OR container IS NOT NULL)" \
+   ");" \
++  "CREATE TABLE IF NOT EXISTS staged(\n"             \
++  "    container TEXT NOT NULL,\n"                   \
++  "    db INTEGER NOT NULL,\n"                        \
++  "    dbpos INTEGER NOT NULL,\n"                     \
++  "    generation BLOB NOT NULL,\n"                   \
++  "    blockid BLOB NOT NULL,\n"                      \
++  "    sequence INTEGER NOT NULL,\n"                  \
++  "    PRIMARY KEY(container, db, dbpos, generation)\n" \
++  ");" \
++  "CREATE TABLE IF NOT EXISTS staged_sequence(\n"       \
++  "    container TEXT PRIMARY KEY,\n"                  \
++  "    sequence INTEGER NOT NULL\n"                    \
++  ");" \
++  "CREATE TABLE IF NOT EXISTS staged_gc(\n"             \
++  "    container TEXT NOT NULL,\n"                     \
++  "    db INTEGER NOT NULL,\n"                          \
++  "    dbpos INTEGER NOT NULL,\n"                       \
++  "    generation BLOB NOT NULL,\n"                     \
++  "    blockid BLOB NOT NULL,\n"                        \
++  "    sequence INTEGER NOT NULL,\n"                    \
++  "    PRIMARY KEY(container, db, dbpos, generation, sequence)\n" \
++  ");" \
++  "CREATE TABLE IF NOT EXISTS pending_publish(\n"       \
++  "    container TEXT PRIMARY KEY,\n"                  \
++  "    manifest BLOB NOT NULL,\n"                     \
++  "    maxseq INTEGER NOT NULL\n"                     \
++  ");" \
+   "CREATE TABLE IF NOT EXISTS container(\n"             \
+   "    name TEXT PRIMARY KEY,\n"                        \
+   "    storage TEXT,\n"                                 \
+@@ -993,9 +1027,16 @@
+   pStmt = pFs->c.pInsertBlock;
+   sqlite3_bind_int(pStmt, 1, pEntry->iPos);
+   if( pEntry->bDirty ){
+-    sqlite3_bind_text(pStmt, 3, pFile->pCont->zName, -1, SQLITE_STATIC); 
+-    sqlite3_bind_int64(pStmt, 4, pFile->iFileDbId);
+-    sqlite3_bind_int(pStmt, 5, iBlk);
++    Container *pCont = pFile ? pFile->pCont : pEntry->pCont;
++    i64 iDbId = pFile ? pFile->iFileDbId : pEntry->iDbId;
++    int iDbPos = pFile ? iBlk : pEntry->iDbPos;
++    if( pCont==0 ){
++      sqlite3_clear_bindings(pStmt);
++      return SQLITE_CORRUPT;
++    }
++    sqlite3_bind_text(pStmt, 3, pCont->zName, -1, SQLITE_STATIC);
++    sqlite3_bind_int64(pStmt, 4, iDbId);
++    sqlite3_bind_int(pStmt, 5, iDbPos);
+     sqlite3_bind_int(pStmt, 6, 0);
+   }else{
+     assert( pEntry->aName && pEntry->nName>0 );
+@@ -1007,33 +1048,392 @@
+   return rc;
+ }
+ 
++static int bcvfsWriteBlockClean(BcvCommon *p, CacheEntry *pEntry){
++  sqlite3_stmt *pStmt = p->pInsertBlock;
++  int rc;
++  sqlite3_bind_int(pStmt, 1, pEntry->iPos);
++  sqlite3_bind_blob(pStmt, 2, pEntry->aName, pEntry->nName, SQLITE_STATIC);
++  sqlite3_step(pStmt);
++  rc = sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
++/*
++** Record an uploaded-but-unpublished block. The generation is the block
++** identifier currently present in ManifestDb.aBlkLocal[]. Keeping it in a
++** separate table means that the cache slot may be reused without losing the
++** object needed to assemble the next manifest.
++*/
++static int bcvfsStagedNextSequence(
++  BcvCommon *p,
++  const char *zContainer,
++  i64 *piSeq
++){
++  sqlite3_stmt *pStmt;
++  int rc;
++  int step;
++
++  pStmt = p->pInsertStageSeq;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  sqlite3_step(pStmt);
++  rc = sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  if( rc!=SQLITE_OK ) return rc;
++
++  pStmt = p->pUpdateStageSeq;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  sqlite3_step(pStmt);
++  rc = sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  if( rc!=SQLITE_OK ) return rc;
++
++  pStmt = p->pFindStageSeq;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  step = sqlite3_step(pStmt);
++  if( step==SQLITE_ROW ){
++    *piSeq = sqlite3_column_int64(pStmt, 0);
++    rc = SQLITE_OK;
++  }else{
++    rc = (step==SQLITE_DONE) ? SQLITE_CORRUPT : step;
++  }
++  sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
++static int bcvfsStagedPut(
++  BcvCommon *p,
++  const char *zContainer,
++  i64 iDbId,
++  int iDbPos,
++  const u8 *aGeneration,
++  int nGeneration,
++  const u8 *aBlock,
++  int nBlock
++){
++  sqlite3_stmt *pStmt = p->pInsertStaged;
++  i64 iSeq = 0;
++  int rc;
++  rc = bcvfsStagedNextSequence(p, zContainer, &iSeq);
++  if( rc!=SQLITE_OK ) return rc;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  sqlite3_bind_int64(pStmt, 2, iDbId);
++  sqlite3_bind_int(pStmt, 3, iDbPos);
++  sqlite3_bind_blob(pStmt, 4, aGeneration, nGeneration, SQLITE_STATIC);
++  sqlite3_bind_blob(pStmt, 5, aBlock, nBlock, SQLITE_STATIC);
++  sqlite3_bind_int64(pStmt, 6, iSeq);
++  sqlite3_step(pStmt);
++  rc = sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
++/*
++** Return SQLITE_OK if the current generation has a staged object,
++** SQLITE_NOTFOUND if it does not, or another SQLite error.
++*/
++static int bcvfsStagedFind(
++  BcvCommon *p,
++  const char *zContainer,
++  i64 iDbId,
++  int iDbPos,
++  const u8 *aGeneration,
++  int nGeneration,
++  u8 *aBlock,
++  int *pnBlock
++){
++  sqlite3_stmt *pStmt = p->pFindStaged;
++  int step;
++  int rc;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  sqlite3_bind_int64(pStmt, 2, iDbId);
++  sqlite3_bind_int(pStmt, 3, iDbPos);
++  sqlite3_bind_blob(pStmt, 4, aGeneration, nGeneration, SQLITE_STATIC);
++  step = sqlite3_step(pStmt);
++  if( step==SQLITE_ROW ){
++    int n = sqlite3_column_bytes(pStmt, 0);
++    if( aBlock && n<=BCV_MAX_NAMEBYTES ){
++      memcpy(aBlock, sqlite3_column_blob(pStmt, 0), n);
++      if( pnBlock ) *pnBlock = n;
++    }
++    rc = SQLITE_OK;
++  }else if( step==SQLITE_DONE ){
++    rc = SQLITE_NOTFOUND;
++  }else{
++    rc = step;
++  }
++  sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
++/*
++** Mark all staged generations for one logical block as discarded. The rows
++** remain in staged so that this operation is crash-safe: a restart can see
++** both the original mapping and the durable tombstone, and will not replay a
++** generation that was truncated or reverted. The object ids remain available
++** to the delayed-GC pass at the next publication.
++*/
++static int bcvfsStagedDelete(
++  BcvCommon *p,
++  const char *zContainer,
++  i64 iDbId,
++  int iDbPos
++){
++  sqlite3_stmt *pStmt = p->pDeleteStaged;
++  int rc;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  sqlite3_bind_int64(pStmt, 2, iDbId);
++  sqlite3_bind_int(pStmt, 3, iDbPos);
++  sqlite3_step(pStmt);
++  rc = sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
++static int bcvfsStagedDeleteContainer(BcvCommon *p, const char *zContainer){
++  sqlite3_stmt *pStmt = p->pDeleteStagedCont;
++  int rc;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  sqlite3_step(pStmt);
++  rc = sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  if( rc==SQLITE_OK ){
++    pStmt = p->pDeleteStagedGcCont;
++    sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++    sqlite3_step(pStmt);
++    rc = sqlite3_reset(pStmt);
++    sqlite3_clear_bindings(pStmt);
++  }
++  return rc;
++}
++
++static int bcvfsStagedMax(
++  BcvCommon *p,
++  const char *zContainer,
++  i64 *piMax
++){
++  sqlite3_stmt *pStmt = p->pFindStagedMax;
++  int step;
++  int rc = SQLITE_OK;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  step = sqlite3_step(pStmt);
++  if( step==SQLITE_ROW ){
++    *piMax = sqlite3_column_int64(pStmt, 0);
++  }else{
++    rc = (step==SQLITE_DONE ? SQLITE_CORRUPT : step);
++  }
++  sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
++static int bcvfsStagedDeleteBefore(
++  BcvCommon *p,
++  const char *zContainer,
++  i64 iMax
++){
++  sqlite3_stmt *pStmt = p->pDeleteStagedBefore;
++  int rc;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  sqlite3_bind_int64(pStmt, 2, iMax);
++  sqlite3_step(pStmt);
++  rc = sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  if( rc==SQLITE_OK ){
++    pStmt = p->pDeleteStagedGcBefore;
++    sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++    sqlite3_bind_int64(pStmt, 2, iMax);
++    sqlite3_step(pStmt);
++    rc = sqlite3_reset(pStmt);
++    sqlite3_clear_bindings(pStmt);
++  }
++  return rc;
++}
++
++static int bcvfsStagedHasAfter(
++  BcvCommon *p,
++  const char *zContainer,
++  i64 iMax
++){
++  sqlite3_stmt *pStmt = p->pFindStagedAfter;
++  int step;
++  int rc;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  sqlite3_bind_int64(pStmt, 2, iMax);
++  step = sqlite3_step(pStmt);
++  rc = (step==SQLITE_ROW) ? SQLITE_BUSY :
++       (step==SQLITE_DONE) ? SQLITE_NOTFOUND : step;
++  sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
++static int bcvfsPendingPublishPut(
++  BcvCommon *p,
++  const char *zContainer,
++  Manifest *pMan,
++  i64 *piMax
++){
++  sqlite3_stmt *pStmt = p->pInsertPending;
++  u8 *aMan = 0;
++  int nMan = 0;
++  int rc = SQLITE_OK;
++
++  aMan = bcvManifestCompose(pMan, &nMan);
++  if( aMan==0 ) rc = SQLITE_NOMEM;
++  if( rc==SQLITE_OK ) rc = bcvfsStagedMax(p, zContainer, piMax);
++  if( rc==SQLITE_OK ){
++    sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++    sqlite3_bind_blob(pStmt, 2, aMan, nMan, SQLITE_STATIC);
++    sqlite3_bind_int64(pStmt, 3, *piMax);
++    sqlite3_step(pStmt);
++    rc = sqlite3_reset(pStmt);
++    sqlite3_clear_bindings(pStmt);
++  }
++  sqlite3_free(aMan);
++  return rc;
++}
++
++static int bcvfsPendingPublishFind(
++  BcvCommon *p,
++  const char *zContainer,
++  u8 **paMan,
++  int *pnMan,
++  i64 *piMax
++){
++  sqlite3_stmt *pStmt = p->pFindPending;
++  const u8 *aMan;
++  int nMan;
++  int step;
++  int rc = SQLITE_OK;
++  *paMan = 0;
++  *pnMan = 0;
++  *piMax = 0;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  step = sqlite3_step(pStmt);
++  if( step==SQLITE_ROW ){
++    aMan = sqlite3_column_blob(pStmt, 0);
++    nMan = sqlite3_column_bytes(pStmt, 0);
++    *piMax = sqlite3_column_int64(pStmt, 1);
++    if( aMan==0 || nMan<=0 ){
++      rc = SQLITE_CORRUPT;
++    }else{
++      *paMan = (u8*)sqlite3_malloc(nMan);
++      if( *paMan==0 ){
++        rc = SQLITE_NOMEM;
++      }else{
++        memcpy(*paMan, aMan, nMan);
++        *pnMan = nMan;
++      }
++    }
++  }else if( step==SQLITE_DONE ){
++    rc = SQLITE_NOTFOUND;
++  }else{
++    rc = step;
++  }
++  sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
++static int bcvfsPendingPublishDelete(BcvCommon *p, const char *zContainer){
++  sqlite3_stmt *pStmt = p->pDeletePending;
++  int rc;
++  sqlite3_bind_text(pStmt, 1, zContainer, -1, SQLITE_STATIC);
++  sqlite3_step(pStmt);
++  rc = sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
++/* Return SQLITE_OK only if the durable pending marker is byte-for-byte the
++** same manifest. A manifest marker is deliberately independent of its ETag,
++** which is assigned by the remote object store. */
++static int bcvfsPendingPublishMatches(
++  BcvCommon *p,
++  const char *zContainer,
++  Manifest *pMan,
++  i64 *piMax
++){
++  u8 *aPending = 0;
++  u8 *aMan = 0;
++  int nPending = 0;
++  int nMan = 0;
++  int rc;
++
++  aMan = bcvManifestCompose(pMan, &nMan);
++  if( aMan==0 ) return SQLITE_NOMEM;
++  rc = bcvfsPendingPublishFind(
++      p, zContainer, &aPending, &nPending, piMax
++  );
++  if( rc==SQLITE_OK ){
++    rc = (nPending==nMan && 0==memcmp(aPending, aMan, nMan))
++       ? SQLITE_OK : SQLITE_NOTFOUND;
++  }
++  sqlite3_free(aPending);
++  sqlite3_free(aMan);
++  return rc;
++}
++
++static int bcvfsClearBlock(BcvCommon *p, CacheEntry *pEntry){
++  sqlite3_stmt *pStmt = p->pDeleteBlock;
++  int rc;
++  sqlite3_bind_int(pStmt, 1, pEntry->iPos);
++  sqlite3_step(pStmt);
++  rc = sqlite3_reset(pStmt);
++  sqlite3_clear_bindings(pStmt);
++  return rc;
++}
++
+ CacheEntry *bcvfsAllocCacheEntry(int *pRc, BcvCommon *p){
+   CacheEntry *pRet = 0;
++  i64 nMaxBlk = p->szBlk>0 ? p->nMaxCache/p->szBlk : 0;
++  CacheEntry **pp;
+ 
+-  if( p->pUnused ){
+-    pRet = p->pUnused;
+-    p->pUnused = pRet->pHashNext;
+-    pRet->pHashNext = 0;
+-  }else if( (p->nBlk*p->szBlk)>=p->nMaxCache ){
++  /* A blocksdb from an older configuration may contain unused slots above
++  ** the current limit. Never take one of those slots: the configured limit
++  ** is a limit on physical cachefile positions, not just live entries. */
++  for(pp=&p->pUnused; *pp; pp=&(*pp)->pHashNext){
++    if( (*pp)->iPos<nMaxBlk ){
++      pRet = *pp;
++      *pp = pRet->pHashNext;
++      pRet->pHashNext = 0;
++      break;
++    }
++  }
++  if( pRet==0 && p->nBlk>=nMaxBlk ){
+     for(pRet=p->pLruFirst; pRet; pRet=pRet->pLruNext){
+       assert( pRet->bValid );
+       assert( pRet->nRef==0 || p->bDaemon );
+-      if( pRet->nRef==0 ){
++      if( pRet->nRef==0 && pRet->iPos<nMaxBlk ){
++        int bStageReuse = pRet->bStaged;
+         bcvfsLruRemove(p, pRet);
+         bcvfsHashRemove(p, pRet);
+         pRet->bValid = 0;
++        pRet->bDirty = 0;
++        pRet->bStaged = 0;
++        pRet->bStaging = 0;
++        pRet->bStageReuse = bStageReuse;
+         break;
+       }
+     }
+   }
+   
+   if( pRet==0 ){
+-    /* Allocate a new structure to represent the next free slot in the
+-    ** cache file. */
+-    pRet = (CacheEntry*)bcvMallocRc(pRc, sizeof(CacheEntry));
+-    if( pRet ){
+-      pRet->iPos = p->nBlk;
+-      p->nBlk++;
++    if( p->nBlk<nMaxBlk ){
++      /* Allocate a new structure to represent the next free slot in the
++      ** cache file. */
++      pRet = (CacheEntry*)bcvMallocRc(pRc, sizeof(CacheEntry));
++      if( pRet ){
++        pRet->iPos = p->nBlk;
++        p->nBlk++;
++      }
++    }else if( *pRc==SQLITE_OK ){
++      /* A full cache is handled by the caller, which can stage an
++      ** unpinned dirty block before retrying the allocation. */
++      *pRc = SQLITE_FULL;
+     }
+   }
+ 
+@@ -1291,6 +1691,213 @@
+   }
+ }
+ 
++typedef struct BcvfsStageCtx BcvfsStageCtx;
++struct BcvfsStageCtx {
++  int rc;
++  char *zErr;
++};
++
++static void bcvfsStageDone(void *pArg, int rc, char *zETag){
++  BcvfsStageCtx *pCtx = (BcvfsStageCtx*)pArg;
++  if( rc==SQLITE_OK ) BCVFS_TEST_EVENT(1);
++  if( zETag ) pCtx->zErr = sqlite3_mprintf("%s", zETag);
++  pCtx->rc = rc;
++}
++
++/* These are defined with the other container-state helpers below. */
++static void bcvfsEnterState(sqlite3_bcvfs*, Container*, int);
++static void bcvfsLeaveState(sqlite3_bcvfs*, Container*);
++
++/*
++** Upload one unpinned dirty block without publishing the manifest. The
++** local generation is selected before the PUT and the metadata transaction
++** that records the staged object is completed before the cache entry becomes
++** clean and eligible for reuse.
++*/
++static int bcvfsStageOneForFile(BcvfsFile *pFile){
++  sqlite3_bcvfs *pFs = pFile->pFs;
++  BcvCommon *pCommon = &pFs->c;
++  CacheEntry *pEntry = 0;
++  BcvDispatch *pDisp = 0;
++  BcvContainer *pBcv = 0;
++  int nName = 0;
++  int iPos = 0;
++  int iDbPos = 0;
++  i64 iDbId = 0;
++  int rc = SQLITE_OK;
++  u8 *aBuf = 0;
++  u8 aOld[BCV_MAX_NAMEBYTES];
++  u8 aNew[BCV_MAX_NAMEBYTES];
++  char zFile[BCV_MAX_FSNAMEBYTES];
++  BcvfsStageCtx ctx;
++  Container *pCont = 0;
++  int bState = 0;
++
++  memset(&ctx, 0, sizeof(ctx));
++  ENTER_VFS_MUTEX; {
++    int ii;
++    for(ii=0; ii<pCommon->nHash && pEntry==0; ii++){
++      CacheEntry *pTry;
++      for(pTry=pCommon->aHash[ii]; pTry; pTry=pTry->pHashNext){
++        ManifestDb *pTryDb = 0;
++        if( pTry->bValid && pTry->bDirty
++         && pTry->nRef==0 && pTry->bStaging==0 && pTry->pCont
++         && (pTry->pCont->eState==CONTAINER_STATE_NONE
++          || (pTry->pCont==pFile->pCont
++           && pTry->pCont->eState==CONTAINER_STATE_UPLOAD))
++        ){
++          pTryDb = bcvfsFindDatabaseById(pTry->pCont->pMan, pTry->iDbId);
++          if( pTryDb==0 || pTry->iDbPos<0
++           || pTry->iDbPos>=pTryDb->nBlkLocal
++           || pTry->nName!=NAMEBYTES(pTry->pCont->pMan)
++           || memcmp(
++                &pTryDb->aBlkLocal[pTry->iDbPos*pTry->nName],
++                pTry->aName, pTry->nName
++              )!=0
++          ){
++            continue;
++          }
++          pEntry = pTry;
++          pCont = pTry->pCont;
++          iPos = pTry->iPos;
++          iDbId = pTry->iDbId;
++          iDbPos = pTry->iDbPos;
++          pEntry->bStaging = 1;
++          pEntry->nRef++;
++          bcvfsLruRemoveIf(pCommon, pEntry);
++          nName = pEntry->nName;
++          memcpy(aOld, pEntry->aName, nName);
++          if( pCont->eState==CONTAINER_STATE_NONE ){
++            bcvfsEnterState(pFs, pCont, CONTAINER_STATE_STAGE);
++            bState = 1;
++          }else{
++            /* The caller is the checkpointer running inside UPLOAD. That
++            ** state already excludes competing manifest operations, so do
++            ** not try to enter STAGE recursively. */
++            assert( pCont->eState==CONTAINER_STATE_UPLOAD );
++          }
++          break;
++        }
++      }
++    }
++    if( pEntry ){
++      rc = bcvfsContainerGetBcv(pFs, pCont, &pDisp, &pBcv, 0);
++      if( rc==SQLITE_OK ){
++        bcvDispatchClientId(pDisp, pFile->zClientId);
++      }else{
++        pEntry->bStaging = 0;
++        bcvfsEntryUnref(pCommon, pEntry);
++        if( bState ){
++          bcvfsLeaveState(pFs, pCont);
++          bState = 0;
++        }
++        pEntry = 0;
++      }
++    }else{
++      rc = SQLITE_FULL;
++    }
++  } LEAVE_VFS_MUTEX;
++
++  if( rc==SQLITE_OK ){
++    aBuf = (u8*)sqlite3_malloc(pCommon->szBlk);
++    if( aBuf==0 ){
++      rc = SQLITE_NOMEM;
++    }else{
++      rc = bcvReadfile(
++          pFile->pCacheFile, aBuf, pCommon->szBlk,
++          (i64)iPos*pCommon->szBlk
++      );
++    }
++  }
++  if( rc==SQLITE_OK ){
++    memcpy(aNew, aOld, nName);
++    if( nName>=BCV_MIN_MD5_NAMEBYTES ){
++      MD5(aBuf, pCommon->szBlk, aNew);
++    }
++    bcvfsBlockidToName(aNew, nName, zFile);
++
++    /* Publish the new local generation before doing the network PUT. This
++    ** makes a failed PUT an ordinary dirty block, while a successful PUT
++    ** can record exactly the generation that the final manifest will use. */
++    ENTER_VFS_MUTEX; {
++      ManifestDb *pManDb = bcvfsFindDatabaseById(pCont->pMan, iDbId);
++      if( pManDb==0 ){
++        rc = SQLITE_CORRUPT;
++      }else{
++        rc = bcvfsManifestWrite(pManDb, iDbPos, aNew, nName);
++        if( rc==SQLITE_OK ){
++          bcvfsHashRemove(pCommon, pEntry);
++          memcpy(pEntry->aName, aNew, nName);
++          bcvfsHashAdd(pCommon, pEntry);
++        }
++      }
++    } LEAVE_VFS_MUTEX;
++  }
++  if( rc==SQLITE_OK ){
++    rc = bcvDispatchPut(
++        pDisp, pBcv, zFile, 0, aBuf, pCommon->szBlk,
++        (void*)&ctx, bcvfsStageDone
++    );
++  }
++  if( rc==SQLITE_OK ){
++    rc = bcvDispatchRunAll(pDisp);
++  }
++  if( rc==SQLITE_OK ){
++    rc = ctx.rc;
++  }
++
++  ENTER_VFS_MUTEX; {
++    if( pEntry ){
++      if( rc==SQLITE_OK ){
++        rc = bcvfsStagedPut(
++            pCommon, pCont->zName, iDbId, iDbPos,
++            aNew, nName, aNew, nName
++        );
++        if( rc==SQLITE_OK ){
++          BCVFS_TEST_EVENT(2);
++          int rcBlock = bcvfsWriteBlockClean(pCommon, pEntry);
++          if( rcBlock==SQLITE_OK ){
++            pEntry->bStaged = 1;
++            pEntry->bDirty = 0;
++          }else{
++            /* The staged row is durable, but keep the slot dirty when its
++            ** cache-row update failed. The next upload can retry the PUT;
++            ** restart reconciliation will also recover from staged. */
++            pEntry->bStaged = 0;
++            pEntry->bDirty = 1;
++            rc = rcBlock;
++          }
++        }
++      }
++      pEntry->bStaging = 0;
++      bcvfsEntryUnref(pCommon, pEntry);
++      bcvfsMutexCondSignal(&pFs->mutex);
++      bcvfsContainerReleaseBcv(pFs, pCont, pDisp, pBcv, rc!=SQLITE_OK);
++      if( bState ) bcvfsLeaveState(pFs, pCont);
++    }
++  } LEAVE_VFS_MUTEX;
++
++  sqlite3_free(ctx.zErr);
++  sqlite3_free(aBuf);
++  return rc;
++}
++
++static int bcvfsZeroCacheEntry(BcvfsFile *pFile, CacheEntry *pEntry){
++  int rc = SQLITE_OK;
++  u8 *aZero = (u8*)sqlite3_malloc(pFile->pFs->c.szBlk);
++  if( aZero==0 ){
++    rc = SQLITE_NOMEM;
++  }else{
++    memset(aZero, 0, pFile->pFs->c.szBlk);
++    rc = bcvWritefile(
++        pFile->pCacheFile, aZero, pFile->pFs->c.szBlk,
++        (i64)pEntry->iPos*pFile->pFs->c.szBlk
++    );
++  }
++  sqlite3_free(aZero);
++  return rc;
++}
++
+ static int bcvfsFindBlockForIO(
+   sqlite3_bcvfs *pFs,
+   ManifestDb *pManDb,
+@@ -1321,7 +1928,7 @@
+       pEntry = bcvfsHashFind(pCommon, pBlk, nNameBytes);
+ 
+       if( pEntry ){
+-        if( pEntry->bValid==0 ){
++        if( pEntry->bValid==0 || pEntry->bStaging ){
+           /* Case 2. Wait a while and then try again. Eventually, either the
+           ** block will be fully downloaded or the entry removed from the
+           ** hash table.  */
+@@ -1340,7 +1947,14 @@
+         pEntry = bcvfsAllocCacheEntry(&rc, pCommon);
+ 
+         /* Add the entry to the hash table using the new key */
+-        if( pEntry ){
++        if( pEntry && rc==SQLITE_OK ){
++          rc = bcvfsClearBlock(pCommon, pEntry);
++        }
++        if( pEntry && rc!=SQLITE_OK ){
++          bcvfsUnusedAdd(pCommon, pEntry);
++          pEntry = 0;
++        }
++        if( pEntry && rc==SQLITE_OK ){
+           pEntry->nName = nNameBytes;
+           memcpy(pEntry->aName, pBlk, nNameBytes);
+           bcvfsHashAdd(pCommon, pEntry);
+@@ -1353,7 +1967,14 @@
+   }else{
+     /* The file is being extended. Allocate a new, empty, block. */
+     pEntry = bcvfsAllocCacheEntry(&rc, pCommon);
+-    if( pEntry ){
++    if( pEntry && rc==SQLITE_OK ){
++      rc = bcvfsClearBlock(pCommon, pEntry);
++    }
++    if( pEntry && rc!=SQLITE_OK ){
++      bcvfsUnusedAdd(pCommon, pEntry);
++      pEntry = 0;
++    }
++    if( pEntry && rc==SQLITE_OK ){
+       pEntry->nRef++;
+       pEntry->nName = nNameBytes;
+     }
+@@ -1375,6 +1996,9 @@
+   int rc = SQLITE_OK;
+   CacheEntry *pEntry = *ppEntry;
+   CacheEntry *pNew = 0;
++  int nOldName = 0;
++  u8 aOldName[BCV_MAX_NAMEBYTES];
++  int bOldStaged = 0;
+ 
+   ENTER_VFS_MUTEX; {
+     ManifestDb *pManDb = pFile->pManDb;
+@@ -1390,28 +2014,66 @@
+       ** a part of some pinned database other than this one. Make a copy of
+       ** the block to write to in this case too.  */
+       pNew = bcvfsAllocCacheEntry(&rc, pCommon);
+-      pNew->nName = pEntry->nName;
+-      pNew->nRef = 1;
++      if( pNew && rc==SQLITE_OK ){
++        rc = bcvfsClearBlock(pCommon, pNew);
++        pNew->nName = pEntry->nName;
++        pNew->nRef = 1;
++      }
++      if( pNew && rc!=SQLITE_OK ){
++        bcvfsUnusedAdd(pCommon, pNew);
++        pNew = 0;
++      }
+     }else{
+-      bcvfsHashRemove(pCommon, pEntry);
+-      pNew = pEntry;
++      nOldName = pEntry->nName;
++      memcpy(aOldName, pEntry->aName, nOldName);
++      bOldStaged = pEntry->bStaged;
++      /* Invalidate the durable clean-row mapping before an in-place rewrite.
++      ** If the process stops after xWrite but before the dirty row is
++      ** recorded, the old object id must not point at the overwritten slot. */
++      rc = bcvfsClearBlock(pCommon, pEntry);
++      if( rc==SQLITE_OK ){
++        bcvfsHashRemove(pCommon, pEntry);
++        pNew = pEntry;
++        /* Keep older staged generations until the next manifest publication.
++        ** The new local generation below makes them ineligible for reads, and
++        ** retaining them makes a crash between rewrite and staging recoverable. */
++        pEntry->bStaged = 0;
++      }
+     }
+     assert( pNew || rc!=SQLITE_OK );
+ 
+     if( rc==SQLITE_OK && pNew!=pEntry ){
+       rc = bcvfsCopyBlock(pFile, pCommon->szBlk, pNew->iPos, pEntry->iPos);
++      if( rc!=SQLITE_OK ){
++        bcvfsUnusedAdd(pCommon, pNew);
++        pNew = 0;
++      }
+     }
+ 
+-    if( pNew ){
++    if( pNew && rc==SQLITE_OK ){
++      pNew->pCont = pFile->pCont;
++      pNew->iDbId = pFile->iFileDbId;
++      pNew->iDbPos = iBlk;
+       sqlite3_randomness(pNew->nName, pNew->aName);
+       rc = bcvfsManifestWrite(pManDb, iBlk, pNew->aName, pNew->nName);
+       if( rc==SQLITE_OK ){
+         pNew->bDirty = 1;
++        pNew->bStaged = 0;
++        bcvfsHashAdd(pCommon, pNew);
++      }else if( pNew==pEntry ){
++        /* Restore the old resident generation if local manifest growth
++        ** fails. Its staged row was deliberately retained above. */
++        pNew->nName = nOldName;
++        memcpy(pNew->aName, aOldName, nOldName);
++        pNew->bStaged = bOldStaged;
++        bcvfsHashAdd(pCommon, pNew);
++      }else{
++        bcvfsUnusedAdd(pCommon, pNew);
++        pNew = 0;
+       }
+-      bcvfsHashAdd(pCommon, pNew);
+ 
+       /* Log a message announcing the new dirty block. */
+-      if( pFs->mLog & SQLITE_BCV_LOG_UPLOAD ){
++      if( rc==SQLITE_OK && (pFs->mLog & SQLITE_BCV_LOG_UPLOAD) ){
+         char zBlock[BCV_MAX_FSNAMEBYTES];
+         bcvfsBlockidToName(pNew->aName, pNew->nName, zBlock);
+         bcvfsUploadLog(pFs, "block %d of %s/%s is now dirty block %s"
+@@ -1431,6 +2093,8 @@
+   return rc;
+ }
+ 
++static int bcvfsAtStageWatermark(BcvCommon *p);
++
+ static int bcvfsReadWriteDatabase(
+   int bWrite,                     /* True for write, false for read */
+   BcvfsFile *pFile, 
+@@ -1448,6 +2112,7 @@
+   CacheEntry *pEntry = 0;
+   BcvContainer *pBcv = 0;
+   BcvDispatch *pDisp = 0;
++  int nStage = 0;
+ 
+   /* When it opens a database, SQLite attempts to read the 100 byte 
+   ** database header without first taking a read-lock. This is an 
+@@ -1458,6 +2123,12 @@
+     return SQLITE_IOERR_SHORT_READ;
+   }
+ 
++retry:
++  pEntry = 0;
++  pBcv = 0;
++  pDisp = 0;
++  bWriteBlock = 0;
++
+   /* Take the VFS mutex and do three things under its cover:
+   **
+   **   1) If one is not already held, obtain a reference to the current
+@@ -1474,6 +2145,15 @@
+   **      a pBcv handle to do the download with.
+   */
+   ENTER_VFS_MUTEX; {
++    /* Staging owns the container while it has a cache entry pinned and its
++    ** bytes are in flight. Writers must wait for that state so a newer
++    ** generation cannot race the staged mapping. Do not wait for UPLOAD:
++    ** its checkpoint can re-enter xWrite. */
++    while( pFile->pCont
++        && pFile->pCont->eState==CONTAINER_STATE_STAGE
++    ){
++      bcvfsMutexCondWait(&pFs->mutex);
++    }
+     szBlk = pCommon->szBlk;
+     iBlk = iOfst / szBlk;
+     rc = bcvfsGetManifestRef(pFile, ioerr);
+@@ -1481,13 +2161,44 @@
+       int nName = NAMEBYTES(pFile->pMan);
+       rc = bcvfsFindBlockForIO(pFs, pFile->pManDb, nName, iBlk, &pEntry);
+     }
+-    if( rc==SQLITE_OK && pEntry->bValid==0 && iBlk<pFile->pManDb->nBlkOrig ){
+-      assert( iBlk<pFile->pManDb->nBlkLocal || bWrite );
++    if( rc==SQLITE_OK && pEntry && pEntry->bValid==0
++     && iBlk<pFile->pManDb->nBlkLocal
++    ){
++      if( iBlk>=pFile->pManDb->nBlkOrig ){
++        int rcStaged = bcvfsStagedFind(
++            &pFs->c, pFile->pCont->zName, pFile->iFileDbId, iBlk,
++            &pFile->pManDb->aBlkLocal[iBlk*NAMEBYTES(pFile->pMan)],
++            NAMEBYTES(pFile->pMan), 0, 0
++        );
++        if( rcStaged==SQLITE_OK ){
++          pEntry->bStaged = 1;
++        }else if( rcStaged!=SQLITE_NOTFOUND ){
++          rc = rcStaged;
++        }
++      }
++      if( rc==SQLITE_OK
++       && (iBlk<pFile->pManDb->nBlkOrig || pEntry->bStaged)
++      ){
+       rc = bcvfsContainerGetBcv(pFs, pFile->pCont, &pDisp, &pBcv, 0);
+-      bcvDispatchClientId(pDisp, pFile->zClientId);
++      if( rc==SQLITE_OK ){
++        bcvDispatchClientId(pDisp, pFile->zClientId);
++      }
++      }
+     }
+   } LEAVE_VFS_MUTEX;
+ 
++  /*
++  ** A full cache is recoverable when an unpinned dirty block can be staged.
++  ** The upload is performed without holding the VFS mutex and the original
++  ** operation is retried against the newly reusable slot.
++  */
++  if( rc==SQLITE_FULL ){
++    rc = bcvfsStageOneForFile(pFile);
++    if( rc==SQLITE_OK && nStage++<pCommon->nBlk+1 ){
++      goto retry;
++    }
++  }
++
+   /* If pBcv is not NULL, then this thread must download the block from cloud
+   ** storage. Note that while it is ok to read pEntry->bValid and other 
+   ** fields here, it may not be set following a successful download.
+@@ -1497,11 +2208,34 @@
+     bWriteBlock = 1;
+   }
+ 
++  if( rc==SQLITE_OK && bWrite && pEntry && pEntry->bValid==0
++   && pEntry->bStaged==0 && iBlk>=pFile->pManDb->nBlkOrig
++  ){
++    rc = bcvfsZeroCacheEntry(pFile, pEntry);
++  }
++
+   if( rc==SQLITE_OK && bWrite && pEntry->bDirty==0 ){
+     rc = bcvfsMakeBlockWritable(pFile, iBlk, &pEntry);
+     bWriteBlock = 1;
+   }
+ 
++  /* Copy-on-write can need a slot even when the initial lookup succeeded.
++  ** Release this call's reference before asking staging to free a slot, then
++  ** retry the whole block operation so no reference is leaked. */
++  if( rc==SQLITE_FULL ){
++    ENTER_VFS_MUTEX; {
++      if( pEntry ){
++        bcvfsEntryUnref(pCommon, pEntry);
++        pEntry = 0;
++      }
++      bcvfsContainerReleaseBcv(pFs, pFile->pCont, pDisp, pBcv, 1);
++      pDisp = 0;
++      pBcv = 0;
++    } LEAVE_VFS_MUTEX;
++    rc = bcvfsStageOneForFile(pFile);
++    if( rc==SQLITE_OK && nStage++<pCommon->nBlk+1 ) goto retry;
++  }
++
+   /* Read or write the data from or to the appropriate page of the
+   ** cache file block.  
+   */
+@@ -1510,9 +2244,14 @@
+     i64 iOff = (pEntry->iPos * szBlk) + (iOfst % szBlk);
+     if( bWrite ){
+       rc = pCF->pMethods->xWrite(pCF, pBuf, iAmt, iOff);
+-    }else{
+-      rc = pCF->pMethods->xRead(pCF, pBuf, iAmt, iOff);
+-      if( iOfst==0 ){
++      if( rc==SQLITE_OK && pEntry->bStageReuse ){
++        pEntry->bStageReuse = 0;
++        BCVFS_TEST_EVENT(3);
++      }
++      }else{
++        rc = pCF->pMethods->xRead(pCF, pBuf, iAmt, iOff);
++        if( rc==SQLITE_OK ) pEntry->bStageReuse = 0;
++        if( iOfst==0 ){
+         /* Force database to look like a wal database */
+         if( iAmt>=20 ){
+           ((u8*)pBuf)[18] = 0x02;
+@@ -1550,6 +2289,18 @@
+     bcvfsContainerReleaseBcv(pFs, pFile->pCont, pDisp, pBcv, rc!=SQLITE_OK);
+   } LEAVE_VFS_MUTEX; 
+ 
++  /*
++  ** Start draining dirty entries before the hard limit is reached. The
++  ** watermark is relative to the configured block-payload capacity; the
++  ** final slot remains available for a block that cannot yet be staged.
++  */
++  if( rc==SQLITE_OK && bWrite && bcvfsAtStageWatermark(pCommon) ){
++    int rcStage = bcvfsStageOneForFile(pFile);
++    if( rcStage!=SQLITE_OK && rcStage!=SQLITE_FULL ){
++      rc = rcStage;
++    }
++  }
++
+   return rc;
+ }
+ 
+@@ -1567,6 +2318,24 @@
+   return rc;
+ }
+ 
++/* Compare occupancy with the configured watermark without multiplying large
++** byte counts. CacheSize is an i64 API, so direct nBlk*szBlk and
++** nMaxCache*percent expressions could overflow before the comparison. */
++static int bcvfsAtStageWatermark(BcvCommon *p){
++  i64 nTargetBytes;
++  i64 nCap;
++  i64 nTargetSlots;
++  if( p->szBlk<=0 || p->nMaxCache<=0 || p->nStageWatermark<=0 ){
++    return 0;
++  }
++  nCap = p->nMaxCache;
++  nTargetBytes = (nCap/100)*p->nStageWatermark
++               + ((nCap%100)*p->nStageWatermark)/100;
++  nTargetSlots = nTargetBytes/p->szBlk
++               + (nTargetBytes%p->szBlk!=0);
++  return (i64)p->nBlk>=nTargetSlots;
++}
++
+ static int bcvfsReadWriteDatabaseWithRetry(
+   int bWrite,                     /* True for write, false for read */
+   BcvfsFile *pFile, 
+@@ -1575,12 +2344,30 @@
+   sqlite3_int64 iOfst
+ ){
+   int rc = SQLITE_OK;
+-  int iIter = 0;
+-  do {
+-    rc = bcvfsReadWriteDatabase(bWrite, pFile, pBuf, iAmt, iOfst);
+-  }while( rc==HTTP_AUTH_ERROR && (++iIter<=BCVFS_MAX_AUTH_RETRIES) );
+-  if( rc!=SQLITE_IOERR_SHORT_READ ){
+-    rc = bcvErrorToSqlite(rc);
++  int nDone = 0;
++  int szBlk = pFile->pFs->c.szBlk;
++  u8 *aBuf = (u8*)pBuf;
++
++  /* SQLite is permitted to issue an I/O that crosses a CBS block boundary.
++  ** Keep each underlying operation inside one reusable cache slot; otherwise
++  ** the tail would extend cachefile.bcv past the configured slot cap (and a
++  ** write could corrupt the following slot). */
++  if( iAmt>0 && szBlk<=0 ) return SQLITE_IOERR;
++  while( rc==SQLITE_OK && nDone<iAmt ){
++    sqlite3_int64 iPos = iOfst + nDone;
++    int nPart = szBlk - (int)(iPos % szBlk);
++    int iIter = 0;
++    if( nPart > iAmt-nDone ) nPart = iAmt-nDone;
++    do {
++      rc = bcvfsReadWriteDatabase(
++          bWrite, pFile, &aBuf[nDone], nPart, iPos
++      );
++    }while( rc==HTTP_AUTH_ERROR && (++iIter<=BCVFS_MAX_AUTH_RETRIES) );
++    if( rc!=SQLITE_IOERR_SHORT_READ ){
++      rc = bcvErrorToSqlite(rc);
++    }
++    if( rc==SQLITE_IOERR_SHORT_READ ) break;
++    nDone += nPart;
+   }
+   return rc;
+ }
+@@ -1868,26 +2655,42 @@
+ ** and the end of the db, inclusive. i.e. if iFirst==0, undirty all blocks
+ ** in the database.
+ */
+-static void bcvfsUndirtyBlocks(
++static int bcvfsUndirtyBlocks(
+   sqlite3_bcvfs *pFs, 
++  Container *pCont,
+   int nName, 
+   ManifestDb *pDb,
+   int iFirst
+ ){
+   int iBlk;
++  int rc = SQLITE_OK;
+   CHECK_VFS_MUTEX;
+ 
+-  for(iBlk=iFirst; iBlk<pDb->nBlkLocal; iBlk++){
++  for(iBlk=iFirst; rc==SQLITE_OK && iBlk<pDb->nBlkLocal; iBlk++){
+     int iOff = iBlk*nName;
+     u8 *aBlk = &pDb->aBlkLocal[iOff];
+     if( iBlk>=pDb->nBlkOrig || memcmp(aBlk, &pDb->aBlkOrig[iOff], nName) ){
+       CacheEntry *pEntry = bcvfsHashFind(&pFs->c, aBlk, nName);
+-      assert( pEntry && pEntry->bDirty );
+-      pEntry->bDirty = 0;
+-      bcvfsLruAddIf(&pFs->c, pEntry);
+-      bcvfsWriteBlock(pFs, 0, 0, pEntry);
++      int bWasDirty = pEntry && pEntry->bDirty;
++      /* A staged block may have been evicted from the slot. Remove its
++      ** durable mapping before the caller drops the local manifest range;
++      ** otherwise restart would resurrect a truncated/reverted block. */
++      rc = bcvfsStagedDelete(
++          &pFs->c, pCont->zName, pDb->iDbId, iBlk
++      );
++      if( rc==SQLITE_OK && pEntry ){
++        if( pEntry->bDirty ){
++          pEntry->bDirty = 0;
++          pEntry->bStaged = 0;
++          rc = bcvfsWriteBlock(pFs, 0, 0, pEntry);
++        }else if( pEntry->bStaged ){
++          pEntry->bStaged = 0;
++        }
++        if( rc==SQLITE_OK && bWasDirty ) bcvfsLruAddIf(&pFs->c, pEntry);
++      }
+     }
+   }
++  return rc;
+ }
+ 
+ 
+@@ -1903,18 +2706,64 @@
+       rc = pFile->pFile->pMethods->xTruncate(pFile->pFile, size);
+       break;
+ 
++    case BCVFS_PROXY_FILE:
++      rc = SQLITE_READONLY;
++      break;
++
+     default: {
+       sqlite3_bcvfs *pFs = pFile->pFs;
+       int szBlk;
+       int nNew;
+-      assert( pFile->pMan && pFile->pManDb );
+-      szBlk = pFile->pMan->szBlk;
+-      nNew = (size + szBlk - 1) / szBlk;
+-      if( nNew<pFile->pManDb->nBlkLocal ){
+-        assert( pFile->pManDb->nBlkLocalAlloc );
++      int bTempRef = 0;
++      if( pFile->pCont==0 ){
++        rc = SQLITE_IOERR;
++      }else{
+         ENTER_VFS_MUTEX; {
+-          bcvfsUndirtyBlocks(pFs, NAMEBYTES(pFile->pMan), pFile->pManDb, nNew);
+-          pFile->pManDb->nBlkLocal = nNew;
++          while( pFile->pCont->eState==CONTAINER_STATE_STAGE ){
++            bcvfsMutexCondWait(&pFs->mutex);
++          }
++          /* An unlocked handle may have retained a manifest reference from
++          ** an earlier operation while the wait above released the mutex.
++          ** Refresh it after the state transition so pMan and pManDb remain
++          ** a matching pair for the truncate below. */
++          if( pFile->lockMask==0 && pFile->pMan ){
++            bcvManifestDeref(pFile->pMan);
++            pFile->pMan = 0;
++            pFile->pManDb = 0;
++          }
++          if( pFile->pMan==0 ){
++            rc = bcvfsGetManifestRef(pFile, SQLITE_IOERR);
++            if( rc==SQLITE_OK ) bTempRef = 1;
++          }
++          if( rc==SQLITE_OK && pFile->pManDb==0 ){
++            rc = SQLITE_IOERR;
++          }
++          if( rc==SQLITE_OK ){
++            szBlk = pFile->pMan->szBlk;
++            if( szBlk<=0 || size<0
++             || size>(sqlite3_int64)0x7fffffffffffffff-(szBlk-1) ){
++              rc = SQLITE_IOERR;
++            }else{
++              sqlite3_int64 nNew64 = (size + szBlk - 1) / szBlk;
++              if( nNew64>(sqlite3_int64)0x7fffffff ){
++                rc = SQLITE_TOOBIG;
++              }else{
++                nNew = (int)nNew64;
++              }
++              if( rc==SQLITE_OK && nNew<pFile->pManDb->nBlkLocal ){
++                rc = bcvfsUndirtyBlocks(
++                    pFs, pFile->pCont, NAMEBYTES(pFile->pMan),
++                    pFile->pManDb, nNew
++                );
++                if( rc==SQLITE_OK ) pFile->pManDb->nBlkLocal = nNew;
++              }
++            }
++          }
++          if( bTempRef && pFile->lockMask==0 ){
++            bcvManifestDeref(pFile->pMan);
++            pFile->pMan = 0;
++            pFile->pManDb = 0;
++          }
+         } LEAVE_VFS_MUTEX;
+       }
+       assert( bcvfsFileType(pFile)==BCVFS_DATABASE_FILE );
+@@ -1923,8 +2772,52 @@
+   }
+   return rc;
+ }
++static int bcvfsSyncMainCache(BcvfsFile *pFile, int flags){
++  sqlite3_bcvfs *pFs = pFile->pFs;
++  int rc = SQLITE_OK;
++  if( pFile->pCacheFile ){
++    return pFile->pCacheFile->pMethods->xSync(pFile->pCacheFile, flags);
++  }
++  if( pFile->pCont && pFs->zPortnumber==0 ){
++    BcvfsFile *pMain;
++    /* In WAL mode SQLite syncs the WAL handle rather than the main database
++    ** handle. Dirty CBS payloads are written through the latter, so flush
++    ** every matching open cache handle at this same durability boundary. */
++    ENTER_VFS_MUTEX; {
++      for(pMain=pFs->pFileList; pMain && rc==SQLITE_OK; pMain=pMain->pNextFile){
++        if( pMain->pCont==pFile->pCont
++         && pMain->iFileDbId==pFile->iFileDbId
++         && pMain->pCacheFile
++        ){
++          rc = pMain->pCacheFile->pMethods->xSync(
++              pMain->pCacheFile, flags
++          );
++        }
++      }
++    } LEAVE_VFS_MUTEX;
++  }
++  return rc;
++}
++
+ static int bcvfsSync(sqlite3_file *pFile, int flags){
+-  return SQLITE_OK;
++  BcvfsFile *pBcvFile = (BcvfsFile*)pFile;
++  int rc;
++  switch( bcvfsFileType(pBcvFile) ){
++    case BCVFS_DATABASE_FILE:
++      /* xSync is a durability boundary for local cache payload bytes. It
++      ** must not publish a remote manifest: publication remains explicit in
++      ** sqlite3_bcvfs_upload(). */
++      return bcvfsSyncMainCache(pBcvFile, flags);
++    case BCVFS_WAL_FILE:
++    case BCVFS_PASSTHRU_FILE:
++      rc = pBcvFile->pFile->pMethods->xSync(pBcvFile->pFile, flags);
++      if( rc==SQLITE_OK && bcvfsFileType(pBcvFile)==BCVFS_WAL_FILE ){
++        rc = bcvfsSyncMainCache(pBcvFile, flags);
++      }
++      return rc;
++    default:
++      return SQLITE_OK;
++  }
+ }
+ static int bcvfsFileSize(sqlite3_file *pFd, sqlite3_int64 *pSize){
+   int rc = SQLITE_OK;
+@@ -2013,6 +2906,16 @@
+   int rc = SQLITE_OK;
+   
+   assert( p->szBlk==0 || pMan->szBlk==p->szBlk );
++  if( p->szBlk==0 && pMan->szBlk>0
++   && (p->nMaxCache<pMan->szBlk || p->nMaxCache%pMan->szBlk)
++  ){
++    return SQLITE_MISUSE;
++  }
++  if( p->szBlk==0 && pMan->szBlk>0
++   && p->nBlk>p->nMaxCache/pMan->szBlk
++  ){
++    return SQLITE_FULL;
++  }
+ 
+   if( pCont->pKey==0 ){
+     int nMan = 0;
+@@ -2082,6 +2985,7 @@
+ struct UploadRecord {
+   u8 *aOldName;                   /* Block's temp name */
+   u8 *aNewName;                   /* Block's new name (as uploaded) */
++  CacheEntry *pEntry;             /* Pinned dirty entry, while upload runs */
+   UploadRecord *pNext;            /* Next element in list */
+ };
+ 
+@@ -2154,6 +3058,7 @@
+     "COPY",
+     "POLL",
+     "DELETE",
++    "STAGE",
+   };
+ 
+   assert( CONTAINER_STATE_NONE==0 );
+@@ -2161,6 +3066,7 @@
+   assert( CONTAINER_STATE_COPY==2 );
+   assert( CONTAINER_STATE_POLL==3 );
+   assert( CONTAINER_STATE_DELETE==4 );
++  assert( CONTAINER_STATE_STAGE==5 );
+ 
+   return azName[eState];
+ }
+@@ -2818,6 +3724,59 @@
+   return pCont;
+ }
+ 
++/*
++** Complete recovery of a publication whose remote PUT succeeded before the
++** local manifest install. This is used only after the caller has fetched the
++** remote manifest and it matches the durable marker. If newer staged rows or
++** dirty resident blocks exist, leave the marker and let normal collision
++** handling preserve the newer local state.
++*/
++static int bcvfsPendingPublishTryInstall(
++  sqlite3_bcvfs *pFs,
++  Container *pCont,
++  Manifest **ppMan
++){
++  Manifest *pMan = *ppMan;
++  i64 iMax = 0;
++  int rc;
++  int ii;
++
++  rc = bcvfsPendingPublishMatches(
++      &pFs->c, pCont->zName, pMan, &iMax
++  );
++  if( rc!=SQLITE_OK ) return rc;
++  if( bcvfsStagedHasAfter(&pFs->c, pCont->zName, iMax)!=SQLITE_NOTFOUND ){
++    return SQLITE_NOTFOUND;
++  }
++
++  for(ii=0; ii<pFs->c.nHash; ii++){
++    CacheEntry *pEntry;
++    for(pEntry=pFs->c.aHash[ii]; pEntry; pEntry=pEntry->pHashNext){
++      if( pEntry->bDirty && pEntry->pCont==pCont ){
++        return SQLITE_NOTFOUND;
++      }
++    }
++  }
++
++  /* bcvManifestInstall() takes ownership of pMan even on an error. */
++  *ppMan = 0;
++  rc = bcvManifestInstall(&pFs->c, pCont, pMan);
++  if( rc==SQLITE_OK ){
++    for(ii=0; ii<pFs->c.nHash; ii++){
++      CacheEntry *pEntry;
++      for(pEntry=pFs->c.aHash[ii]; pEntry; pEntry=pEntry->pHashNext){
++        if( pEntry->pCont==pCont ) pEntry->bStaged = 0;
++      }
++    }
++    /* Cleanup is retryable. Keep the marker if either local DELETE fails so
++    ** a later restart can prove this exact publication again. */
++    if( bcvfsStagedDeleteBefore(&pFs->c, pCont->zName, iMax)==SQLITE_OK ){
++      bcvfsPendingPublishDelete(&pFs->c, pCont->zName);
++    }
++  }
++  return rc;
++}
++
+ 
+ static int bcvfsPollContainer(
+   sqlite3_bcvfs *pFs, 
+@@ -2854,7 +3813,17 @@
+     assert( (rc==SQLITE_OK)==(pMan!=0) );
+     ENTER_VFS_MUTEX; {
+       if( rc==SQLITE_OK ){
+-        rc = bcvManifestUpdate(&pFs->c, pCont, pMan, &zErr);
++        int rcRecover = bcvfsPendingPublishTryInstall(
++            pFs, pCont, &pMan
++        );
++        if( rcRecover!=SQLITE_OK && rcRecover!=SQLITE_NOTFOUND ){
++          rc = rcRecover;
++          if( pMan ) bcvManifestDeref(pMan);
++          pMan = 0;
++        }else if( pMan ){
++          rc = bcvManifestUpdate(&pFs->c, pCont, pMan, &zErr);
++          pMan = 0;
++        }
+       }
+       if( pCont ){
+         bcvfsLeaveState(pFs, pCont);
+@@ -3629,6 +4598,179 @@
+   }
+ }
+ 
++static int bcvfsTableHasColumn(
++  sqlite3 *db,
++  const char *zTable,
++  const char *zColumn,
++  int *pbFound
++){
++  sqlite3_stmt *pStmt = 0;
++  char *zSql = sqlite3_mprintf("PRAGMA table_info(%Q)", zTable);
++  int rc = zSql ? sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0) : SQLITE_NOMEM;
++  int step = SQLITE_DONE;
++  sqlite3_free(zSql);
++  *pbFound = 0;
++  while( rc==SQLITE_OK && (step=sqlite3_step(pStmt))==SQLITE_ROW ){
++    const char *zName = (const char*)sqlite3_column_text(pStmt, 1);
++    if( zName && strcmp(zName, zColumn)==0 ){
++      *pbFound = 1;
++      break;
++    }
++  }
++  if( rc==SQLITE_OK && step!=SQLITE_ROW && step!=SQLITE_DONE ){
++    rc = step;
++  }
++  if( pStmt ){
++    int rc2 = sqlite3_finalize(pStmt);
++    if( rc==SQLITE_OK ) rc = rc2;
++  }
++  return rc;
++}
++
++/*
++** Return true if table zTable contains at least one row. This is used when
++** deciding whether an old pre-sequence metadata schema can be upgraded
++** safely. Such rows cannot be chronologically ordered from DoltLite's
++** metadata rowids, so they must be rejected rather than guessed at.
++*/
++static int bcvfsTableHasRows(
++  sqlite3 *db,
++  const char *zTable,
++  int *pbFound
++){
++  sqlite3_stmt *pStmt = 0;
++  char *zSql = sqlite3_mprintf(
++      "SELECT 1 FROM \"%w\" LIMIT 1", zTable
++  );
++  int rc = zSql ? sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0) : SQLITE_NOMEM;
++  int step = SQLITE_DONE;
++  sqlite3_free(zSql);
++  *pbFound = 0;
++  if( rc==SQLITE_OK ){
++    step = sqlite3_step(pStmt);
++    if( step==SQLITE_ROW ){
++      *pbFound = 1;
++    }else if( step!=SQLITE_DONE ){
++      rc = step;
++    }
++  }
++  if( pStmt ){
++    int rc2 = sqlite3_finalize(pStmt);
++    if( rc==SQLITE_OK ) rc = rc2;
++  }
++  return rc;
++}
++
++/*
++** Upgrade only empty metadata tables created by an earlier draft of the
++** staged-cache patch. DoltLite does not provide insertion-order rowids, so
++** existing pre-sequence staged generations (or pending publication markers)
++** cannot be assigned a safe chronology. Fail closed and require rebuilding
++** that unpublished cache rather than silently choosing a winner.
++*/
++static int bcvfsMigrateStagedSchema(sqlite3 *db){
++  int bFound = 0;
++  int rc;
++
++  rc = bcvfsTableHasColumn(db, "staged", "sequence", &bFound);
++  if( rc==SQLITE_OK && bFound==0 ){
++    rc = bcvfsTableHasRows(db, "staged", &bFound);
++    if( rc==SQLITE_OK && bFound ) return SQLITE_CORRUPT;
++    if( rc==SQLITE_OK ){
++      rc = sqlite3_exec(
++          db, "ALTER TABLE staged ADD COLUMN sequence INTEGER", 0, 0, 0
++      );
++    }
++  }
++  if( rc==SQLITE_OK ){
++    rc = bcvfsTableHasColumn(db, "pending_publish", "maxseq", &bFound);
++  }
++  if( rc==SQLITE_OK && bFound==0 ){
++    int bOld = 0;
++    rc = bcvfsTableHasColumn(db, "pending_publish", "maxrowid", &bOld);
++    if( rc==SQLITE_OK && bOld ){
++      rc = bcvfsTableHasRows(db, "pending_publish", &bFound);
++      if( rc==SQLITE_OK && bFound ) return SQLITE_CORRUPT;
++      if( rc==SQLITE_OK ){
++        rc = sqlite3_exec(
++            db,
++            "ALTER TABLE pending_publish RENAME COLUMN maxrowid TO maxseq",
++            0, 0, 0
++        );
++      }
++    }
++  }
++  if( rc==SQLITE_OK ){
++    sqlite3_stmt *pStmt = 0;
++    int step;
++    rc = sqlite3_prepare_v2(
++        db, "SELECT 1 FROM staged WHERE sequence IS NULL LIMIT 1",
++        -1, &pStmt, 0
++    );
++    if( rc==SQLITE_OK ){
++      step = sqlite3_step(pStmt);
++      if( step==SQLITE_ROW ){
++        rc = SQLITE_CORRUPT;
++      }else if( step!=SQLITE_DONE ){
++        rc = step;
++      }
++    }
++    if( pStmt ){
++      int rc2 = sqlite3_finalize(pStmt);
++      if( rc==SQLITE_OK ) rc = rc2;
++    }
++  }
++  if( rc==SQLITE_OK ){
++    rc = sqlite3_exec(
++        db,
++        "INSERT OR IGNORE INTO staged_sequence(container,sequence) "
++        "SELECT container, MAX(sequence) FROM staged GROUP BY container;"
++        "UPDATE staged_sequence SET sequence=("
++        "  SELECT MAX(sequence) FROM staged "
++        "  WHERE staged.container=staged_sequence.container"
++        ") WHERE sequence < ("
++        "  SELECT MAX(sequence) FROM staged "
++        "  WHERE staged.container=staged_sequence.container"
++        ")",
++        0, 0, 0
++    );
++  }
++  return rc;
++}
++
++/* Reconcile the payload file with the durable slot table before serving any
++** cache hit. A tail beyond the highest recorded slot is orphaned bytes from
++** an interrupted/reverted allocation and is safe to truncate. A short file
++** means a durable mapping can point at bytes that were never written; fail
++** closed rather than serving unrelated or zero-filled data. */
++static int bcvfsReconcileCacheFile(BcvCommon *p, const char *zDir){
++  sqlite3_file *pFile = 0;
++  char *zFile = 0;
++  sqlite3_int64 nFile = 0;
++  sqlite3_int64 nExpected;
++  int rc = SQLITE_OK;
++
++  zFile = sqlite3_mprintf(
++      "%s" BCV_PATH_SEPARATOR "%s", zDir, BCV_CACHEFILE_NAME
++  );
++  if( zFile==0 ) return SQLITE_NOMEM;
++  rc = bcvOpenLocal(zFile, 0, 0, &pFile);
++  if( rc==SQLITE_OK ) rc = pFile->pMethods->xFileSize(pFile, &nFile);
++  if( rc==SQLITE_OK && p->nBlk>0 && p->szBlk<=0 ){
++    rc = SQLITE_CORRUPT;
++  }
++  nExpected = (sqlite3_int64)p->nBlk * p->szBlk;
++  if( rc==SQLITE_OK && nFile<nExpected ){
++    rc = SQLITE_CORRUPT;
++  }else if( rc==SQLITE_OK && nFile>nExpected ){
++    rc = pFile->pMethods->xTruncate(pFile, nExpected);
++    if( rc==SQLITE_OK ) rc = pFile->pMethods->xSync(pFile, 0);
++  }
++  if( pFile ) bcvCloseLocal(pFile);
++  sqlite3_free(zFile);
++  return rc;
++}
++
+ /*
+ ** Usage:
+ **
+@@ -3694,11 +4836,38 @@
+ 
+   p->bdb = db;
+   p->zDir = zFullDir;
++  rc = bcvfsMigrateStagedSchema(db);
+   p->nHash = 128;
+   p->aHash = (CacheEntry**)bcvMallocRc(&rc, sizeof(CacheEntry*)*p->nHash);
+   p->pInsertCont = bcvfsPrepare(&rc, p, BCVFS_INSERT_CONT);
+   p->pInsertBlock = bcvfsPrepare(&rc, p, BCVFS_INSERT_BLOCK);
++  p->pInsertStaged = bcvfsPrepare(&rc, p, BCVFS_INSERT_STAGED);
++  p->pInsertStageSeq = bcvfsPrepare(&rc, p, BCVFS_INSERT_STAGE_SEQ);
++  p->pUpdateStageSeq = bcvfsPrepare(&rc, p, BCVFS_UPDATE_STAGE_SEQ);
++  p->pFindStageSeq = bcvfsPrepare(&rc, p, BCVFS_FIND_STAGE_SEQ);
++  p->pDeleteStaged = bcvfsPrepare(&rc, p, BCVFS_DELETE_STAGED);
++  p->pDeleteStagedCont = bcvfsPrepare(&rc, p, BCVFS_DELETE_STAGED_CONT);
++  p->pDeleteStagedGcCont = bcvfsPrepare(&rc, p, BCVFS_DELETE_STAGED_GC_CONT);
++  p->pFindStaged = bcvfsPrepare(&rc, p, BCVFS_FIND_STAGED);
++  p->pDeleteBlock = bcvfsPrepare(&rc, p, BCVFS_DELETE_BLOCK);
++  p->pInsertPending = bcvfsPrepare(&rc, p, BCVFS_INSERT_PENDING);
++  p->pDeletePending = bcvfsPrepare(&rc, p, BCVFS_DELETE_PENDING);
++  p->pFindPending = bcvfsPrepare(&rc, p, BCVFS_FIND_PENDING);
++  p->pDeleteStagedBefore = bcvfsPrepare(&rc, p, BCVFS_DELETE_STAGED_BEFORE);
++  p->pDeleteStagedGcBefore = bcvfsPrepare(&rc, p, BCVFS_DELETE_STAGED_GC_BEFORE);
++  p->pFindStagedMax = bcvfsPrepare(&rc, p, BCVFS_FIND_STAGED_MAX);
++  p->pFindStagedAfter = bcvfsPrepare(&rc, p, BCVFS_FIND_STAGED_AFTER);
+   p->nMaxCache = BCV_DEFAULT_CACHESIZE;
++  p->nStageWatermark = 90;
++
++  /* A clean block row is only a cache hint. The payload file has no durable
++  ** mapping/journal pair, so a power loss can leave blocksdb with a clean
++  ** object id whose cache slot was never persisted. Keep dirty rows and
++  ** staged mappings (both are needed for local recovery), but force clean
++  ** objects to be fetched again rather than trusting an unverified slot. */
++  bcvExecPrintf(&rc, p->bdb,
++      "DELETE FROM block WHERE blockid IS NOT NULL"
++  );
+ 
+   /* Remove any entries that are not either cloud blocks or dirty blocks */
+   bcvExecPrintf(&rc, p->bdb,
+@@ -3729,6 +4898,9 @@
+   bcvfsFinalize(&rc, p1);
+   if( rc==SQLITE_OK && p->pCList ){
+     p->szBlk = p->pCList->pMan->szBlk;
++    if( p->nMaxCache<p->szBlk || p->nMaxCache%p->szBlk ){
++      rc = SQLITE_MISUSE;
++    }
+   }
+ 
+   /* Load the contents of the "block" table into memory */
+@@ -3764,6 +4936,9 @@
+         }else{
+           pNew->bValid = 1;
+           pNew->bDirty = 1;
++          pNew->pCont = pCont;
++          pNew->iDbId = iDbId;
++          pNew->iDbPos = (int)iDbPos;
+           pNew->nName = NAMEBYTES(pCont->pMan);
+           sqlite3_randomness(pNew->nName, pNew->aName);
+           bcvfsManifestWrite(pManDb, iDbPos, pNew->aName, pNew->nName);
+@@ -3789,6 +4964,126 @@
+     }
+   }
+   bcvfsFinalize(&rc, p4);
++
++  if( rc==SQLITE_OK ){
++    rc = bcvfsReconcileCacheFile(p, zFullDir);
++  }
++
++  /* If the local container row already contains the manifest recorded by a
++  ** pending publication, the remote PUT and the local install both happened
++  ** before the previous process stopped. Retire only the staged rows that
++  ** existed when that publication was prepared. Rows created by a later
++  ** operation remain available for replay. */
++  if( rc==SQLITE_OK ){
++    Container *pCont;
++    for(pCont=p->pCList; pCont && rc==SQLITE_OK; pCont=pCont->pNext){
++      i64 iMax = 0;
++      int rcMatch = bcvfsPendingPublishMatches(
++          p, pCont->zName, pCont->pMan, &iMax
++      );
++      if( rcMatch==SQLITE_OK ){
++        rc = bcvfsStagedDeleteBefore(p, pCont->zName, iMax);
++        if( rc==SQLITE_OK ){
++          rc = bcvfsPendingPublishDelete(p, pCont->zName);
++        }
++      }else if( rcMatch!=SQLITE_NOTFOUND ){
++        rc = rcMatch;
++      }
++    }
++  }
++  /*
++  ** Staged rows are the authoritative source for local generations that
++  ** have no resident cache slot. Load them after the container and block
++  ** tables so both the manifest database and any resident entry exist.
++  */
++  if( rc==SQLITE_OK ){
++    sqlite3_stmt *p5 = 0;
++      p5 = bcvfsPrepare(&rc, p,
++        "SELECT container, db, dbpos, generation, blockid "
++        "FROM staged AS s "
++        "WHERE NOT EXISTS ("
++        "  SELECT 1 FROM staged_gc AS discarded "
++        "  WHERE discarded.container=s.container "
++        "    AND discarded.db=s.db "
++        "    AND discarded.dbpos=s.dbpos "
++        "    AND discarded.generation=s.generation "
++        "    AND discarded.sequence=s.sequence"
++        ") AND NOT EXISTS ("
++        "  SELECT 1 FROM staged AS newer "
++        "  WHERE newer.container=s.container "
++        "    AND newer.db=s.db "
++        "    AND newer.dbpos=s.dbpos "
++        "    AND newer.sequence>s.sequence"
++        ") ORDER BY s.sequence"
++    );
++    while( rc==SQLITE_OK && sqlite3_step(p5)==SQLITE_ROW ){
++      const char *zContainer = (const char*)sqlite3_column_text(p5, 0);
++      i64 iDbId = sqlite3_column_int64(p5, 1);
++      int iDbPos = sqlite3_column_int(p5, 2);
++      const u8 *aGeneration = sqlite3_column_blob(p5, 3);
++      int nGeneration = sqlite3_column_bytes(p5, 3);
++      const u8 *aBlock = sqlite3_column_blob(p5, 4);
++      int nBlock = sqlite3_column_bytes(p5, 4);
++      Container *pCont = bcvfsFindContAlias(p, zContainer, 0);
++      ManifestDb *pManDb = 0;
++      if( pCont ){
++        pManDb = bcvfsFindDatabaseById(pCont->pMan, iDbId);
++      }
++      if( pManDb==0 || nGeneration!=NAMEBYTES(pCont->pMan)
++       || nBlock!=NAMEBYTES(pCont->pMan)
++      ){
++        rc = SQLITE_CORRUPT;
++      }else{
++        CacheEntry *pDirty = 0;
++        int ii;
++        int bPublished = iDbPos<pManDb->nBlkOrig
++                      && 0==memcmp(
++                          &pManDb->aBlkOrig[iDbPos*NAMEBYTES(pCont->pMan)],
++                          aGeneration, nGeneration
++                      );
++
++        /* A successful manifest install persists the new id in aBlkOrig.
++        ** If cleanup of staged metadata was interrupted afterwards, the
++        ** row is already represented by the published manifest and must not
++        ** be replayed as local unpublished state. */
++        if( bPublished ) continue;
++
++        /* A dirty slot is authoritative on restart. In particular, if the
++        ** staged PUT committed but its clean-slot row did not, keeping the
++        ** dirty bytes lets the next explicit upload retry them. It also
++        ** prevents an older staged row from replacing a newer rewrite. */
++        for(ii=0; ii<p->nHash && pDirty==0; ii++){
++          CacheEntry *pTry;
++          for(pTry=p->aHash[ii]; pTry; pTry=pTry->pHashNext){
++            if( pTry->bDirty && pTry->pCont==pCont
++             && pTry->iDbId==iDbId && pTry->iDbPos==iDbPos
++            ){
++              pDirty = pTry;
++              break;
++            }
++          }
++        }
++
++        if( pDirty==0 ){
++          CacheEntry *pEntry;
++          if( bcvfsManifestWrite(
++              pManDb, iDbPos, aGeneration, nGeneration
++          )!=SQLITE_OK ){
++            rc = SQLITE_NOMEM;
++          }else{
++            pEntry = bcvfsHashFind(p, aBlock, nBlock);
++            if( pEntry && pEntry->bDirty==0 ){
++              pEntry->bStaged = 1;
++              pEntry->pCont = pCont;
++              pEntry->iDbId = iDbId;
++              pEntry->iDbPos = iDbPos;
++            }
++          }
++        }
++      }
++    }
++    bcvfsFinalize(&rc, p5);
++  }
+   assert( no_blocks_leaked(p) );
+   return rc;
+ }
+@@ -3818,9 +5113,9 @@
+       rc = sqlite3_open_v2(zBlocksDb, &db, f, 0);
+       sqlite3_free(zBlocksDb);
+       if( rc==SQLITE_OK ){
+-        rc = sqlite3_exec(db, 
++      rc = sqlite3_exec(db,
+             "PRAGMA locking_mode = exclusive;"
+-            "PRAGMA synchronous = OFF;"
++            "PRAGMA synchronous = FULL;"
+             "BEGIN EXCLUSIVE;"
+             BCV_DATABASE_SCHEMA
+             "COMMIT;", 0, 0, pzErr
+@@ -3981,6 +5276,7 @@
+   rc = sqlite3_initialize();
+   pFs = (sqlite3_bcvfs*)bcvMallocRc(&rc, sizeof(sqlite3_bcvfs));
+   if( rc!=SQLITE_OK ) return rc;
++  pFs->c.nStageWatermark = 90;
+   pFs->zName = bcvStrdupRc(&rc, zName);
+   memcpy(&pFs->base, &bcv_template, sizeof(bcv_template));
+   pFs->base.zName = pFs->zName;
+@@ -4077,7 +5373,31 @@
+     ENTER_VFS_MUTEX; {
+       switch( op ){
+         case SQLITE_BCV_CACHESIZE:
+-          pFs->c.nMaxCache = iVal;
++          if( iVal<=0 ){
++            rc = SQLITE_MISUSE;
++          }else if( pFs->c.szBlk>0 && iVal<pFs->c.szBlk ){
++            rc = SQLITE_MISUSE;
++          }else if( pFs->c.szBlk>0
++                 && (iVal/pFs->c.szBlk)*pFs->c.szBlk!=iVal
++          ){
++            rc = SQLITE_MISUSE;
++          }else if( pFs->c.szBlk>0
++                 && pFs->c.nBlk>iVal/pFs->c.szBlk
++          ){
++            /* Reconfiguring a live cache below its high-water mark would
++            ** otherwise orphan slots or dirty payloads. A new cache (or an
++            ** explicit compaction operation) is required to reduce it. */
++            rc = SQLITE_FULL;
++          }else{
++            pFs->c.nMaxCache = iVal;
++          }
++          break;
++        case SQLITE_BCV_STAGEWATERMARK:
++          if( iVal<1 || iVal>100 ){
++            rc = SQLITE_MISUSE;
++          }else{
++            pFs->c.nStageWatermark = (int)iVal;
++          }
+           break;
+         case SQLITE_BCV_NREQUEST:
+           pFs->nRequest = iVal;
+@@ -4145,7 +5465,15 @@
+   bcvExecPrintf(&rc, p->bdb,
+       "DELETE FROM container WHERE name=%Q;"
+       "DELETE FROM pinned WHERE container=%Q;"
++      "DELETE FROM staged WHERE container=%Q;"
++      "DELETE FROM staged_gc WHERE container=%Q;"
++      "DELETE FROM staged_sequence WHERE container=%Q;"
++      "DELETE FROM pending_publish WHERE container=%Q;"
+       , pCont->zName, pCont->zName
++      , pCont->zName
++      , pCont->zName
++      , pCont->zName
++      , pCont->zName
+   );
+   if( rc==SQLITE_OK ){
+     Container **pp;
+@@ -4166,6 +5494,22 @@
+   assert( no_blocks_leaked(p) );
+   sqlite3_finalize(p->pInsertBlock);
+   sqlite3_finalize(p->pInsertCont);
++  sqlite3_finalize(p->pInsertStaged);
++  sqlite3_finalize(p->pInsertStageSeq);
++  sqlite3_finalize(p->pUpdateStageSeq);
++  sqlite3_finalize(p->pFindStageSeq);
++  sqlite3_finalize(p->pDeleteStaged);
++  sqlite3_finalize(p->pDeleteStagedCont);
++  sqlite3_finalize(p->pDeleteStagedGcCont);
++  sqlite3_finalize(p->pFindStaged);
++  sqlite3_finalize(p->pDeleteBlock);
++  sqlite3_finalize(p->pInsertPending);
++  sqlite3_finalize(p->pDeletePending);
++  sqlite3_finalize(p->pFindPending);
++  sqlite3_finalize(p->pDeleteStagedBefore);
++  sqlite3_finalize(p->pDeleteStagedGcBefore);
++  sqlite3_finalize(p->pFindStagedMax);
++  sqlite3_finalize(p->pFindStagedAfter);
+   rc = sqlite3_close(p->bdb);
+   assert( rc==SQLITE_OK );
+ 
+@@ -4658,6 +6002,7 @@
+ 
+ struct UploadCtx2 {
+   sqlite3_bcvfs *pFs;
++  const char *zCont;
+   sqlite3_file *pCacheFile;
+   BcvContainer *pBcv;
+   BcvDispatch *pDisp;
+@@ -4671,6 +6016,7 @@
+   int iDb;                        /* Current entry in aDb */
+   int iBlk;                       /* Last block in aDb[iDb].pDb uploaded */
+   ManifestHash *pMHash;           /* Hash of blocks except aDb[iDb].pDb */
++  i64 iPendingMax;                /* Staged row high-water for this publish */
+ 
+   int rc;                         /* Error code */
+   char *zErrMsg;                  /* Error message */
+@@ -4695,6 +6041,7 @@
+ static void bcvfsUploadRecordAdd(
+   int *pRc, 
+   UploadCtx2 *pCtx, 
++  CacheEntry *pEntry,
+   const u8 *aOld,
+   const u8 *aNew,
+   int nName
+@@ -4704,6 +6051,7 @@
+   if( pNew ){
+     pNew->aOldName = (u8*)&pNew[1];
+     pNew->aNewName = &pNew->aOldName[nName];
++    pNew->pEntry = pEntry;
+     memcpy(pNew->aOldName, aOld, nName);
+     memcpy(pNew->aNewName, aNew, nName);
+     pNew->pNext = pCtx->pRecord;
+@@ -4741,6 +6089,100 @@
+   }
+ }
+ 
++/* Add staged generations superseded by this publication to the manifest's
++** normal delayed-GC list. They are immutable remote objects, so deleting
++** their metadata row alone would leak them forever. The final manifest and
++** its existing delete list are treated as live references; staged rows newer
++** than the publication high-water mark are deliberately left out for a
++** later retry/publication. This helper performs metadata-only work while the
++** caller holds the VFS mutex; it performs no network I/O. */
++static int bcvfsUploadAddStagedGc(UploadCtx2 *pCtx){
++  sqlite3_bcvfs *pFs = pCtx->pFs;
++  Manifest *pMan = pCtx->pMan;
++  sqlite3_stmt *pStmt = 0;
++  ManifestHash *pHash = 0;
++  const int nName = NAMEBYTES(pMan);
++  const int nGC = GCENTRYBYTES(pMan);
++  int rc;
++  int step = SQLITE_DONE;
++
++  rc = bcvMHashBuild(pMan, 1, 0, &pHash);
++  if( rc==SQLITE_OK ){
++    rc = sqlite3_prepare_v2(
++        pFs->c.bdb,
++        "SELECT blockid FROM ("
++        "  SELECT s.blockid FROM staged AS s "
++        "  WHERE s.container=? AND s.sequence<=? "
++        "    AND NOT EXISTS ("
++        "      SELECT 1 FROM staged AS newer "
++        "      WHERE newer.container=s.container "
++        "        AND newer.sequence>? AND newer.blockid=s.blockid"
++        "    )"
++        "  UNION ALL"
++        "  SELECT g.blockid FROM staged_gc AS g "
++        "  WHERE g.container=? AND g.sequence<=?"
++        ")",
++        -1, &pStmt, 0
++    );
++  }
++  if( rc==SQLITE_OK ){
++    sqlite3_bind_text(pStmt, 1, pCtx->zCont, -1, SQLITE_STATIC);
++    sqlite3_bind_int64(pStmt, 2, pCtx->iPendingMax);
++    sqlite3_bind_int64(pStmt, 3, pCtx->iPendingMax);
++    sqlite3_bind_text(pStmt, 4, pCtx->zCont, -1, SQLITE_STATIC);
++    sqlite3_bind_int64(pStmt, 5, pCtx->iPendingMax);
++    while( (step=sqlite3_step(pStmt))==SQLITE_ROW ){
++      const u8 *aBlock = sqlite3_column_blob(pStmt, 0);
++      int nBlock = sqlite3_column_bytes(pStmt, 0);
++      int ii;
++      int bSeen = 0;
++      if( aBlock==0 || nBlock!=nName ){
++        rc = SQLITE_CORRUPT;
++        break;
++      }
++      if( bcvMHashQuery(pHash, (u8*)aBlock, nName) ) continue;
++      for(ii=0; ii<pMan->nDelBlk; ii++){
++        if( 0==memcmp(aBlock, &pMan->aDelBlk[ii*nGC], nName) ){
++          bSeen = 1;
++          break;
++        }
++      }
++      if( bSeen ) continue;
++      {
++        u8 *aDel;
++        if( pMan->bDelFree ){
++          aDel = (u8*)sqlite3_realloc(
++              pMan->aDelBlk, (pMan->nDelBlk+1)*nGC
++          );
++        }else{
++          aDel = (u8*)sqlite3_malloc((pMan->nDelBlk+1)*nGC);
++          if( aDel && pMan->nDelBlk ){
++            memcpy(aDel, pMan->aDelBlk, pMan->nDelBlk*nGC);
++          }
++        }
++        if( aDel==0 ){
++          rc = SQLITE_NOMEM;
++          break;
++        }
++        pMan->aDelBlk = aDel;
++        pMan->bDelFree = 1;
++        memcpy(&aDel[pMan->nDelBlk*nGC], aBlock, nName);
++        bcvPutU64(&aDel[pMan->nDelBlk*nGC+nName], pCtx->iDelTime);
++        pMan->nDelBlk++;
++      }
++    }
++    if( rc==SQLITE_OK && step!=SQLITE_ROW && step!=SQLITE_DONE ){
++      rc = step;
++    }
++  }
++  if( pStmt ){
++    int rc2 = sqlite3_finalize(pStmt);
++    if( rc==SQLITE_OK ) rc = rc2;
++  }
++  bcvMHashFree(pHash);
++  return rc;
++}
++
+ 
+ /*
+ ** Dispatch another block upload for the upload-context passed as the only
+@@ -4782,14 +6224,79 @@
+ 
+   if( pDb && rc==SQLITE_OK ){
+     CacheEntry *pEntry;
++    int bStaged = 0;
++    int bPinned = 0;
+     u8 *aName = &pDb->aBlkLocal[nName*pCtx->iBlk];
+     int nBuf = pMan->szBlk;
+     UploadBlockCtx *p = 0;
+ 
+     ENTER_VFS_MUTEX; {
+       pEntry = bcvfsHashFind(&pFs->c, aName, nName);
++      if( pEntry ){
++        bStaged = pEntry->bStaged;
++        if( bStaged==0 && pEntry->bDirty==0 ){
++          int rcStaged = bcvfsStagedFind(
++              &pFs->c, pCtx->zCont,
++              pCtx->aDb[pCtx->iDb].iDbId, pCtx->iBlk,
++              aName, nName, 0, 0
++          );
++          if( rcStaged==SQLITE_OK ){
++            /* A successful staged PUT may have persisted its clean slot
++            ** mapping before a later path cleared the in-memory marker. */
++            bStaged = 1;
++          }else if( rcStaged!=SQLITE_NOTFOUND ){
++            rc = rcStaged;
++          }
++        }
++        if( bStaged==0 ){
++          /* Keep the source slot alive until the manifest has been
++          ** published and the cache mapping is reconciled. A bounded cache
++          ** may otherwise evict and reuse this entry while the PUT is in
++          ** flight, making the post-PUT UploadRecord point at unrelated
++          ** bytes. */
++          if( pEntry->bDirty==0 ){
++            rc = SQLITE_CORRUPT;
++          }else{
++            bcvfsLruRemoveIf(&pFs->c, pEntry);
++            pEntry->nRef++;
++            bPinned = 1;
++          }
++        }
++      }else{
++        int rcStaged = bcvfsStagedFind(
++            &pFs->c, pCtx->zCont,
++            pCtx->aDb[pCtx->iDb].iDbId, pCtx->iBlk,
++            aName, nName, 0, 0
++        );
++        if( rcStaged==SQLITE_OK ){
++          bStaged = 1;
++        }else if( rcStaged!=SQLITE_NOTFOUND ){
++          rc = rcStaged;
++        }
++      }
+     } LEAVE_VFS_MUTEX;
+-    assert( pEntry );
++
++    if( rc!=SQLITE_OK ){
++      pCtx->rc = rc;
++      return;
++    }
++
++    /*
++    ** A staged block is already durable under its current object id. It
++    ** need not occupy a cache slot, so an upload after eviction can compose
++    ** the final manifest directly from the staged mapping.
++    */
++    if( rc==SQLITE_OK && bStaged ){
++      if( pCtx->iBlk<pDb->nBlkOrig ){
++        bcvfsUploadDeleteBlockIf(pCtx, pCtx->iBlk);
++      }
++      pCtx->rc = SQLITE_OK;
++      return;
++    }
++    if( pEntry==0 ){
++      pCtx->rc = SQLITE_CORRUPT;
++      return;
++    }
+ 
+     p = (UploadBlockCtx*)bcvMallocRc(&rc, sizeof(UploadBlockCtx) + nBuf);
+     if( p ){
+@@ -4808,8 +6315,14 @@
+           *pbRetry = bSkip = 1;
+         }
+       }
+-      bcvfsUploadRecordAdd(&rc, pCtx, aName, aNew, nName);
+-      memcpy(aName, aNew, nName);
++      if( rc==SQLITE_OK ){
++        bcvfsUploadRecordAdd(&rc, pCtx, pEntry, aName, aNew, nName);
++        if( rc==SQLITE_OK ){
++          /* UploadRecord now owns the pin until final reconciliation. */
++          bPinned = 0;
++          memcpy(aName, aNew, nName);
++        }
++      }
+       if( rc==SQLITE_OK && bSkip==0 ){
+         char zFile[BCV_MAX_FSNAMEBYTES];
+         bcvBlockidToText(NAMEBYTES(pCtx->pMan), aNew, zFile);
+@@ -4829,6 +6342,11 @@
+         bcvfsUploadDeleteBlockIf(pCtx, pCtx->iBlk);
+       }
+     }
++    if( bPinned ){
++      ENTER_VFS_MUTEX; {
++        bcvfsEntryUnref(&pFs->c, pEntry);
++      } LEAVE_VFS_MUTEX;
++    }
+   }
+ 
+   pCtx->rc = rc;
+@@ -4941,6 +6459,7 @@
+ 
+     memset(&ctx, 0, sizeof(ctx));
+     ctx.pFs = pFs;
++    ctx.zCont = zCont;
+     ctx.iDelTime = sqlite_timestamp();
+ 
+     /* Put the container in UPLOAD state. Then duplicate the manifest file
+@@ -5112,9 +6631,30 @@
+         }
+       }
+ 
++      /* Record the exact manifest and staged-row high-water before the
++      ** remote PUT. This marker lets restart distinguish a publication
++      ** that reached the object store from an older staged generation,
++      ** even if local cleanup is interrupted. */
++      if( rc==SQLITE_OK ){
++        ENTER_VFS_MUTEX; {
++          rc = bcvfsStagedMax(
++              &pFs->c, pCont->zName, &ctx.iPendingMax
++          );
++          if( rc==SQLITE_OK ){
++            rc = bcvfsUploadAddStagedGc(&ctx);
++          }
++          if( rc==SQLITE_OK ){
++            rc = bcvfsPendingPublishPut(
++                &pFs->c, pCont->zName, ctx.pMan, &ctx.iPendingMax
++            );
++          }
++        } LEAVE_VFS_MUTEX;
++      }
++
+       /* Upload the new manifest to cloud storage */
+       if( rc==SQLITE_OK ){
+         rc = bcvfsUploadManifest(ctx.pDisp, ctx.pBcv, ctx.pMan, &ctx.zErrMsg);
++        if( rc==SQLITE_OK ) BCVFS_TEST_EVENT(4);
+       }
+ 
+       ENTER_VFS_MUTEX; {
+@@ -5124,6 +6664,33 @@
+         UploadRecord *pNext;
+         if( rc==SQLITE_OK ){
+           rc = bcvfsManifestMergeAndInstall(pFs, pCont, &ctx);
++          if( rc==SQLITE_OK ){
++            /*
++            ** The remote manifest is now authoritative. Remove staged
++            ** generations so a restart cannot replay unpublished state over
++            ** the newly installed manifest. A cleanup failure is harmless:
++            ** retaining the rows preserves a retryable object mapping.
++            */
++            int rcStage = bcvfsStagedDeleteBefore(
++                pCommon, pCont->zName, ctx.iPendingMax
++            );
++            if( rcStage!=SQLITE_OK ){
++              bcvfsUploadLog(pFs,
++                  "could not clear staged metadata for %s (%d)",
++                  pCont->zName, rcStage
++              );
++            }else{
++              int rcPending = bcvfsPendingPublishDelete(
++                  pCommon, pCont->zName
++              );
++              if( rcPending!=SQLITE_OK ){
++                bcvfsUploadLog(pFs,
++                    "could not clear pending publication for %s (%d)",
++                    pCont->zName, rcPending
++                );
++              }
++            }
++          }
+         }
+ 
+         /* If any local databases were uploaded by this operation, their
+@@ -5148,16 +6715,40 @@
+         }
+ 
+         for(pRec=ctx.pRecord; pRec; pRec=pNext){
++          CacheEntry *pEntry = pRec->pEntry;
+           pNext = pRec->pNext;
+           if( rc==SQLITE_OK ){
+-            CacheEntry *pEntry = bcvfsHashFind(pCommon, pRec->aOldName, nName);
+-            assert( pEntry && pEntry->bDirty && pEntry->bValid );
+-            pEntry->bDirty = 0;
+-            bcvfsHashRemove(pCommon, pEntry);
+-            memcpy(pEntry->aName, pRec->aNewName, nName);
+-            bcvfsHashAdd(pCommon, pEntry);
+-            bcvfsLruAddIf(pCommon, pEntry);
+-            rc = bcvfsWriteBlock(pFs, 0, 0, pEntry);
++            if( pEntry==0 || pEntry->bValid==0 ){
++              rc = SQLITE_CORRUPT;
++            }else if( pEntry->bDirty
++                   && 0==memcmp(pEntry->aName, pRec->aOldName, nName) ){
++              pEntry->bDirty = 0;
++              bcvfsHashRemove(pCommon, pEntry);
++              memcpy(pEntry->aName, pRec->aNewName, nName);
++              bcvfsHashAdd(pCommon, pEntry);
++              rc = bcvfsWriteBlock(pFs, 0, 0, pEntry);
++              if( rc!=SQLITE_OK ){
++                /* Keep a durable dirty mapping if the clean-row update
++                ** fails. The remote manifest may already be authoritative,
++                ** so losing the local generation here would make restart
++                ** replay an unrelated slot. */
++                pEntry->bDirty = 1;
++                {
++                  int rcDirty = bcvfsWriteBlock(pFs, 0, 0, pEntry);
++                  if( rcDirty!=SQLITE_OK ) rc = rcDirty;
++                }
++              }
++            }else if( pEntry->bDirty==0
++                   && 0==memcmp(pEntry->aName, pRec->aNewName, nName) ){
++              /* A shared dirty block can produce more than one record. The
++              ** first record performs the rename; later records only release
++              ** their additional pin. */
++            }else{
++              rc = SQLITE_CORRUPT;
++            }
++          }
++          if( pEntry ){
++            bcvfsEntryUnref(pCommon, pEntry);
+           }
+           sqlite3_free(pRec);
+         }
+@@ -5378,7 +6969,9 @@
+           pFs->c.pVfs->xDelete(pFs->c.pVfs, zWal, 0);
+ 
+           /* Undirty any dirty blocks */
+-          bcvfsUndirtyBlocks(pFs, nName, pDb, 0);
++          if( rc==SQLITE_OK ){
++            rc = bcvfsUndirtyBlocks(pFs, pCont, nName, pDb, 0);
++          }
+ 
+           if( rc==SQLITE_OK ){
+             rc = bcvDeleteBlocks(pMan, pDb - pMan->aDb);
+@@ -5849,7 +7442,7 @@
+ **   3. Install the old manifest (read from the blocksdb file).
+ */ 
+ int sqlite3_bcvfs_revert(sqlite3_bcvfs *pFs, const char *zCont, char **pzErr){
+-  const char *zSql = "SELECT manifest, etag FROM container WHERE container=?";
++  const char *zSql = "SELECT manifest, etag FROM container WHERE name=?";
+   int rc = SQLITE_OK;
+   char *zErr = 0;
+ 
+@@ -5870,6 +7463,10 @@
+       Manifest *pMan = pCont->pMan;
+       Manifest *pNew = 0;
+ 
++      /* Serialize against staging/upload so staged rows cannot be recreated
++      ** after they are removed for the revert. */
++      bcvfsEnterState(pFs, pCont, CONTAINER_STATE_DELETE);
++
+       /* Load the old manifest from disk */
+       aWrap = bcvMallocRc(&rc, sizeof(FileWrapper)*(pMan->nDb+1));
+       pSel = bcvfsPrepare(&rc, &pFs->c, zSql);
+@@ -5963,8 +7560,8 @@
+       for(ii=0; rc==SQLITE_OK && ii<pMan->nDb; ii++){
+         sqlite3_file *pFd = aWrap[ii].pWalFd;
+         ManifestDb *pDb = &pMan->aDb[ii];
+-        bcvfsUndirtyBlocks(pFs, NAMEBYTES(pMan), pDb, 0);
+-        if( pFd ){
++        rc = bcvfsUndirtyBlocks(pFs, pCont, NAMEBYTES(pMan), pDb, 0);
++        if( rc==SQLITE_OK && pFd ){
+           rc = pFd->pMethods->xTruncate(pFd, 0);
+         }
+       }
+@@ -5995,6 +7592,7 @@
+         bcvManifestDeref(pNew);
+       }
+ 
++      bcvfsLeaveState(pFs, pCont);
+     }
+ 
+   }; LEAVE_VFS_MUTEX;
+@@ -7950,5 +9548,3 @@
+   }
+   return rc;
+ }
+-
+-
+--- a/blockcachevfs.h
++++ b/blockcachevfs.h
+@@ -383,6 +383,12 @@
+ **   The maximum number of entries that the bcv_http_log table may contain.
+ **   A value less than 0 means there is no limit on the number of entries.
+ **   The default value is -1.
++**
++** SQLITE_BCV_STAGEWATERMARK:
++**   The cache occupancy percentage at which dirty blocks are proactively
++**   staged. The value must be between 1 and 100, inclusive. The default is
++**   90. Allocation at the hard cache limit stages blocks regardless of this
++**   setting.
+ */
+ #define SQLITE_BCV_CACHESIZE   1
+ #define SQLITE_BCV_NREQUEST    2
+@@ -390,6 +396,7 @@
+ #define SQLITE_BCV_CURLVERBOSE 4
+ #define SQLITE_BCV_HTTPLOG_TIMEOUT 5
+ #define SQLITE_BCV_HTTPLOG_NENTRY  6
++#define SQLITE_BCV_STAGEWATERMARK  7
+ 
+ /*
+ ** Return true if this VFS is connected to a daemon process. Or false if
+@@ -736,4 +743,3 @@
+ #ifdef __cplusplus
+ } /* end of the extern "C" block */
+ #endif
+-
+

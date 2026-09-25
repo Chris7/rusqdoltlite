@@ -1,16 +1,118 @@
 #![cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 
 use std::{
+    ffi::{c_char, c_int, c_void, CString},
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
-    sync::{Arc, Barrier},
+    ptr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    },
     thread,
     time::Duration,
 };
 
 use rusqlite::{
-    params, Connection, Error, RemoteAuthenticator, RemoteServer, RemoteServerOptions, Result,
+    ffi, params, Connection, Error, RemoteAuthenticator, RemoteServer, RemoteServerOptions, Result,
 };
+
+struct CountingVfsState {
+    underlying: *mut ffi::sqlite3_vfs,
+    accesses: AtomicUsize,
+    opens: AtomicUsize,
+}
+
+struct CountingVfs {
+    raw: Box<ffi::sqlite3_vfs>,
+    state: Box<CountingVfsState>,
+    name: CString,
+}
+
+unsafe extern "C" fn counting_vfs_access(
+    vfs: *mut ffi::sqlite3_vfs,
+    name: *const c_char,
+    flags: c_int,
+    result: *mut c_int,
+) -> c_int {
+    let state = &*((*vfs).pAppData.cast::<CountingVfsState>());
+    state.accesses.fetch_add(1, Ordering::Relaxed);
+    ((*state.underlying)
+        .xAccess
+        .expect("default VFS has xAccess"))(state.underlying, name, flags, result)
+}
+
+unsafe extern "C" fn counting_vfs_open(
+    vfs: *mut ffi::sqlite3_vfs,
+    name: *const c_char,
+    file: *mut ffi::sqlite3_file,
+    flags: c_int,
+    output_flags: *mut c_int,
+) -> c_int {
+    let state = &*((*vfs).pAppData.cast::<CountingVfsState>());
+    state.opens.fetch_add(1, Ordering::Relaxed);
+    ((*state.underlying).xOpen.expect("default VFS has xOpen"))(
+        state.underlying,
+        name,
+        file,
+        flags,
+        output_flags,
+    )
+}
+
+impl CountingVfs {
+    fn new() -> Self {
+        let underlying = unsafe { ffi::sqlite3_vfs_find(ptr::null()) };
+        assert!(!underlying.is_null(), "DoltLite must provide a default VFS");
+        let name = CString::new("rusqdoltlite-counting-vfs").expect("static VFS name");
+        let state = Box::new(CountingVfsState {
+            underlying,
+            accesses: AtomicUsize::new(0),
+            opens: AtomicUsize::new(0),
+        });
+        let mut raw = Box::new(unsafe { *underlying });
+        raw.zName = name.as_ptr();
+        raw.pAppData = (&*state as *const CountingVfsState)
+            .cast_mut()
+            .cast::<c_void>();
+        raw.pNext = ptr::null_mut();
+        raw.xAccess = Some(counting_vfs_access);
+        raw.xOpen = Some(counting_vfs_open);
+        let rc = unsafe { ffi::sqlite3_vfs_register(raw.as_mut(), 0) };
+        assert_eq!(rc, ffi::SQLITE_OK, "register counting VFS");
+        Self { raw, state, name }
+    }
+
+    fn name(&self) -> &str {
+        self.name.to_str().expect("static VFS name")
+    }
+
+    fn accesses(&self) -> usize {
+        self.state.accesses.load(Ordering::Relaxed)
+    }
+
+    fn opens(&self) -> usize {
+        self.state.opens.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for CountingVfs {
+    fn drop(&mut self) {
+        let rc = unsafe { ffi::sqlite3_vfs_unregister(self.raw.as_mut()) };
+        assert_eq!(rc, ffi::SQLITE_OK, "unregister counting VFS");
+    }
+}
+
+fn send_http_request(port: u16, request: &[u8]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to remote server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream.write_all(request).expect("write request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    response
+}
 
 #[test]
 fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
@@ -53,6 +155,56 @@ fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
     assert_eq!(value, "remote value");
     assert_eq!(tracking_hash, branch_hash);
     assert!(server_root.join("origin.db").exists());
+
+    Ok(())
+}
+
+#[test]
+fn remote_server_rejects_unknown_vfs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("server directory");
+
+    let result = RemoteServer::start_with_options(
+        &server_root,
+        &RemoteServerOptions::new().vfs_name("rusqdoltlite-vfs-does-not-exist"),
+    );
+    assert!(matches!(
+        result,
+        Err(Error::SqliteFailure(code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR
+    ));
+}
+
+#[test]
+fn remote_server_uses_named_vfs_for_access_and_open() -> Result<()> {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("server directory");
+    let counting_vfs = CountingVfs::new();
+    let vfs_name = counting_vfs.name().to_owned();
+    let options = RemoteServerOptions::new().vfs_name(vfs_name);
+    let server = RemoteServer::start_with_options(&server_root, &options)?;
+
+    let missing = send_http_request(
+        server.port(),
+        b"GET /missing.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(missing.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    assert!(
+        counting_vfs.accesses() > 0,
+        "the configured VFS must handle remote database existence checks"
+    );
+
+    std::fs::write(server_root.join("existing.db"), b"not a chunk store")
+        .expect("seed existing remote file");
+    let _ = send_http_request(
+        server.port(),
+        b"GET /existing.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        counting_vfs.opens() > 0,
+        "the configured VFS must handle remote ChunkStore opens"
+    );
 
     Ok(())
 }

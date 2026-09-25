@@ -1,6 +1,8 @@
 #![cfg(feature = "blockcachevfs")]
 
+use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Storage};
@@ -45,6 +47,13 @@ fn ensure_google_bucket(endpoint: &str, bucket: &str) {
     );
 }
 
+fn shared_cache() -> &'static Path {
+    static CACHE: OnceLock<tempfile::TempDir> = OnceLock::new();
+    CACHE
+        .get_or_init(|| tempfile::tempdir().expect("shared cache directory"))
+        .path()
+}
+
 fn run_bootstrap(backend: &str) {
     let suffix = unique_suffix();
     let endpoint = match backend {
@@ -70,8 +79,7 @@ fn run_bootstrap(backend: &str) {
         Storage::s3_with_endpoint("test", &container, "us-east-1", &endpoint)
     };
 
-    let cache = tempfile::tempdir().expect("cache directory");
-    let vfs = BlockCacheVfs::builder(cache.path())
+    let vfs = BlockCacheVfs::builder(shared_cache())
         .expect("VFS builder")
         .auth_callback(move |provider, _account, _container| {
             if provider.starts_with("google?") {
@@ -96,7 +104,7 @@ fn run_bootstrap(backend: &str) {
         .expect("upload initial database");
     vfs.initialize_container(&storage)
         .expect_err("existing CBS manifest must not be replaced");
-    let alias = format!("bootstrap_{}", std::process::id());
+    let alias = format!("bootstrap_{backend}_{}", std::process::id());
     vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias))
         .expect("attach created database");
     let control = vfs
@@ -124,7 +132,7 @@ fn run_bootstrap(backend: &str) {
     vfs.detach(&alias).expect("detach created database");
 
     let second_alias = format!("{alias}_again");
-    vfs.attach(&AttachSpec::new(storage).alias(&second_alias))
+    vfs.attach(&AttachSpec::new(storage.clone()).alias(&second_alias))
         .expect("re-attach created database");
     let path = format!("/{second_alias}/bootstrap.sqlite");
     let db = vfs.open(&path).expect("re-open created database");
@@ -133,8 +141,31 @@ fn run_bootstrap(backend: &str) {
         .expect("read uploaded database");
     assert_eq!(count, 2);
     drop(db);
+
+    vfs.delete_database(&second_alias, "bootstrap.sqlite")
+        .expect("delete database locally");
+    vfs.upload(&second_alias).expect("upload database deletion");
     vfs.detach(&second_alias)
-        .expect("detach re-opened database");
+        .expect("detach after database deletion");
+
+    vfs.create_database(&storage, &local_path, "bootstrap.sqlite")
+        .expect("re-create deleted database");
+    let third_alias = format!("{alias}_replacement");
+    vfs.attach(&AttachSpec::new(storage).alias(&third_alias))
+        .expect("attach replacement database");
+    let path = format!("/{third_alias}/bootstrap.sqlite");
+    let db = vfs.open(&path).expect("open replacement database");
+    let count: i64 = db
+        .query_row("SELECT count(*) FROM bootstrap", [], |row| row.get(0))
+        .expect("read replacement database");
+    assert_eq!(count, 1, "replacement database must not retain old rows");
+    let value: String = db
+        .query_row("SELECT value FROM bootstrap", [], |row| row.get(0))
+        .expect("read replacement database value");
+    assert_eq!(value, "ok");
+    drop(db);
+    vfs.detach(&third_alias)
+        .expect("detach replacement database");
 }
 
 #[test]
