@@ -176,6 +176,24 @@ fn remote_server_rejects_unknown_vfs() {
 }
 
 #[test]
+fn remote_server_upload_requires_a_session_owned_attachment() -> Result<()> {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("server directory");
+
+    let mut server = RemoteServer::start(&server_root)?;
+    let error = server
+        .upload()
+        .expect_err("a server without a session cannot publish CBS state");
+    assert!(matches!(
+        error,
+        Error::SqliteFailure(code, _)
+            if code.extended_code == rusqlite::ffi::SQLITE_MISUSE
+    ));
+    Ok(())
+}
+
+#[test]
 fn remote_server_uses_named_vfs_for_access_and_open() -> Result<()> {
     let temp = tempfile::tempdir().expect("tempdir");
     let server_root = temp.path().join("server");

@@ -86,7 +86,9 @@ git -C "$tmp/src" apply \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0011-doltlite-upload-lock.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0012-s3-tls-and-verbose-logging.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0013-bounded-staged-cache.patch" \
-  "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0014-staging-fault-tests.patch"
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0014-serverless-upload-sessions.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0014-staging-fault-tests.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0015-serverless-upload-session-tests.patch"
 
 export BLOCKCACHEVFS_CBS_BASE_CONFIG="$checkout/test/config.tcl"
 cp "$repo_root/tools/blockcachevfs-cbs-config.tcl" "$tmp/test/config.tcl"
@@ -94,11 +96,39 @@ cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_staging_fault.t
   "$tmp/test/bcvfs_staging_fault.test"
 cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_synchronous.test" \
   "$tmp/test/bcvfs_synchronous.test"
+cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_records.test" \
+  "$tmp/test/bcvfs_session_records.test"
+cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_checkpoint.test" \
+  "$tmp/test/bcvfs_session_checkpoint.test"
+cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_overlay.test" \
+  "$tmp/test/bcvfs_session_overlay.test"
+cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_publication.test" \
+  "$tmp/test/bcvfs_session_publication.test"
+cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_acceptance.test" \
+  "$tmp/test/bcvfs_session_acceptance.test"
+cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_gc.test" \
+  "$tmp/test/bcvfs_session_gc.test"
+cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_compaction.test" \
+  "$tmp/test/bcvfs_session_compaction.test"
 # Keep the power-loss regression in the backend matrix without changing the
 # pristine CBS test configuration.
 sed -i '/^[[:space:]]*bcvfs_poll1\.test[[:space:]]*$/a\  bcvfs_staging_fault.test' \
   "$tmp/test/config.tcl"
 sed -i '/^[[:space:]]*bcvfs_staging_fault\.test[[:space:]]*$/a\  bcvfs_synchronous.test' \
+  "$tmp/test/config.tcl"
+sed -i '/^[[:space:]]*bcvfs_synchronous\.test[[:space:]]*$/a\  bcvfs_session_records.test' \
+  "$tmp/test/config.tcl"
+sed -i '/^[[:space:]]*bcvfs_session_records\.test[[:space:]]*$/a\  bcvfs_session_checkpoint.test' \
+  "$tmp/test/config.tcl"
+sed -i '/^[[:space:]]*bcvfs_session_checkpoint\.test[[:space:]]*$/a\  bcvfs_session_overlay.test' \
+  "$tmp/test/config.tcl"
+sed -i '/^[[:space:]]*bcvfs_session_overlay\.test[[:space:]]*$/a\  bcvfs_session_publication.test' \
+  "$tmp/test/config.tcl"
+sed -i '/^[[:space:]]*bcvfs_session_publication\.test[[:space:]]*$/a\  bcvfs_session_acceptance.test' \
+  "$tmp/test/config.tcl"
+sed -i '/^[[:space:]]*bcvfs_session_acceptance\.test[[:space:]]*$/a\  bcvfs_session_gc.test' \
+  "$tmp/test/config.tcl"
+sed -i '/^[[:space:]]*bcvfs_session_gc\.test[[:space:]]*$/a\  bcvfs_session_compaction.test' \
   "$tmp/test/config.tcl"
 
 suffix=${BLOCKCACHEVFS_TEST_SUFFIX:-$(date +%s)-$$}
@@ -182,4 +212,40 @@ fi
   CFLAGS="${CFLAGS:-} -DSQLITE_BCVFS_TESTING" \
   ./configure >/dev/null)
 (cd "$tmp" && make -j"${JOBS:-2}" bcvtclsqlite)
-(cd "$tmp" && ./bcvtclsqlite test/runtests.tcl -config 'rusqdoltlite_*')
+test_log="$tmp/cbs-test-output.log"
+set +e
+if [ -n "${BLOCKCACHEVFS_TEST_PATTERN:-}" ]; then
+  (cd "$tmp" && ./bcvtclsqlite test/runtests.tcl \
+      -config 'rusqdoltlite_*' "$BLOCKCACHEVFS_TEST_PATTERN") \
+    >"$test_log" 2>&1
+else
+  (cd "$tmp" && ./bcvtclsqlite test/runtests.tcl -config 'rusqdoltlite_*') \
+    >"$test_log" 2>&1
+fi
+test_rc=$?
+set -e
+cat "$test_log"
+if [ "$test_rc" -ne 0 ]; then
+  echo "CBS Tcl test process failed with status $test_rc" >&2
+  exit "$test_rc"
+fi
+
+# The upstream Tcl harness prints its failure count but intentionally leaves
+# the process status at zero. Treat a missing summary or any nonzero count as
+# a runner failure so CI cannot report a broken backend suite as successful.
+summary_line=$(grep -E '^[0-9]+ errors from [0-9]+ tests$' "$test_log" | tail -n 1 || true)
+if [ -z "$summary_line" ]; then
+  echo "CBS Tcl test suite produced no final result summary" >&2
+  exit 1
+fi
+n_errors=${summary_line%% errors from *}
+case "$n_errors" in
+  ''|*[!0-9]*)
+    echo "CBS Tcl test suite produced an invalid result summary: $summary_line" >&2
+    exit 1
+    ;;
+esac
+if [ "$n_errors" -ne 0 ]; then
+  echo "CBS Tcl test suite reported failures: $summary_line" >&2
+  exit 1
+fi

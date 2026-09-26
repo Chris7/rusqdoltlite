@@ -1,0 +1,4534 @@
+diff --git a/blockcachevfstest.c b/blockcachevfstest.c
+index 184169b..fd8b12e 100644
+--- a/blockcachevfstest.c
++++ b/blockcachevfstest.c
+@@ -18,6 +18,8 @@
+ #include "sqlite3.h"
+ #include <assert.h>
+ #include <string.h>
++#include <stdio.h>
++#include <openssl/sha.h>
+ #include <stdlib.h>
+ #if !defined(_WIN32)
+ # include <unistd.h>
+@@ -346,8 +348,6 @@ static int test_bcv_detach(
+   return TCL_OK;
+ }
+ 
+-#include "blockcachevfs.h"
+-
+ typedef struct TestBcv TestBcv;
+ struct TestBcv {
+   sqlite3_bcv *pBcv;
+@@ -428,6 +428,8 @@ static int test_bcv_cmd(
+     { "errmsg",   0, "" },                  /* 8 */
+     { "upload",   2, "LOCAL REMOTE" },      /* 9 */
+     { "cleanup",  1, "MS" },                /* 10 */
++    { "put",      2, "LOCAL REMOTE" },      /* 11 */
++    { "get",      2, "REMOTE LOCAL" },      /* 12 */
+     { 0, 0 }
+   };
+   int iCmd = 0;
+@@ -612,6 +614,20 @@ static int test_bcv_cmd(
+       Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+       break;
+     };
++    case 11: {      /* put */
++      rc = sqlite3_bcv_test_put_file(
++          p->pBcv,Tcl_GetString(objv[2]),Tcl_GetString(objv[3])
++      );
++      Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
++      break;
++    };
++    case 12: {      /* get */
++      rc = sqlite3_bcv_test_get_file(
++          p->pBcv,Tcl_GetString(objv[2]),Tcl_GetString(objv[3])
++      );
++      Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
++      break;
++    };
+     default:
+       assert( 0 );
+   }
+@@ -1025,6 +1041,68 @@ struct TestBcvfs {
+   Tcl_Interp *interp;
+ };
+ 
++static int test_bcvfs_session_checkpoint(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++);
++
++static int test_bcvfs_session_overlay(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++);
++
++static int test_bcvfs_session_publication(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++);
++
++static int test_bcvfs_session_acceptance(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++);
++
++static int test_bcvfs_session_attempt_marker(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++);
++
++static int test_bcvfs_session_expired_records(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++);
++
++static int test_bcvfs_session_candidate(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++);
++static int test_bcvfs_session_compaction(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++);
++
++static int test_bcvfs_session_backend(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++);
++
+ static void bcvfsDestroy(ClientData clientData){
+   TestBcvfs *pTest = (TestBcvfs*)clientData;
+   sqlite3_bcvfs_destroy(pTest->pFs);
+@@ -1273,7 +1351,16 @@ static int bcvfsCommand(
+     "delete",           /* 10 */
+     "prefetch_new",     /* 11 */
+     "revert",           /* 12 */
+-    0,                             
++    "session_backend_test", /* 13 */
++    "session_checkpoint_test", /* 14 */
++    "session_overlay_test", /* 15 */
++    "session_publication_test", /* 16 */
++    "session_acceptance_test", /* 17 */
++    "session_attempt_marker_test", /* 18 */
++    "session_expired_records_test", /* 19 */
++    "session_candidate_test", /* 20 */
++    "session_compaction_test", /* 21 */
++    0,
+   };
+   TestBcvfs *pTest = (TestBcvfs*)clientData;
+   int iCmd;
+@@ -1674,13 +1761,4385 @@ static int bcvfsCommand(
+       }
+       break;
+     }
++
++    case 13: assert( !strcmp("session_backend_test", azSub[iCmd]) ); {
++      return test_bcvfs_session_backend(clientData, interp, objc, objv);
++    }
++    case 14: assert( !strcmp("session_checkpoint_test", azSub[iCmd]) ); {
++      return test_bcvfs_session_checkpoint(clientData, interp, objc, objv);
++    }
++    case 15: assert( !strcmp("session_overlay_test", azSub[iCmd]) ); {
++      return test_bcvfs_session_overlay(clientData, interp, objc, objv);
++    }
++    case 16: assert( !strcmp("session_publication_test", azSub[iCmd]) ); {
++      return test_bcvfs_session_publication(clientData, interp, objc, objv);
++    }
++    case 17: assert( !strcmp("session_acceptance_test", azSub[iCmd]) ); {
++      return test_bcvfs_session_acceptance(clientData, interp, objc, objv);
++    }
++    case 18: assert( !strcmp("session_attempt_marker_test", azSub[iCmd]) ); {
++      return test_bcvfs_session_attempt_marker(clientData, interp, objc, objv);
++    }
++    case 19: assert( !strcmp("session_expired_records_test", azSub[iCmd]) ); {
++      return test_bcvfs_session_expired_records(clientData, interp, objc, objv);
++    }
++    case 20: assert( !strcmp("session_candidate_test", azSub[iCmd]) ); {
++      return test_bcvfs_session_candidate(clientData, interp, objc, objv);
++    }
++    case 21: assert( !strcmp("session_compaction_test", azSub[iCmd]) ); {
++      return test_bcvfs_session_compaction(clientData, interp, objc, objv);
++    }
+   }
+   return TCL_OK;
+ }
+ 
++#include <openssl/sha.h>
++
++static int bcvfsSessionTestHeadBody(
++  unsigned char *aOut,
++  int nOut,
++  const char *zEtag,
++  const unsigned char *aCheckpointHash,
++  const unsigned char *aCandidateHash
++){
++  static const unsigned char aMagic[] = {'B','C','V','H','D','0','2','\0'};
++  int nEtag = zEtag ? (int)strlen(zEtag) : 0;
++  if( aOut==0 || nOut<116+nEtag || nEtag>SQLITE_BCVFS_SESSION_ETAG_MAX_BYTES ) return 0;
++  memset(aOut,0,116);
++  memcpy(aOut,aMagic,sizeof(aMagic));
++  if( aCheckpointHash ) memcpy(&aOut[12],aCheckpointHash,SQLITE_BCVFS_SESSION_HASH_BYTES);
++  else memset(&aOut[12],0,SQLITE_BCVFS_SESSION_HASH_BYTES);
++  if( aCandidateHash ) memcpy(&aOut[44],aCandidateHash,SQLITE_BCVFS_SESSION_HASH_BYTES);
++  else memset(&aOut[44],0,SQLITE_BCVFS_SESSION_HASH_BYTES);
++  bcvPutU32(&aOut[112],(u32)nEtag);
++  if( nEtag ) memcpy(&aOut[116],zEtag,nEtag);
++  return 116+nEtag;
++}
++
++static int bcvfsSessionTestCheckpointBody(
++  unsigned char *aOut,
++  int nOut,
++  sqlite3_uint64 iFileSize,
++  const char *zEtag,
++  const unsigned char *aManifest,
++  int nManifest
++){
++  static const unsigned char aMagic[] = {'B','C','V','C','P','0','1','\0'};
++  int nEtag = zEtag ? (int)strlen(zEtag) : 0;
++  if( aOut==0 || aManifest==0 || nManifest<=0
++   || nEtag>SQLITE_BCVFS_SESSION_ETAG_MAX_BYTES
++   || nManifest>SQLITE_BCVFS_SESSION_BODY_MAX_BYTES
++   || nOut<24+nEtag+nManifest
++  ) return 0;
++  memcpy(aOut,aMagic,sizeof(aMagic));
++  bcvPutU64(&aOut[8],(u64)iFileSize);
++  bcvPutU32(&aOut[16],(u32)nManifest);
++  bcvPutU32(&aOut[20],(u32)nEtag);
++  if( nEtag ) memcpy(&aOut[24],zEtag,nEtag);
++  memcpy(&aOut[24+nEtag],aManifest,nManifest);
++  return 24+nEtag+nManifest;
++}
++
+ /*
+-** sqlite3_bcvfs_create DIR VFSNAME
++** sqlite3_bcvfs_session_record_test
++**
++** Exercise the local format and access-boundary checks without requiring a
++** cloud emulator.  Remote conditional PUTs are covered by the backend matrix;
++** this command keeps malformed, cross-scope and path-construction cases in
++** the ordinary CBS test binary as well.
++*/
++static int test_bcvfs_session_record(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  sqlite3_bcvfs_session_record in;
++  sqlite3_bcvfs_session_record out;
++  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aScope2[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aScopeRotated[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3Scope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3Rotated[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3OtherTarget[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3EndpointSlash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3EndpointNoSlash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3RegionOther[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3Default[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3MaxResults[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3ContainerSlash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3ContainerNoSlash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aS3ContainerDoubleSlash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aGoogleDefault[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aGoogleMaxResults[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aStorage[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char *aEncoded = 0;
++  unsigned char *aTooBig = 0;
++  unsigned char aHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  char zName[256];
++  char *zErr = 0;
++  int nEncoded = 0;
++  int rc;
++  int rcRet = TCL_OK;
++  unsigned char aBody[256];
++  static const unsigned char aManifest[] = "serialized-cbs-manifest";
++  int nBody;
++  const char *zUuid = "550e8400-e29b-41d4-a716-446655440000";
++
++  (void)clientData;
++  if( objc!=1 ){
++    Tcl_WrongNumArgs(interp, 1, objv, "");
++    return TCL_ERROR;
++  }
++#define SESSION_TEST_FAIL(zMsg) do { \
++    Tcl_SetObjResult(interp, Tcl_NewStringObj((zMsg), -1)); \
++    rcRet = TCL_ERROR; \
++    goto session_test_done; \
++  } while(0)
++#define SESSION_TEST_REQUIRE(cond,zMsg) \
++  do { if(!(cond)) SESSION_TEST_FAIL(zMsg); } while(0)
++
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "google?api=json", "project-old", "bucket/prefix", "principal-1",
++      "db/main", "read,write,commit", aScope, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0, "scope hash failed");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "google?api=json", "project-new", "bucket/prefix", "principal-1",
++      "db/main", "read,write,other", aScope2, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0, "second scope hash failed");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "google?api=json", "project-rotated", "bucket/prefix", "principal-1",
++      "db/main", "read,write,commit", aScopeRotated, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && !memcmp(aScope,aScopeRotated,sizeof(aScope)),
++      "Google project credential rotation changed scope unexpectedly");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?region=us-east-1", "access-old", "bucket/prefix", "principal-1",
++      "db/main", "read,write,commit", aS3Scope, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0, "S3 scope hash failed");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?region=us-east-1", "access-rotated", "bucket/prefix", "principal-1",
++      "db/main", "read,write,commit", aS3Rotated, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && !memcmp(aS3Scope,aS3Rotated,sizeof(aS3Scope)),
++      "S3 credential rotation changed scope unexpectedly");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?region=us-east-1", "access-rotated", "other-bucket/prefix",
++      "principal-1", "db/main", "read,write,commit", aS3OtherTarget, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && memcmp(aS3Scope,aS3OtherTarget,sizeof(aS3Scope)),
++      "S3 target change did not change scope");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "S3?REGION=us-east-1&ENDPOINT=https://storage.example.test///",
++      "access-rotated", "bucket/prefix", "principal-1", "db/main",
++      "read,write,commit", aS3EndpointSlash, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0, "canonical S3 scope failed");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?endpoint=https://storage.example.test&region=us-east-1",
++      "access-new", "bucket/prefix", "principal-1", "db/main",
++      "read,write,commit", aS3EndpointNoSlash, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && !memcmp(aS3EndpointSlash,aS3EndpointNoSlash,sizeof(aS3Scope)),
++      "equivalent S3 endpoints split the scope");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?endpoint=https://storage.example.test&region=eu-west-1",
++      "access-new", "bucket/prefix", "principal-1", "db/main",
++      "read,write,commit", aS3RegionOther, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && memcmp(aS3EndpointNoSlash,aS3RegionOther,sizeof(aS3Scope)),
++      "different S3 regions share a scope");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3", "access-new", "bucket/prefix", "principal-1", "db/main",
++      "read,write,commit", aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0, "default S3 scope failed");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?maxresults=17&region=us-east-1", "access-new", "bucket/prefix",
++      "principal-1", "db/main", "read,write,commit", aS3MaxResults, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && !memcmp(aS3Default,aS3MaxResults,sizeof(aS3Scope)),
++      "S3 defaults or listing tuning split the scope");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?region=us-east-1", "access-new", "bucket/prefix/",
++      "principal-1", "db/main", "read,write,commit", aS3ContainerSlash,
++      &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0, "slash S3 scope failed");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?region=us-east-1", "access-new", "bucket/prefix",
++      "principal-1", "db/main", "read,write,commit", aS3ContainerNoSlash,
++      &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && !memcmp(aS3ContainerSlash,aS3ContainerNoSlash,sizeof(aS3Scope)),
++      "equivalent S3 prefixes split the scope");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?region=us-east-1", "access-new", "bucket/prefix//",
++      "principal-1", "db/main", "read,write,commit", aS3ContainerDoubleSlash,
++      &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && memcmp(aS3ContainerSlash,aS3ContainerDoubleSlash,sizeof(aS3Scope)),
++      "repeated S3 prefix separators were collapsed");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "google", "project-new", "bucket/prefix", "principal-1", "db/main",
++      "read,write,commit", aGoogleDefault, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0, "default Google scope failed");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "google?api=json&maxresults=17", "project-new", "bucket/prefix",
++      "principal-1", "db/main", "read,write,commit", aGoogleMaxResults,
++      &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && !memcmp(aGoogleDefault,aGoogleMaxResults,sizeof(aScope)),
++      "Google transport or listing tuning split the scope");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?unknown=alias", "access-new", "bucket/prefix", "principal-1",
++      "db/main", "read,write,commit", aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "unknown S3 selector was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "unknown?maxresults=1", "account", "bucket/prefix", "principal-1",
++      "db/main", "read,write,commit", aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc!=SQLITE_OK, "unknown storage provider was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?region=US-EAST-1", "access-new", "bucket/prefix", "principal-1",
++      "db/main", "read,write,commit", aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "noncanonical S3 region was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?endpoint=https://Storage.example.test", "access-new",
++      "bucket/prefix", "principal-1", "db/main", "read,write,commit",
++      aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "noncanonical endpoint host was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?endpoint=https://storage.example.test/a/../b", "access-new",
++      "bucket/prefix", "principal-1", "db/main", "read,write,commit",
++      aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "noncanonical endpoint path was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?endpoint=https://storage.example.test:0081", "access-new",
++      "bucket/prefix", "principal-1", "db/main", "read,write,commit",
++      aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "leading-zero endpoint port was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?endpoint=https://0177.0.0.1:81", "access-new",
++      "bucket/prefix", "principal-1", "db/main", "read,write,commit",
++      aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "noncanonical IPv4 endpoint was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "s3?region=us-east-1&endpoint=https://s3.us-east-1.amazonaws.com",
++      "access-new", "bucket/prefix", "principal-1", "db/main",
++      "read,write,commit", aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "AWS endpoint alias was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      "azure?emulator=127.0.0.1:10000", "account", "bucket/prefix",
++      "principal-1", "db/main", "read,write,commit", aS3Default, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "unfenced Azure selector was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  /* The operation scope above intentionally differs, so the hashes must not
++  ** compare equal.  This also catches accidental separator concatenation. */
++  if( !memcmp(aScope,aScope2,sizeof(aScope)) ) SESSION_TEST_FAIL(
++      "operation scope was not bound into hash"
++  );
++  rc = sqlite3_bcvfs_session_storage_scope_hash(
++      "google?api=json", "project", "bucket/prefix", aStorage, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0, "storage scope hash failed");
++
++  nBody = bcvfsSessionTestCheckpointBody(
++      aBody,sizeof(aBody),4096,"base-etag",aManifest,sizeof(aManifest)-1
++  );
++  SESSION_TEST_REQUIRE(nBody>0, "checkpoint body construction failed");
++
++  memset(&in, 0, sizeof(in));
++  in.eType = SQLITE_BCVFS_SESSION_CHECKPOINT;
++  in.eState = SQLITE_BCVFS_SESSION_OPEN;
++  in.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++  in.iSequence = 7;
++  in.iCreated = 1000;
++  in.iExpires = 2000;
++  memcpy(in.zSessionId, zUuid, strlen(zUuid)+1);
++  memcpy(in.aScopeHash, aScope, sizeof(aScope));
++  in.aPredecessorHash[0] = 0xA5;
++  in.aOperationId[0] = 0x5A;
++  in.aBody = aBody;
++  in.nBody = nBody;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &in, &aEncoded, &nEncoded, aHash, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0 && aEncoded!=0, "record encode failed");
++  rc = sqlite3_bcvfs_session_record_decode(
++      aEncoded,nEncoded,zUuid,aScope,&out,&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0
++      && out.eType==in.eType && out.iSequence==in.iSequence
++      && out.nBody==in.nBody && !memcmp(out.aBody,aBody,in.nBody)
++      && !memcmp(out.aRecordHash,aHash,sizeof(aHash)), "record decode failed");
++  SESSION_TEST_REQUIRE(sqlite3_bcvfs_session_record_is_expired(&out,1999)==0
++      && sqlite3_bcvfs_session_record_is_expired(&out,2000)!=0,
++      "expiration check failed");
++  {
++    sqlite3_bcvfs_session_record invalid = in;
++    unsigned char *aInvalid = 0;
++    memset(invalid.aOperationId,0,sizeof(invalid.aOperationId));
++    rc = sqlite3_bcvfs_session_record_encode(
++        &invalid,&aInvalid,&nEncoded,aHash,&zErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_MISUSE && aInvalid==0,
++        "zero checkpoint operation ID was accepted"
++    );
++    sqlite3_free(zErr);
++    zErr = 0;
++    sqlite3_free(aInvalid);
++  }
++  sqlite3_free(aEncoded);
++  aEncoded = 0;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &in,&aEncoded,&nEncoded,aHash,&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && aEncoded!=0,
++      "checkpoint record restore before operation-ID decode failed");
++  {
++    SHA256_CTX sha;
++    memset(&aEncoded[128],0,SQLITE_BCVFS_SESSION_HASH_BYTES);
++    SHA256_Init(&sha);
++    SHA256_Update(
++        &sha,aEncoded,
++        nEncoded-SQLITE_BCVFS_SESSION_HASH_BYTES
++    );
++    SHA256_Final(
++        &aEncoded[nEncoded-SQLITE_BCVFS_SESSION_HASH_BYTES],&sha
++    );
++    rc = sqlite3_bcvfs_session_record_decode(
++        aEncoded,nEncoded,zUuid,aScope,&out,&zErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_CORRUPT, "zero checkpoint operation ID decoded"
++    );
++    sqlite3_free(zErr);
++    zErr = 0;
++    sqlite3_free(aEncoded);
++    aEncoded = 0;
++    rc = sqlite3_bcvfs_session_record_encode(
++        &in,&aEncoded,&nEncoded,aHash,&zErr
++    );
++    SESSION_TEST_REQUIRE(rc==SQLITE_OK && aEncoded!=0,
++        "checkpoint record restore failed");
++  }
++  rc = sqlite3_bcvfs_session_record_decode(
++      aEncoded,nEncoded,zUuid,aScope,&out,&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK && zErr==0,
++      "checkpoint record restore decode failed");
++  {
++    sqlite3_bcvfs_session_body body;
++    rc = sqlite3_bcvfs_session_body_decode(
++        out.eType,out.eState,out.zSessionId,out.aBody,out.nBody,&body,&zErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_OK && body.iFileSize==4096
++            && body.nManifest==(int)sizeof(aManifest)-1
++            && body.nBaseManifestETag==9
++            && !memcmp(body.aManifest,aManifest,body.nManifest),
++        "typed checkpoint body decode failed"
++    );
++  }
++  {
++    unsigned char aBadBody[256];
++    sqlite3_bcvfs_session_body body;
++    memcpy(aBadBody,aBody,nBody);
++    bcvPutU32(&aBadBody[16],0xFFFFFFFFu);
++    rc = sqlite3_bcvfs_session_body_decode(
++        SQLITE_BCVFS_SESSION_CHECKPOINT,SQLITE_BCVFS_SESSION_OPEN,
++        zUuid,aBadBody,nBody,&body,&zErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_CORRUPT, "malformed checkpoint length was accepted"
++    );
++    sqlite3_free(zErr);
++    zErr = 0;
++  }
++  {
++    unsigned char aEmptyBody[256];
++    sqlite3_bcvfs_session_body body;
++    int nEmptyBody = bcvfsSessionTestCheckpointBody(
++        aEmptyBody,sizeof(aEmptyBody),4096,"",
++        aManifest,sizeof(aManifest)-1
++    );
++    rc = sqlite3_bcvfs_session_body_decode(
++        SQLITE_BCVFS_SESSION_CHECKPOINT,SQLITE_BCVFS_SESSION_OPEN,
++        zUuid,aEmptyBody,nEmptyBody,&body,&zErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_CORRUPT, "empty base manifest ETag was accepted"
++    );
++    sqlite3_free(zErr);
++    zErr = 0;
++  }
++
++  aEncoded[SQLITE_BCVFS_SESSION_RECORD_HEADER_BYTES] ^= 0x01;
++  rc = sqlite3_bcvfs_session_record_decode(
++      aEncoded,nEncoded,zUuid,aScope,&out,&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_CORRUPT, "tampered record was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  aEncoded[SQLITE_BCVFS_SESSION_RECORD_HEADER_BYTES] ^= 0x01;
++  rc = sqlite3_bcvfs_session_record_decode(
++      aEncoded,nEncoded,zUuid,aScope2,&out,&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_AUTH, "cross-scope record was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_record_decode(
++      aEncoded,nEncoded,"550e8400-e29b-41d4-a716-446655440001",aScope,&out,&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_AUTH, "cross-session record was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++
++  rc = sqlite3_bcvfs_session_object_name(
++      SQLITE_BCVFS_SESSION_HEAD,zUuid,0,zName,sizeof(zName),&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK
++      && !strcmp(zName,"bcv-session/v1/head/550e8400-e29b-41d4-a716-446655440000.bcv"),
++      "session head key was not canonical");
++  rc = sqlite3_bcvfs_session_object_name(
++      SQLITE_BCVFS_SESSION_CHECKPOINT,zUuid,aHash,zName,sizeof(zName),&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK
++      && strstr(zName,"bcv-session/v1/checkpoint/550e8400-e29b-41d4-a716-446655440000/")==zName,
++      "checkpoint key escaped its namespace");
++  rc = sqlite3_bcvfs_session_object_name(
++      SQLITE_BCVFS_SESSION_PUBLICATION,0,aStorage,zName,sizeof(zName),&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_OK
++      && strstr(zName,"bcv-session/v1/publication/")==zName,
++      "publication key escaped its namespace");
++  rc = sqlite3_bcvfs_session_object_name(
++      SQLITE_BCVFS_SESSION_HEAD,"../550e8400-e29b-41d4-a716-446655440000",0,
++      zName,sizeof(zName),&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "path-like UUID was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_object_name(
++      SQLITE_BCVFS_SESSION_HEAD,"00000000-0000-0000-0000-000000000000",0,
++      zName,sizeof(zName),&zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_MISUSE, "nil UUID object key was accepted");
++  sqlite3_free(zErr);
++  zErr = 0;
++  sqlite3_free(aEncoded);
++  aEncoded = 0;
++
++  {
++    sqlite3_bcvfs_session_record invalid = in;
++    unsigned char *aInvalid = 0;
++    invalid.eType = SQLITE_BCVFS_SESSION_CHECKPOINT;
++    invalid.eState = SQLITE_BCVFS_SESSION_COMMITTED;
++    invalid.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS;
++    rc = sqlite3_bcvfs_session_record_encode(
++        &invalid,&aInvalid,&nEncoded,aHash,&zErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_MISUSE && aInvalid==0,
++        "invalid checkpoint state was accepted"
++    );
++    sqlite3_free(zErr);
++    zErr = 0;
++    sqlite3_free(aInvalid);
++  }
++
++  {
++    sqlite3_bcvfs_session_record accepted = in;
++    unsigned char aHeadBody[128];
++    unsigned char aCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++    unsigned char aCandidateHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++    int nHeadBody;
++    memset(aCheckpointHash,0x42,sizeof(aCheckpointHash));
++    memset(aCandidateHash,0x24,sizeof(aCandidateHash));
++    nHeadBody = bcvfsSessionTestHeadBody(
++        aHeadBody,sizeof(aHeadBody),"base-etag",aCheckpointHash,0
++    );
++    accepted.eType = SQLITE_BCVFS_SESSION_HEAD;
++    accepted.eState = SQLITE_BCVFS_SESSION_ACCEPTED;
++    accepted.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS;
++    accepted.aBody = aHeadBody;
++    accepted.nBody = nHeadBody;
++    rc = sqlite3_bcvfs_session_record_encode(
++        &accepted,&aEncoded,&nEncoded,aHash,&zErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_OK && aEncoded!=0,
++        "accepted-success head state was rejected"
++    );
++    sqlite3_free(aEncoded);
++    aEncoded = 0;
++    nHeadBody = bcvfsSessionTestHeadBody(
++        aHeadBody,sizeof(aHeadBody),"base-etag",aCheckpointHash,aCandidateHash
++    );
++    accepted.eState = SQLITE_BCVFS_SESSION_PUBLISHING;
++    accepted.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++    accepted.aBody = aHeadBody;
++    accepted.nBody = nHeadBody;
++    rc = sqlite3_bcvfs_session_record_encode(
++        &accepted,&aEncoded,&nEncoded,aHash,&zErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_OK && aEncoded!=0,
++        "publishing head candidate was rejected"
++    );
++    {
++      sqlite3_bcvfs_session_body body;
++      rc = sqlite3_bcvfs_session_body_decode(
++          accepted.eType,accepted.eState,accepted.zSessionId,
++          accepted.aBody,accepted.nBody,&body,&zErr
++      );
++      SESSION_TEST_REQUIRE(
++          rc==SQLITE_OK
++              && !memcmp(body.aCandidateManifestHash,aCandidateHash,sizeof(aCandidateHash)),
++          "publishing head candidate was not decoded"
++      );
++    }
++    sqlite3_free(aEncoded);
++    aEncoded = 0;
++    {
++      static const int aState[] = {
++        SQLITE_BCVFS_SESSION_ACCEPTED,
++        SQLITE_BCVFS_SESSION_PUBLISHING,
++        SQLITE_BCVFS_SESSION_COMMITTED
++      };
++      static const int aOutcome[] = {
++        SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS,
++        SQLITE_BCVFS_SESSION_OUTCOME_NONE,
++        SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS
++      };
++      unsigned char *aInvalid = 0;
++      int ii;
++      memset(accepted.aOperationId,0,sizeof(accepted.aOperationId));
++      for(ii=0; ii<(int)(sizeof(aState)/sizeof(aState[0])); ii++){
++        accepted.eState = aState[ii];
++        accepted.eOutcome = aOutcome[ii];
++        rc = sqlite3_bcvfs_session_record_encode(
++            &accepted,&aInvalid,&nEncoded,aHash,&zErr
++        );
++        SESSION_TEST_REQUIRE(
++            rc==SQLITE_MISUSE && aInvalid==0,
++            "zero request-head operation ID was accepted"
++        );
++        sqlite3_free(zErr);
++        zErr = 0;
++        sqlite3_free(aInvalid);
++        aInvalid = 0;
++      }
++    }
++  }
++
++  {
++    sqlite3_bcvfs_session_record invalid = in;
++    unsigned char *aInvalid = 0;
++    memset(invalid.zSessionId,'0',36);
++    invalid.zSessionId[8] = invalid.zSessionId[13] = '-';
++    invalid.zSessionId[18] = invalid.zSessionId[23] = '-';
++    rc = sqlite3_bcvfs_session_record_encode(
++        &invalid,&aInvalid,&nEncoded,aHash,&zErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_MISUSE && aInvalid==0,
++        "nil UUID record was accepted"
++    );
++    sqlite3_free(zErr);
++    zErr = 0;
++    sqlite3_free(aInvalid);
++  }
++
++  aTooBig = (unsigned char*)sqlite3_malloc64(SQLITE_BCVFS_SESSION_RECORD_MAX_BYTES);
++  SESSION_TEST_REQUIRE(aTooBig!=0, "oversize test allocation failed");
++  memset(aTooBig, 0, SQLITE_BCVFS_SESSION_RECORD_MAX_BYTES);
++  sqlite3_free(aEncoded);
++  aEncoded = 0;
++  in.aBody = aTooBig;
++  in.nBody = SQLITE_BCVFS_SESSION_RECORD_MAX_BYTES;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &in, &aEncoded, &nEncoded, aHash, &zErr
++  );
++  SESSION_TEST_REQUIRE(rc==SQLITE_TOOBIG, "oversize session record was accepted");
++
++  /* The publication manifest carries exact logical EOF metadata in a
++  ** bounded trailer. Exercise the codec directly so a short or overflowing
++  ** remote object cannot become an apparently valid rounded manifest. */
++  {
++    Manifest manifest;
++    ManifestDb manifestDb;
++    unsigned char aBlock[BCV_DEFAULT_NAMEBYTES];
++    unsigned char *aManifest = 0;
++    unsigned char *aMalformed = 0;
++    Manifest *pParsed = 0;
++    int nManifest = 0;
++    char *zManifestErr = 0;
++    memset(&manifest,0,sizeof(manifest));
++    memset(&manifestDb,0,sizeof(manifestDb));
++    memset(aBlock,0x5a,sizeof(aBlock));
++    manifest.nDb = 1;
++    manifest.szBlk = 131072;
++    manifest.nNamebytes = sizeof(aBlock);
++    manifest.iMaxDbId = 1;
++    manifest.aDb = &manifestDb;
++    manifestDb.iDbId = 1;
++    manifestDb.iVersion = 1;
++    sqlite3_snprintf(sizeof(manifestDb.zDName),manifestDb.zDName,"main");
++    manifestDb.aBlkOrig = aBlock;
++    manifestDb.aBlkLocal = aBlock;
++    manifestDb.nBlkOrig = 1;
++    manifestDb.nBlkLocal = 1;
++    manifestDb.iFileSize = 8192;
++    aManifest = bcvManifestCompose(&manifest,&nManifest);
++    SESSION_TEST_REQUIRE(
++        aManifest!=0 && nManifest>0, "size-trailer manifest compose failed"
++    );
++    rc = bcvManifestParseCopy(
++        aManifest,nManifest,"etag",&pParsed,&zManifestErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_OK && pParsed!=0 && pParsed->aDb[0].iFileSize==8192,
++        "size-trailer logical EOF did not round-trip"
++    );
++    bcvManifestDeref(pParsed);
++    pParsed = 0;
++    sqlite3_free(zManifestErr);
++    zManifestErr = 0;
++    aMalformed = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nManifest);
++    SESSION_TEST_REQUIRE(aMalformed!=0, "size-trailer malformed allocation failed");
++    memcpy(aMalformed,aManifest,(size_t)nManifest);
++    rc = bcvManifestParseCopy(
++        aMalformed,nManifest-1,"etag",&pParsed,&zManifestErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_CORRUPT && pParsed==0,
++        "truncated size trailer was accepted"
++    );
++    sqlite3_free(zManifestErr);
++    zManifestErr = 0;
++    bcvPutU32(&aMalformed[nManifest-16],0xffffffffU);
++    rc = bcvManifestParseCopy(
++        aMalformed,nManifest,"etag",&pParsed,&zManifestErr
++    );
++    SESSION_TEST_REQUIRE(
++        rc==SQLITE_CORRUPT && pParsed==0,
++        "overflowing size trailer was accepted"
++    );
++    sqlite3_free(zManifestErr);
++    sqlite3_free(aMalformed);
++    sqlite3_free(aManifest);
++  }
++
++session_test_done:
++  sqlite3_free(zErr);
++  sqlite3_free(aEncoded);
++  sqlite3_free(aTooBig);
++#undef SESSION_TEST_REQUIRE
++#undef SESSION_TEST_FAIL
++  return rcRet;
++}
++
++/*
++** $vfs session_backend_test MODULE ACCOUNT CONTAINER SESSION_ID
++**
++** Exercise the provider conditional-write contract through the real CBS
++** module. This intentionally uses a session head rather than manifest.bcv:
++** create-if-absent, exact opaque ETag replacement, stale ETag rejection and
++** scope-bound reads must all be enforced by the backend.
+ */
++static int test_bcvfs_session_backend(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  TestBcvfs *pTest = (TestBcvfs*)clientData;
++  const char *zStorage;
++  const char *zAccount;
++  const char *zContainer;
++  const char *zSessionId;
++  const char *zAlias = "session-cas-test";
++  const char *zPrincipal = "session-test-principal";
++  const char *zDatabase = "session-test-database";
++  const char *zOperations = "read,write,commit";
++  static const unsigned char aManifest[] = "serialized-cbs-manifest";
++  unsigned char aBody1[128];
++  unsigned char aBody2[128];
++  unsigned char aBodyCheckpoint[128];
++  unsigned char aAcceptedCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  sqlite3_bcvfs_session_record record;
++  sqlite3_bcvfs_session_record decoded;
++  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aWrongScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aHash1[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aHash2[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aHashCheckpoint[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char *aEncoded1 = 0;
++  unsigned char *aEncoded2 = 0;
++  unsigned char *aEncodedCheckpoint = 0;
++  unsigned char *aFetched = 0;
++  char *zEtag1 = 0;
++  char *zEtag2 = 0;
++  char *zCheckpointEtag = 0;
++  char *zFetchedEtag = 0;
++  char *zErr = 0;
++  int nEncoded1 = 0;
++  int nEncoded2 = 0;
++  int nEncodedCheckpoint = 0;
++  int nBody1;
++  int nBody2;
++  int nBodyCheckpoint;
++  int nFetched = 0;
++  int rc = SQLITE_OK;
++  int rcRet = TCL_OK;
++  int bAttached = 0;
++
++  if( objc!=6 ){
++    Tcl_WrongNumArgs(
++        interp, 2, objv, "MODULE ACCOUNT CONTAINER SESSION_ID"
++    );
++    return TCL_ERROR;
++  }
++  zStorage = Tcl_GetString(objv[2]);
++  zAccount = Tcl_GetString(objv[3]);
++  zContainer = Tcl_GetString(objv[4]);
++  zSessionId = Tcl_GetString(objv[5]);
++
++#define SESSION_BACKEND_FAIL(zMsg) do { \
++    Tcl_SetObjResult(interp, Tcl_NewStringObj((zMsg), -1)); \
++    rcRet = TCL_ERROR; \
++    goto session_backend_done; \
++  } while(0)
++#define SESSION_BACKEND_REQUIRE(cond,zMsg) \
++  do { if(!(cond)) SESSION_BACKEND_FAIL(zMsg); } while(0)
++
++  rc = sqlite3_bcvfs_attach_session(
++      pTest->pFs, zStorage, zAccount, zContainer, zAlias, zSessionId, 0,
++      &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0, "session backend attachment failed"
++  );
++  bAttached = 1;
++
++  rc = sqlite3_bcvfs_session_scope_hash(
++      zStorage, zAccount, zContainer, zPrincipal, zDatabase, zOperations,
++      aScope, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(rc==SQLITE_OK && zErr==0, "session scope failed");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      zStorage, zAccount, zContainer, "other-principal", zDatabase,
++      zOperations, aWrongScope, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0, "alternate session scope failed"
++  );
++
++  memset(aAcceptedCheckpointHash,0x11,sizeof(aAcceptedCheckpointHash));
++  nBody1 = bcvfsSessionTestHeadBody(
++      aBody1,sizeof(aBody1),"base-etag",0,0
++  );
++  nBody2 = bcvfsSessionTestHeadBody(
++      aBody2,sizeof(aBody2),"base-etag",aAcceptedCheckpointHash,0
++  );
++  nBodyCheckpoint = bcvfsSessionTestCheckpointBody(
++      aBodyCheckpoint,sizeof(aBodyCheckpoint),4096,"base-etag",
++      aManifest,sizeof(aManifest)-1
++  );
++  SESSION_BACKEND_REQUIRE(
++      nBody1>0 && nBody2>0 && nBodyCheckpoint>0,
++      "typed session body construction failed"
++  );
++
++  memset(&record, 0, sizeof(record));
++  record.eType = SQLITE_BCVFS_SESSION_HEAD;
++  record.eState = SQLITE_BCVFS_SESSION_OPEN;
++  record.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++  record.iSequence = 1;
++  record.iCreated = 1000;
++  record.iExpires = 2000;
++  if( strlen(zSessionId)!=36 ) SESSION_BACKEND_FAIL(
++      "session backend test requires a canonical UUID"
++  );
++  memcpy(record.zSessionId, zSessionId, 36);
++  record.zSessionId[36] = '\0';
++  memcpy(record.aScopeHash, aScope, sizeof(aScope));
++  record.aBody = aBody1;
++  record.nBody = nBody1;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &record, &aEncoded1, &nEncoded1, aHash1, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0 && aEncoded1!=0,
++      "first session record encode failed"
++  );
++
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs, zAlias, SQLITE_BCVFS_SESSION_HEAD, zSessionId, 0,
++      zPrincipal,zDatabase,zOperations,"*", aEncoded1, nEncoded1,
++      &zEtag1, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0 && zEtag1 && zEtag1[0],
++      "create-if-absent session PUT failed"
++  );
++
++  record.eState = SQLITE_BCVFS_SESSION_ACCEPTED;
++  record.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS;
++  record.iSequence = 2;
++  record.aOperationId[0] = 0x5A;
++  record.aBody = aBody2;
++  record.nBody = nBody2;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &record, &aEncoded2, &nEncoded2, aHash2, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0 && aEncoded2!=0,
++      "second session record encode failed"
++  );
++
++  record.eType = SQLITE_BCVFS_SESSION_CHECKPOINT;
++  record.eState = SQLITE_BCVFS_SESSION_OPEN;
++  record.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++  record.iSequence = 3;
++  record.aBody = aBodyCheckpoint;
++  record.nBody = nBodyCheckpoint;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &record, &aEncodedCheckpoint, &nEncodedCheckpoint,
++      aHashCheckpoint, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0 && aEncodedCheckpoint!=0,
++      "checkpoint record encode failed"
++  );
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs, zAlias, SQLITE_BCVFS_SESSION_CHECKPOINT, zSessionId,
++      aHashCheckpoint, zPrincipal,zDatabase,zOperations,"*",aEncodedCheckpoint,
++      nEncodedCheckpoint, &zCheckpointEtag, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0 && zCheckpointEtag && zCheckpointEtag[0],
++      "checkpoint create failed"
++  );
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs, zAlias, SQLITE_BCVFS_SESSION_CHECKPOINT, zSessionId,
++      aHashCheckpoint, zPrincipal,zDatabase,zOperations,"*",aEncodedCheckpoint,
++      nEncodedCheckpoint, &zFetchedEtag, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0 && zFetchedEtag && zFetchedEtag[0]
++          && !strcmp(zFetchedEtag,zCheckpointEtag),
++      "identical checkpoint create was not reconciled"
++  );
++  sqlite3_free(zFetchedEtag);
++  zFetchedEtag = 0;
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs, zAlias, SQLITE_BCVFS_SESSION_CHECKPOINT, zSessionId,
++      aHashCheckpoint, zPrincipal,zDatabase,zOperations,zEtag1,aEncodedCheckpoint,
++      nEncodedCheckpoint, &zFetchedEtag, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_MISUSE, "checkpoint overwrite condition was accepted"
++  );
++  sqlite3_free(zFetchedEtag);
++  zFetchedEtag = 0;
++  record.eType = SQLITE_BCVFS_SESSION_HEAD;
++
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs, zAlias, SQLITE_BCVFS_SESSION_HEAD, zSessionId, 0,
++      zPrincipal,zDatabase,zOperations,"*", aEncoded2, nEncoded2,
++      &zEtag2, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc!=SQLITE_OK, "create-if-absent session PUT overwrote the head"
++  );
++  sqlite3_free(zEtag2);
++  zEtag2 = 0;
++
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs, zAlias, SQLITE_BCVFS_SESSION_HEAD, zSessionId, 0,
++      zPrincipal,zDatabase,zOperations,zEtag1, aEncoded2, nEncoded2,
++      &zEtag2, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0 && zEtag2 && zEtag2[0],
++      "exact ETag session update failed"
++  );
++
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs, zAlias, SQLITE_BCVFS_SESSION_HEAD, zSessionId, 0,
++      zPrincipal,zDatabase,zOperations,zEtag1, aEncoded1, nEncoded1,
++      &zFetchedEtag, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc!=SQLITE_OK, "stale ETag session update was accepted"
++  );
++  sqlite3_free(zFetchedEtag);
++  zFetchedEtag = 0;
++
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_fetch(
++      pTest->pFs, zAlias, SQLITE_BCVFS_SESSION_HEAD, zSessionId, 0,
++      zPrincipal,zDatabase,zOperations,&aFetched, &nFetched,
++      &zFetchedEtag, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && zErr==0 && aFetched!=0 && zFetchedEtag!=0
++          && !strcmp(zFetchedEtag,zEtag2),
++      "updated session head fetch failed"
++  );
++  rc = sqlite3_bcvfs_session_record_decode(
++      aFetched, nFetched, zSessionId, aScope, &decoded, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_OK && decoded.eState==SQLITE_BCVFS_SESSION_ACCEPTED
++          && decoded.iSequence==2,
++      "updated session head contents were not fetched"
++  );
++  sqlite3_free(aFetched);
++  aFetched = 0;
++  sqlite3_free(zFetchedEtag);
++  zFetchedEtag = 0;
++
++  sqlite3_free(zErr);
++  zErr = 0;
++  rc = sqlite3_bcvfs_session_fetch(
++      pTest->pFs, zAlias, SQLITE_BCVFS_SESSION_HEAD, zSessionId, 0,
++      "other-principal",zDatabase,zOperations,&aFetched, &nFetched,
++      &zFetchedEtag, &zErr
++  );
++  SESSION_BACKEND_REQUIRE(
++      rc==SQLITE_AUTH, "cross-scope session head was accepted"
++  );
++
++session_backend_done:
++  sqlite3_free(zErr);
++  sqlite3_free(aEncoded1);
++  sqlite3_free(aEncoded2);
++  sqlite3_free(aEncodedCheckpoint);
++  sqlite3_free(aFetched);
++  sqlite3_free(zEtag1);
++  sqlite3_free(zEtag2);
++  sqlite3_free(zCheckpointEtag);
++  sqlite3_free(zFetchedEtag);
++  if( bAttached ){
++    char *zDetachErr = 0;
++    int rcDetach = sqlite3_bcvfs_detach_session(
++        pTest->pFs, zAlias, zSessionId, &zDetachErr
++    );
++    if( rcRet==TCL_OK && rcDetach!=SQLITE_OK ){
++      Tcl_SetObjResult(interp, Tcl_NewStringObj(
++          zDetachErr ? zDetachErr : "session backend detach failed", -1
++      ));
++      rcRet = TCL_ERROR;
++    }
++    sqlite3_free(zDetachErr);
++  }
++  if( rcRet==TCL_OK ) Tcl_ResetResult(interp);
++#undef SESSION_BACKEND_REQUIRE
++#undef SESSION_BACKEND_FAIL
++  return rcRet;
++}
++
++static int bcvfsSessionCheckpointFetchSize(
++  sqlite3_bcvfs *pFs,
++  const char *zAlias,
++  const char *zStorage,
++  const char *zAccount,
++  const char *zContainer,
++  const char *zSessionId,
++  const char *zPrincipal,
++  const char *zDatabase,
++  const char *zOperations,
++  const unsigned char *aCheckpointHash,
++  sqlite3_uint64 *piFileSize,
++  int *pnManifest,
++  char **pzErr
++){
++  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char *aData = 0;
++  char *zEtag = 0;
++  sqlite3_bcvfs_session_record record;
++  sqlite3_bcvfs_session_body body;
++  int nData = 0;
++  int rc;
++  if( piFileSize ) *piFileSize = 0;
++  if( pnManifest ) *pnManifest = 0;
++  if( pzErr ) *pzErr = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      zStorage,zAccount,zContainer,zPrincipal,zDatabase,zOperations,
++      aScope,pzErr
++  );
++  if( rc==SQLITE_OK ) rc = sqlite3_bcvfs_session_fetch(
++      pFs,zAlias,SQLITE_BCVFS_SESSION_CHECKPOINT,zSessionId,
++      aCheckpointHash,zPrincipal,zDatabase,zOperations,&aData,&nData,
++      &zEtag,pzErr
++  );
++  if( rc==SQLITE_OK ) rc = sqlite3_bcvfs_session_record_decode(
++      aData,nData,zSessionId,aScope,&record,pzErr
++  );
++  if( rc==SQLITE_OK && record.eType!=SQLITE_BCVFS_SESSION_CHECKPOINT ){
++    rc = SQLITE_CORRUPT;
++  }
++  if( rc==SQLITE_OK ) rc = sqlite3_bcvfs_session_body_decode(
++      record.eType,record.eState,record.zSessionId,
++      record.aBody,record.nBody,&body,pzErr
++  );
++  if( rc==SQLITE_OK
++   && (body.iFileSize==0 || body.nManifest<=0
++       || body.nBaseManifestETag<=0 || zEtag==0 || zEtag[0]=='\0')
++  ){
++    rc = SQLITE_CORRUPT;
++  }
++  if( rc==SQLITE_OK ){
++    *piFileSize = body.iFileSize;
++    *pnManifest = body.nManifest;
++  }
++  sqlite3_free(aData);
++  sqlite3_free(zEtag);
++  return rc;
++}
++
++/* Build a real rollback-journal SQLite image outside the block-cache VFS.
++** The second image is deliberately produced by DELETE/VACUUM with
++** synchronous=OFF, so the checkpoint path is tested against the exact main
++** file rather than a generic SQLite WAL sidecar. */
++static int bcvfsSessionBuildImage(
++  const char *zPath,
++  int bKeepRows,
++  char **pzErr
++){
++  sqlite3 *db = 0;
++  char *zSqlErr = 0;
++  char zSql[128];
++  int rc = SQLITE_OK;
++  int ii;
++  if( pzErr ) *pzErr = 0;
++  rc = sqlite3_open_v2(
++      zPath,&db,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,0
++  );
++  if( rc==SQLITE_OK ) rc = sqlite3_exec(
++      db,
++      "PRAGMA journal_mode=DELETE;"
++      "PRAGMA synchronous=FULL;"
++      "CREATE TABLE t(v);"
++      "BEGIN;",
++      0,0,&zSqlErr
++  );
++  for(ii=0; rc==SQLITE_OK && ii<4096; ii++){
++    sqlite3_snprintf(
++        sizeof(zSql),zSql,"INSERT INTO t(v) VALUES('row-%04d')",ii
++    );
++    rc = sqlite3_exec(db,zSql,0,0,&zSqlErr);
++  }
++  if( rc==SQLITE_OK ) rc = sqlite3_exec(db,"COMMIT;",0,0,&zSqlErr);
++  if( rc==SQLITE_OK && !bKeepRows ) rc = sqlite3_exec(
++      db,"PRAGMA synchronous=OFF; DELETE FROM t; VACUUM;",0,0,&zSqlErr
++  );
++  if( rc!=SQLITE_OK && pzErr && *pzErr==0 ){
++    *pzErr = zSqlErr ? zSqlErr : sqlite3_mprintf(
++        "could not build SQLite image (rc=%d)",rc
++    );
++    zSqlErr = 0;
++  }
++  sqlite3_free(zSqlErr);
++  if( db ){
++    int rcClose = sqlite3_close(db);
++    if( rc==SQLITE_OK ) rc = rcClose;
++  }
++  return rc;
++}
++
++/* Copy a complete ordinary SQLite image into an already-open block-cache
++** file. The source is read with the default SQLite VFS, avoiding stdio path
++** and encoding differences in the upstream CBS test harness. */
++static int bcvfsSessionCopyImage(
++  sqlite3_file *pDst,
++  const char *zSrc,
++  char **pzErr
++){
++  sqlite3_vfs *pVfs = sqlite3_vfs_find(0);
++  sqlite3_file *pSrc = 0;
++  unsigned char *aBuf = 0;
++  sqlite3_int64 nSize = 0;
++  sqlite3_int64 iOff = 0;
++  int flags = SQLITE_OPEN_READONLY;
++  int outFlags = 0;
++  int rc = SQLITE_OK;
++  if( pzErr ) *pzErr = 0;
++  if( pDst==0 || pDst->pMethods==0 || pVfs==0 ){
++    return SQLITE_MISUSE;
++  }
++  pSrc = (sqlite3_file*)sqlite3_malloc64((sqlite3_uint64)pVfs->szOsFile);
++  aBuf = (unsigned char*)sqlite3_malloc(64*1024);
++  if( pSrc==0 || aBuf==0 ){
++    rc = SQLITE_NOMEM;
++  }
++  if( pSrc ) memset(pSrc,0,(size_t)pVfs->szOsFile);
++  if( rc==SQLITE_OK ) rc = pVfs->xOpen(pVfs,zSrc,pSrc,flags,&outFlags);
++  if( rc==SQLITE_OK ) rc = pSrc->pMethods->xFileSize(pSrc,&nSize);
++  while( rc==SQLITE_OK && iOff<nSize ){
++    int n = (int)((nSize-iOff)>64*1024 ? 64*1024 : (nSize-iOff));
++    rc = pSrc->pMethods->xRead(pSrc,aBuf,n,iOff);
++    if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_IOERR;
++    if( rc==SQLITE_OK ) rc = pDst->pMethods->xWrite(pDst,aBuf,n,iOff);
++    iOff += n;
++  }
++  if( rc==SQLITE_OK ) rc = pDst->pMethods->xTruncate(pDst,nSize);
++  if( rc!=SQLITE_OK && pzErr && *pzErr==0 ){
++    *pzErr = sqlite3_mprintf("could not copy SQLite image (rc=%d)",rc);
++  }
++  if( pSrc && pSrc->pMethods ) pSrc->pMethods->xClose(pSrc);
++  sqlite3_free(aBuf);
++  sqlite3_free(pSrc);
++  return rc;
++}
++
++/* Write one valid WAL frame without opening a generic SQLite client.  The
++** session overlay deliberately allows the database's -wal sidecar but not
++** an unrelated journal path.  Constructing the frame directly therefore
++** tests the checkpoint guard itself, without making the negative test depend
++** on compatibility-mode SQLite transaction routing. */
++static void bcvfsSessionWalChecksum(
++  int bBig,
++  const unsigned char *aIn,
++  int nIn,
++  unsigned int *pCksum1,
++  unsigned int *pCksum2
++){
++  unsigned int cksum1 = *pCksum1;
++  unsigned int cksum2 = *pCksum2;
++  int ii;
++  for(ii=0; ii<nIn; ii+=8){
++    unsigned int x1;
++    unsigned int x2;
++    if( bBig ){
++      x1 = ((unsigned int)aIn[ii]<<24)
++         | ((unsigned int)aIn[ii+1]<<16)
++         | ((unsigned int)aIn[ii+2]<<8)
++         | (unsigned int)aIn[ii+3];
++      x2 = ((unsigned int)aIn[ii+4]<<24)
++         | ((unsigned int)aIn[ii+5]<<16)
++         | ((unsigned int)aIn[ii+6]<<8)
++         | (unsigned int)aIn[ii+7];
++    }else{
++      x1 = ((unsigned int)aIn[ii+3]<<24)
++         | ((unsigned int)aIn[ii+2]<<16)
++         | ((unsigned int)aIn[ii+1]<<8)
++         | (unsigned int)aIn[ii];
++      x2 = ((unsigned int)aIn[ii+7]<<24)
++         | ((unsigned int)aIn[ii+6]<<16)
++         | ((unsigned int)aIn[ii+5]<<8)
++         | (unsigned int)aIn[ii+4];
++    }
++    cksum1 += x1 + cksum2;
++    cksum2 += x2 + cksum1;
++  }
++  *pCksum1 = cksum1;
++  *pCksum2 = cksum2;
++}
++
++static int bcvfsSessionWriteWalFixture(
++  sqlite3_vfs *pVfs,
++  const char *zPath,
++  char **pzErr
++){
++  sqlite3_file *pWal = 0;
++  unsigned char *aWal = 0;
++  unsigned int cksum1 = 0;
++  unsigned int cksum2 = 0;
++  int outFlags = 0;
++  int rc = SQLITE_OK;
++  if( pzErr ) *pzErr = 0;
++  if( pVfs==0 || zPath==0 ) return SQLITE_MISUSE;
++  pWal = (sqlite3_file*)sqlite3_malloc64((sqlite3_uint64)pVfs->szOsFile);
++  aWal = (unsigned char*)sqlite3_malloc(32+24+512);
++  if( pWal==0 || aWal==0 ) rc = SQLITE_NOMEM;
++  if( pWal ) memset(pWal,0,(size_t)pVfs->szOsFile);
++  if( rc==SQLITE_OK ){
++    rc = pVfs->xOpen(
++        pVfs,zPath,pWal,
++        SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,
++        &outFlags
++    );
++  }
++  if( rc==SQLITE_OK ){
++    memset(aWal,0,32+24+512);
++    /* SQLite WAL magic with little-endian checksums; the page size is
++    ** encoded big-endian as required by the WAL format. */
++    aWal[0] = 0x37; aWal[1] = 0x7f; aWal[2] = 0x06; aWal[3] = 0x82;
++    aWal[4] = 0x00; aWal[5] = 0x2d; aWal[6] = 0xe3; aWal[7] = 0x18;
++    aWal[8] = 0x00; aWal[9] = 0x00; aWal[10] = 0x02; aWal[11] = 0x00;
++    bcvfsSessionWalChecksum(0,aWal,24,&cksum1,&cksum2);
++    bcvPutU32(&aWal[24],cksum1);
++    bcvPutU32(&aWal[28],cksum2);
++    /* Commit field is deliberately nonzero so the runtime treats this as a
++    ** complete transaction after validating both checksums. */
++    aWal[32+0] = 0x00; aWal[32+1] = 0x00;
++    aWal[32+2] = 0x00; aWal[32+3] = 0x01;
++    aWal[32+4] = 0x00; aWal[32+5] = 0x00;
++    aWal[32+6] = 0x00; aWal[32+7] = 0x01;
++    /* Frame checksums continue from the header checksum. */
++    cksum1 = ((unsigned int)aWal[24]<<24)
++           | ((unsigned int)aWal[25]<<16)
++           | ((unsigned int)aWal[26]<<8)
++           | (unsigned int)aWal[27];
++    cksum2 = ((unsigned int)aWal[28]<<24)
++           | ((unsigned int)aWal[29]<<16)
++           | ((unsigned int)aWal[30]<<8)
++           | (unsigned int)aWal[31];
++    bcvfsSessionWalChecksum(0,&aWal[32],8,&cksum1,&cksum2);
++    bcvfsSessionWalChecksum(0,&aWal[32+24],512,&cksum1,&cksum2);
++    bcvPutU32(&aWal[32+16],cksum1);
++    bcvPutU32(&aWal[32+20],cksum2);
++    rc = pWal->pMethods->xWrite(pWal,aWal,32+24+512,0);
++    if( rc!=SQLITE_OK && pzErr ) *pzErr = sqlite3_mprintf(
++        "could not write WAL fixture payload (rc=%d)",rc
++    );
++    if( rc==SQLITE_OK ) {
++      rc = pWal->pMethods->xTruncate(pWal,32+24+512);
++    }
++    if( rc!=SQLITE_OK && pzErr && *pzErr==0 ) *pzErr = sqlite3_mprintf(
++        "could not truncate WAL fixture (rc=%d)",rc
++    );
++  }
++  if( rc!=SQLITE_OK && pzErr && *pzErr==0 ){
++    *pzErr = sqlite3_mprintf("could not open WAL fixture (rc=%d)",rc);
++  }
++  if( pWal && pWal->pMethods ) {
++    pWal->pMethods->xClose(pWal);
++  }
++  sqlite3_free(aWal);
++  sqlite3_free(pWal);
++  return rc;
++}
++
++/* Build the small rollback-mode images used by the publication test outside
++** the block-cache VFS.  Keeping the source on the default VFS means the test
++** never relies on SQLite's compatibility WAL path; the image is later copied
++** into an already-open BCV file through xWrite. */
++static int bcvfsSessionBuildPublicationImage(
++  const char *zPath,
++  int nRows,
++  char **pzErr
++){
++  sqlite3 *db = 0;
++  char *zSqlErr = 0;
++  char zSql[128];
++  int rc = SQLITE_OK;
++  int ii;
++  if( pzErr ) *pzErr = 0;
++  if( nRows<1 || nRows>2 ) return SQLITE_MISUSE;
++  rc = sqlite3_open_v2(
++      zPath,&db,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,0
++  );
++  if( rc==SQLITE_OK ) rc = sqlite3_exec(
++      db,
++      "PRAGMA journal_mode=DELETE;"
++      "PRAGMA synchronous=FULL;"
++      "CREATE TABLE t(v); BEGIN;",
++      0,0,&zSqlErr
++  );
++  for(ii=0; rc==SQLITE_OK && ii<nRows; ii++){
++    sqlite3_snprintf(
++        sizeof(zSql),zSql,
++        "INSERT INTO t(v) VALUES('%s')",
++        ii==0 ? "fenced-row" : "successor-row"
++    );
++    rc = sqlite3_exec(db,zSql,0,0,&zSqlErr);
++  }
++  if( rc==SQLITE_OK ) rc = sqlite3_exec(db,"COMMIT;",0,0,&zSqlErr);
++  if( rc!=SQLITE_OK && pzErr && *pzErr==0 ){
++    *pzErr = zSqlErr ? zSqlErr : sqlite3_mprintf(
++        "could not build publication SQLite image (rc=%d)",rc
++    );
++    zSqlErr = 0;
++  }
++  sqlite3_free(zSqlErr);
++  if( db ){
++    int rcClose = sqlite3_close(db);
++    if( rc==SQLITE_OK ) rc = rcClose;
++  }
++  return rc;
++}
++
++/* The publication test needs to model a process dying between the immutable
++** candidate PUT and the manifest PUT.  Use the internal dispatcher exposed to
++** CBS tests to snapshot and restore manifest.bcv; this keeps the production
++** API unchanged while allowing the fixture to leave the visible manifest at
++** its exact base bytes. */
++typedef struct BcvfsSessionObjectTransfer BcvfsSessionObjectTransfer;
++struct BcvfsSessionObjectTransfer {
++  int rc;
++  unsigned char *aData;
++  int nData;
++  char *zETag;
++  char *zErr;
++};
++
++int bcvfsGetBcv(sqlite3*, BcvDispatch**, BcvContainer**);
++void bcvfsReleaseBcv(sqlite3*, BcvDispatch*, BcvContainer*, int);
++
++static void bcvfsSessionObjectFetchCb(
++  void *pArg,
++  int rc,
++  char *zETag,
++  const u8 *aData,
++  int nData,
++  const u8 *aHdrs,
++  int nHdrs
++){
++  BcvfsSessionObjectTransfer *p = (BcvfsSessionObjectTransfer*)pArg;
++  (void)aHdrs;
++  (void)nHdrs;
++  p->rc = rc;
++  if( rc==SQLITE_OK ){
++    if( nData<0 || aData==0 || zETag==0 || zETag[0]=='\0' ){
++      p->rc = SQLITE_CORRUPT;
++      p->zErr = sqlite3_mprintf("manifest transfer returned invalid bytes");
++    }else{
++      p->aData = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nData+1);
++      p->zETag = sqlite3_mprintf("%s",zETag);
++      if( p->aData==0 || p->zETag==0 ){
++        p->rc = SQLITE_NOMEM;
++      }else{
++        memcpy(p->aData,aData,nData);
++        p->aData[nData] = 0;
++        p->nData = nData;
++      }
++    }
++  }else if( zETag ){
++    p->zErr = sqlite3_mprintf("%s",zETag);
++  }
++}
++
++static void bcvfsSessionObjectPutCb(void *pArg, int rc, char *zETag){
++  BcvfsSessionObjectTransfer *p = (BcvfsSessionObjectTransfer*)pArg;
++  p->rc = rc;
++  if( rc==SQLITE_OK ){
++    if( zETag==0 || zETag[0]=='\0' ){
++      p->rc = SQLITE_CORRUPT;
++      p->zErr = sqlite3_mprintf("manifest transfer PUT returned no ETag");
++    }else{
++      p->zETag = sqlite3_mprintf("%s",zETag);
++      if( p->zETag==0 ) p->rc = SQLITE_NOMEM;
++    }
++  }else if( zETag ){
++    p->zErr = sqlite3_mprintf("%s",zETag);
++  }
++}
++
++static int bcvfsSessionFetchObject(
++  sqlite3 *db,
++  const char *zName,
++  unsigned char **paData,
++  int *pnData,
++  char **pzETag,
++  char **pzErr
++){
++  BcvDispatch *pDisp = 0;
++  BcvContainer *pBcv = 0;
++  BcvfsSessionObjectTransfer ctx;
++  int rc;
++  memset(&ctx,0,sizeof(ctx));
++  if( paData ) *paData = 0;
++  if( pnData ) *pnData = 0;
++  if( pzETag ) *pzETag = 0;
++  if( pzErr ) *pzErr = 0;
++  if( db==0 || zName==0 || paData==0 || pnData==0 || pzETag==0 ){
++    return SQLITE_MISUSE;
++  }
++  rc = bcvfsGetBcv(db,&pDisp,&pBcv);
++  if( rc==SQLITE_OK && pBcv==0 ) rc = SQLITE_MISUSE;
++  if( rc==SQLITE_OK ) rc = bcvDispatchFetch(
++      pDisp,pBcv,zName,0,0,&ctx,bcvfsSessionObjectFetchCb
++  );
++  if( rc==SQLITE_OK ) rc = bcvDispatchRunAll(pDisp);
++  if( rc==SQLITE_OK ) rc = ctx.rc;
++  if( rc==SQLITE_OK ){
++    *paData = ctx.aData;
++    *pnData = ctx.nData;
++    *pzETag = ctx.zETag;
++    ctx.aData = 0;
++    ctx.zETag = 0;
++  }else if( pzErr && ctx.zErr ){
++    *pzErr = ctx.zErr;
++    ctx.zErr = 0;
++  }
++  bcvfsReleaseBcv(db,pDisp,pBcv,rc!=SQLITE_OK);
++  sqlite3_free(ctx.aData);
++  sqlite3_free(ctx.zETag);
++  sqlite3_free(ctx.zErr);
++  return rc;
++}
++
++static int bcvfsSessionPutObject(
++  sqlite3 *db,
++  const char *zName,
++  const char *zIfMatch,
++  const unsigned char *aData,
++  int nData,
++  char **pzETag,
++  char **pzErr
++){
++  BcvDispatch *pDisp = 0;
++  BcvContainer *pBcv = 0;
++  BcvfsSessionObjectTransfer ctx;
++  int rc;
++  memset(&ctx,0,sizeof(ctx));
++  if( pzETag ) *pzETag = 0;
++  if( pzErr ) *pzErr = 0;
++  if( db==0 || zName==0 || zIfMatch==0 || aData==0 || nData<=0
++   || pzETag==0
++  ) return SQLITE_MISUSE;
++  rc = bcvfsGetBcv(db,&pDisp,&pBcv);
++  if( rc==SQLITE_OK && pBcv==0 ) rc = SQLITE_MISUSE;
++  if( rc==SQLITE_OK ) rc = bcvDispatchPut(
++      pDisp,pBcv,zName,zIfMatch,aData,nData,&ctx,bcvfsSessionObjectPutCb
++  );
++  if( rc==SQLITE_OK ) rc = bcvDispatchRunAll(pDisp);
++  if( rc==SQLITE_OK ) rc = ctx.rc;
++  if( rc==SQLITE_OK ){
++    *pzETag = ctx.zETag;
++    ctx.zETag = 0;
++  }else if( pzErr && ctx.zErr ){
++    *pzErr = ctx.zErr;
++    ctx.zErr = 0;
++  }
++  bcvfsReleaseBcv(db,pDisp,pBcv,rc!=SQLITE_OK);
++  sqlite3_free(ctx.aData);
++  sqlite3_free(ctx.zETag);
++  sqlite3_free(ctx.zErr);
++  return rc;
++}
++
++/*
++** $vfs session_checkpoint_test VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR
++**
++** Exercise the session-bound xSync and explicit final-checkpoint paths. The
++** first checkpoint is made through a live VFS file handle, followed by a
++** repeated xSync and a write after that sync. A compact synchronous=OFF image
++** with a partial tail is then written and a final checkpoint is made after
++** the handle is closed. No manifest publication is performed by this test.
++*/
++static int test_bcvfs_session_checkpoint(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  TestBcvfs *pTest = (TestBcvfs*)clientData;
++  const char *zVfs;
++  const char *zStorage;
++  const char *zAccount;
++  const char *zContainer;
++  const char *zSessionId;
++  const char *zDatabase;
++  const char *zFreshDirArg;
++  const char *zMode;
++  const char *zAlias = "session-checkpoint-test";
++  const char *zPrincipal = "session-checkpoint-principal";
++  const char *zOperations = "read,write,commit";
++  unsigned char aOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aCheckpoint1[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aCheckpointRepeat[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aCheckpoint2[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  sqlite3_uint64 iFileSize1 = 0;
++  sqlite3_uint64 iFileSizeRepeat = 0;
++  sqlite3_uint64 iFileSize2 = 0;
++  int nManifest1 = 0;
++  int nManifestRepeat = 0;
++  int nManifest2 = 0;
++  sqlite3_int64 iImage2Size = 0;
++  static const unsigned char aTail[] = "tail-after-xsync";
++  sqlite3_bcvfs *pFresh = 0;
++  sqlite3 *dbFresh = 0;
++  sqlite3_stmt *pFreshStmt = 0;
++  sqlite3_vfs *pSessionVfs = 0;
++  sqlite3_file *pRaw = 0;
++  char *zPath = 0;
++  char *zFreshDir = 0;
++  char *zFreshVfs = 0;
++  char *zFreshPath = 0;
++  char *zWalDir = 0;
++  char *zWalPath = 0;
++  char *zImage1 = 0;
++  char *zImage2 = 0;
++  char *zErr = 0;
++  char *zCheckpointEtag = 0;
++  char *zBadEtag = 0;
++  unsigned char *aBadData = 0;
++  char zFailure[256];
++  int rc = SQLITE_OK;
++  int rcRet = TCL_OK;
++  int bAttached = 0;
++  int bFreshAttached = 0;
++  int bRawOpen = 0;
++
++  if( objc!=9 && objc!=10 ){
++    Tcl_WrongNumArgs(
++        interp, 2, objv,
++        "VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR ?MODE?"
++    );
++    return TCL_ERROR;
++  }
++  zVfs = Tcl_GetString(objv[2]);
++  zStorage = Tcl_GetString(objv[3]);
++  zAccount = Tcl_GetString(objv[4]);
++  zContainer = Tcl_GetString(objv[5]);
++  zSessionId = Tcl_GetString(objv[6]);
++  zDatabase = Tcl_GetString(objv[7]);
++  zFreshDirArg = Tcl_GetString(objv[8]);
++  zMode = objc==10 ? Tcl_GetString(objv[9]) : "nowal";
++  if( strcmp(zMode,"nowal")!=0 && strcmp(zMode,"wal")!=0 ){
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("unknown checkpoint test mode",-1));
++    return TCL_ERROR;
++  }
++  memset(aOperationId,0,sizeof(aOperationId));
++  aOperationId[0] = 0xA7;
++  aOperationId[1] = 0x17;
++
++#define SESSION_CHECKPOINT_FAIL(zMsg) do { \
++    Tcl_SetObjResult(interp, Tcl_NewStringObj((zMsg), -1)); \
++    rcRet = TCL_ERROR; \
++    goto session_checkpoint_done; \
++  } while(0)
++#define SESSION_CHECKPOINT_REQUIRE(cond,zMsg) \
++  do { if(!(cond)) SESSION_CHECKPOINT_FAIL(zMsg); } while(0)
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aOperationId,0,&zErr
++  );
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK && zErr==0, "session-scoped checkpoint attachment failed"
++  );
++  bAttached = 1;
++
++  /* A bound alias must reject incomplete context arguments, not evaluate
++  ** strcmp() through a NULL pointer while checking its binding. */
++  {
++    int nBadData = 0;
++    rc = sqlite3_bcvfs_session_fetch(
++        pTest->pFs,zAlias,SQLITE_BCVFS_SESSION_HEAD,zSessionId,0,
++        0,zDatabase,zOperations,&aBadData,&nBadData,&zBadEtag,&zErr
++    );
++    SESSION_CHECKPOINT_REQUIRE(
++        rc==SQLITE_MISUSE && aBadData==0 && zBadEtag==0,
++        "NULL session context was not rejected"
++    );
++    sqlite3_free(zErr);
++    zErr = 0;
++  }
++
++  zPath = sqlite3_mprintf("/%s/%s",zAlias,zDatabase);
++  SESSION_CHECKPOINT_REQUIRE(zPath!=0, "session checkpoint path allocation failed");
++  if( strcmp(zMode,"wal")==0 ){
++  /* Write a complete valid WAL frame through the selected VFS. A generic
++  ** SQLite client would also open a rollback journal on this compatibility
++  ** VFS, which the session path intentionally rejects as an unrelated file.
++  ** This direct fixture isolates the committed-WAL fail-closed property. */
++  pSessionVfs = sqlite3_vfs_find(zVfs);
++  SESSION_CHECKPOINT_REQUIRE(pSessionVfs!=0, "session VFS lookup failed");
++  {
++    const char *zSlash = strrchr(zFreshDirArg,'/');
++    if( zSlash==0 ) zSlash = strrchr(zFreshDirArg,'\\');
++    zWalDir = zSlash
++        ? sqlite3_mprintf("%.*s/%s",(int)(zSlash-zFreshDirArg),zFreshDirArg,zAlias)
++        : sqlite3_mprintf("%s",zAlias);
++  }
++  zWalPath = zWalDir ? sqlite3_mprintf("%s/%s-wal",zWalDir,zDatabase) : 0;
++  SESSION_CHECKPOINT_REQUIRE(zWalPath!=0, "WAL fixture path allocation failed");
++  rc = bcvfsSessionWriteWalFixture(sqlite3_vfs_find(0),zWalPath,&zErr);
++  SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK, zErr ? zErr : "WAL fixture write failed");
++
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zAlias,zSessionId,aCheckpoint1,&zCheckpointEtag,&zErr
++  );
++  if( rc!=SQLITE_MISUSE || zErr==0
++   || strstr(zErr,"committed WAL frames") == 0
++   || zCheckpointEtag!=0
++  ){
++    sqlite3_snprintf(
++        sizeof(zFailure),zFailure,
++        "checkpoint did not reject committed WAL data rc=%d err=%s",
++        rc,zErr ? zErr : "(none)"
++    );
++    SESSION_CHECKPOINT_FAIL(zFailure);
++  }
++  sqlite3_free(zErr);
++  zErr = 0;
++  sqlite3_free(zCheckpointEtag);
++  zCheckpointEtag = 0;
++  rc = sqlite3_vfs_find(0)->xDelete(sqlite3_vfs_find(0),zWalPath,0);
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK || rc==SQLITE_IOERR_DELETE_NOENT,
++      "WAL fixture cleanup failed"
++  );
++  goto session_checkpoint_done;
++  }
++
++  pSessionVfs = sqlite3_vfs_find(zVfs);
++  SESSION_CHECKPOINT_REQUIRE(pSessionVfs!=0, "session VFS lookup failed");
++
++  zImage1 = sqlite3_mprintf("%s/session-image-1.db",zFreshDirArg);
++  zImage2 = sqlite3_mprintf("%s/session-image-2.db",zFreshDirArg);
++  SESSION_CHECKPOINT_REQUIRE(
++      zImage1!=0 && zImage2!=0, "rollback image path allocation failed"
++  );
++  rc = bcvfsSessionBuildImage(zImage1,1,&zErr);
++  SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK, "rollback image 1 build failed");
++  rc = bcvfsSessionBuildImage(zImage2,0,&zErr);
++  SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK, "rollback image 2 build failed");
++
++  pRaw = (sqlite3_file*)sqlite3_malloc64((sqlite3_uint64)pSessionVfs->szOsFile);
++  SESSION_CHECKPOINT_REQUIRE(pRaw!=0, "raw checkpoint file allocation failed");
++  memset(pRaw,0,(size_t)pSessionVfs->szOsFile);
++  {
++    int rawFlags = SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
++    rc = pSessionVfs->xOpen(pSessionVfs,zPath,pRaw,rawFlags,&rawFlags);
++  }
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK && pRaw->pMethods!=0, "raw checkpoint file open failed"
++  );
++  bRawOpen = 1;
++  rc = bcvfsSessionCopyImage(pRaw,zImage1,&zErr);
++  SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK, "rollback image 1 copy failed");
++  rc = pRaw->pMethods->xSync(pRaw,0);
++  if( rc!=SQLITE_OK || zErr!=0 ){
++    sqlite3_snprintf(
++        sizeof(zFailure),zFailure,
++        "rollback xSync checkpoint failed rc=%d err=%s",
++        rc,zErr ? zErr : "(none)"
++    );
++    SESSION_CHECKPOINT_FAIL(zFailure);
++  }
++  sqlite3_free(zErr);
++  zErr = 0;
++
++  /* xSync above emits an immutable checkpoint but does not publish the
++  ** manifest. Ask for a second, explicit record so its exact body can be
++  ** decoded and compared with the post-truncation record below. */
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zAlias,zSessionId,aCheckpoint1,&zCheckpointEtag,&zErr
++  );
++  if( rc!=SQLITE_OK || zErr!=0 || zCheckpointEtag==0 ){
++    sqlite3_snprintf(
++        sizeof(zFailure),zFailure,
++        "explicit rollback checkpoint failed rc=%d err=%s",
++        rc,zErr ? zErr : "(none)"
++    );
++    SESSION_CHECKPOINT_FAIL(zFailure);
++  }
++  rc = bcvfsSessionCheckpointFetchSize(
++      pTest->pFs,zAlias,zStorage,zAccount,zContainer,zSessionId,
++      zPrincipal,zDatabase,zOperations,aCheckpoint1,&iFileSize1,
++      &nManifest1,&zErr
++  );
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK && iFileSize1>0 && nManifest1>0,
++      "first rollback checkpoint body was not exact"
++  );
++
++  /* A second xSync with no intervening write must still flush/checkpoint the
++  ** session state without publishing it. The explicit call below makes the
++  ** immutable record observable so the test can prove it is a new version. */
++  rc = pRaw->pMethods->xSync(pRaw,0);
++  SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK, "repeated xSync failed");
++  sqlite3_free(zCheckpointEtag);
++  zCheckpointEtag = 0;
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zAlias,zSessionId,aCheckpointRepeat,
++      &zCheckpointEtag,&zErr
++  );
++  if( rc!=SQLITE_OK || zErr!=0 || zCheckpointEtag==0 ){
++    sqlite3_snprintf(
++        sizeof(zFailure),zFailure,
++        "explicit repeated checkpoint failed rc=%d err=%s",
++        rc,zErr ? zErr : "(none)"
++    );
++    SESSION_CHECKPOINT_FAIL(zFailure);
++  }
++  rc = bcvfsSessionCheckpointFetchSize(
++      pTest->pFs,zAlias,zStorage,zAccount,zContainer,zSessionId,
++      zPrincipal,zDatabase,zOperations,aCheckpointRepeat,&iFileSizeRepeat,
++      &nManifestRepeat,&zErr
++  );
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK && iFileSizeRepeat==iFileSize1
++          && nManifestRepeat==nManifest1
++          && memcmp(aCheckpoint1,aCheckpointRepeat,sizeof(aCheckpoint1))!=0,
++      "repeated xSync did not create the expected immutable checkpoint"
++  );
++
++  /* Write a compact synchronous=OFF image after the last xSync, then append
++  ** bytes without syncing. The final checkpoint must include that write even
++  ** though the live handle is closed before the explicit call. */
++  rc = bcvfsSessionCopyImage(pRaw,zImage2,&zErr);
++  SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK, "rollback image 2 copy failed");
++  rc = pRaw->pMethods->xFileSize(pRaw,&iImage2Size);
++  SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK && iImage2Size>0,
++      "rollback image 2 size query failed");
++  rc = pRaw->pMethods->xWrite(
++      pRaw,aTail,sizeof(aTail)-1,iImage2Size
++  );
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK, "write after repeated xSync failed"
++  );
++
++  /* A separate VFS can only see the published manifest. Both xSync records
++  ** above must therefore remain invisible until sqlite3_bcvfs_upload(). */
++  zFreshDir = sqlite3_mprintf("%s",zFreshDirArg);
++  zFreshVfs = sqlite3_mprintf("bcvfs-checkpoint-fresh-%s",zSessionId);
++  SESSION_CHECKPOINT_REQUIRE(
++      zFreshDir!=0 && zFreshVfs!=0, "fresh checkpoint VFS allocation failed"
++  );
++  rc = sqlite3_bcvfs_create(zFreshDir,zFreshVfs,&pFresh,&zErr);
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK && pFresh!=0 && zErr==0,
++      "fresh checkpoint VFS creation failed"
++  );
++  if( pTest->pAuthCallback ){
++    rc = sqlite3_bcvfs_auth_callback(pFresh,(void*)pTest,bcvfsAuthCb);
++    SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK, "fresh VFS auth setup failed");
++  }
++  rc = sqlite3_bcvfs_attach(
++      pFresh,zStorage,zAccount,zContainer,"fresh-checkpoint",0,&zErr
++  );
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK && zErr==0, "fresh checkpoint VFS attachment failed"
++  );
++  bFreshAttached = 1;
++  zFreshPath = sqlite3_mprintf("/fresh-checkpoint/%s",zDatabase);
++  SESSION_CHECKPOINT_REQUIRE(zFreshPath!=0, "fresh checkpoint path allocation failed");
++  rc = sqlite3_open_v2(
++      zFreshPath,&dbFresh,SQLITE_OPEN_READONLY,zFreshVfs
++  );
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK && dbFresh!=0, "fresh checkpoint database open failed"
++  );
++  rc = sqlite3_prepare_v2(dbFresh,"SELECT count(*) FROM t",-1,&pFreshStmt,0);
++  SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK, "fresh checkpoint query prepare failed");
++  rc = sqlite3_step(pFreshStmt);
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_ROW && sqlite3_column_int(pFreshStmt,0)==0,
++      "xSync checkpoint leaked data through the published manifest"
++  );
++  sqlite3_finalize(pFreshStmt);
++  pFreshStmt = 0;
++  sqlite3_close(dbFresh);
++  dbFresh = 0;
++  sqlite3_bcvfs_detach(pFresh,"fresh-checkpoint",0);
++  bFreshAttached = 0;
++  sqlite3_bcvfs_destroy(pFresh);
++  pFresh = 0;
++  sqlite3_free(zCheckpointEtag);
++  zCheckpointEtag = 0;
++
++  /* Close the unsynced handle. The subsequent explicit call must flush and
++  ** record the final logical state, including the smaller page-count from
++  ** VACUUM and the write-after-xSync partial tail. */
++  rc = pRaw->pMethods->xClose(pRaw);
++  bRawOpen = 0;
++  sqlite3_free(pRaw);
++  pRaw = 0;
++  SESSION_CHECKPOINT_REQUIRE(rc==SQLITE_OK, "raw checkpoint file close failed");
++
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zAlias,zSessionId,aCheckpoint2,&zCheckpointEtag,&zErr
++  );
++  if( rc!=SQLITE_OK || zErr!=0 || zCheckpointEtag==0 ){
++    sqlite3_snprintf(
++        sizeof(zFailure),zFailure,
++        "final checkpoint without a live SQLite handle failed rc=%d err=%s",
++        rc,zErr ? zErr : "(none)"
++    );
++    SESSION_CHECKPOINT_FAIL(zFailure);
++  }
++  rc = bcvfsSessionCheckpointFetchSize(
++      pTest->pFs,zAlias,zStorage,zAccount,zContainer,zSessionId,
++      zPrincipal,zDatabase,zOperations,aCheckpoint2,&iFileSize2,
++      &nManifest2,&zErr
++  );
++  SESSION_CHECKPOINT_REQUIRE(
++      rc==SQLITE_OK && iFileSize2>0 && nManifest2>0,
++      "final checkpoint body was not decodable"
++  );
++  SESSION_CHECKPOINT_REQUIRE(
++      memcmp(aCheckpointRepeat,aCheckpoint2,sizeof(aCheckpointRepeat))!=0,
++      "write after the last xSync was not represented by a new record"
++  );
++  if( (iFileSize1%512)!=0 || iFileSize2!=iImage2Size+sizeof(aTail)-1
++   || (iFileSize2%512)==0 || iFileSize2>=iFileSize1 ){
++    sqlite3_snprintf(
++        sizeof(zFailure),zFailure,
++        "write-after-xSync or truncation size was not recorded exactly size1=%lld image2=%lld size2=%lld manifest1=%d manifest2=%d",
++        (long long)iFileSize1,(long long)iImage2Size,
++        (long long)iFileSize2,nManifest1,nManifest2
++    );
++    SESSION_CHECKPOINT_FAIL(zFailure);
++  }
++
++session_checkpoint_done:
++  sqlite3_free(zErr);
++  sqlite3_free(zCheckpointEtag);
++  if( bRawOpen && pRaw && pRaw->pMethods ) pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  if( pFreshStmt ) sqlite3_finalize(pFreshStmt);
++  if( dbFresh ) sqlite3_close(dbFresh);
++  if( bFreshAttached && pFresh ){
++    sqlite3_bcvfs_detach(pFresh,"fresh-checkpoint",0);
++  }
++  if( pFresh ) sqlite3_bcvfs_destroy(pFresh);
++  sqlite3_free(zPath);
++  sqlite3_free(zFreshDir);
++  sqlite3_free(zFreshVfs);
++  sqlite3_free(zFreshPath);
++  sqlite3_free(zWalDir);
++  sqlite3_free(zWalPath);
++  sqlite3_free(zImage1);
++  sqlite3_free(zImage2);
++  sqlite3_free(aBadData);
++  sqlite3_free(zBadEtag);
++  if( bAttached ){
++    char *zDetachErr = 0;
++    int rcDetach = sqlite3_bcvfs_detach_session(
++        pTest->pFs,zAlias,zSessionId,&zDetachErr
++    );
++    if( rcRet==TCL_OK && rcDetach!=SQLITE_OK ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          zDetachErr ? zDetachErr : "session checkpoint detach failed",-1
++      ));
++      rcRet = TCL_ERROR;
++    }
++    sqlite3_free(zDetachErr);
++  }
++  if( rcRet==TCL_OK ) Tcl_ResetResult(interp);
++#undef SESSION_CHECKPOINT_REQUIRE
++#undef SESSION_CHECKPOINT_FAIL
++  return rcRet;
++}
++
++/*
++** $vfs session_overlay_test VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR
++**
++** The accepted session head is the only input to a fresh request overlay. A
++** second VFS must see the immutable checkpoint named by that head, while a
++** warm alias must discard its unaccepted local generation before rehydrating.
++** This also covers the operation-id binding between a head and its newest
++** checkpoint, and rejects a poll that could otherwise overwrite the overlay
++** with the published base manifest.
++*/
++static int test_bcvfs_session_overlay(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  TestBcvfs *pTest = (TestBcvfs*)clientData;
++  const char *zVfs;
++  const char *zStorage;
++  const char *zAccount;
++  const char *zContainer;
++  const char *zSessionId;
++  const char *zDatabase;
++  const char *zFreshDir;
++  const char *zAlias = "session-overlay-test";
++  const char *zBadAlias = "session-overlay-invalid";
++  const char *zExpiredAlias = "session-overlay-expired";
++  const char *zPrincipal = "session-overlay-principal";
++  const char *zOperations = "read,write,commit";
++  const char *zBadSession = "550e8400-e29b-41d4-a716-000000000001";
++  const char *zExpiredSession = "550e8400-e29b-41d4-a716-000000000002";
++  unsigned char aOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aFreshOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aBadOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aBadCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aHeadHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aBadHeadHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aExpiredCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aExpiredHeadHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char *aCheckpointData = 0;
++  unsigned char *aBadCheckpointBody = 0;
++  unsigned char *aHeadBody = 0;
++  unsigned char *aBadHeadBody = 0;
++  unsigned char *aHeadEncoded = 0;
++  unsigned char *aBadCheckpointEncoded = 0;
++  unsigned char *aBadHeadEncoded = 0;
++  unsigned char *aExpiredHeadBody = 0;
++  unsigned char *aExpiredCheckpointEncoded = 0;
++  unsigned char *aExpiredHeadEncoded = 0;
++  sqlite3_bcvfs_session_record checkpointRecord;
++  sqlite3_bcvfs_session_record headRecord;
++  sqlite3_bcvfs_session_record badCheckpointRecord;
++  sqlite3_bcvfs_session_record badHeadRecord;
++  sqlite3_bcvfs_session_record expiredCheckpointRecord;
++  sqlite3_bcvfs_session_record expiredHeadRecord;
++  sqlite3_bcvfs_session_body checkpointBody;
++  sqlite3_bcvfs *pFresh = 0;
++  sqlite3 *db = 0;
++  sqlite3 *dbFresh = 0;
++  sqlite3_stmt *pStmt = 0;
++  sqlite3_stmt *pFreshStmt = 0;
++  sqlite3_vfs *pClockVfs = 0;
++  sqlite3_vfs *pSessionVfs = 0;
++  char *zPath = 0;
++  char *zImage = 0;
++  char *zFreshVfs = 0;
++  sqlite3_file *pRaw = 0;
++  char *zErr = 0;
++  char *zEtag = 0;
++  char *zBaseEtag = 0;
++  int nCheckpointData = 0;
++  int nCheckpointBody = 0;
++  int nHeadBody = 0;
++  int nBadHeadBody = 0;
++  int nHeadEncoded = 0;
++  int nBadCheckpointEncoded = 0;
++  int nBadHeadEncoded = 0;
++  int nExpiredHeadBody = 0;
++  int nExpiredCheckpointEncoded = 0;
++  int nExpiredHeadEncoded = 0;
++  int nCount = -1;
++  sqlite3_int64 iNow = 0;
++  int rc = SQLITE_OK;
++  int rcRet = TCL_OK;
++  int bAttached = 0;
++  int bBadAttached = 0;
++  int bExpiredAttached = 0;
++  int bFreshAttached = 0;
++  int bRawOpen = 0;
++
++  if( objc!=9 ){
++    Tcl_WrongNumArgs(
++        interp, 2, objv,
++        "VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR"
++    );
++    return TCL_ERROR;
++  }
++  zVfs = Tcl_GetString(objv[2]);
++  zStorage = Tcl_GetString(objv[3]);
++  zAccount = Tcl_GetString(objv[4]);
++  zContainer = Tcl_GetString(objv[5]);
++  zSessionId = Tcl_GetString(objv[6]);
++  zDatabase = Tcl_GetString(objv[7]);
++  zFreshDir = Tcl_GetString(objv[8]);
++  memset(aOperationId,0,sizeof(aOperationId));
++  memset(aFreshOperationId,0,sizeof(aFreshOperationId));
++  memset(aBadOperationId,0,sizeof(aBadOperationId));
++  aOperationId[0] = 0x18;
++  aFreshOperationId[0] = 0x19;
++  aBadOperationId[0] = 0xA8;
++  aBadOperationId[1] = 0x01;
++#define SESSION_OVERLAY_FAIL(zMsg) do { \
++    Tcl_SetObjResult(interp, Tcl_NewStringObj((zMsg), -1)); \
++    rcRet = TCL_ERROR; \
++    goto session_overlay_done; \
++  } while(0)
++#define SESSION_OVERLAY_REQUIRE(cond,zMsg) \
++  do { if(!(cond)) SESSION_OVERLAY_FAIL(zMsg); } while(0)
++
++  pClockVfs = sqlite3_vfs_find(0);
++  SESSION_OVERLAY_REQUIRE(
++      pClockVfs!=0
++       && pClockVfs->xCurrentTimeInt64(pClockVfs,&iNow)==SQLITE_OK,
++      "session overlay clock unavailable"
++  );
++
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aOperationId,0,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_OK && zErr==0, "session overlay attachment failed"
++  );
++  bAttached = 1;
++
++  pSessionVfs = sqlite3_vfs_find(zVfs);
++  nCount = 0;
++  SESSION_OVERLAY_REQUIRE(
++      pSessionVfs!=0
++       && pSessionVfs->xAccess(
++           pSessionVfs,"/session-overlay-test/other.db",
++           SQLITE_ACCESS_EXISTS,&nCount
++       )==SQLITE_AUTH
++       && nCount==0,
++      "session xAccess exposed an unrelated database"
++  );
++  rc = sqlite3_open_v2(
++      "/session-overlay-test/other.db",&db,SQLITE_OPEN_READWRITE,zVfs
++  );
++  SESSION_OVERLAY_REQUIRE(
++      rc!=SQLITE_OK, "session xOpen allowed an unrelated database"
++  );
++  if( db ){
++    sqlite3_close(db);
++    db = 0;
++  }
++
++  zPath = sqlite3_mprintf("/%s/%s",zAlias,zDatabase);
++  SESSION_OVERLAY_REQUIRE(zPath!=0, "session overlay path allocation failed");
++  zImage = sqlite3_mprintf("%s/session-overlay-image.db",zFreshDir);
++  SESSION_OVERLAY_REQUIRE(zImage!=0, "session overlay image path allocation failed");
++  rc = bcvfsSessionBuildImage(zImage,1,&zErr);
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "session overlay image build failed");
++  pRaw = (sqlite3_file*)sqlite3_malloc64(
++      (sqlite3_uint64)pSessionVfs->szOsFile
++  );
++  SESSION_OVERLAY_REQUIRE(pRaw!=0, "session overlay raw file allocation failed");
++  memset(pRaw,0,(size_t)pSessionVfs->szOsFile);
++  {
++    int rawFlags = SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
++    rc = pSessionVfs->xOpen(pSessionVfs,zPath,pRaw,rawFlags,&rawFlags);
++  }
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_OK && pRaw->pMethods!=0,
++      "session overlay raw file open failed"
++  );
++  bRawOpen = 1;
++  rc = bcvfsSessionCopyImage(pRaw,zImage,&zErr);
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "session overlay image copy failed");
++  rc = pRaw->pMethods->xSync(pRaw,0);
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "session overlay raw sync failed");
++  rc = pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  pRaw = 0;
++  bRawOpen = 0;
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "session overlay raw close failed");
++
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zAlias,zSessionId,aCheckpointHash,&zEtag,&zErr
++  );
++  if( !(rc==SQLITE_OK && zEtag!=0 && zEtag[0]) ){
++    char *zDiag = sqlite3_mprintf(
++        "session overlay checkpoint failed (rc=%d, err=%s)",
++        rc,zErr ? zErr : sqlite3_errstr(rc)
++    );
++    if( zDiag ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(zDiag,-1));
++      sqlite3_free(zDiag);
++    }else{
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          "session overlay checkpoint failed (diagnostic allocation failed)",-1
++      ));
++    }
++    rcRet = TCL_ERROR;
++    goto session_overlay_done;
++  }
++  sqlite3_free(zEtag);
++  zEtag = 0;
++
++  rc = sqlite3_bcvfs_session_scope_hash(
++      zStorage,zAccount,zContainer,zPrincipal,zDatabase,zOperations,
++      aScope,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "session overlay scope failed");
++  rc = sqlite3_bcvfs_session_fetch(
++      pTest->pFs,zAlias,SQLITE_BCVFS_SESSION_CHECKPOINT,zSessionId,
++      aCheckpointHash,zPrincipal,zDatabase,zOperations,&aCheckpointData,
++      &nCheckpointData,&zEtag,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_OK && aCheckpointData!=0 && zEtag!=0,
++      "session overlay checkpoint fetch failed"
++  );
++  rc = sqlite3_bcvfs_session_record_decode(
++      aCheckpointData,nCheckpointData,zSessionId,aScope,&checkpointRecord,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "session overlay checkpoint decode failed");
++  rc = sqlite3_bcvfs_session_body_decode(
++      checkpointRecord.eType,checkpointRecord.eState,
++      checkpointRecord.zSessionId,checkpointRecord.aBody,
++      checkpointRecord.nBody,&checkpointBody,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_OK && checkpointBody.nBaseManifestETag>0
++          && checkpointBody.aBaseManifestETag!=0
++          && checkpointBody.nManifest>0,
++      "session overlay checkpoint body decode failed"
++  );
++  SESSION_OVERLAY_REQUIRE(
++      0==memcmp(checkpointRecord.aOperationId,aOperationId,
++          sizeof(aOperationId)),
++      "checkpoint operation identity was not preserved"
++  );
++  zBaseEtag = (char*)sqlite3_malloc64(
++      (sqlite3_uint64)checkpointBody.nBaseManifestETag+1
++  );
++  SESSION_OVERLAY_REQUIRE(zBaseEtag!=0, "base ETag allocation failed");
++  memcpy(zBaseEtag,checkpointBody.aBaseManifestETag,
++      checkpointBody.nBaseManifestETag);
++  zBaseEtag[checkpointBody.nBaseManifestETag] = '\0';
++  sqlite3_free(zEtag);
++  zEtag = 0;
++
++  nHeadBody = 116 + checkpointBody.nBaseManifestETag;
++  aHeadBody = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nHeadBody);
++  SESSION_OVERLAY_REQUIRE(aHeadBody!=0, "head body allocation failed");
++  nHeadBody = bcvfsSessionTestHeadBody(
++      aHeadBody,nHeadBody,zBaseEtag,aCheckpointHash,0
++  );
++  SESSION_OVERLAY_REQUIRE(nHeadBody>0, "head body construction failed");
++  memset(&headRecord,0,sizeof(headRecord));
++  headRecord.eType = SQLITE_BCVFS_SESSION_HEAD;
++  headRecord.eState = SQLITE_BCVFS_SESSION_ACCEPTED;
++  headRecord.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS;
++  headRecord.iSequence = checkpointRecord.iSequence+1;
++  headRecord.iCreated = iNow;
++  headRecord.iExpires = iNow + 60000;
++  sqlite3_snprintf(sizeof(headRecord.zSessionId),headRecord.zSessionId,
++      "%s",zSessionId);
++  memcpy(headRecord.aScopeHash,aScope,sizeof(aScope));
++  memcpy(headRecord.aOperationId,aOperationId,sizeof(aOperationId));
++  headRecord.aBody = aHeadBody;
++  headRecord.nBody = nHeadBody;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &headRecord,&aHeadEncoded,&nHeadEncoded,aHeadHash,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_OK && aHeadEncoded!=0, "accepted head encode failed"
++  );
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs,zAlias,SQLITE_BCVFS_SESSION_HEAD,zSessionId,0,
++      zPrincipal,zDatabase,zOperations,"*",aHeadEncoded,nHeadEncoded,
++      &zEtag,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_OK && zEtag!=0 && zEtag[0],
++      "accepted head publication failed"
++  );
++  sqlite3_free(zEtag);
++  zEtag = 0;
++  sqlite3_free(aHeadEncoded);
++  aHeadEncoded = 0;
++
++  /* A session-owned alias cannot poll its way back to the public manifest. */
++  rc = sqlite3_bcvfs_poll(pTest->pFs,zAlias,&zErr);
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_BUSY, "session overlay poll was allowed to replace its base"
++  );
++  sqlite3_free(zErr);
++  zErr = 0;
++
++  zFreshVfs = sqlite3_mprintf("bcvfs-overlay-fresh-%s",zSessionId);
++  SESSION_OVERLAY_REQUIRE(zFreshVfs!=0, "fresh overlay VFS allocation failed");
++  rc = sqlite3_bcvfs_create(zFreshDir,zFreshVfs,&pFresh,&zErr);
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_OK && pFresh!=0, "fresh overlay VFS creation failed"
++  );
++  if( pTest->pAuthCallback ){
++    rc = sqlite3_bcvfs_auth_callback(pFresh,(void*)pTest,bcvfsAuthCb);
++    SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "fresh overlay auth setup failed");
++  }
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pFresh,zStorage,zAccount,zContainer,"fresh-overlay",zSessionId,
++      zPrincipal,zDatabase,zOperations,aFreshOperationId,0,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_OK, "fresh overlay rehydration failed"
++  );
++  bFreshAttached = 1;
++  {
++    char *zFreshPath = sqlite3_mprintf("/fresh-overlay/%s",zDatabase);
++    SESSION_OVERLAY_REQUIRE(zFreshPath!=0, "fresh overlay path allocation failed");
++    rc = sqlite3_open_v2(
++        zFreshPath,&dbFresh,SQLITE_OPEN_READONLY,zFreshVfs
++    );
++    sqlite3_free(zFreshPath);
++    SESSION_OVERLAY_REQUIRE(
++        rc==SQLITE_OK && dbFresh!=0, "fresh overlay database open failed"
++    );
++    rc = sqlite3_prepare_v2(
++        dbFresh,"SELECT count(*) FROM t",-1,&pFreshStmt,0
++    );
++    SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "fresh overlay query failed");
++    rc = sqlite3_step(pFreshStmt);
++    nCount = (rc==SQLITE_ROW) ? sqlite3_column_int(pFreshStmt,0) : -1;
++    SESSION_OVERLAY_REQUIRE(
++        nCount==4096, "fresh overlay did not read the accepted checkpoint"
++    );
++    sqlite3_finalize(pFreshStmt);
++    pFreshStmt = 0;
++    sqlite3_close(dbFresh);
++    dbFresh = 0;
++  }
++  rc = sqlite3_bcvfs_detach_session(
++      pFresh,"fresh-overlay",zSessionId,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "fresh overlay detach failed");
++  bFreshAttached = 0;
++  sqlite3_bcvfs_destroy(pFresh);
++  pFresh = 0;
++
++  /* A warm alias with a newer unaccepted local write is reset to the head. */
++  rc = sqlite3_open_v2(zPath,&db,SQLITE_OPEN_READWRITE,zVfs);
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK && db!=0, "warm overlay reopen failed");
++  rc = sqlite3_exec(db,"INSERT INTO t(v) VALUES('stale')",0,0,&zErr);
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "warm overlay stale write failed");
++  sqlite3_close(db);
++  db = 0;
++  rc = sqlite3_bcvfs_detach_session(
++      pTest->pFs,zAlias,zSessionId,&zErr
++  );
++  if( rc!=SQLITE_OK ){
++    char *zDiag = sqlite3_mprintf(
++        "warm overlay detach failed (rc=%d, err=%s)",
++        rc,zErr ? zErr : sqlite3_errstr(rc)
++    );
++    if( zDiag ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(zDiag,-1));
++      sqlite3_free(zDiag);
++    }else{
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          "warm overlay detach failed (diagnostic allocation failed)",-1
++      ));
++    }
++    rcRet = TCL_ERROR;
++    goto session_overlay_done;
++  }
++  bAttached = 0;
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aFreshOperationId,0,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "warm overlay reattach failed");
++  bAttached = 1;
++  rc = sqlite3_open_v2(zPath,&db,SQLITE_OPEN_READONLY,zVfs);
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK && db!=0, "warm overlay reopen after reset failed");
++  rc = sqlite3_prepare_v2(db,"SELECT count(*) FROM t",-1,&pStmt,0);
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "warm overlay query failed");
++  rc = sqlite3_step(pStmt);
++  nCount = (rc==SQLITE_ROW) ? sqlite3_column_int(pStmt,0) : -1;
++  SESSION_OVERLAY_REQUIRE(nCount==4096, "warm overlay retained unaccepted data");
++  sqlite3_finalize(pStmt);
++  pStmt = 0;
++  sqlite3_close(db);
++  db = 0;
++
++  /* Construct a checkpoint whose operation token differs from its head. */
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zBadAlias,zBadSession,
++      zPrincipal,zDatabase,zOperations,aBadOperationId,0,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "invalid overlay attachment failed");
++  bBadAttached = 1;
++  nCheckpointBody = checkpointRecord.nBody;
++  aBadCheckpointBody = (unsigned char*)sqlite3_malloc64(
++      (sqlite3_uint64)nCheckpointBody
++  );
++  SESSION_OVERLAY_REQUIRE(aBadCheckpointBody!=0, "invalid checkpoint body allocation failed");
++  memcpy(aBadCheckpointBody,checkpointRecord.aBody,nCheckpointBody);
++  memset(&badCheckpointRecord,0,sizeof(badCheckpointRecord));
++  badCheckpointRecord.eType = SQLITE_BCVFS_SESSION_CHECKPOINT;
++  badCheckpointRecord.eState = SQLITE_BCVFS_SESSION_OPEN;
++  badCheckpointRecord.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++  badCheckpointRecord.iSequence = checkpointRecord.iSequence;
++  badCheckpointRecord.iCreated = iNow;
++  badCheckpointRecord.iExpires = iNow + 60000;
++  sqlite3_snprintf(sizeof(badCheckpointRecord.zSessionId),
++      badCheckpointRecord.zSessionId,"%s",zBadSession);
++  memcpy(badCheckpointRecord.aScopeHash,aScope,sizeof(aScope));
++  memcpy(badCheckpointRecord.aOperationId,aBadOperationId,
++      sizeof(aBadOperationId));
++  badCheckpointRecord.aBody = aBadCheckpointBody;
++  badCheckpointRecord.nBody = nCheckpointBody;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &badCheckpointRecord,&aBadCheckpointEncoded,
++      &nBadCheckpointEncoded,aBadCheckpointHash,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "invalid checkpoint encode failed");
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs,zBadAlias,SQLITE_BCVFS_SESSION_CHECKPOINT,zBadSession,
++      aBadCheckpointHash,zPrincipal,zDatabase,zOperations,"*",
++      aBadCheckpointEncoded,nBadCheckpointEncoded,&zEtag,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "invalid checkpoint PUT failed");
++  sqlite3_free(zEtag);
++  zEtag = 0;
++
++  nBadHeadBody = 116 + checkpointBody.nBaseManifestETag;
++  aBadHeadBody = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nBadHeadBody);
++  SESSION_OVERLAY_REQUIRE(aBadHeadBody!=0, "invalid head body allocation failed");
++  nBadHeadBody = bcvfsSessionTestHeadBody(
++      aBadHeadBody,nBadHeadBody,zBaseEtag,aBadCheckpointHash,0
++  );
++  SESSION_OVERLAY_REQUIRE(nBadHeadBody>0, "invalid head body construction failed");
++  memset(&badHeadRecord,0,sizeof(badHeadRecord));
++  badHeadRecord.eType = SQLITE_BCVFS_SESSION_HEAD;
++  badHeadRecord.eState = SQLITE_BCVFS_SESSION_ACCEPTED;
++  badHeadRecord.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS;
++  badHeadRecord.iSequence = badCheckpointRecord.iSequence+1;
++  badHeadRecord.iCreated = iNow;
++  badHeadRecord.iExpires = iNow + 60000;
++  sqlite3_snprintf(sizeof(badHeadRecord.zSessionId),badHeadRecord.zSessionId,
++      "%s",zBadSession);
++  memcpy(badHeadRecord.aScopeHash,aScope,sizeof(aScope));
++  memcpy(badHeadRecord.aOperationId,aOperationId,sizeof(aOperationId));
++  badHeadRecord.aBody = aBadHeadBody;
++  badHeadRecord.nBody = nBadHeadBody;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &badHeadRecord,&aBadHeadEncoded,&nBadHeadEncoded,aBadHeadHash,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "invalid head encode failed");
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs,zBadAlias,SQLITE_BCVFS_SESSION_HEAD,zBadSession,0,
++      zPrincipal,zDatabase,zOperations,"*",aBadHeadEncoded,nBadHeadEncoded,
++      &zEtag,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "invalid head PUT failed");
++  sqlite3_free(zEtag);
++  zEtag = 0;
++  sqlite3_free(aBadHeadEncoded);
++  aBadHeadEncoded = 0;
++  rc = sqlite3_bcvfs_session_rehydrate(
++      pTest->pFs,zBadAlias,zBadSession,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_CORRUPT,
++      "checkpoint from a different operation was accepted by rehydration"
++  );
++  sqlite3_free(zErr);
++  zErr = 0;
++
++  /* An expired accepted head is not a live predecessor for a new request. */
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zExpiredAlias,zExpiredSession,
++      zPrincipal,zDatabase,zOperations,aFreshOperationId,0,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "expired overlay attachment failed");
++  bExpiredAttached = 1;
++  memset(&expiredCheckpointRecord,0,sizeof(expiredCheckpointRecord));
++  expiredCheckpointRecord.eType = SQLITE_BCVFS_SESSION_CHECKPOINT;
++  expiredCheckpointRecord.eState = SQLITE_BCVFS_SESSION_OPEN;
++  expiredCheckpointRecord.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++  expiredCheckpointRecord.iSequence = checkpointRecord.iSequence;
++  expiredCheckpointRecord.iCreated = iNow-60000;
++  expiredCheckpointRecord.iExpires = iNow+60000;
++  sqlite3_snprintf(sizeof(expiredCheckpointRecord.zSessionId),
++      expiredCheckpointRecord.zSessionId,"%s",zExpiredSession);
++  memcpy(expiredCheckpointRecord.aScopeHash,aScope,sizeof(aScope));
++  memcpy(expiredCheckpointRecord.aOperationId,aOperationId,
++      sizeof(aOperationId));
++  expiredCheckpointRecord.aBody = checkpointRecord.aBody;
++  expiredCheckpointRecord.nBody = checkpointRecord.nBody;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &expiredCheckpointRecord,&aExpiredCheckpointEncoded,
++      &nExpiredCheckpointEncoded,aExpiredCheckpointHash,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "expired checkpoint encode failed");
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs,zExpiredAlias,SQLITE_BCVFS_SESSION_CHECKPOINT,
++      zExpiredSession,aExpiredCheckpointHash,zPrincipal,zDatabase,
++      zOperations,"*",aExpiredCheckpointEncoded,nExpiredCheckpointEncoded,
++      &zEtag,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "expired checkpoint PUT failed");
++  sqlite3_free(zEtag);
++  zEtag = 0;
++  nExpiredHeadBody = 116 + checkpointBody.nBaseManifestETag;
++  aExpiredHeadBody = (unsigned char*)sqlite3_malloc64(
++      (sqlite3_uint64)nExpiredHeadBody
++  );
++  SESSION_OVERLAY_REQUIRE(aExpiredHeadBody!=0, "expired head body allocation failed");
++  nExpiredHeadBody = bcvfsSessionTestHeadBody(
++      aExpiredHeadBody,nExpiredHeadBody,zBaseEtag,aExpiredCheckpointHash,0
++  );
++  SESSION_OVERLAY_REQUIRE(nExpiredHeadBody>0, "expired head body construction failed");
++  memset(&expiredHeadRecord,0,sizeof(expiredHeadRecord));
++  expiredHeadRecord.eType = SQLITE_BCVFS_SESSION_HEAD;
++  expiredHeadRecord.eState = SQLITE_BCVFS_SESSION_ACCEPTED;
++  expiredHeadRecord.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS;
++  expiredHeadRecord.iSequence = expiredCheckpointRecord.iSequence+1;
++  expiredHeadRecord.iCreated = iNow-60000;
++  expiredHeadRecord.iExpires = iNow-1;
++  sqlite3_snprintf(sizeof(expiredHeadRecord.zSessionId),
++      expiredHeadRecord.zSessionId,"%s",zExpiredSession);
++  memcpy(expiredHeadRecord.aScopeHash,aScope,sizeof(aScope));
++  memcpy(expiredHeadRecord.aOperationId,aOperationId,sizeof(aOperationId));
++  expiredHeadRecord.aBody = aExpiredHeadBody;
++  expiredHeadRecord.nBody = nExpiredHeadBody;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &expiredHeadRecord,&aExpiredHeadEncoded,
++      &nExpiredHeadEncoded,aExpiredHeadHash,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "expired head encode failed");
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs,zExpiredAlias,SQLITE_BCVFS_SESSION_HEAD,zExpiredSession,0,
++      zPrincipal,zDatabase,zOperations,"*",aExpiredHeadEncoded,
++      nExpiredHeadEncoded,&zEtag,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "expired head PUT failed");
++  sqlite3_free(zEtag);
++  zEtag = 0;
++  rc = sqlite3_bcvfs_session_rehydrate(
++      pTest->pFs,zExpiredAlias,zExpiredSession,&zErr
++  );
++  SESSION_OVERLAY_REQUIRE(
++      rc==SQLITE_AUTH, "expired accepted head was used for rehydration"
++  );
++  sqlite3_free(zErr);
++  zErr = 0;
++
++session_overlay_done:
++  sqlite3_free(zErr);
++  sqlite3_free(zEtag);
++  sqlite3_free(zPath);
++  sqlite3_free(zImage);
++  sqlite3_free(zFreshVfs);
++  sqlite3_free(zBaseEtag);
++  sqlite3_free(aCheckpointData);
++  sqlite3_free(aBadCheckpointBody);
++  sqlite3_free(aHeadBody);
++  sqlite3_free(aBadHeadBody);
++  sqlite3_free(aHeadEncoded);
++  sqlite3_free(aBadCheckpointEncoded);
++  sqlite3_free(aBadHeadEncoded);
++  sqlite3_free(aExpiredHeadBody);
++  sqlite3_free(aExpiredCheckpointEncoded);
++  sqlite3_free(aExpiredHeadEncoded);
++  if( pStmt ) sqlite3_finalize(pStmt);
++  if( pFreshStmt ) sqlite3_finalize(pFreshStmt);
++  if( db ) sqlite3_close(db);
++  if( dbFresh ) sqlite3_close(dbFresh);
++  if( bRawOpen && pRaw ) pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  if( bFreshAttached && pFresh ){
++    char *zDetachErr = 0;
++    sqlite3_bcvfs_detach_session(pFresh,"fresh-overlay",zSessionId,&zDetachErr);
++    sqlite3_free(zDetachErr);
++  }
++  if( pFresh ) sqlite3_bcvfs_destroy(pFresh);
++  if( bBadAttached ){
++    char *zDetachErr = 0;
++    int rcDetach = sqlite3_bcvfs_detach_session(
++        pTest->pFs,zBadAlias,zBadSession,&zDetachErr
++    );
++    if( rcRet==TCL_OK && rcDetach!=SQLITE_OK ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          zDetachErr ? zDetachErr : "invalid overlay detach failed",-1
++      ));
++      rcRet = TCL_ERROR;
++    }
++    sqlite3_free(zDetachErr);
++  }
++  if( bExpiredAttached ){
++    char *zDetachErr = 0;
++    int rcDetach = sqlite3_bcvfs_detach_session(
++        pTest->pFs,zExpiredAlias,zExpiredSession,&zDetachErr
++    );
++    if( rcRet==TCL_OK && rcDetach!=SQLITE_OK ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          zDetachErr ? zDetachErr : "expired overlay detach failed",-1
++      ));
++      rcRet = TCL_ERROR;
++    }
++    sqlite3_free(zDetachErr);
++  }
++  if( bAttached ){
++    char *zDetachErr = 0;
++    int rcDetach = sqlite3_bcvfs_detach_session(
++        pTest->pFs,zAlias,zSessionId,&zDetachErr
++    );
++    if( rcRet==TCL_OK && rcDetach!=SQLITE_OK ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          zDetachErr ? zDetachErr : "session overlay detach failed",-1
++      ));
++      rcRet = TCL_ERROR;
++    }
++    sqlite3_free(zDetachErr);
++  }
++  if( rcRet==TCL_OK ) Tcl_ResetResult(interp);
++#undef SESSION_OVERLAY_REQUIRE
++#undef SESSION_OVERLAY_FAIL
++  return rcRet;
++}
++
++/*
++** $vfs session_publication_test VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR
++**
++** Check that checkpoint bytes remain unpublished until the explicit fenced
++** upload call, that the legacy upload entry point cannot bypass that fence,
++** and that a repeated upload reconciles the already committed records.
++*/
++static int test_bcvfs_session_publication(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  TestBcvfs *pTest = (TestBcvfs*)clientData;
++  const char *zVfs;
++  const char *zStorage;
++  const char *zAccount;
++  const char *zContainer;
++  const char *zSessionId;
++  const char *zDatabase;
++  const char *zFreshDir;
++  const char *zAlias = "session-publication-test";
++  const char *zPrincipal = "session-publication-principal";
++  const char *zOperations = "read,write,commit";
++  const char *zNextAlias = "session-publication-next";
++  unsigned char aOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aNextOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aStorageScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aHeadHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aPendingCandidateHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char *aCheckpointData = 0;
++  unsigned char *aHeadBody = 0;
++  unsigned char *aHeadEncoded = 0;
++  unsigned char *aHeadData = 0;
++  unsigned char *aPublicationData = 0;
++  unsigned char *aExpiredPublicationEncoded = 0;
++  unsigned char *aPendingPublicationBody = 0;
++  unsigned char *aBaseManifest = 0;
++  unsigned char *aCurrentManifest = 0;
++  unsigned char *aNextHeadBody = 0;
++  unsigned char *aNextHeadEncoded = 0;
++  sqlite3_bcvfs_session_record checkpointRecord;
++  sqlite3_bcvfs_session_record headRecord;
++  sqlite3_bcvfs_session_record decodedHead;
++  sqlite3_bcvfs_session_record publicationRecord;
++  sqlite3_bcvfs_session_record nextCheckpointRecord;
++  sqlite3_bcvfs_session_record nextHeadRecord;
++  sqlite3_bcvfs_session_body checkpointBody;
++  sqlite3_bcvfs_session_body publicationBody;
++  sqlite3_bcvfs_session_body nextCheckpointBody;
++  sqlite3_bcvfs *pFresh = 0;
++  sqlite3 *dbFresh = 0;
++  sqlite3_stmt *pStmt = 0;
++  sqlite3_vfs *pClockVfs;
++  sqlite3_vfs *pSessionVfs = 0;
++  sqlite3_file *pRaw = 0;
++  char *zPath = 0;
++  char *zImage = 0;
++  char *zFreshVfs = 0;
++  char *zFreshPath = 0;
++  char *zErr = 0;
++  char *zEtag = 0;
++  char *zBaseEtag = 0;
++  char *zBaseManifestEtag = 0;
++  char *zCurrentManifestEtag = 0;
++  char *zRestoredManifestEtag = 0;
++  char *zLegacyErr = 0;
++  char zNextSessionId[SQLITE_BCVFS_SESSION_ID_TEXT_BYTES];
++  int nCheckpointData = 0;
++  int nHeadBody = 0;
++  int nHeadEncoded = 0;
++  int nHeadData = 0;
++  int nPublicationData = 0;
++  int nExpiredPublicationEncoded = 0;
++  int nPendingPublicationBody = 0;
++  int nBaseManifest = 0;
++  int nCurrentManifest = 0;
++  int nNextHeadBody = 0;
++  int nNextHeadEncoded = 0;
++  sqlite3_int64 iCandidateFileSize = 0;
++  sqlite3_int64 iPublishedFileSize = 0;
++  sqlite3_int64 iNow = 0;
++  int rc = SQLITE_OK;
++  int rcRet = TCL_OK;
++  int bAttached = 0;
++  int bFreshAttached = 0;
++  int bNextAttached = 0;
++  int bRawOpen = 0;
++
++  if( objc!=9 ){
++    Tcl_WrongNumArgs(
++        interp,2,objv,
++        "VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR"
++    );
++    return TCL_ERROR;
++  }
++  zVfs = Tcl_GetString(objv[2]);
++  zStorage = Tcl_GetString(objv[3]);
++  zAccount = Tcl_GetString(objv[4]);
++  zContainer = Tcl_GetString(objv[5]);
++  zSessionId = Tcl_GetString(objv[6]);
++  zDatabase = Tcl_GetString(objv[7]);
++  zFreshDir = Tcl_GetString(objv[8]);
++  memset(aOperationId,0,sizeof(aOperationId));
++  aOperationId[0] = 0x19;
++  aOperationId[1] = 0x01;
++  memset(aNextOperationId,0,sizeof(aNextOperationId));
++  aNextOperationId[0] = 0x19;
++  aNextOperationId[1] = 0x02;
++  memset(&checkpointRecord,0,sizeof(checkpointRecord));
++  memset(&headRecord,0,sizeof(headRecord));
++  memset(&decodedHead,0,sizeof(decodedHead));
++  memset(&publicationRecord,0,sizeof(publicationRecord));
++  memset(&nextCheckpointRecord,0,sizeof(nextCheckpointRecord));
++  memset(&nextHeadRecord,0,sizeof(nextHeadRecord));
++  memset(&checkpointBody,0,sizeof(checkpointBody));
++  memset(&publicationBody,0,sizeof(publicationBody));
++  memset(aPendingCandidateHash,0,sizeof(aPendingCandidateHash));
++  memset(&nextCheckpointBody,0,sizeof(nextCheckpointBody));
++  sqlite3_snprintf(sizeof(zNextSessionId),zNextSessionId,"%s",zSessionId);
++  zNextSessionId[35] = zNextSessionId[35]=='1' ? '2' : '1';
++
++#define SESSION_PUBLICATION_FAIL(zMsg) do { \
++    Tcl_SetObjResult(interp,Tcl_NewStringObj((zMsg),-1)); \
++    rcRet = TCL_ERROR; \
++    goto session_publication_done; \
++  } while(0)
++#define SESSION_PUBLICATION_REQUIRE(cond,zMsg) \
++  do { if(!(cond)) SESSION_PUBLICATION_FAIL(zMsg); } while(0)
++
++  pClockVfs = sqlite3_vfs_find(0);
++  SESSION_PUBLICATION_REQUIRE(
++      pClockVfs!=0
++       && pClockVfs->xCurrentTimeInt64(pClockVfs,&iNow)==SQLITE_OK,
++      "session publication clock unavailable"
++  );
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aOperationId,0,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && zErr==0, "session publication attachment failed"
++  );
++  bAttached = 1;
++
++  zPath = sqlite3_mprintf("/%s/%s",zAlias,zDatabase);
++  SESSION_PUBLICATION_REQUIRE(zPath!=0, "session publication path allocation failed");
++  zImage = sqlite3_mprintf("%s/publication-image-1.db",zFreshDir);
++  SESSION_PUBLICATION_REQUIRE(zImage!=0, "publication image path allocation failed");
++  rc = bcvfsSessionBuildPublicationImage(zImage,1,&zErr);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "publication image build failed");
++  pSessionVfs = sqlite3_vfs_find(zVfs);
++  SESSION_PUBLICATION_REQUIRE(pSessionVfs!=0, "publication VFS lookup failed");
++  pRaw = (sqlite3_file*)sqlite3_malloc64((sqlite3_uint64)pSessionVfs->szOsFile);
++  SESSION_PUBLICATION_REQUIRE(pRaw!=0, "publication raw file allocation failed");
++  memset(pRaw,0,(size_t)pSessionVfs->szOsFile);
++  {
++    int rawFlags = SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
++    rc = pSessionVfs->xOpen(pSessionVfs,zPath,pRaw,rawFlags,&rawFlags);
++  }
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && pRaw->pMethods!=0, "publication raw file open failed"
++  );
++  bRawOpen = 1;
++  rc = bcvfsSessionCopyImage(pRaw,zImage,&zErr);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "publication image copy failed");
++  rc = pRaw->pMethods->xSync(pRaw,0);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "publication image sync failed");
++  rc = pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  pRaw = 0;
++  bRawOpen = 0;
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "publication raw file close failed");
++  sqlite3_free(zImage);
++  zImage = 0;
++
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zAlias,zSessionId,aCheckpointHash,&zEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && zEtag!=0 && zEtag[0],
++      "session publication checkpoint failed"
++  );
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      zStorage,zAccount,zContainer,zPrincipal,zDatabase,zOperations,
++      aScope,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "session publication scope failed");
++  rc = sqlite3_bcvfs_session_storage_scope_hash(
++      zStorage,zAccount,zContainer,aStorageScope,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK, "session publication storage scope failed"
++  );
++  rc = sqlite3_bcvfs_session_fetch(
++      pTest->pFs,zAlias,SQLITE_BCVFS_SESSION_CHECKPOINT,zSessionId,
++      aCheckpointHash,zPrincipal,zDatabase,zOperations,&aCheckpointData,
++      &nCheckpointData,&zEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && aCheckpointData!=0 && zEtag!=0,
++      "session publication checkpoint fetch failed"
++  );
++  rc = sqlite3_bcvfs_session_record_decode(
++      aCheckpointData,nCheckpointData,zSessionId,aScope,
++      &checkpointRecord,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK, "session publication checkpoint decode failed"
++  );
++  rc = sqlite3_bcvfs_session_body_decode(
++      checkpointRecord.eType,checkpointRecord.eState,
++      checkpointRecord.zSessionId,checkpointRecord.aBody,
++      checkpointRecord.nBody,&checkpointBody,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && checkpointBody.nBaseManifestETag>0
++       && checkpointBody.nManifest>0,
++      "session publication checkpoint body decode failed"
++  );
++  iCandidateFileSize = (sqlite3_int64)checkpointBody.iFileSize;
++  SESSION_PUBLICATION_REQUIRE(
++      iCandidateFileSize>0 && iCandidateFileSize<131072,
++      "checkpoint did not preserve the partial logical EOF"
++  );
++  zBaseEtag = (char*)sqlite3_malloc64(
++      (sqlite3_uint64)checkpointBody.nBaseManifestETag+1
++  );
++  SESSION_PUBLICATION_REQUIRE(zBaseEtag!=0, "base ETag allocation failed");
++  memcpy(zBaseEtag,checkpointBody.aBaseManifestETag,
++      checkpointBody.nBaseManifestETag);
++  zBaseEtag[checkpointBody.nBaseManifestETag] = '\0';
++  sqlite3_free(zEtag); zEtag = 0;
++
++  rc = sqlite3_bcvfs_upload(pTest->pFs,zAlias,0,0,&zLegacyErr);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_AUTH && zLegacyErr!=0,
++      "legacy upload bypassed the session publication fence"
++  );
++  sqlite3_free(zLegacyErr); zLegacyErr = 0;
++
++  /* The ordinary view must remain at the old manifest until publication. */
++  zFreshVfs = sqlite3_mprintf("bcvfs-publication-pre-%s",zSessionId);
++  SESSION_PUBLICATION_REQUIRE(zFreshVfs!=0, "pre-publication VFS allocation failed");
++  rc = sqlite3_bcvfs_create(zFreshDir,zFreshVfs,&pFresh,&zErr);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && pFresh!=0, "pre-publication VFS creation failed");
++  if( pTest->pAuthCallback ){
++    rc = sqlite3_bcvfs_auth_callback(pFresh,(void*)pTest,bcvfsAuthCb);
++    SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "pre-publication auth setup failed");
++  }
++  rc = sqlite3_bcvfs_attach(
++      pFresh,zStorage,zAccount,zContainer,"fresh-publication",0,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "pre-publication attach failed");
++  bFreshAttached = 1;
++  zFreshPath = sqlite3_mprintf("/fresh-publication/%s",zDatabase);
++  SESSION_PUBLICATION_REQUIRE(zFreshPath!=0, "pre-publication path allocation failed");
++  rc = sqlite3_open_v2(zFreshPath,&dbFresh,SQLITE_OPEN_READONLY,zFreshVfs);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && dbFresh!=0, "pre-publication open failed");
++  rc = sqlite3_prepare_v2(dbFresh,"SELECT count(*) FROM t",-1,&pStmt,0);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "pre-publication query failed");
++  rc = sqlite3_step(pStmt);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_ROW && sqlite3_column_int(pStmt,0)==0,
++      "checkpoint became visible before upload"
++  );
++  sqlite3_finalize(pStmt); pStmt = 0;
++  rc = bcvfsSessionFetchObject(
++      dbFresh,"manifest.bcv",&aBaseManifest,&nBaseManifest,
++      &zBaseManifestEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && aBaseManifest!=0 && nBaseManifest>0
++       && zBaseManifestEtag!=0,
++      "base manifest snapshot failed"
++  );
++  sqlite3_close(dbFresh); dbFresh = 0;
++
++  rc = sqlite3_bcvfs_session_finalize(pTest->pFs,zAlias,zSessionId,&zErr);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && zErr==0,
++      "direct-to-publishing session finalization failed"
++  );
++  rc = sqlite3_bcvfs_session_upload(pTest->pFs,zAlias,zSessionId,&zErr);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && zErr==0, "idempotent fenced upload failed"
++  );
++  rc = sqlite3_bcvfs_session_fetch(
++      pTest->pFs,zAlias,SQLITE_BCVFS_SESSION_HEAD,zSessionId,0,
++      zPrincipal,zDatabase,zOperations,&aHeadData,&nHeadData,&zEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && aHeadData!=0, "head fetch failed");
++  rc = sqlite3_bcvfs_session_record_decode(
++      aHeadData,nHeadData,zSessionId,aScope,&decodedHead,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK
++       && decodedHead.eState==SQLITE_BCVFS_SESSION_COMMITTED
++       && decodedHead.eOutcome==SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS,
++      "session head was not finalized"
++  );
++  sqlite3_free(aHeadData); aHeadData = 0;
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_session_fetch(
++      pTest->pFs,zAlias,SQLITE_BCVFS_SESSION_PUBLICATION,0,
++      aStorageScope,zPrincipal,zDatabase,zOperations,&aPublicationData,
++      &nPublicationData,&zEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && aPublicationData!=0, "publication fetch failed");
++  rc = sqlite3_bcvfs_session_record_decode(
++      aPublicationData,nPublicationData,0,aStorageScope,
++      &publicationRecord,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK
++       && publicationRecord.eState==SQLITE_BCVFS_SESSION_COMMITTED
++       && publicationRecord.eOutcome==SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS,
++      "publication head was not finalized"
++  );
++  rc = sqlite3_bcvfs_session_body_decode(
++      publicationRecord.eType,publicationRecord.eState,
++      publicationRecord.zSessionId,publicationRecord.aBody,
++      publicationRecord.nBody,&publicationBody,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK,
++      "publication body decode failed"
++  );
++  memcpy(aPendingCandidateHash,publicationBody.aCandidateManifestHash,
++      sizeof(aPendingCandidateHash));
++
++  /* Restore the exact base manifest while retaining the immutable candidate
++  ** object written by the first upload. This is the state left by a process
++  ** which died after candidate PUT and publication-head CAS, but before the
++  ** conditional manifest PUT. */
++  rc = sqlite3_open_v2(zFreshPath,&dbFresh,SQLITE_OPEN_READONLY,zFreshVfs);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && dbFresh!=0,
++      "manifest restore connection failed");
++  rc = bcvfsSessionFetchObject(
++      dbFresh,"manifest.bcv",&aCurrentManifest,&nCurrentManifest,
++      &zCurrentManifestEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && aCurrentManifest!=0 && zCurrentManifestEtag!=0,
++      "published manifest snapshot failed"
++  );
++  rc = bcvfsSessionPutObject(
++      dbFresh,"manifest.bcv",zCurrentManifestEtag,
++      aBaseManifest,nBaseManifest,&zRestoredManifestEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && zRestoredManifestEtag!=0,
++      "base manifest restore failed"
++  );
++  sqlite3_close(dbFresh); dbFresh = 0;
++  sqlite3_free(aCurrentManifest); aCurrentManifest = 0;
++  sqlite3_free(zCurrentManifestEtag); zCurrentManifestEtag = 0;
++  rc = sqlite3_bcvfs_detach(pFresh,"fresh-publication",&zErr);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "manifest restore detach failed");
++  bFreshAttached = 0;
++  sqlite3_bcvfs_destroy(pFresh); pFresh = 0;
++  sqlite3_free(zFreshPath); zFreshPath = 0;
++  sqlite3_free(zFreshVfs); zFreshVfs = 0;
++
++  /* Rebuild the pending publication body with the ETag returned by the
++  ** restore. ETags are provider versions, not hashes: restoring identical
++  ** bytes still creates a new conditional version. */
++  nPendingPublicationBody = 92 + (int)strlen(zRestoredManifestEtag);
++  aPendingPublicationBody = (unsigned char*)sqlite3_malloc64(
++      (sqlite3_uint64)nPendingPublicationBody
++  );
++  SESSION_PUBLICATION_REQUIRE(aPendingPublicationBody!=0,
++      "pending publication body allocation failed");
++  memcpy(aPendingPublicationBody,publicationRecord.aBody,92);
++  bcvPutU32(&aPendingPublicationBody[88],
++      (u32)strlen(zRestoredManifestEtag));
++  memcpy(&aPendingPublicationBody[92],zRestoredManifestEtag,
++      strlen(zRestoredManifestEtag));
++  publicationRecord.aBody = aPendingPublicationBody;
++  publicationRecord.nBody = nPendingPublicationBody;
++
++  /* Simulate the crash after candidate persistence and publication fencing,
++  ** before manifest publication. A different session must replay the exact
++  ** candidate conditionally; its own stale-base candidate must not overwrite
++  ** that recovery result. */
++  publicationRecord.eState = SQLITE_BCVFS_SESSION_PUBLISHING;
++  publicationRecord.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++  publicationRecord.iSequence++;
++  publicationRecord.iCreated = iNow-120000;
++  /* Expiry is a GC horizon, not a takeover lease: a cooperative publisher
++  ** must still recover an exact pending candidate while the head exists. */
++  publicationRecord.iExpires = iNow - 1;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &publicationRecord,&aExpiredPublicationEncoded,
++      &nExpiredPublicationEncoded,aHeadHash,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && aExpiredPublicationEncoded!=0,
++      "expired publication head encode failed"
++  );
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs,zAlias,SQLITE_BCVFS_SESSION_PUBLICATION,0,
++      aStorageScope,zPrincipal,zDatabase,zOperations,zEtag,
++      aExpiredPublicationEncoded,nExpiredPublicationEncoded,
++      &zLegacyErr,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && zLegacyErr!=0,
++      "expired publication head update failed"
++  );
++  sqlite3_free(zEtag); zEtag = zLegacyErr; zLegacyErr = 0;
++  sqlite3_free(aPublicationData); aPublicationData = 0;
++  sqlite3_free(aExpiredPublicationEncoded); aExpiredPublicationEncoded = 0;
++  sqlite3_free(aCheckpointData); aCheckpointData = 0;
++  sqlite3_free(aHeadBody); aHeadBody = 0;
++  sqlite3_free(aHeadEncoded); aHeadEncoded = 0;
++  sqlite3_free(zBaseEtag); zBaseEtag = 0;
++  sqlite3_free(zEtag); zEtag = 0;
++
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zNextAlias,zNextSessionId,
++      zPrincipal,zDatabase,zOperations,aNextOperationId,0,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK, "successor session attachment failed"
++  );
++  bNextAttached = 1;
++  sqlite3_free(zPath); zPath = 0;
++  zPath = sqlite3_mprintf("/%s/%s",zNextAlias,zDatabase);
++  SESSION_PUBLICATION_REQUIRE(zPath!=0, "successor path allocation failed");
++  zImage = sqlite3_mprintf("%s/publication-image-2.db",zFreshDir);
++  SESSION_PUBLICATION_REQUIRE(zImage!=0, "successor image path allocation failed");
++  rc = bcvfsSessionBuildPublicationImage(zImage,2,&zErr);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "successor image build failed");
++  pRaw = (sqlite3_file*)sqlite3_malloc64((sqlite3_uint64)pSessionVfs->szOsFile);
++  SESSION_PUBLICATION_REQUIRE(pRaw!=0, "successor raw file allocation failed");
++  memset(pRaw,0,(size_t)pSessionVfs->szOsFile);
++  {
++    int rawFlags = SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
++    rc = pSessionVfs->xOpen(pSessionVfs,zPath,pRaw,rawFlags,&rawFlags);
++  }
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && pRaw->pMethods!=0, "successor raw file open failed"
++  );
++  bRawOpen = 1;
++  rc = bcvfsSessionCopyImage(pRaw,zImage,&zErr);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "successor image copy failed");
++  rc = pRaw->pMethods->xSync(pRaw,0);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "successor image sync failed");
++  rc = pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  pRaw = 0;
++  bRawOpen = 0;
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "successor raw file close failed");
++  sqlite3_free(zImage);
++  zImage = 0;
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zNextAlias,zNextSessionId,aCheckpointHash,&zEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && zEtag!=0, "successor checkpoint failed");
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_session_fetch(
++      pTest->pFs,zNextAlias,SQLITE_BCVFS_SESSION_CHECKPOINT,zNextSessionId,
++      aCheckpointHash,zPrincipal,zDatabase,zOperations,&aCheckpointData,
++      &nCheckpointData,&zEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && aCheckpointData!=0, "successor checkpoint fetch failed");
++  rc = sqlite3_bcvfs_session_record_decode(
++      aCheckpointData,nCheckpointData,zNextSessionId,aScope,
++      &nextCheckpointRecord,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "successor checkpoint decode failed");
++  rc = sqlite3_bcvfs_session_body_decode(
++      nextCheckpointRecord.eType,nextCheckpointRecord.eState,
++      nextCheckpointRecord.zSessionId,nextCheckpointRecord.aBody,
++      nextCheckpointRecord.nBody,&nextCheckpointBody,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && nextCheckpointBody.nBaseManifestETag>0,
++      "successor checkpoint body decode failed"
++  );
++  zBaseEtag = (char*)sqlite3_malloc64(
++      (sqlite3_uint64)nextCheckpointBody.nBaseManifestETag+1
++  );
++  SESSION_PUBLICATION_REQUIRE(zBaseEtag!=0, "successor base ETag allocation failed");
++  memcpy(zBaseEtag,nextCheckpointBody.aBaseManifestETag,
++      nextCheckpointBody.nBaseManifestETag);
++  zBaseEtag[nextCheckpointBody.nBaseManifestETag] = '\0';
++  sqlite3_free(zEtag); zEtag = 0;
++  nNextHeadBody = 116 + nextCheckpointBody.nBaseManifestETag;
++  aNextHeadBody = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nNextHeadBody);
++  SESSION_PUBLICATION_REQUIRE(aNextHeadBody!=0, "successor head body allocation failed");
++  memset(aNextHeadBody,0,(size_t)nNextHeadBody);
++  nNextHeadBody = bcvfsSessionTestHeadBody(
++      aNextHeadBody,nNextHeadBody,zBaseEtag,aCheckpointHash,0
++  );
++  SESSION_PUBLICATION_REQUIRE(nNextHeadBody>0, "successor head body construction failed");
++  nextHeadRecord.eType = SQLITE_BCVFS_SESSION_HEAD;
++  nextHeadRecord.eState = SQLITE_BCVFS_SESSION_ACCEPTED;
++  nextHeadRecord.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS;
++  nextHeadRecord.iSequence = nextCheckpointRecord.iSequence+1;
++  nextHeadRecord.iCreated = iNow;
++  nextHeadRecord.iExpires = iNow + 60000;
++  sqlite3_snprintf(sizeof(nextHeadRecord.zSessionId),nextHeadRecord.zSessionId,
++      "%s",zNextSessionId);
++  memcpy(nextHeadRecord.aScopeHash,aScope,sizeof(aScope));
++  memcpy(nextHeadRecord.aOperationId,aNextOperationId,sizeof(aNextOperationId));
++  nextHeadRecord.aBody = aNextHeadBody;
++  nextHeadRecord.nBody = nNextHeadBody;
++  rc = sqlite3_bcvfs_session_record_encode(
++      &nextHeadRecord,&aNextHeadEncoded,&nNextHeadEncoded,aHeadHash,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && aNextHeadEncoded!=0, "successor head encode failed");
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs,zNextAlias,SQLITE_BCVFS_SESSION_HEAD,zNextSessionId,0,
++      zPrincipal,zDatabase,zOperations,"*",aNextHeadEncoded,nNextHeadEncoded,
++      &zEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && zEtag!=0, "successor head PUT failed");
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_session_upload(
++      pTest->pFs,zNextAlias,zNextSessionId,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_CONSTRAINT && zErr!=0,
++      "stale successor base was not rejected after candidate recovery"
++  );
++  sqlite3_free(zErr); zErr = 0;
++  rc = sqlite3_bcvfs_session_fetch(
++      pTest->pFs,zNextAlias,SQLITE_BCVFS_SESSION_PUBLICATION,0,
++      aStorageScope,zPrincipal,zDatabase,zOperations,&aPublicationData,
++      &nPublicationData,&zEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && aPublicationData!=0,
++      "recovered publication head fetch failed"
++  );
++  rc = sqlite3_bcvfs_session_record_decode(
++      aPublicationData,nPublicationData,0,aStorageScope,
++      &publicationRecord,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK
++       && publicationRecord.eState==SQLITE_BCVFS_SESSION_COMMITTED
++       && publicationRecord.eOutcome==SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS,
++      "pending publication was not finalized before stale-base rejection"
++  );
++  rc = sqlite3_bcvfs_session_body_decode(
++      publicationRecord.eType,publicationRecord.eState,
++      publicationRecord.zSessionId,publicationRecord.aBody,
++      publicationRecord.nBody,&publicationBody,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK
++       && !memcmp(
++              publicationBody.aCandidateManifestHash,
++              aPendingCandidateHash,
++              SQLITE_BCVFS_SESSION_HASH_BYTES
++          ),
++      "recovery finalized a different candidate"
++  );
++  sqlite3_free(aPublicationData); aPublicationData = 0;
++  sqlite3_free(zEtag); zEtag = 0;
++  {
++    char *zDetachErr = 0;
++    rc = sqlite3_bcvfs_detach_session(
++        pTest->pFs,zNextAlias,zNextSessionId,&zDetachErr
++    );
++    sqlite3_free(zDetachErr);
++  }
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "successor detach failed");
++  bNextAttached = 0;
++  sqlite3_free(aCheckpointData); aCheckpointData = 0;
++  sqlite3_free(aNextHeadBody); aNextHeadBody = 0;
++  sqlite3_free(aNextHeadEncoded); aNextHeadEncoded = 0;
++  sqlite3_free(zBaseEtag); zBaseEtag = 0;
++  sqlite3_free(zPath); zPath = 0;
++  sqlite3_free(zEtag); zEtag = 0;
++
++  sqlite3_free(aPublicationData); aPublicationData = 0;
++  sqlite3_free(zEtag); zEtag = 0;
++
++  /* Re-open through an ordinary VFS after upload and verify the candidate. */
++  zFreshVfs = sqlite3_mprintf("bcvfs-publication-after-%s",zSessionId);
++  SESSION_PUBLICATION_REQUIRE(zFreshVfs!=0, "post-publication VFS allocation failed");
++  rc = sqlite3_bcvfs_create(zFreshDir,zFreshVfs,&pFresh,&zErr);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && pFresh!=0, "post-publication VFS creation failed");
++  if( pTest->pAuthCallback ){
++    rc = sqlite3_bcvfs_auth_callback(pFresh,(void*)pTest,bcvfsAuthCb);
++    SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "post-publication auth setup failed");
++  }
++  rc = sqlite3_bcvfs_attach(
++      pFresh,zStorage,zAccount,zContainer,"fresh-publication",0,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "post-publication attach failed");
++  bFreshAttached = 1;
++  zFreshPath = sqlite3_mprintf("/fresh-publication/%s",zDatabase);
++  SESSION_PUBLICATION_REQUIRE(zFreshPath!=0, "post-publication path allocation failed");
++  rc = sqlite3_open_v2(zFreshPath,&dbFresh,SQLITE_OPEN_READONLY,zFreshVfs);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && dbFresh!=0, "post-publication open failed");
++  {
++    sqlite3_file *pPublishedFile = 0;
++    /* BCV_FCNTL_FD is intentionally private to the VFS implementation. The
++    ** test uses its stable testing value to inspect xFileSize after an
++    ** ordinary (non-session) reopen. */
++    rc = sqlite3_file_control(dbFresh,"main",82460214,&pPublishedFile);
++    SESSION_PUBLICATION_REQUIRE(
++        rc==SQLITE_OK && pPublishedFile!=0 && pPublishedFile->pMethods!=0,
++        "post-publication file handle lookup failed"
++    );
++    rc = pPublishedFile->pMethods->xFileSize(
++        pPublishedFile,&iPublishedFileSize
++    );
++    SESSION_PUBLICATION_REQUIRE(
++        rc==SQLITE_OK && iPublishedFileSize==iCandidateFileSize,
++        "fresh ordinary reopen lost the exact logical EOF"
++    );
++  }
++  rc = sqlite3_prepare_v2(dbFresh,"SELECT count(*) FROM t",-1,&pStmt,0);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "post-publication query failed");
++  rc = sqlite3_step(pStmt);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_ROW && sqlite3_column_int(pStmt,0)==1,
++      "recovered candidate was not conditionally published"
++  );
++  sqlite3_finalize(pStmt); pStmt = 0;
++  rc = sqlite3_prepare_v2(dbFresh,"SELECT v FROM t",-1,&pStmt,0);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "recovery row query failed");
++  rc = sqlite3_step(pStmt);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_ROW
++       && 0==strcmp((const char*)sqlite3_column_text(pStmt,0),"fenced-row"),
++      "visible manifest is not the exact pending candidate"
++  );
++
++session_publication_done:
++  sqlite3_free(zErr);
++  sqlite3_free(zEtag);
++  sqlite3_free(zLegacyErr);
++  sqlite3_free(zPath);
++  sqlite3_free(zFreshPath);
++  sqlite3_free(zFreshVfs);
++  sqlite3_free(zBaseEtag);
++  sqlite3_free(zBaseManifestEtag);
++  sqlite3_free(zCurrentManifestEtag);
++  sqlite3_free(zRestoredManifestEtag);
++  sqlite3_free(zImage);
++  sqlite3_free(aCheckpointData);
++  sqlite3_free(aHeadBody);
++  sqlite3_free(aHeadEncoded);
++  sqlite3_free(aHeadData);
++  sqlite3_free(aPublicationData);
++  sqlite3_free(aExpiredPublicationEncoded);
++  sqlite3_free(aPendingPublicationBody);
++  sqlite3_free(aBaseManifest);
++  sqlite3_free(aCurrentManifest);
++  sqlite3_free(aNextHeadBody);
++  sqlite3_free(aNextHeadEncoded);
++  if( pStmt ) sqlite3_finalize(pStmt);
++  if( bRawOpen && pRaw && pRaw->pMethods ) pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  if( dbFresh ) sqlite3_close(dbFresh);
++  if( bFreshAttached && pFresh ){
++    char *zDetachErr = 0;
++    sqlite3_bcvfs_detach(pFresh,"fresh-publication",&zDetachErr);
++    sqlite3_free(zDetachErr);
++  }
++  if( pFresh ) sqlite3_bcvfs_destroy(pFresh);
++  if( bNextAttached ){
++    char *zDetachErr = 0;
++    sqlite3_bcvfs_detach_session(
++        pTest->pFs,zNextAlias,zNextSessionId,&zDetachErr
++    );
++    sqlite3_free(zDetachErr);
++  }
++  if( bAttached ){
++    char *zDetachErr = 0;
++    int rcDetach = sqlite3_bcvfs_detach_session(
++        pTest->pFs,zAlias,zSessionId,&zDetachErr
++    );
++    if( rcRet==TCL_OK && rcDetach!=SQLITE_OK ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          zDetachErr ? zDetachErr : "session publication detach failed",-1
++      ));
++      rcRet = TCL_ERROR;
++    }
++    sqlite3_free(zDetachErr);
++  }
++  if( rcRet==TCL_OK ) Tcl_ResetResult(interp);
++#undef SESSION_PUBLICATION_REQUIRE
++#undef SESSION_PUBLICATION_FAIL
++  return rcRet;
++}
++
++/*
++** $vfs session_acceptance_test VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR
++**
++** Exercise the accepted-head CAS independently from publication. The first
++** acceptance must require a checkpoint, a successful acceptance must be
++** idempotent, a successor operation may use an accepted predecessor, and an
++** older operation ID remains fenced by checkpoint history.
++*/
++static int test_bcvfs_session_acceptance(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  TestBcvfs *pTest = (TestBcvfs*)clientData;
++  const char *zVfs;
++  const char *zStorage;
++  const char *zAccount;
++  const char *zContainer;
++  const char *zSessionId;
++  const char *zDatabase;
++  const char *zFreshDir;
++  const char *zAlias = "session-acceptance-test";
++  const char *zPrincipal = "session-acceptance-principal";
++  const char *zOperations = "read,write,commit";
++  unsigned char aOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aNextOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  sqlite3_vfs *pSessionVfs = 0;
++  sqlite3_file *pRaw = 0;
++  char *zImage = 0;
++  char *zPath = 0;
++  char *zErr = 0;
++  char *zEtag = 0;
++  int operationStatus = SQLITE_BCVFS_SESSION_STATUS_NEW;
++  int rc = SQLITE_OK;
++  int rcRet = TCL_OK;
++  int bAttached = 0;
++  int bRawOpen = 0;
++
++  if( objc!=9 ){
++    Tcl_WrongNumArgs(
++        interp,2,objv,
++        "VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR"
++    );
++    return TCL_ERROR;
++  }
++  zVfs = Tcl_GetString(objv[2]);
++  zStorage = Tcl_GetString(objv[3]);
++  zAccount = Tcl_GetString(objv[4]);
++  zContainer = Tcl_GetString(objv[5]);
++  zSessionId = Tcl_GetString(objv[6]);
++  zDatabase = Tcl_GetString(objv[7]);
++  zFreshDir = Tcl_GetString(objv[8]);
++  memset(aOperationId,0,sizeof(aOperationId));
++  memset(aNextOperationId,0,sizeof(aNextOperationId));
++  aOperationId[0] = 0x20;
++  aNextOperationId[0] = 0x21;
++
++#define SESSION_ACCEPTANCE_FAIL(zMsg) do { \
++    Tcl_SetObjResult(interp,Tcl_NewStringObj((zMsg),-1)); \
++    rcRet = TCL_ERROR; \
++    goto session_acceptance_done; \
++  } while(0)
++#define SESSION_ACCEPTANCE_REQUIRE(cond,zMsg) \
++  do { if(!(cond)) SESSION_ACCEPTANCE_FAIL(zMsg); } while(0)
++
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aOperationId,0,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(
++      rc==SQLITE_OK && zErr==0, "session acceptance attachment failed"
++  );
++  bAttached = 1;
++
++  rc = sqlite3_bcvfs_session_operation_status(
++      pTest->pFs,zAlias,zSessionId,&operationStatus,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(
++      rc==SQLITE_OK && operationStatus==SQLITE_BCVFS_SESSION_STATUS_NEW,
++      "new operation did not report NEW status"
++  );
++  rc = sqlite3_bcvfs_session_accept(
++      pTest->pFs,zAlias,zSessionId,&zEtag,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(
++      rc==SQLITE_CONSTRAINT,
++      "accepted-head CAS succeeded without a final checkpoint"
++  );
++  sqlite3_free(zErr); zErr = 0;
++  sqlite3_free(zEtag); zEtag = 0;
++
++  zPath = sqlite3_mprintf("/%s/%s",zAlias,zDatabase);
++  zImage = sqlite3_mprintf("%s/acceptance-image.db",zFreshDir);
++  SESSION_ACCEPTANCE_REQUIRE(zPath!=0 && zImage!=0, "acceptance image path allocation failed");
++  rc = bcvfsSessionBuildPublicationImage(zImage,1,&zErr);
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "acceptance image build failed");
++  pSessionVfs = sqlite3_vfs_find(zVfs);
++  SESSION_ACCEPTANCE_REQUIRE(pSessionVfs!=0, "acceptance VFS lookup failed");
++  pRaw = (sqlite3_file*)sqlite3_malloc64((sqlite3_uint64)pSessionVfs->szOsFile);
++  SESSION_ACCEPTANCE_REQUIRE(pRaw!=0, "acceptance raw file allocation failed");
++  memset(pRaw,0,(size_t)pSessionVfs->szOsFile);
++  {
++    int rawFlags = SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
++    rc = pSessionVfs->xOpen(pSessionVfs,zPath,pRaw,rawFlags,&rawFlags);
++  }
++  SESSION_ACCEPTANCE_REQUIRE(
++      rc==SQLITE_OK && pRaw->pMethods!=0, "acceptance raw file open failed"
++  );
++  bRawOpen = 1;
++  rc = bcvfsSessionCopyImage(pRaw,zImage,&zErr);
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "acceptance image copy failed");
++  rc = pRaw->pMethods->xSync(pRaw,0);
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "acceptance image sync failed");
++  rc = pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  pRaw = 0;
++  bRawOpen = 0;
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "acceptance raw file close failed");
++
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zAlias,zSessionId,aCheckpointHash,&zEtag,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(
++      rc==SQLITE_OK && zEtag!=0, "acceptance checkpoint failed"
++  );
++  sqlite3_free(zEtag); zEtag = 0;
++  /* xSync/final-checkpoint may run more than once before the application
++  ** accepts the request. Acceptance must validate this immutable chain back
++  ** to the captured predecessor, not only the newest record. */
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zAlias,zSessionId,aCheckpointHash,&zEtag,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(
++      rc==SQLITE_OK && zEtag!=0, "acceptance follow-up checkpoint failed"
++  );
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_session_accept(
++      pTest->pFs,zAlias,zSessionId,&zEtag,&zErr
++  );
++  if( rc!=SQLITE_OK || zEtag==0 ){
++    Tcl_SetObjResult(interp,Tcl_ObjPrintf(
++        "accepted-head CAS failed rc=%d err=%s",rc,zErr ? zErr : "(none)"
++    ));
++    rcRet = TCL_ERROR;
++    goto session_acceptance_done;
++  }
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_session_operation_status(
++      pTest->pFs,zAlias,zSessionId,&operationStatus,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(
++      rc==SQLITE_OK && operationStatus==SQLITE_BCVFS_SESSION_STATUS_ACCEPTED,
++      "accepted operation did not report ACCEPTED status"
++  );
++
++  /* A lost response after the conditional HEAD PUT is an exact success. */
++  rc = sqlite3_bcvfs_session_accept(
++      pTest->pFs,zAlias,zSessionId,&zEtag,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(
++      rc==SQLITE_OK && zEtag!=0, "exact accepted-head retry was not reconciled"
++  );
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_detach_session(
++      pTest->pFs,zAlias,zSessionId,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "first acceptance detach failed");
++  bAttached = 0;
++
++  /* A new operation may advance an accepted predecessor. */
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aNextOperationId,0,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "successor operation attach failed");
++  bAttached = 1;
++  rc = sqlite3_bcvfs_session_operation_status(
++      pTest->pFs,zAlias,zSessionId,&operationStatus,&zErr
++  );
++  if( rc!=SQLITE_OK || operationStatus!=SQLITE_BCVFS_SESSION_STATUS_NEW ){
++    Tcl_SetObjResult(interp,Tcl_ObjPrintf(
++        "successor operation was not reported NEW rc=%d status=%d err=%s",
++        rc,operationStatus,zErr ? zErr : "(none)"
++    ));
++    rcRet = TCL_ERROR;
++    goto session_acceptance_done;
++  }
++  rc = sqlite3_bcvfs_session_checkpoint(
++      pTest->pFs,zAlias,zSessionId,aCheckpointHash,&zEtag,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "successor checkpoint failed");
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_session_accept(
++      pTest->pFs,zAlias,zSessionId,&zEtag,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "successor acceptance failed");
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_detach_session(
++      pTest->pFs,zAlias,zSessionId,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "successor detach failed");
++  bAttached = 0;
++
++  /* The first operation remains a historical receipt and cannot be replayed. */
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aOperationId,0,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(rc==SQLITE_OK, "historical operation attach failed");
++  bAttached = 1;
++  rc = sqlite3_bcvfs_session_operation_status(
++      pTest->pFs,zAlias,zSessionId,&operationStatus,&zErr
++  );
++  SESSION_ACCEPTANCE_REQUIRE(
++      rc==SQLITE_OK && operationStatus==SQLITE_BCVFS_SESSION_STATUS_CONFLICT,
++      "historical operation was not fenced"
++  );
++
++session_acceptance_done:
++  sqlite3_free(zErr);
++  sqlite3_free(zEtag);
++  sqlite3_free(zImage);
++  sqlite3_free(zPath);
++  if( bRawOpen && pRaw && pRaw->pMethods ) pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  if( bAttached ){
++    char *zDetachErr = 0;
++    int rcDetach = sqlite3_bcvfs_detach_session(
++        pTest->pFs,zAlias,zSessionId,&zDetachErr
++    );
++    if( rcRet==TCL_OK && rcDetach!=SQLITE_OK ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          zDetachErr ? zDetachErr : "acceptance detach failed",-1
++      ));
++      rcRet = TCL_ERROR;
++    }
++    sqlite3_free(zDetachErr);
++  }
++  if( rcRet==TCL_OK ) Tcl_ResetResult(interp);
++#undef SESSION_ACCEPTANCE_REQUIRE
++#undef SESSION_ACCEPTANCE_FAIL
++  return rcRet;
++}
++
++/*
++** sqlite3_bcvfs_create DIR VFSNAME
++*/
++static int test_bcvfs_session_uuid_decode(
++  const char *z,
++  unsigned char aUuid[16]
++){
++  static const int aDash[] = { 8, 13, 18, 23 };
++  int ii = 0;
++  int jj = 0;
++  int kk;
++  if( z==0 || strlen(z)!=36 ) return 0;
++  for(ii=0; ii<36; ){
++    int hi;
++    int lo;
++    for(kk=0; kk<4; kk++){
++      if( ii==aDash[kk] ){
++        if( z[ii]!='-' ) return 0;
++        ii++;
++        break;
++      }
++    }
++    if( ii>=36 ) break;
++    hi = z[ii]>='0' && z[ii]<='9' ? z[ii]-'0'
++       : z[ii]>='a' && z[ii]<='f' ? z[ii]-'a'+10
++       : z[ii]>='A' && z[ii]<='F' ? z[ii]-'A'+10 : -1;
++    ii++;
++    lo = z[ii]>='0' && z[ii]<='9' ? z[ii]-'0'
++       : z[ii]>='a' && z[ii]<='f' ? z[ii]-'a'+10
++       : z[ii]>='A' && z[ii]<='F' ? z[ii]-'A'+10 : -1;
++    ii++;
++    if( hi<0 || lo<0 || jj>=16 ) return 0;
++    aUuid[jj++] = (unsigned char)((hi<<4)|lo);
++  }
++  return jj==16;
++}
++
++static int test_bcvfs_session_write_binary(
++  const char *zPath,
++  const unsigned char *aData,
++  int nData
++){
++  FILE *pFile = fopen(zPath,"wb");
++  size_t nWrite;
++  if( pFile==0 ) return SQLITE_CANTOPEN;
++  nWrite = fwrite(aData,1,(size_t)nData,pFile);
++  if( fclose(pFile)!=0 || nWrite!=(size_t)nData ) return SQLITE_IOERR_WRITE;
++  return SQLITE_OK;
++}
++
++/* Build a valid pre-head marker and a block object for the GC regression.
++** The fixture intentionally does not create a session head or checkpoint;
++** only the durable marker is allowed to preserve the otherwise unreferenced
++** ordinary block. */
++static int test_bcvfs_session_attempt_marker(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  const char *zSessionId;
++  const char *zFreshDir;
++  const char *zMode;
++  int nBlock = 0;
++  unsigned char aUuid[16];
++  unsigned char aOperation[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aBlock[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aAttempt[16];
++  unsigned char aBody[172];
++  unsigned char aDigest[SHA256_DIGEST_LENGTH];
++  unsigned char aBlockData[4096];
++  char zOperation[65];
++  char zBlock[65];
++  char zAttempt[33];
++  char zMarkerName[320];
++  char *zMarkerPath = 0;
++  char *zBlockPath = 0;
++  i64 iCreated;
++  int rc;
++  Tcl_Obj *pResult;
++  (void)clientData;
++  if( objc!=11 ){
++    Tcl_WrongNumArgs(
++        interp,2,objv,
++        "VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR MODE NAMEBYTES"
++    );
++    return TCL_ERROR;
++  }
++  zSessionId = Tcl_GetString(objv[6]);
++  zFreshDir = Tcl_GetString(objv[8]);
++  zMode = Tcl_GetString(objv[9]);
++  if( Tcl_GetIntFromObj(interp,objv[10],&nBlock) || nBlock<1
++   || nBlock>(int)sizeof(aBlock)
++  ){
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid block name size",-1));
++    return TCL_ERROR;
++  }
++  if( strcmp(zMode,"active")!=0 && strcmp(zMode,"expired")!=0
++   && strcmp(zMode,"guard")!=0 && strcmp(zMode,"idle")!=0
++  ){
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid marker mode",-1));
++    return TCL_ERROR;
++  }
++  if( !test_bcvfs_session_uuid_decode(zSessionId,aUuid) ){
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid session UUID",-1));
++    return TCL_ERROR;
++  }
++  memset(aOperation,0,sizeof(aOperation));
++  aOperation[0] = 0xA7;
++  aOperation[1] = 0x21;
++  memset(aBlock,0,sizeof(aBlock));
++  memset(aBlock,0xAB,(size_t)nBlock);
++  memset(aScope,0x53,sizeof(aScope));
++  for(rc=0; rc<(int)sizeof(aAttempt); rc++) aAttempt[rc] = (unsigned char)rc;
++  hex_encode(aOperation,sizeof(aOperation),zOperation,1);
++  hex_encode(aBlock,nBlock,zBlock,1);
++  hex_encode(aAttempt,sizeof(aAttempt),zAttempt,1);
++  sqlite3_snprintf(
++      sizeof(zMarkerName),zMarkerName,
++      "bcv-session/v1/attempt/%s/%s/%s/%s.bcv",
++      zSessionId,zOperation,zBlock,zAttempt
++  );
++  if( strcmp(zMode,"guard")==0 || strcmp(zMode,"idle")==0 ){
++    sqlite3_snprintf(
++        sizeof(zMarkerName),zMarkerName,"bcv-session/v1/guard.bcv"
++    );
++  }
++  zMarkerPath = sqlite3_mprintf("%s/session-attempt-marker.bcv",zFreshDir);
++  zBlockPath = sqlite3_mprintf("%s/session-attempt-block.bcv",zFreshDir);
++  if( zMarkerPath==0 || zBlockPath==0 ) rc = SQLITE_NOMEM;
++  else{
++    iCreated = sqlite_timestamp();
++    if( strcmp(zMode,"guard")==0 || strcmp(zMode,"idle")==0 ){
++      memset(aBody,0,68);
++      memcpy(aBody,"BCVGD01",7);
++      aBody[9] = 1;
++      if( strcmp(zMode,"guard")==0 ){
++        aBody[10] = 1;
++        bcvPutU64(&aBody[12],(u64)(iCreated + 30LL*24*60*60*1000));
++        memset(&aBody[20],0xC1,16);
++      }
++      SHA256(aBody,36,aDigest);
++      memcpy(&aBody[36],aDigest,sizeof(aDigest));
++    }else{
++      memset(aBody,0,sizeof(aBody));
++      memcpy(aBody,"BCVAT01",7);
++      aBody[9] = 1;
++      aBody[10] = (unsigned char)((nBlock>>8)&0xFF);
++      aBody[11] = (unsigned char)(nBlock&0xFF);
++      if( strcmp(zMode,"expired")==0 ){
++        iCreated -= 2LL*30*24*60*60*1000;
++      }
++      bcvPutU64(&aBody[12],(u64)iCreated);
++      bcvPutU64(&aBody[20],(u64)(iCreated + 30LL*24*60*60*1000));
++      memcpy(&aBody[28],aUuid,sizeof(aUuid));
++      memcpy(&aBody[44],aOperation,sizeof(aOperation));
++      memcpy(&aBody[76],aBlock,(size_t)nBlock);
++      memcpy(&aBody[108],aScope,sizeof(aScope));
++      SHA256(aBody,140,aDigest);
++      memcpy(&aBody[140],aDigest,sizeof(aDigest));
++    }
++    memset(aBlockData,'B',sizeof(aBlockData));
++    rc = test_bcvfs_session_write_binary(
++        zMarkerPath,aBody,
++        (strcmp(zMode,"guard")==0 || strcmp(zMode,"idle")==0) ? 68 : sizeof(aBody)
++    );
++    if( rc==SQLITE_OK ) rc = test_bcvfs_session_write_binary(
++        zBlockPath,aBlockData,sizeof(aBlockData)
++    );
++  }
++  if( rc!=SQLITE_OK ){
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("could not create marker fixture",-1));
++    sqlite3_free(zMarkerPath);
++    sqlite3_free(zBlockPath);
++    return TCL_ERROR;
++  }
++  pResult = Tcl_NewListObj(0,0);
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zMarkerPath,-1));
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zMarkerName,-1));
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zBlockPath,-1));
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zBlock,-1));
++  Tcl_SetObjResult(interp,pResult);
++  sqlite3_free(zMarkerPath);
++  sqlite3_free(zBlockPath);
++  return TCL_OK;
++}
++
++/* Create an expired, otherwise well-formed head and checkpoint pair. The
++** head is intentionally not reachable from a current live session, so GC
++** must sweep both superseded records after validating their envelopes. */
++static int test_bcvfs_session_expired_records(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  const char *zStorage;
++  const char *zAccount;
++  const char *zContainer;
++  const char *zSessionId;
++  const char *zDatabase;
++  const char *zFreshDir;
++  const char *zManifestPath;
++  const char *zPrincipal = "gc-expired-principal";
++  const char *zOperations = "read,write,commit";
++  const char *zHeadEtag = "expired-head-etag";
++  const char *zCheckpointEtag = "expired-checkpoint-etag";
++  unsigned char *aManifest = 0;
++  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aOperation[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aZero[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char *aBody = 0;
++  unsigned char *aEncoded = 0;
++  char zCheckpointHex[SQLITE_BCVFS_SESSION_HASH_BYTES*2+1];
++  char *zHeadPath = 0;
++  char *zCheckpointPath = 0;
++  char *zHeadName = 0;
++  char *zCheckpointName = 0;
++  FILE *pManifest = 0;
++  char *zErr = 0;
++  sqlite3_bcvfs_session_record record;
++  sqlite3_int64 iNow;
++  int nBody;
++  int nManifest = 0;
++  int nBodyCapacity = 0;
++  long nManifestFile = 0;
++  int nEncoded = 0;
++  int rc = SQLITE_OK;
++  Tcl_Obj *pResult = 0;
++  (void)clientData;
++  if( objc!=10 ){
++    Tcl_WrongNumArgs(
++        interp,2,objv,
++        "VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR MANIFEST_PATH"
++    );
++    return TCL_ERROR;
++  }
++  zStorage = Tcl_GetString(objv[3]);
++  zAccount = Tcl_GetString(objv[4]);
++  zContainer = Tcl_GetString(objv[5]);
++  zSessionId = Tcl_GetString(objv[6]);
++  zDatabase = Tcl_GetString(objv[7]);
++  zFreshDir = Tcl_GetString(objv[8]);
++  zManifestPath = Tcl_GetString(objv[9]);
++  pManifest = fopen(zManifestPath,"rb");
++  if( pManifest==0 ) rc = SQLITE_CANTOPEN;
++  if( rc==SQLITE_OK ){
++    if( fseek(pManifest,0,SEEK_END)!=0 ) rc = SQLITE_IOERR_READ;
++    else{
++      nManifestFile = ftell(pManifest);
++      if( nManifestFile<=0
++       || nManifestFile>(long)(SQLITE_BCVFS_SESSION_BODY_MAX_BYTES
++                             -24-(int)strlen(zCheckpointEtag))
++       || fseek(pManifest,0,SEEK_SET)!=0
++      ) rc = SQLITE_CORRUPT;
++    }
++  }
++  if( rc==SQLITE_OK ){
++    nManifest = (int)nManifestFile;
++    nBodyCapacity = 24+(int)strlen(zCheckpointEtag)+nManifest;
++    aManifest = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nManifest);
++    aBody = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nBodyCapacity);
++    if( aManifest==0 || aBody==0 ) rc = SQLITE_NOMEM;
++  }
++  if( rc==SQLITE_OK
++   && fread(aManifest,1,(size_t)nManifestFile,pManifest)!=(size_t)nManifestFile
++  ) rc = SQLITE_IOERR_READ;
++  if( pManifest && fclose(pManifest)!=0 && rc==SQLITE_OK ) rc = SQLITE_IOERR;
++  pManifest = 0;
++  memset(aOperation,0,sizeof(aOperation));
++  aOperation[0] = 0xE7;
++  memset(aZero,0,sizeof(aZero));
++  if( rc==SQLITE_OK ) rc = sqlite3_bcvfs_session_scope_hash(
++      zStorage,zAccount,zContainer,zPrincipal,zDatabase,zOperations,
++      aScope,&zErr
++  );
++  if( rc==SQLITE_OK ){
++    memset(&record,0,sizeof(record));
++    record.eType = SQLITE_BCVFS_SESSION_CHECKPOINT;
++    record.eState = SQLITE_BCVFS_SESSION_OPEN;
++    record.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++    record.iSequence = 1;
++    iNow = sqlite_timestamp();
++    record.iCreated = iNow-2LL*30*24*60*60*1000;
++    record.iExpires = iNow-30LL*24*60*60*1000;
++    sqlite3_snprintf(sizeof(record.zSessionId),record.zSessionId,"%s",zSessionId);
++    memcpy(record.aScopeHash,aScope,sizeof(aScope));
++    memcpy(record.aOperationId,aOperation,sizeof(aOperation));
++    nBody = bcvfsSessionTestCheckpointBody(
++        aBody,nBodyCapacity,4096,zCheckpointEtag,aManifest,nManifest
++    );
++    if( nBody<=0 ) rc = SQLITE_CORRUPT;
++    if( rc==SQLITE_OK ){
++      record.aBody = aBody;
++      record.nBody = nBody;
++      rc = sqlite3_bcvfs_session_record_encode(
++          &record,&aEncoded,&nEncoded,aCheckpointHash,&zErr
++      );
++    }
++  }
++  if( rc==SQLITE_OK ){
++    hex_encode(aCheckpointHash,sizeof(aCheckpointHash),zCheckpointHex,0);
++    zCheckpointName = sqlite3_mprintf(
++        "bcv-session/v1/checkpoint/%s/%s.bcv",zSessionId,zCheckpointHex
++    );
++    zCheckpointPath = sqlite3_mprintf(
++        "%s/expired-checkpoint.bcv",zFreshDir
++    );
++    if( zCheckpointName==0 || zCheckpointPath==0 ) rc = SQLITE_NOMEM;
++    else rc = test_bcvfs_session_write_binary(
++        zCheckpointPath,aEncoded,nEncoded
++    );
++  }
++  sqlite3_free(aEncoded); aEncoded = 0; nEncoded = 0;
++  if( rc==SQLITE_OK ){
++    memset(&record,0,sizeof(record));
++    record.eType = SQLITE_BCVFS_SESSION_HEAD;
++    record.eState = SQLITE_BCVFS_SESSION_OPEN;
++    record.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++    record.iSequence = 2;
++    record.iCreated = iNow-2LL*30*24*60*60*1000;
++    record.iExpires = iNow-30LL*24*60*60*1000;
++    sqlite3_snprintf(sizeof(record.zSessionId),record.zSessionId,"%s",zSessionId);
++    memcpy(record.aScopeHash,aScope,sizeof(aScope));
++    memcpy(record.aOperationId,aOperation,sizeof(aOperation));
++    nBody = bcvfsSessionTestHeadBody(
++        aBody,nBodyCapacity,zHeadEtag,aCheckpointHash,aZero
++    );
++    record.aBody = aBody;
++    record.nBody = nBody;
++    rc = sqlite3_bcvfs_session_record_encode(
++        &record,&aEncoded,&nEncoded,aZero,&zErr
++    );
++    if( rc==SQLITE_OK ){
++      zHeadName = sqlite3_mprintf(
++          "bcv-session/v1/head/%s.bcv",zSessionId
++      );
++      zHeadPath = sqlite3_mprintf("%s/expired-head.bcv",zFreshDir);
++      if( zHeadName==0 || zHeadPath==0 ) rc = SQLITE_NOMEM;
++      else rc = test_bcvfs_session_write_binary(zHeadPath,aEncoded,nEncoded);
++    }
++  }
++  if( rc!=SQLITE_OK ){
++    Tcl_SetObjResult(interp,Tcl_ObjPrintf(
++        "could not create expired records rc=%d err=%s",rc,zErr?zErr:"(none)"
++    ));
++    goto session_expired_records_done;
++  }
++  pResult = Tcl_NewListObj(0,0);
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zHeadPath,-1));
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zHeadName,-1));
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zCheckpointPath,-1));
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zCheckpointName,-1));
++  Tcl_SetObjResult(interp,pResult);
++
++session_expired_records_done:
++  sqlite3_free(aManifest);
++  sqlite3_free(aBody);
++  sqlite3_free(aEncoded);
++  sqlite3_free(zHeadPath);
++  sqlite3_free(zCheckpointPath);
++  sqlite3_free(zHeadName);
++  sqlite3_free(zCheckpointName);
++  sqlite3_free(zErr);
++  return rc==SQLITE_OK ? TCL_OK : TCL_ERROR;
++}
++
++static int test_bcvfs_session_candidate(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  const char *zPath;
++  const char *zModule;
++  const char *zAccount;
++  const char *zContainer;
++  const char *zSessionId;
++  const char *zDatabase;
++  const char *zFreshDir;
++  const char *zMode;
++  FILE *pFile;
++  long nFile;
++  unsigned char *aData;
++  unsigned char *aBody = 0;
++  unsigned char *aEncoded = 0;
++  unsigned char aHash[SHA256_DIGEST_LENGTH];
++  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aOperation[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  char zHash[65];
++  char zName[128];
++  char zCheckpointHex[SQLITE_BCVFS_SESSION_HASH_BYTES*2+1];
++  char *zCheckpointPath = 0;
++  char *zCheckpointName = 0;
++  char *zErr = 0;
++  sqlite3_bcvfs_session_record record;
++  sqlite3_int64 iNow;
++  int nBody = 0;
++  int nEncoded = 0;
++  int rc = SQLITE_OK;
++  Tcl_Obj *pResult;
++  (void)clientData;
++  if( objc!=10 ){
++    Tcl_WrongNumArgs(
++        interp,2,objv,
++        "MANIFEST_PATH MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR MODE"
++    );
++    return TCL_ERROR;
++  }
++  zPath = Tcl_GetString(objv[2]);
++  zModule = Tcl_GetString(objv[3]);
++  zAccount = Tcl_GetString(objv[4]);
++  zContainer = Tcl_GetString(objv[5]);
++  zSessionId = Tcl_GetString(objv[6]);
++  zDatabase = Tcl_GetString(objv[7]);
++  zFreshDir = Tcl_GetString(objv[8]);
++  zMode = Tcl_GetString(objv[9]);
++  if( strcmp(zMode,"active")!=0 && strcmp(zMode,"expired")!=0 ){
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid candidate mode",-1));
++    return TCL_ERROR;
++  }
++  {
++    unsigned char aUuid[16];
++    if( !test_bcvfs_session_uuid_decode(zSessionId,aUuid) ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid session UUID",-1));
++      return TCL_ERROR;
++    }
++  }
++  pFile = fopen(zPath,"rb");
++  if( pFile==0 ){
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("cannot open candidate manifest",-1));
++    return TCL_ERROR;
++  }
++  if( fseek(pFile,0,SEEK_END)!=0 ){
++    fclose(pFile);
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("cannot seek candidate manifest",-1));
++    return TCL_ERROR;
++  }
++  nFile = ftell(pFile);
++  if( nFile<=0 || nFile>67108864L || fseek(pFile,0,SEEK_SET)!=0 ){
++    fclose(pFile);
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid candidate manifest size",-1));
++    return TCL_ERROR;
++  }
++  aData = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nFile);
++  if( aData==0 ){
++    fclose(pFile);
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("candidate manifest allocation failed",-1));
++    return TCL_ERROR;
++  }
++  if( fread(aData,1,(size_t)nFile,pFile)!=(size_t)nFile ){
++    fclose(pFile);
++    sqlite3_free(aData);
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("candidate manifest read failed",-1));
++    return TCL_ERROR;
++  }
++  fclose(pFile);
++  SHA256(aData,(size_t)nFile,aHash);
++  hex_encode(aHash,sizeof(aHash),zHash,0);
++  sqlite3_snprintf(sizeof(zName),zName,
++      "bcv-session/v1/candidate/%s.bcv",zHash
++  );
++  memset(aOperation,0,sizeof(aOperation));
++  aOperation[0] = 0xC7;
++  aOperation[1] = 0x21;
++  rc = sqlite3_bcvfs_session_scope_hash(
++      zModule,zAccount,zContainer,"gc-candidate-principal",zDatabase,
++      "read,write,commit",aScope,&zErr
++  );
++  if( rc==SQLITE_OK ){
++    aBody = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nFile+128);
++    if( aBody==0 ) rc = SQLITE_NOMEM;
++  }
++  if( rc==SQLITE_OK ){
++    memset(&record,0,sizeof(record));
++    record.eType = SQLITE_BCVFS_SESSION_CHECKPOINT;
++    record.eState = SQLITE_BCVFS_SESSION_OPEN;
++    record.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_NONE;
++    record.iSequence = 1;
++    iNow = sqlite_timestamp();
++    if( strcmp(zMode,"expired")==0 ){
++      record.iCreated = iNow-2LL*30*24*60*60*1000;
++      record.iExpires = iNow-30LL*24*60*60*1000;
++    }else{
++      record.iCreated = iNow;
++      record.iExpires = iNow+30LL*24*60*60*1000;
++    }
++    sqlite3_snprintf(sizeof(record.zSessionId),record.zSessionId,"%s",zSessionId);
++    memcpy(record.aScopeHash,aScope,sizeof(aScope));
++    memcpy(record.aOperationId,aOperation,sizeof(aOperation));
++    nBody = bcvfsSessionTestCheckpointBody(
++        aBody,(int)nFile+128,4096,"gc-candidate-etag",aData,(int)nFile
++    );
++    if( nBody<=0 ) rc = SQLITE_CORRUPT;
++    record.aBody = aBody;
++    record.nBody = nBody;
++  }
++  if( rc==SQLITE_OK ) rc = sqlite3_bcvfs_session_record_encode(
++      &record,&aEncoded,&nEncoded,aCheckpointHash,&zErr
++  );
++  if( rc==SQLITE_OK ){
++    hex_encode(aCheckpointHash,sizeof(aCheckpointHash),zCheckpointHex,0);
++    zCheckpointName = sqlite3_mprintf(
++        "bcv-session/v1/checkpoint/%s/%s.bcv",zSessionId,zCheckpointHex
++    );
++    zCheckpointPath = sqlite3_mprintf(
++        "%s/candidate-checkpoint-%s.bcv",zFreshDir,zMode
++    );
++    if( zCheckpointName==0 || zCheckpointPath==0 ) rc = SQLITE_NOMEM;
++    else rc = test_bcvfs_session_write_binary(
++        zCheckpointPath,aEncoded,nEncoded
++    );
++  }
++  if( rc==SQLITE_OK ){
++    pResult = Tcl_NewListObj(0,0);
++    Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zName,-1));
++    Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zCheckpointPath,-1));
++    Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zCheckpointName,-1));
++    Tcl_SetObjResult(interp,pResult);
++  }else{
++    Tcl_SetObjResult(interp,Tcl_ObjPrintf(
++        "could not create candidate checkpoint rc=%d err=%s",
++        rc,zErr?zErr:"(none)"
++    ));
++  }
++  sqlite3_free(aData);
++  sqlite3_free(aBody);
++  sqlite3_free(aEncoded);
++  sqlite3_free(zCheckpointName);
++  sqlite3_free(zCheckpointPath);
++  sqlite3_free(zErr);
++  return rc==SQLITE_OK ? TCL_OK : TCL_ERROR;
++}
++
++/*
++** $vfs session_compaction_test VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR
++**
++** Exercise the bounded immutable operation history.  The test deliberately
++** writes a valid history object before omitting its HEAD CAS, so the object
++** must remain invisible to replay detection and must be collectible.  The
++** final operation uses the direct finalizer after a history roll to verify
++** that it carries the compacted root forward.
++*/
++static int test_bcvfs_session_compaction(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  TestBcvfs *pTest = (TestBcvfs*)clientData;
++  const char *zVfs;
++  const char *zStorage;
++  const char *zAccount;
++  const char *zContainer;
++  const char *zSessionId;
++  const char *zDatabase;
++  const char *zFreshDir;
++  const char *zAlias = "session-compaction-test";
++  const char *zPrincipal = "session-compaction-principal";
++  const char *zOperations = "read,write,commit";
++  unsigned char aOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aFirstOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aHistoryRoot[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aOrphanOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aOrphanHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aFinalizeOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aHistoryBody[80];
++  sqlite3_bcvfs_session_record head;
++  sqlite3_bcvfs_session_record orphan;
++  sqlite3_bcvfs_session_body headBody;
++  sqlite3_vfs *pSessionVfs = 0;
++  sqlite3_file *pRaw = 0;
++  unsigned char *aHeadData = 0;
++  unsigned char *aOrphanEncoded = 0;
++  char *zImage = 0;
++  char *zPath = 0;
++  char *zErr = 0;
++  char *zEtag = 0;
++  int nHeadData = 0;
++  int nOrphanEncoded = 0;
++  int operationStatus = SQLITE_BCVFS_SESSION_STATUS_NEW;
++  int rc = SQLITE_OK;
++  int rcRet = TCL_OK;
++  int bAttached = 0;
++  int bRawOpen = 0;
++  int ii;
++  char zRootHash[SQLITE_BCVFS_SESSION_HASH_BYTES*2+1];
++  char zOrphanHash[SQLITE_BCVFS_SESSION_HASH_BYTES*2+1];
++  Tcl_Obj *pResult = 0;
++
++  if( objc!=9 ){
++    Tcl_WrongNumArgs(
++        interp,2,objv,
++        "VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR"
++    );
++    return TCL_ERROR;
++  }
++  zVfs = Tcl_GetString(objv[2]);
++  zStorage = Tcl_GetString(objv[3]);
++  zAccount = Tcl_GetString(objv[4]);
++  zContainer = Tcl_GetString(objv[5]);
++  zSessionId = Tcl_GetString(objv[6]);
++  zDatabase = Tcl_GetString(objv[7]);
++  zFreshDir = Tcl_GetString(objv[8]);
++  memset(aOperationId,0,sizeof(aOperationId));
++  memset(aFirstOperationId,0,sizeof(aFirstOperationId));
++  memset(aCheckpointHash,0,sizeof(aCheckpointHash));
++  memset(aHistoryRoot,0,sizeof(aHistoryRoot));
++  memset(aOrphanOperationId,0,sizeof(aOrphanOperationId));
++  memset(aOrphanHash,0,sizeof(aOrphanHash));
++  memset(aFinalizeOperationId,0,sizeof(aFinalizeOperationId));
++  memset(aScope,0,sizeof(aScope));
++  memset(&head,0,sizeof(head));
++  memset(&orphan,0,sizeof(orphan));
++  memset(&headBody,0,sizeof(headBody));
++
++#define SESSION_COMPACTION_FAIL(zMsg) do { \
++    Tcl_SetObjResult(interp,Tcl_ObjPrintf("%s rc=%d err=%s",(zMsg),rc,zErr ? zErr : "(none)")); \
++    rcRet = TCL_ERROR; \
++    goto session_compaction_done; \
++  } while(0)
++#define SESSION_COMPACTION_REQUIRE(cond,zMsg) \
++  do { if(!(cond)) SESSION_COMPACTION_FAIL(zMsg); } while(0)
++
++  pSessionVfs = sqlite3_vfs_find(zVfs);
++  SESSION_COMPACTION_REQUIRE(pSessionVfs!=0, "compaction VFS lookup failed");
++
++  /* SQLITE_BCVFS_TESTING lowers the production 1024-operation watermark to
++  ** four. Eight accepted operations therefore create multiple segments. */
++  for(ii=0; ii<8; ii++){
++    int rawFlags;
++    memset(aOperationId,0,sizeof(aOperationId));
++    aOperationId[0] = 0xC2;
++    aOperationId[1] = (unsigned char)ii;
++    if( ii==0 ) memcpy(aFirstOperationId,aOperationId,sizeof(aOperationId));
++    rc = sqlite3_bcvfs_attach_session_scoped(
++        pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++        zPrincipal,zDatabase,zOperations,aOperationId,0,&zErr
++    );
++    SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "compaction operation attach failed");
++    bAttached = 1;
++    zPath = sqlite3_mprintf("/%s/%s",zAlias,zDatabase);
++    zImage = sqlite3_mprintf("%s/compaction-%d.db",zFreshDir,ii);
++    SESSION_COMPACTION_REQUIRE(zPath!=0 && zImage!=0,
++        "compaction image path allocation failed");
++    rc = bcvfsSessionBuildPublicationImage(zImage,(ii&1)+1,&zErr);
++    SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "compaction image build failed");
++    pRaw = (sqlite3_file*)sqlite3_malloc64((sqlite3_uint64)pSessionVfs->szOsFile);
++    SESSION_COMPACTION_REQUIRE(pRaw!=0, "compaction raw file allocation failed");
++    memset(pRaw,0,(size_t)pSessionVfs->szOsFile);
++    rawFlags = SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
++    rc = pSessionVfs->xOpen(pSessionVfs,zPath,pRaw,rawFlags,&rawFlags);
++    SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK && pRaw->pMethods!=0,
++        "compaction raw file open failed");
++    bRawOpen = 1;
++    rc = bcvfsSessionCopyImage(pRaw,zImage,&zErr);
++    SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "compaction image copy failed");
++    rc = pRaw->pMethods->xSync(pRaw,0);
++    SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "compaction image sync failed");
++    rc = pRaw->pMethods->xClose(pRaw);
++    sqlite3_free(pRaw);
++    pRaw = 0;
++    bRawOpen = 0;
++    SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "compaction raw file close failed");
++    sqlite3_free(zImage); zImage = 0;
++    sqlite3_free(zPath); zPath = 0;
++    sqlite3_free(zErr); zErr = 0;
++    rc = sqlite3_bcvfs_session_checkpoint(
++        pTest->pFs,zAlias,zSessionId,aCheckpointHash,&zEtag,&zErr
++    );
++    SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK && zEtag!=0,
++        "compaction checkpoint failed");
++    sqlite3_free(zEtag); zEtag = 0;
++    rc = sqlite3_bcvfs_session_accept(
++        pTest->pFs,zAlias,zSessionId,&zEtag,&zErr
++    );
++    SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK && zEtag!=0,
++        "compaction operation acceptance failed");
++    sqlite3_free(zEtag); zEtag = 0;
++    rc = sqlite3_bcvfs_detach_session(
++        pTest->pFs,zAlias,zSessionId,&zErr
++    );
++    SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "compaction operation detach failed");
++    bAttached = 0;
++    sqlite3_free(zErr); zErr = 0;
++  }
++
++  /* The accepted HEAD must contain only a bounded tail and a nonzero root. */
++  memset(aOrphanOperationId,0,sizeof(aOrphanOperationId));
++  aOrphanOperationId[0] = 0xD1;
++  aOrphanOperationId[1] = 1;
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aOrphanOperationId,0,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "orphan operation attach failed");
++  bAttached = 1;
++  rc = sqlite3_bcvfs_session_operation_status(
++      pTest->pFs,zAlias,zSessionId,&operationStatus,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(
++      rc==SQLITE_OK && operationStatus==SQLITE_BCVFS_SESSION_STATUS_NEW,
++      "unaccepted operation was not initially NEW");
++  rc = sqlite3_bcvfs_session_scope_hash(
++      zStorage,zAccount,zContainer,zPrincipal,zDatabase,zOperations,
++      aScope,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "compaction scope hash failed");
++  rc = sqlite3_bcvfs_session_fetch(
++      pTest->pFs,zAlias,SQLITE_BCVFS_SESSION_HEAD,zSessionId,0,
++      zPrincipal,zDatabase,zOperations,&aHeadData,&nHeadData,&zEtag,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK && aHeadData!=0,
++      "compacted HEAD fetch failed");
++  rc = sqlite3_bcvfs_session_record_decode(
++      aHeadData,nHeadData,zSessionId,aScope,&head,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "compacted HEAD decode failed");
++  rc = sqlite3_bcvfs_session_body_decode(
++      head.eType,head.eState,head.zSessionId,head.aBody,head.nBody,
++      &headBody,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(
++      rc==SQLITE_OK && headBody.nHistoryOperations==0,
++      "compacted HEAD retained an unbounded operation tail");
++  for(ii=0; ii<SQLITE_BCVFS_SESSION_HASH_BYTES; ii++){
++    if( headBody.aHistoryHeadHash[ii]!=0 ) break;
++  }
++  SESSION_COMPACTION_REQUIRE(
++      ii<SQLITE_BCVFS_SESSION_HASH_BYTES,
++      "accepted operations did not produce a history root");
++  memcpy(aHistoryRoot,headBody.aHistoryHeadHash,sizeof(aHistoryRoot));
++  sqlite3_free(aHeadData); aHeadData = 0;
++  sqlite3_free(zEtag); zEtag = 0;
++
++  /* Put a valid history record for the pending operation without changing
++  ** HEAD.  Replay detection must follow only the current HEAD root. */
++  memset(aHistoryBody,0,sizeof(aHistoryBody));
++  memcpy(aHistoryBody,"BCVHS02",7);
++  bcvPutU32(&aHistoryBody[40],1);
++  memcpy(&aHistoryBody[48],aOrphanOperationId,
++      SQLITE_BCVFS_SESSION_HASH_BYTES);
++  memset(&orphan,0,sizeof(orphan));
++  orphan.eType = SQLITE_BCVFS_SESSION_HISTORY;
++  orphan.eState = SQLITE_BCVFS_SESSION_ACCEPTED;
++  orphan.eOutcome = SQLITE_BCVFS_SESSION_OUTCOME_SUCCESS;
++  orphan.iSequence = 100000;
++  orphan.iCreated = sqlite_timestamp()-300000;
++  orphan.iExpires = orphan.iCreated + 60000;
++  sqlite3_snprintf(sizeof(orphan.zSessionId),orphan.zSessionId,
++      "%s",zSessionId);
++  memcpy(orphan.aScopeHash,aScope,sizeof(aScope));
++  memcpy(orphan.aOperationId,aOrphanOperationId,sizeof(aOrphanOperationId));
++  orphan.aBody = aHistoryBody;
++  orphan.nBody = sizeof(aHistoryBody);
++  rc = sqlite3_bcvfs_session_record_encode(
++      &orphan,&aOrphanEncoded,&nOrphanEncoded,aOrphanHash,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(
++      rc==SQLITE_OK && aOrphanEncoded!=0,
++      "orphan history segment encode failed");
++  rc = sqlite3_bcvfs_session_put(
++      pTest->pFs,zAlias,SQLITE_BCVFS_SESSION_HISTORY,zSessionId,aOrphanHash,
++      zPrincipal,zDatabase,zOperations,"*",aOrphanEncoded,nOrphanEncoded,
++      &zEtag,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "orphan history segment PUT failed");
++  sqlite3_free(zEtag); zEtag = 0;
++  rc = sqlite3_bcvfs_session_operation_status(
++      pTest->pFs,zAlias,zSessionId,&operationStatus,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(
++      rc==SQLITE_OK && operationStatus==SQLITE_BCVFS_SESSION_STATUS_NEW,
++      "unreferenced history segment changed operation status");
++
++  rc = sqlite3_bcvfs_detach_session(
++      pTest->pFs,zAlias,zSessionId,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "orphan operation detach failed");
++  bAttached = 0;
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aFirstOperationId,0,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "historical operation attach failed");
++  bAttached = 1;
++  rc = sqlite3_bcvfs_session_operation_status(
++      pTest->pFs,zAlias,zSessionId,&operationStatus,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(
++      rc==SQLITE_OK && operationStatus==SQLITE_BCVFS_SESSION_STATUS_CONFLICT,
++      "historical operation was not fenced after compaction");
++  rc = sqlite3_bcvfs_detach_session(
++      pTest->pFs,zAlias,zSessionId,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "historical operation detach failed");
++  bAttached = 0;
++
++  /* Start one new operation from the compacted HEAD and use the direct
++  ** finalizer. This specifically exercises preserving the history body in
++  ** the synthetic OPEN predecessor used by the PUBLISHING CAS. */
++  aFinalizeOperationId[0] = 0xC3;
++  aFinalizeOperationId[1] = 1;
++  rc = sqlite3_bcvfs_attach_session_scoped(
++      pTest->pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,
++      zPrincipal,zDatabase,zOperations,aFinalizeOperationId,0,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "final operation attach failed");
++  bAttached = 1;
++  zPath = sqlite3_mprintf("/%s/%s",zAlias,zDatabase);
++  zImage = sqlite3_mprintf("%s/compaction-final.db",zFreshDir);
++  SESSION_COMPACTION_REQUIRE(zPath!=0 && zImage!=0,
++      "final operation image path allocation failed");
++  rc = bcvfsSessionBuildPublicationImage(zImage,2,&zErr);
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "final operation image build failed");
++  pRaw = (sqlite3_file*)sqlite3_malloc64((sqlite3_uint64)pSessionVfs->szOsFile);
++  SESSION_COMPACTION_REQUIRE(pRaw!=0, "final operation raw file allocation failed");
++  memset(pRaw,0,(size_t)pSessionVfs->szOsFile);
++  {
++    int rawFlags = SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
++    rc = pSessionVfs->xOpen(pSessionVfs,zPath,pRaw,rawFlags,&rawFlags);
++  }
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK && pRaw->pMethods!=0,
++      "final operation raw file open failed");
++  bRawOpen = 1;
++  rc = bcvfsSessionCopyImage(pRaw,zImage,&zErr);
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "final operation image copy failed");
++  rc = pRaw->pMethods->xSync(pRaw,0);
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "final operation image sync failed");
++  rc = pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  pRaw = 0;
++  bRawOpen = 0;
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "final operation raw file close failed");
++  sqlite3_free(zImage); zImage = 0;
++  sqlite3_free(zPath); zPath = 0;
++  sqlite3_free(zErr); zErr = 0;
++  rc = sqlite3_bcvfs_session_finalize(
++      pTest->pFs,zAlias,zSessionId,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "compacted direct finalization failed");
++  rc = sqlite3_bcvfs_detach_session(
++      pTest->pFs,zAlias,zSessionId,&zErr
++  );
++  SESSION_COMPACTION_REQUIRE(rc==SQLITE_OK, "final operation detach failed");
++  bAttached = 0;
++
++  hex_encode(aHistoryRoot,sizeof(aHistoryRoot),zRootHash,0);
++  hex_encode(aOrphanHash,sizeof(aOrphanHash),zOrphanHash,0);
++  pResult = Tcl_NewListObj(0,0);
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zRootHash,-1));
++  Tcl_ListObjAppendElement(interp,pResult,Tcl_NewStringObj(zOrphanHash,-1));
++  Tcl_SetObjResult(interp,pResult);
++  pResult = 0;
++
++session_compaction_done:
++  sqlite3_free(zErr);
++  sqlite3_free(zEtag);
++  sqlite3_free(zImage);
++  sqlite3_free(zPath);
++  sqlite3_free(aHeadData);
++  sqlite3_free(aOrphanEncoded);
++  if( bRawOpen && pRaw && pRaw->pMethods ) pRaw->pMethods->xClose(pRaw);
++  sqlite3_free(pRaw);
++  if( bAttached ){
++    char *zDetachErr = 0;
++    int rcDetach = sqlite3_bcvfs_detach_session(
++        pTest->pFs,zAlias,zSessionId,&zDetachErr
++    );
++    if( rcRet==TCL_OK && rcDetach!=SQLITE_OK ){
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          zDetachErr ? zDetachErr : "compaction detach failed",-1
++      ));
++      rcRet = TCL_ERROR;
++    }
++    sqlite3_free(zDetachErr);
++  }
++  if( pResult ) Tcl_DecrRefCount(pResult);
++#undef SESSION_COMPACTION_REQUIRE
++#undef SESSION_COMPACTION_FAIL
++  return rcRet;
++}
++
+ static int test_bcvfs_create(
+   ClientData clientData,
+   Tcl_Interp *interp,
+@@ -2712,6 +7171,7 @@ const char *bcvtest_init(Tcl_Interp *interp){
+     { "bcv_oom_control", test_bcv_oom_control },
+     { "bcv_socket_fault_control", test_bcv_socket_fault_control },
+     { "sqlite3_bcvfs_create", test_bcvfs_create },
++    { "sqlite3_bcvfs_session_record_test", test_bcvfs_session_record },
+     { "sqlite3_bcvfs_register_vtab", test_bcvfs_register_vtab },
+     { "sqlite3_extended_errcode", test_extended_errcode },
+     { "sqlite3_status", test_status },

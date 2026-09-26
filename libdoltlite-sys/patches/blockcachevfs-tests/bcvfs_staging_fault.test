@@ -159,4 +159,87 @@ foreach event {1 2 3 4} {
   $cmd destroy
 }
 
+# A full cache can leave every changed block durably staged, with no dirty
+# `block` row left to make an ordinary detach notice unpublished data. The
+# alias must remain attached so the explicit upload can publish that same
+# mapping.
+set detach_container "bcv-staged-detach-$run_suffix"
+set detach_dir "staging-detach-testdir-$run_suffix"
+bcv_mkdir $detach_dir
+bcv_create_container $detach_container
+bcv_upload_new_db $detach_container staging.db {
+  CREATE TABLE payload(id INTEGER PRIMARY KEY, body BLOB NOT NULL);
+  WITH RECURSIVE c(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<1000
+  ) INSERT INTO payload(id, body) SELECT i, zeroblob(4096) FROM c;
+}
+set cmd [bcvfs_create $detach_dir "bcvfs"]
+$cmd config cachesize [expr 2*$::D(blocksize)]
+bcvfs_attach -alias staged $cmd $detach_container
+sqlite3 stageddb /staged/staging.db -vfs bcvfs
+stageddb eval {
+  BEGIN IMMEDIATE;
+  UPDATE payload SET body=CAST(zeroblob(4095)||X'01' AS BLOB) WHERE id=1;
+  WITH RECURSIVE c(i) AS (
+    SELECT 1001 UNION ALL SELECT i+1 FROM c WHERE i<2000
+  ) INSERT INTO payload(id, body)
+    SELECT i, CAST(zeroblob(4095)||X'01' AS BLOB) FROM c;
+  COMMIT;
+}
+stageddb eval {PRAGMA wal_checkpoint(TRUNCATE)}
+set materialized [stageddb onecolumn {
+  SELECT sum(length(hex(body))) FROM payload
+}]
+do_test 5.0.read_pressure {
+  expr {$materialized==16384000}
+} 1
+stageddb close
+$cmd destroy
+sqlite3 metadata [file join $detach_dir blocksdb.bcv]
+set nStaged [metadata eval {
+  SELECT count(*) FROM staged WHERE container='staged'
+}]
+set nDirty [metadata eval {
+  SELECT count(*) FROM block WHERE container='staged'
+}]
+metadata close
+do_test 5.1.staged_only {
+  expr {$nStaged>0 && $nDirty==0}
+} 1
+set cmd [bcvfs_create $detach_dir "bcvfs"]
+$cmd config cachesize [expr 2*$::D(blocksize)]
+bcvfs_attach -ifnot -alias staged $cmd $detach_container
+set pre_dir "staging-detach-preupload-$run_suffix"
+bcv_mkdir $pre_dir
+set preCmd [bcvfs_create $pre_dir "bcvfs-preupload"]
+bcvfs_attach -alias before $preCmd $detach_container
+sqlite3 predb /before/staging.db -vfs bcvfs-preupload
+do_test 5.1.remote_unpublished {
+  predb onecolumn {SELECT hex(substr(body,-1)) FROM payload WHERE id=1}
+} 00
+predb close
+$preCmd destroy
+set detachStatus [catch {$cmd detach staged} detachMessage]
+do_test 5.2.detach_busy {
+  list $detachStatus [string match {*container has local changes*} $detachMessage]
+} {1 1}
+do_test 5.3.upload_after_busy_detach {
+  catch {$cmd upload staged}
+} 0
+set verify_dir "staging-detach-verify-$run_suffix"
+bcv_mkdir $verify_dir
+set verifyCmd [bcvfs_create $verify_dir "bcvfs-verify"]
+bcvfs_attach -alias verify $verifyCmd $detach_container
+sqlite3 verifydb /verify/staging.db -vfs bcvfs-verify
+do_test 5.4.manifest_published {
+  verifydb onecolumn {SELECT count(*) FROM payload}
+} 2000
+do_test 5.5.updated_row_published {
+  verifydb onecolumn {SELECT hex(substr(body,-1)) FROM payload WHERE id=1}
+} 01
+verifydb close
+$verifyCmd destroy
+$cmd detach staged
+$cmd destroy
+
 finish_test

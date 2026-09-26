@@ -1,0 +1,28 @@
+# Verify fresh serverless request overlays rehydrate the accepted checkpoint,
+# reset warm scratch, reject poll replacement, and fail closed for stale state.
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_session_overlay
+
+bcv_mkdir testdir
+set nonce [expr {[clock clicks] & 0xFFFFFFFFFFFF}]
+set session_container [format "%s/session-overlay-%012x" $D(container) $nonce]
+set source_db [file join testdir session-overlay-source.db]
+sqlite3 overlay_source $source_db
+overlay_source eval { CREATE TABLE t(v); }
+overlay_source close
+bcv_create_container $session_container
+bcv_upload_database -container $session_container $source_db overlay.db
+file delete -force $source_db
+set cmd [bcvfs_create testdir "bcvfs"]
+set session_id [format "550e8400-e29b-41d4-a716-%012x" $nonce]
+set fresh_dir [file join testdir [format "session-overlay-fresh-%012x" $nonce]]
+bcv_mkdir $fresh_dir
+
+do_test 1.1 {
+  $cmd session_overlay_test bcvfs $C(module) $C(user) \
+      $session_container $session_id overlay.db $fresh_dir
+} {}
+
+$cmd destroy
+finish_test

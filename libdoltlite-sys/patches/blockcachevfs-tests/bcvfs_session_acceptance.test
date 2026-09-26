@@ -1,0 +1,26 @@
+# Exercise accepted-head CAS separately from manifest publication. A missing
+# xSync/final checkpoint is rejected, exact retries reconcile, accepted heads
+# permit a successor operation, and an older operation cannot be replayed.
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_session_acceptance
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir "bcvfs"]
+set nonce [expr {[clock clicks] & 0xFFFFFFFFFFFF}]
+set session_container [format "%s/session-acceptance-%012x" $D(container) $nonce]
+bcv_create_container $session_container
+bcv_upload_new_db $session_container acceptance.db {
+  CREATE TABLE t(v);
+}
+set session_id [format "550e8400-e29b-41d4-a716-%012x" $nonce]
+set fresh_dir [file join testdir [format "session-acceptance-fresh-%012x" $nonce]]
+bcv_mkdir $fresh_dir
+
+do_test 1.1 {
+  $cmd session_acceptance_test bcvfs $C(module) $C(user) \
+      $session_container $session_id acceptance.db $fresh_dir
+} {}
+
+$cmd destroy
+finish_test

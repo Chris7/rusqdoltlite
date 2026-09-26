@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::Path;
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::error::{check, Error};
 use crate::{Connection, OpenFlags, Result};
@@ -163,6 +164,167 @@ impl Storage {
     }
 }
 
+/// Return the selector spelling used for session attachment and scope
+/// derivation. CBS normalizes trailing slashes on its HTTP endpoint before
+/// making requests, while the native session fence hashes the selector text
+/// stored on the container. Normalize that spelling before attachment so
+/// equivalent endpoint selectors cannot create distinct fence identities.
+pub(crate) fn canonical_storage_provider(provider: &str) -> Result<String> {
+    let Some((module, query)) = provider.split_once('?') else {
+        return Ok(provider.to_owned());
+    };
+    let canonical_module = if module.eq_ignore_ascii_case("s3") {
+        "s3"
+    } else if module.eq_ignore_ascii_case("google") {
+        "google"
+    } else {
+        return Ok(provider.to_owned());
+    };
+
+    let mut changed = module != canonical_module;
+    let mut parameters = Vec::new();
+    for parameter in query.split('&') {
+        let Some((key, value)) = parameter.split_once('=') else {
+            parameters.push(parameter.to_owned());
+            continue;
+        };
+        let canonical_key = key.to_ascii_lowercase();
+        if canonical_key == "endpoint" {
+            let canonical_value = value.trim_end_matches('/');
+            if canonical_value.is_empty() {
+                return Err(Error::SqliteFailure(
+                    crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
+                    Some("storage endpoint must not be empty".to_owned()),
+                ));
+            }
+            if canonical_value != value || canonical_key != key {
+                changed = true;
+                parameters.push(format!("{canonical_key}={canonical_value}"));
+                continue;
+            }
+        }
+        if canonical_key != key {
+            changed = true;
+            parameters.push(format!("{canonical_key}={value}"));
+        } else {
+            parameters.push(parameter.to_owned());
+        }
+    }
+    if changed {
+        Ok(format!("{canonical_module}?{}", parameters.join("&")))
+    } else {
+        Ok(provider.to_owned())
+    }
+}
+
+/// Canonicalize the provider selectors accepted by session attachments.
+///
+/// Native CBS accepts defaults and tuning parameters that can address the
+/// same object namespace while producing different selector strings. Session
+/// fences therefore use one spelling: S3 requires an explicit region, and
+/// Google requires the JSON API. Max-results, the XML Google selector, and
+/// currently un-audited Azure selector forms are intentionally not accepted.
+pub(crate) fn canonical_session_storage_provider(provider: &str) -> Result<String> {
+    let provider = canonical_storage_provider(provider)?;
+    let (module, query) = provider
+        .split_once('?')
+        .map_or((provider.as_str(), ""), |(module, query)| (module, query));
+    match module {
+        "s3" => {
+            let mut region = None;
+            let mut endpoint = None;
+            if query.is_empty() {
+                return Err(noncanonical_session_selector(
+                    "S3 sessions require an explicit region selector",
+                ));
+            }
+            for parameter in query.split('&') {
+                let Some((key, value)) = parameter.split_once('=') else {
+                    return Err(noncanonical_session_selector(
+                        "S3 sessions require region=<region> and may use endpoint=<url>",
+                    ));
+                };
+                match key {
+                    "region"
+                        if region.is_none()
+                            && !value.is_empty()
+                            && value == value.to_ascii_lowercase() =>
+                    {
+                        region = Some(value);
+                    }
+                    "endpoint" if endpoint.is_none() && !value.is_empty() => {
+                        endpoint = Some(value);
+                    }
+                    _ => {
+                        return Err(noncanonical_session_selector(
+                            "S3 sessions require region=<region> and may use endpoint=<url>",
+                        ));
+                    }
+                }
+            }
+            let Some(region) = region else {
+                return Err(noncanonical_session_selector(
+                    "S3 sessions require an explicit region selector",
+                ));
+            };
+            let mut canonical = format!("s3?region={region}");
+            if let Some(endpoint) = endpoint {
+                canonical.push_str("&endpoint=");
+                canonical.push_str(endpoint);
+            }
+            Ok(canonical)
+        }
+        "google" => {
+            let mut json_api = false;
+            let mut endpoint = None;
+            for parameter in query.split('&') {
+                let Some((key, value)) = parameter.split_once('=') else {
+                    return Err(noncanonical_session_selector(
+                        "Google sessions require api=json and may use endpoint=<url>",
+                    ));
+                };
+                match key {
+                    "api" if !json_api && value.eq_ignore_ascii_case("json") => {
+                        json_api = true;
+                    }
+                    "endpoint" if endpoint.is_none() && !value.is_empty() => {
+                        endpoint = Some(value);
+                    }
+                    _ => {
+                        return Err(noncanonical_session_selector(
+                            "Google sessions require api=json and may use endpoint=<url>",
+                        ));
+                    }
+                }
+            }
+            if !json_api {
+                return Err(noncanonical_session_selector(
+                    "Google sessions require the api=json selector",
+                ));
+            }
+            let mut canonical = "google?api=json".to_owned();
+            if let Some(endpoint) = endpoint {
+                canonical.push_str("&endpoint=");
+                canonical.push_str(endpoint);
+            }
+            Ok(canonical)
+        }
+        "azure" => Err(noncanonical_session_selector(
+            "Azure session selectors are unavailable until their canonical form is defined",
+        )),
+        _ => Err(noncanonical_session_selector(
+            "unknown CBS provider selectors are unavailable for session attachments",
+        )),
+    }
+}
+
+fn noncanonical_session_selector(message: &str) -> Error {
+    Error::SqliteFailure(
+        crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
+        Some(message.to_owned()),
+    )
+}
+
 /// A container attachment request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachSpec {
@@ -274,6 +436,328 @@ impl AttachSpec {
         self.if_not = if_not;
         self
     }
+}
+
+/// A session identifier bound to one block-cache attachment.
+///
+/// Session identifiers are carried by the Rust attachment context and copied
+/// into the alias-scoped native CBS container metadata. They are never stored
+/// in process-global "current session" state; the native value exists only to
+/// validate ownership and recovery for this attachment alias.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionId(String);
+
+impl SessionId {
+    /// Validate and store a canonical UUID session identifier.
+    pub fn new(session_id: impl AsRef<str>) -> Result<Self> {
+        let session_id = session_id.as_ref();
+        if session_id.len() != 36 {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
+                Some("block-cache session ID must be a canonical non-nil UUID".to_owned()),
+            ));
+        }
+        let session_id = session_id.to_ascii_lowercase();
+        if !is_canonical_uuid(&session_id) {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
+                Some("block-cache session ID must be a canonical non-nil UUID".to_owned()),
+            ));
+        }
+        Ok(Self(session_id))
+    }
+
+    /// Return the validated UUID text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Number of bytes in a per-request session operation identifier.
+pub const SESSION_OPERATION_ID_BYTES: usize = raw::SQLITE_BCVFS_SESSION_HASH_BYTES;
+
+/// Opaque, non-zero identifier for one application request operation.
+///
+/// This is distinct from the client session UUID. Applications may derive it
+/// deterministically from the exact request bytes to make retries idempotent,
+/// but the VFS treats it only as an opaque fence key.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SessionOperationId([u8; SESSION_OPERATION_ID_BYTES]);
+
+impl SessionOperationId {
+    /// Validate and store a fixed-size, non-zero operation identifier.
+    pub fn new(operation_id: impl AsRef<[u8]>) -> Result<Self> {
+        let operation_id = operation_id.as_ref();
+        if operation_id.len() != SESSION_OPERATION_ID_BYTES
+            || operation_id.iter().all(|byte| *byte == 0)
+        {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
+                Some(format!(
+                    "session operation ID must be exactly {SESSION_OPERATION_ID_BYTES} non-zero bytes"
+                )),
+            ));
+        }
+        let mut value = [0_u8; SESSION_OPERATION_ID_BYTES];
+        value.copy_from_slice(operation_id);
+        Ok(Self(value))
+    }
+
+    /// Return the operation identifier bytes for the native session fence.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; SESSION_OPERATION_ID_BYTES] {
+        &self.0
+    }
+}
+
+/// Result of checking a session operation before invoking or retrying its
+/// mutating handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionOperationStatus {
+    /// This operation has not been accepted and its captured predecessor is
+    /// still current. This does not prove that an earlier handler invocation
+    /// did not run.
+    New,
+    /// This operation has been accepted but not published.
+    Accepted,
+    /// This operation has been published and is complete.
+    Committed,
+    /// The operation was rejected or expired.
+    Failed,
+    /// A different operation owns the current session head.
+    Conflict,
+}
+
+impl SessionOperationStatus {
+    fn from_native(value: c_int) -> Result<Self> {
+        match value {
+            raw::SQLITE_BCVFS_SESSION_STATUS_NEW => Ok(Self::New),
+            raw::SQLITE_BCVFS_SESSION_STATUS_ACCEPTED => Ok(Self::Accepted),
+            raw::SQLITE_BCVFS_SESSION_STATUS_COMMITTED => Ok(Self::Committed),
+            raw::SQLITE_BCVFS_SESSION_STATUS_FAILED => Ok(Self::Failed),
+            raw::SQLITE_BCVFS_SESSION_STATUS_CONFLICT => Ok(Self::Conflict),
+            _ => Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_CORRUPT),
+                Some("native CBS returned an unknown session operation status".to_owned()),
+            )),
+        }
+    }
+}
+
+/// A block-cache attachment owned by one server/application session.
+///
+/// The attachment stores its session identity locally and never changes a
+/// process-wide "current session".  Its alias is attached with `IFNOT`
+/// disabled, so an existing alias can never be silently reused by a session
+/// with a different storage context. A second live owner is rejected because
+/// the current CBS container is a mutable request overlay; same-session reuse
+/// is permitted only after the prior owner has released it.
+pub struct SessionAttachment {
+    vfs: &'static BlockCacheVfs,
+    alias: String,
+    session_id: SessionId,
+    operation_id: Option<SessionOperationId>,
+}
+
+impl fmt::Debug for SessionAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionAttachment")
+            .field("alias", &self.alias)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionAttachment {
+    /// Return the validated session identifier bound to this attachment.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        self.session_id.as_str()
+    }
+
+    /// Return the opaque operation identifier bound to this attachment.
+    #[must_use]
+    pub fn operation_id(&self) -> Option<&SessionOperationId> {
+        self.operation_id.as_ref()
+    }
+
+    /// Check this operation's durable session state before invoking or
+    /// retrying a mutating handler. A conflict means another operation owns
+    /// the current session head and must not be retried blindly.
+    pub fn operation_status(&self) -> Result<SessionOperationStatus> {
+        let alias = CString::new(self.alias.as_str()).map_err(Error::NulError)?;
+        let session_id = CString::new(self.session_id.as_str()).map_err(Error::NulError)?;
+        let mut status = raw::SQLITE_BCVFS_SESSION_STATUS_NEW;
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_session_operation_status(
+                self.vfs.fs,
+                alias.as_ptr(),
+                session_id.as_ptr(),
+                &mut status,
+                &mut err,
+            )
+        };
+        result_with_err(rc, &mut err)?;
+        SessionOperationStatus::from_native(status)
+    }
+
+    /// Return the local alias used by the native VFS.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Persist the current logical database state as an immutable session
+    /// checkpoint without advancing the accepted or published heads.
+    #[cfg(feature = "remote")]
+    pub(crate) fn checkpoint(&self) -> Result<()> {
+        let alias = CString::new(self.alias.as_str()).map_err(Error::NulError)?;
+        let session_id = CString::new(self.session_id.as_str()).map_err(Error::NulError)?;
+        let mut checkpoint_hash = [0_u8; raw::SQLITE_BCVFS_SESSION_HASH_BYTES];
+        let mut etag = ptr::null_mut();
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_session_checkpoint(
+                self.vfs.fs,
+                alias.as_ptr(),
+                session_id.as_ptr(),
+                checkpoint_hash.as_mut_ptr(),
+                &mut etag,
+                &mut err,
+            )
+        };
+        let result = result_with_err(rc, &mut err);
+        if !etag.is_null() {
+            unsafe { crate::ffi::sqlite3_free(etag.cast::<c_void>()) };
+        }
+        result
+    }
+
+    /// Advance the accepted request head after the final checkpoint. Native
+    /// CBS performs the predecessor ETag CAS and exact duplicate
+    /// reconciliation; this does not publish the ordinary manifest.
+    #[cfg(feature = "remote")]
+    pub(crate) fn accept(&self) -> Result<()> {
+        let alias = CString::new(self.alias.as_str()).map_err(Error::NulError)?;
+        let session_id = CString::new(self.session_id.as_str()).map_err(Error::NulError)?;
+        let mut etag = ptr::null_mut();
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_session_accept(
+                self.vfs.fs,
+                alias.as_ptr(),
+                session_id.as_ptr(),
+                &mut etag,
+                &mut err,
+            )
+        };
+        let result = result_with_err(rc, &mut err);
+        if !etag.is_null() {
+            unsafe { crate::ffi::sqlite3_free(etag.cast::<c_void>()) };
+        }
+        result
+    }
+
+    /// Publish the accepted session checkpoint through native CBS's fenced
+    /// publication state machine. The native call resolves storage and the
+    /// candidate from the owned alias; no caller-supplied tip or container is
+    /// accepted.
+    pub fn upload(&self) -> Result<()> {
+        let alias = CString::new(self.alias.as_str()).map_err(Error::NulError)?;
+        let session_id = CString::new(self.session_id.as_str()).map_err(Error::NulError)?;
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_session_upload(
+                self.vfs.fs,
+                alias.as_ptr(),
+                session_id.as_ptr(),
+                &mut err,
+            )
+        };
+        result_with_err(rc, &mut err)
+    }
+
+    /// Checkpoint and publish this operation while claiming the session head
+    /// directly in PUBLISHING state. Unlike [`Self::upload`], this is the
+    /// first publication attempt for a still-NEW operation and does not
+    /// expose an intermediate ACCEPTED head to a successor request.
+    #[cfg(feature = "remote")]
+    pub(crate) fn finalize(&self) -> Result<()> {
+        let alias = CString::new(self.alias.as_str()).map_err(Error::NulError)?;
+        let session_id = CString::new(self.session_id.as_str()).map_err(Error::NulError)?;
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_session_finalize(
+                self.vfs.fs,
+                alias.as_ptr(),
+                session_id.as_ptr(),
+                &mut err,
+            )
+        };
+        result_with_err(rc, &mut err)
+    }
+}
+
+impl Drop for SessionAttachment {
+    fn drop(&mut self) {
+        // Native detach can legitimately return SQLITE_BUSY while a database
+        // or unpublished local changes are still present. The session-aware
+        // native release clears the exclusive owner state while preserving
+        // durable session metadata for later recovery.
+        let Ok(alias) = CString::new(self.alias.as_str()) else {
+            return;
+        };
+        let Ok(session_id) = CString::new(self.session_id.as_str()) else {
+            return;
+        };
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_detach_session(
+                self.vfs.fs,
+                alias.as_ptr(),
+                session_id.as_ptr(),
+                &mut err,
+            )
+        };
+        let _ = result_with_err(rc, &mut err);
+    }
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+        && bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 8 | 13 | 18 | 23) && *byte != b'0')
+}
+
+pub(crate) fn session_alias(spec: &AttachSpec, session_id: &SessionId) -> Result<String> {
+    let alias = spec
+        .alias
+        .clone()
+        .unwrap_or_else(|| format!("session-{}", session_id.as_str()));
+    if alias.is_empty()
+        || alias == "."
+        || alias == ".."
+        || alias.contains('/')
+        || alias.contains('\\')
+    {
+        return Err(Error::SqliteFailure(
+            crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
+            Some("session attachment alias must be one non-empty path component".into()),
+        ));
+    }
+    Ok(alias)
 }
 
 /// Integer configuration options accepted by the CBS VFS.
@@ -479,6 +963,135 @@ impl BlockCacheVfs {
         result_with_err(rc, &mut err)
     }
 
+    /// Attach a container to a validated application session.
+    ///
+    /// Session attachments intentionally do not honor [`AttachSpec::if_not`]:
+    /// accepting an existing alias would make it impossible to prove that the
+    /// alias belongs to this session and storage scope. When no alias is
+    /// supplied, a session-specific local alias is derived from the UUID so
+    /// independent sessions for one remote container do not collide. A second
+    /// live owner is rejected; same-session recovery is allowed only after the
+    /// prior owner released the attachment. A different session or storage
+    /// scope is always rejected. The native storage scope currently includes
+    /// [`Storage::account`]. For S3 this is the access key, so rotating that
+    /// key requires a fresh VFS/cache instance until rehydration can replace
+    /// the local container credentials; changing only the callback's secret or
+    /// session token does not change this local identity.
+    pub fn attach_session(
+        &'static self,
+        spec: &AttachSpec,
+        session_id: impl AsRef<str>,
+    ) -> Result<SessionAttachment> {
+        let session_id = SessionId::new(session_id)?;
+        if self.is_daemon() {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
+                Some("session-aware attachments are unavailable through the CBS daemon".to_owned()),
+            ));
+        }
+        let mut canonical_spec = spec.clone();
+        canonical_spec.storage.provider =
+            canonical_session_storage_provider(&canonical_spec.storage.provider)?;
+        let alias_text = session_alias(&canonical_spec, &session_id)?;
+
+        let storage =
+            CString::new(canonical_spec.storage.provider.as_str()).map_err(Error::NulError)?;
+        let account =
+            CString::new(canonical_spec.storage.account.as_str()).map_err(Error::NulError)?;
+        let container =
+            CString::new(canonical_spec.storage.container.as_str()).map_err(Error::NulError)?;
+        let alias = CString::new(alias_text.as_str()).map_err(Error::NulError)?;
+        let session_id_c = CString::new(session_id.as_str()).map_err(Error::NulError)?;
+        let flags = canonical_spec.secure as c_int * raw::SQLITE_BCV_ATTACH_SECURE;
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_attach_session(
+                self.fs,
+                storage.as_ptr(),
+                account.as_ptr(),
+                container.as_ptr(),
+                alias.as_ptr(),
+                session_id_c.as_ptr(),
+                flags,
+                &mut err,
+            )
+        };
+        result_with_err(rc, &mut err)?;
+
+        Ok(SessionAttachment {
+            vfs: self,
+            alias: alias_text,
+            session_id,
+            operation_id: None,
+        })
+    }
+
+    /// Attach and atomically bind an authorized request context.
+    ///
+    /// The native operation ID is mandatory and distinct from the client
+    /// session UUID. Native CBS rehydrates the accepted head internally after
+    /// binding this context; a missing head selects the zero initial
+    /// predecessor and sequence. Callers never supply an expected tip.
+    pub fn attach_session_scoped(
+        &'static self,
+        spec: &AttachSpec,
+        session_id: impl AsRef<str>,
+        principal: &str,
+        database: &str,
+        operations: &str,
+        operation_id: &SessionOperationId,
+    ) -> Result<SessionAttachment> {
+        let session_id = SessionId::new(session_id)?;
+        if self.is_daemon() {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
+                Some("session-aware attachments are unavailable through the CBS daemon".to_owned()),
+            ));
+        }
+        let mut canonical_spec = spec.clone();
+        canonical_spec.storage.provider =
+            canonical_session_storage_provider(&canonical_spec.storage.provider)?;
+        let alias_text = session_alias(&canonical_spec, &session_id)?;
+
+        let storage =
+            CString::new(canonical_spec.storage.provider.as_str()).map_err(Error::NulError)?;
+        let account =
+            CString::new(canonical_spec.storage.account.as_str()).map_err(Error::NulError)?;
+        let container =
+            CString::new(canonical_spec.storage.container.as_str()).map_err(Error::NulError)?;
+        let alias = CString::new(alias_text.as_str()).map_err(Error::NulError)?;
+        let session_id_c = CString::new(session_id.as_str()).map_err(Error::NulError)?;
+        let principal = CString::new(principal).map_err(Error::NulError)?;
+        let database = CString::new(database).map_err(Error::NulError)?;
+        let operations = CString::new(operations).map_err(Error::NulError)?;
+        let flags = canonical_spec.secure as c_int * raw::SQLITE_BCV_ATTACH_SECURE;
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_attach_session_scoped(
+                self.fs,
+                storage.as_ptr(),
+                account.as_ptr(),
+                container.as_ptr(),
+                alias.as_ptr(),
+                session_id_c.as_ptr(),
+                principal.as_ptr(),
+                database.as_ptr(),
+                operations.as_ptr(),
+                operation_id.as_bytes().as_ptr(),
+                flags,
+                &mut err,
+            )
+        };
+        result_with_err(rc, &mut err)?;
+
+        Ok(SessionAttachment {
+            vfs: self,
+            alias: alias_text,
+            session_id,
+            operation_id: Some(*operation_id),
+        })
+    }
+
     /// Detach a container with no open clients or unuploaded changes.
     pub fn detach(&self, alias: &str) -> Result<()> {
         self.with_container(alias, |alias, err| unsafe {
@@ -545,6 +1158,23 @@ impl BlockCacheVfs {
         let handle = self.open_bcv(storage, "initialize_container")?;
         let rc = unsafe { raw_util::sqlite3_bcv_create_if_not_exists(handle.0, 0, 0) };
         bcv_result("initialize_container", rc, &handle)
+    }
+
+    /// Remove eligible orphaned blocks from a remote CBS storage target.
+    ///
+    /// This opens an independent CBS management handle for `storage`; it does
+    /// not require an attached database. Applications should call it from
+    /// their own scheduled maintenance job. It is never run automatically by
+    /// request handling, attachment, `xSync`, or [`Self::upload`].
+    ///
+    /// `minimum_age` is the minimum age of an orphan before CBS may remove
+    /// it. Fractional seconds are rounded up so an object is never treated as
+    /// older than the requested duration.
+    pub fn cleanup(&self, storage: &Storage, minimum_age: Duration) -> Result<()> {
+        let minimum_age_seconds = cleanup_age_seconds(minimum_age)?;
+        let handle = self.open_bcv(storage, "cleanup")?;
+        let rc = unsafe { raw_util::sqlite3_bcv_cleanup(handle.0, minimum_age_seconds) };
+        bcv_result("cleanup", rc, &handle)
     }
 
     /// Upload a valid, non-empty local SQLite database as a new remote name.
@@ -706,6 +1336,19 @@ fn bcv_error(operation: &str, rc: c_int, handle: &BcvHandle) -> Error {
     Error::SqliteFailure(crate::ffi::Error::new(sqlite_code), Some(message))
 }
 
+fn cleanup_age_seconds(minimum_age: Duration) -> Result<c_int> {
+    let mut rounded_up_seconds = u128::from(minimum_age.as_secs());
+    if minimum_age.subsec_nanos() != 0 {
+        rounded_up_seconds += 1;
+    }
+    c_int::try_from(rounded_up_seconds).map_err(|_| {
+        Error::SqliteFailure(
+            crate::ffi::Error::new(crate::ffi::SQLITE_RANGE),
+            Some("cleanup: minimum age exceeds the native seconds limit".into()),
+        )
+    })
+}
+
 fn cstring_path(path: &Path) -> Result<CString> {
     #[cfg(unix)]
     {
@@ -798,6 +1441,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cleanup_age_seconds_rounds_up_and_checks_native_range() {
+        assert_eq!(cleanup_age_seconds(Duration::ZERO).unwrap(), 0);
+        assert_eq!(
+            cleanup_age_seconds(Duration::from_secs(7)).unwrap(),
+            7,
+            "whole seconds should be preserved"
+        );
+        assert_eq!(
+            cleanup_age_seconds(Duration::from_nanos(1)).unwrap(),
+            1,
+            "a fractional second must round up"
+        );
+        assert_eq!(
+            cleanup_age_seconds(Duration::from_secs(7) + Duration::from_nanos(1)).unwrap(),
+            8,
+            "rounding up prevents deleting an object before its requested age"
+        );
+        assert_eq!(
+            cleanup_age_seconds(Duration::from_secs(c_int::MAX as u64)).unwrap(),
+            c_int::MAX
+        );
+        assert!(cleanup_age_seconds(
+            Duration::from_secs(c_int::MAX as u64) + Duration::from_nanos(1)
+        )
+        .is_err());
+        assert!(cleanup_age_seconds(
+            Duration::from_secs(c_int::MAX as u64) + Duration::from_secs(1)
+        )
+        .is_err());
+        assert!(cleanup_age_seconds(Duration::MAX).is_err());
+    }
+
+    #[test]
     fn google_attachment_uses_builtin_provider() {
         let spec = AttachSpec::google("project", "bucket").alias("data");
         assert_eq!(spec.storage, Storage::new("google", "project", "bucket"));
@@ -847,6 +1523,133 @@ mod tests {
         );
         assert!(s3_secret_with_session_token("", "session").is_err());
         assert!(s3_secret_with_session_token("secret", "bad\ntoken").is_err());
+    }
+
+    #[test]
+    fn session_ids_require_canonical_uuid_text() {
+        let valid = SessionId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical UUID should be accepted");
+        assert_eq!(valid.as_str(), "550e8400-e29b-41d4-a716-446655440000");
+        let uppercase = SessionId::new("550E8400-E29B-41D4-A716-446655440000")
+            .expect("UUID hex case should normalize");
+        assert_eq!(uppercase.as_str(), valid.as_str());
+        assert!(SessionId::new("").is_err());
+        assert!(SessionId::new("00000000-0000-0000-0000-000000000000").is_err());
+        assert!(SessionId::new("550e8400e29b41d4a716446655440000").is_err());
+        assert!(SessionId::new("550e8400-e29b-41d4-a716-44665544000z").is_err());
+        assert!(SessionId::new("550e8400-e29b-41d4-a716-446655440000\0").is_err());
+    }
+
+    #[test]
+    fn session_operation_ids_require_nonzero_fixed_bytes() {
+        let mut operation_id = [0_u8; SESSION_OPERATION_ID_BYTES];
+        assert!(SessionOperationId::new(operation_id).is_err());
+        assert!(SessionOperationId::new([1_u8; SESSION_OPERATION_ID_BYTES - 1]).is_err());
+        operation_id[SESSION_OPERATION_ID_BYTES - 1] = 1;
+        let operation_id =
+            SessionOperationId::new(operation_id).expect("non-zero operation ID should pass");
+        assert_eq!(operation_id.as_bytes()[SESSION_OPERATION_ID_BYTES - 1], 1);
+    }
+
+    #[test]
+    fn session_operation_status_maps_native_states() {
+        assert_eq!(
+            SessionOperationStatus::from_native(raw::SQLITE_BCVFS_SESSION_STATUS_NEW)
+                .expect("new status"),
+            SessionOperationStatus::New
+        );
+        assert_eq!(
+            SessionOperationStatus::from_native(raw::SQLITE_BCVFS_SESSION_STATUS_ACCEPTED)
+                .expect("accepted status"),
+            SessionOperationStatus::Accepted
+        );
+        assert_eq!(
+            SessionOperationStatus::from_native(raw::SQLITE_BCVFS_SESSION_STATUS_COMMITTED)
+                .expect("committed status"),
+            SessionOperationStatus::Committed
+        );
+        assert_eq!(
+            SessionOperationStatus::from_native(raw::SQLITE_BCVFS_SESSION_STATUS_CONFLICT)
+                .expect("conflict status"),
+            SessionOperationStatus::Conflict
+        );
+        assert!(SessionOperationStatus::from_native(99).is_err());
+    }
+
+    #[test]
+    fn scoped_attach_preserves_native_validation_error_output() {
+        let directory = tempfile::tempdir().expect("temporary CBS directory");
+        let directory = CString::new(directory.path().to_str().expect("UTF-8 temp path"))
+            .expect("path has no NUL");
+        let name = CString::new("scoped-attach-abi").expect("name has no NUL");
+        let storage = CString::new("s3?region=us-east-1").expect("storage has no NUL");
+        let account = CString::new("account").expect("account has no NUL");
+        let container = CString::new("bucket").expect("container has no NUL");
+        let alias = CString::new("scoped-attach-abi").expect("alias has no NUL");
+        let invalid_session =
+            CString::new("not-a-canonical-session-id").expect("session has no NUL");
+        let principal = CString::new("principal").expect("principal has no NUL");
+        let database = CString::new("main").expect("database has no NUL");
+        let operations = CString::new("read,write").expect("operations have no NUL");
+        let operation_id = [1_u8; SESSION_OPERATION_ID_BYTES];
+
+        let mut fs = ptr::null_mut();
+        let mut create_err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_create(directory.as_ptr(), name.as_ptr(), &mut fs, &mut create_err)
+        };
+        result_with_err(rc, &mut create_err).expect("create test VFS");
+
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_attach_session_scoped(
+                fs,
+                storage.as_ptr(),
+                account.as_ptr(),
+                container.as_ptr(),
+                alias.as_ptr(),
+                invalid_session.as_ptr(),
+                principal.as_ptr(),
+                database.as_ptr(),
+                operations.as_ptr(),
+                operation_id.as_ptr(),
+                0,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, crate::ffi::SQLITE_MISUSE);
+        let message = unsafe {
+            assert!(
+                !err.is_null(),
+                "native validation error was lost across the FFI"
+            );
+            CStr::from_ptr(err).to_string_lossy().into_owned()
+        };
+        assert!(message.contains("canonical non-nil UUID"), "{message}");
+        unsafe {
+            crate::ffi::sqlite3_free(err.cast::<c_void>());
+            assert_eq!(raw::sqlite3_bcvfs_destroy(fs), crate::ffi::SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn session_attachments_derive_distinct_aliases_when_unspecified() {
+        let first = SessionId::new("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let second = SessionId::new("550e8400-e29b-41d4-a716-446655440001").unwrap();
+        let spec = AttachSpec::new(Storage::new("s3", "account", "bucket"));
+        let first_alias = session_alias(&spec, &first).unwrap();
+        let second_alias = session_alias(&spec, &second).unwrap();
+        assert_ne!(first_alias, second_alias);
+        assert!(first_alias.starts_with("session-"));
+        assert!(second_alias.starts_with("session-"));
+
+        let explicit = spec.clone().alias("stable");
+        assert_eq!(session_alias(&explicit, &first).unwrap(), "stable");
+
+        assert!(session_alias(&spec.clone().alias("bad/name"), &first).is_err());
+        assert!(session_alias(&spec.clone().alias(r"bad\\name"), &first).is_err());
+        assert!(session_alias(&spec.clone().alias("."), &first).is_err());
+        assert!(session_alias(&spec.clone().alias(".."), &first).is_err());
     }
 
     #[test]
