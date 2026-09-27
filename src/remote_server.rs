@@ -55,6 +55,20 @@ impl SessionScope {
                 "session target database must be an ASCII DoltLite database name",
             ));
         }
+        // SQLite interprets these exact lowercase endings as sidecars of a
+        // shorter database name. Leading-dot names are already excluded by
+        // `is_native_database_name`; that also prevents `.repo.db-lock` from
+        // colliding with DoltLite's local lock sidecar. Longer suffix
+        // near-misses such as `repo.db-wal-old` remain valid database names.
+        if ["-wal", "-shm", "-journal"]
+            .iter()
+            .any(|suffix| target_database.ends_with(*suffix))
+        {
+            return Err(remote_server_error(
+                ffi::SQLITE_MISUSE,
+                "session target database must not end in a reserved SQLite sidecar suffix",
+            ));
+        }
         Ok(Self {
             principal: validate_scope_field("principal", principal)?,
             target_database,
@@ -915,6 +929,40 @@ mod tests {
         assert_eq!(scope.operations(), "read,write");
         assert!(scope.matches_database("session.sqlite"));
         assert!(!scope.matches_database("other.sqlite"));
+    }
+
+    #[test]
+    fn session_scope_rejects_reserved_sidecar_and_lock_names() {
+        // A user can supply `.repo.db-lock` as a session target even though
+        // that exact path is DoltLite's local lock sidecar for `repo.db`.
+        // Accepting it would let the remote entry collide with the file used
+        // to coordinate local writes. The `-wal`/`-shm`/`-journal` cases
+        // similarly collide with SQLite sidecars. The non-hidden
+        // `repo.db-lock` name remains an ordinary database; leading-dot
+        // near-misses remain excluded by the existing name policy above.
+        for name in [
+            "repo.db-wal",
+            "repo.db-shm",
+            "repo.db-journal",
+            ".repo.db-lock",
+        ] {
+            assert!(
+                SessionScope::new("principal", name, "read").is_err(),
+                "reserved sidecar-shaped target should be rejected: {name}"
+            );
+        }
+
+        for name in [
+            "session.sqlite",
+            "repo.db-lock",
+            "repo.db-wal-old",
+            "repo.db-WAL",
+        ] {
+            assert!(
+                SessionScope::new("principal", name, "read").is_ok(),
+                "ordinary or near-miss database name should remain valid: {name}"
+            );
+        }
     }
 
     #[test]

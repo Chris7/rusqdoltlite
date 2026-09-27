@@ -35,7 +35,7 @@ use rusqlite::blockcachevfs::{
 use rusqlite::ffi::{self, blockcachevfs as raw_bcv};
 #[cfg(feature = "remote")]
 use rusqlite::SessionOperationStatus;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 #[cfg(feature = "remote")]
 use rusqlite::{BlockCacheSessionOptions, RemoteServer, RemoteServerOptions, SessionScope};
 use uuid::Uuid;
@@ -874,6 +874,9 @@ fn reference_adapter_route_selection_is_application_only() {
     );
 }
 
+// Run the full create, attach, write, upload, and replacement lifecycle against
+// the selected emulator. Return its endpoint and bucket so the same CI entry
+// point can exercise the backend-independent session checkpoint regression.
 fn run_bootstrap(backend: &str) -> (String, String) {
     let suffix = unique_suffix();
     let endpoint = match backend {
@@ -925,11 +928,13 @@ fn run_bootstrap(backend: &str) -> (String, String) {
     local.close().expect("close local SQLite database");
     vfs.create_database(&storage, &local_path, "bootstrap.sqlite")
         .expect("upload initial database");
+    assert_reserved_remote_database_names_rejected(&vfs, &storage, &local_path);
     vfs.initialize_container(&storage)
         .expect_err("existing CBS manifest must not be replaced");
     let alias = format!("bootstrap_{backend}_{}", std::process::id());
     vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias))
         .expect("attach created database");
+    assert_reserved_bcv_copy_targets_rejected(&vfs, &alias, "bootstrap.sqlite");
     let control = vfs
         .open(format!("/{alias}"))
         .expect("open attached container control connection");
@@ -990,6 +995,138 @@ fn run_bootstrap(backend: &str) -> (String, String) {
     vfs.detach(&third_alias)
         .expect("detach replacement database");
     (endpoint, bucket)
+}
+
+// A user can pass these names to create_database or directly to the scoped
+// attach API. Exact SQLite sidecar suffixes can collide with SQLite's
+// interpretation of `<database>-wal`, `-shm`, or `-journal`; `.repo.db-lock`
+// is especially dangerous because it is DoltLite's local-only lock path for
+// `repo.db`. Publishing that remote name can shadow the coordination file and
+// block or corrupt later writes. Exercise both API boundaries against
+// run_bootstrap's initialized unique container and valid local seed.
+fn assert_reserved_remote_database_names_rejected(
+    vfs: &'static BlockCacheVfs,
+    storage: &Storage,
+    local_path: &Path,
+) {
+    for (index, remote_name) in [
+        "repo.db-wal",
+        "repo.db-shm",
+        "repo.db-journal",
+        ".repo.db-lock",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let create_error = vfs
+            .create_database(storage, local_path, remote_name)
+            .expect_err("create_database must reject a reserved sidecar or local lock name");
+        assert!(
+            matches!(
+                &create_error,
+                rusqlite::Error::SqliteFailure(code, _)
+                    if code.extended_code == rusqlite::ffi::SQLITE_ERROR
+            ),
+            "expected native database-name validation for {remote_name:?}, got {create_error:?}"
+        );
+
+        // Direct callers of attach_session_scoped must get the same boundary
+        // as callers that first construct SessionScope.
+        let session_id = Uuid::new_v4().to_string();
+        let operation_id = session_operation_id(index as u8 + 1);
+        let attach_error = vfs
+            .attach_session_scoped(
+                &AttachSpec::new(storage.clone()),
+                &session_id,
+                "emulator-principal",
+                remote_name,
+                "read,write",
+                &operation_id,
+            )
+            .expect_err("attach_session_scoped must reject a reserved target database");
+        assert!(
+            matches!(
+                &attach_error,
+                rusqlite::Error::SqliteFailure(code, _)
+                    if code.extended_code == rusqlite::ffi::SQLITE_MISUSE
+            ),
+            "expected native scope validation for {remote_name:?}, got {attach_error:?}"
+        );
+    }
+
+    // Similar-looking but distinct names must remain uploadable. In
+    // particular, only the exact hidden `.<stem>-lock` shape is local-only;
+    // the non-hidden `repo.db-lock`, a nonterminal `.repo.db-lock-old`, and
+    // an uppercase SQLite suffix are valid remote database names.
+    for remote_name in ["repo.db-lock", ".repo.db-lock-old", "repo.db-WAL"] {
+        vfs.create_database(storage, local_path, remote_name)
+            .unwrap_or_else(|error| panic!("upload near-miss {remote_name:?}: {error:?}"));
+    }
+}
+
+// A caller can bypass create_database and ask native sqlite3_bcvfs_copy to add
+// a manifest entry named like another database's SQLite sidecar or DoltLite's
+// local `.<database>-lock` file. Copy from the attached valid source and check
+// the reserved-name error so missing-source/provider failures cannot pass.
+fn assert_reserved_bcv_copy_targets_rejected(
+    vfs: &'static BlockCacheVfs,
+    alias: &str,
+    source_database: &str,
+) {
+    let vfs_name = CString::new(vfs.name()).expect("VFS name is NUL-free");
+    let native_vfs = unsafe { ffi::sqlite3_vfs_find(vfs_name.as_ptr()) };
+    assert!(
+        !native_vfs.is_null(),
+        "registered VFS must be discoverable by name"
+    );
+    let alias = CString::new(alias).expect("alias is NUL-free");
+    let source_database = CString::new(source_database).expect("source name is NUL-free");
+
+    // The first names can shadow SQLite/DoltLite sidecars. The controls
+    // resemble them but do not have the exact reserved suffix/path shape.
+    for (destination_database, expected_rc) in [
+        ("repo.db-wal", ffi::SQLITE_ERROR),
+        ("repo.db-shm", ffi::SQLITE_ERROR),
+        ("repo.db-journal", ffi::SQLITE_ERROR),
+        (".repo.db-lock", ffi::SQLITE_ERROR),
+        ("copy.repo.db-lock", ffi::SQLITE_OK),
+        (".copy.repo.db-lock-old", ffi::SQLITE_OK),
+        ("copy.repo.db-WAL", ffi::SQLITE_OK),
+    ] {
+        let destination_database =
+            CString::new(destination_database).expect("destination name is NUL-free");
+        let mut error = ptr::null_mut();
+        let rc = unsafe {
+            raw_bcv::sqlite3_bcvfs_copy(
+                native_vfs.cast(),
+                alias.as_ptr(),
+                source_database.as_ptr(),
+                destination_database.as_ptr(),
+                &mut error,
+            )
+        };
+        let message = if error.is_null() {
+            None
+        } else {
+            let message = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { ffi::sqlite3_free(error.cast()) };
+            Some(message)
+        };
+        assert_eq!(
+            rc, expected_rc,
+            "native copy returned an unexpected result for {destination_database:?}: {message:?}"
+        );
+        if expected_rc != ffi::SQLITE_OK {
+            assert!(
+                message.as_deref().is_some_and(|message| {
+                    message.contains("reserved SQLite sidecar or local lock name")
+                }),
+                "native copy should report reserved-name validation, got {message:?}"
+            );
+        }
+    }
 }
 
 fn run_session_ownership() {
@@ -1091,6 +1228,8 @@ fn run_session_ownership() {
             "PRAGMA synchronous=OFF; INSERT INTO session_data VALUES ('explicit-dirty');",
         )
         .expect("write explicit session database");
+    // This real DoltLite commit exercises the VFS's internal local lock
+    // sidecar open. Reserving remote `.<database>-lock` names must preserve it.
     let _: String = explicit_db
         .query_row(
             "SELECT dolt_commit('-A', '-m', 'explicit-dirty')",
@@ -4940,6 +5079,9 @@ fn run_generic_process_flow(backend: &str) {
     }
 }
 
+// Serverless SQLite callers may issue xSync repeatedly during a request; invoke
+// the real main-file VFS callback directly so each checkpoint is explicit and
+// independent of pager scheduling or unrelated sidecar synchronization.
 fn session_chain_sync_main_file(database: &Connection) {
     let database_name = CString::new("main").expect("database name is NUL-free");
     let mut file: *mut ffi::sqlite3_file = ptr::null_mut();
@@ -4959,28 +5101,36 @@ fn session_chain_sync_main_file(database: &Connection) {
     assert_eq!(rc, ffi::SQLITE_OK, "VFS xSync failed");
 }
 
+// Force deterministic checkpoint counts even though serverless updates can
+// trigger pager syncs; only this test suppresses them before explicit xSyncs.
 fn session_chain_prepare_database(database: &Connection) {
-    // The seed is created in DELETE rollback-journal mode before upload;
-    // bcvfs rejects journal_mode PRAGMAs, so do not query or change it here.
-    // Keep UPDATE commits from issuing pager-driven xSync callbacks. The test
-    // invokes the main-file xSync explicitly once per intended checkpoint.
+    // The seed is uploaded in DELETE mode because bcvfs rejects journal_mode
+    // PRAGMAs. Serverless updates may trigger pager syncs, so test-only
+    // synchronous=OFF leaves each intended checkpoint to one explicit xSync.
     database
         .execute_batch("PRAGMA synchronous=OFF;")
         .expect("disable automatic sync for deterministic checkpoints");
 }
 
+// Change real database content before each explicit xSync, so checkpoint
+// recovery proves the sequence's latest state rather than only chain metadata.
 fn session_chain_write_state(database: &Connection, value: i64) {
     database
         .execute("UPDATE checkpoint_state SET value = ?1", [value])
         .expect("update checkpoint test state");
 }
 
+// Read the durable test value after a new request attaches; this catches a
+// chain that rehydrates structurally but exposes stale checkpoint contents.
 fn session_chain_read_state(database: &Connection) -> i64 {
     database
         .query_row("SELECT value FROM checkpoint_state", [], |row| row.get(0))
         .expect("read checkpoint test state")
 }
 
+// The production accept wrapper is feature-gated behind `remote`; call the
+// native accept boundary directly so blockcachevfs-only tests isolate this
+// exact accepted-head transition without involving an HTTP server.
 fn session_chain_accept(vfs: &'static BlockCacheVfs, alias: &str, session_id: &str) {
     let vfs_name = CString::new(vfs.name()).expect("VFS name is NUL-free");
     let native_vfs = unsafe { ffi::sqlite3_vfs_find(vfs_name.as_ptr()) };
@@ -5016,6 +5166,9 @@ fn session_chain_accept(vfs: &'static BlockCacheVfs, alias: &str, session_id: &s
     assert_eq!(rc, ffi::SQLITE_OK, "session acceptance failed: {message:?}");
 }
 
+// The public Rust finalize wrapper is likewise remote-gated. This raw call
+// exercises NEW-operation finalization itself, distinct from accepting a head
+// and later uploading it through the already-accepted SessionAttachment path.
 fn session_chain_finalize(vfs: &'static BlockCacheVfs, alias: &str, session_id: &str) {
     let vfs_name = CString::new(vfs.name()).expect("VFS name is NUL-free");
     let native_vfs = unsafe { ffi::sqlite3_vfs_find(vfs_name.as_ptr()) };
@@ -5050,6 +5203,8 @@ fn session_chain_finalize(vfs: &'static BlockCacheVfs, alias: &str, session_id: 
     );
 }
 
+// Model successive stateless serverless requests: each gets a fresh scoped
+// attachment and operation ID while continuing the same logical session.
 fn attach_session_chain_request(
     vfs: &'static BlockCacheVfs,
     storage: &Storage,
@@ -5062,6 +5217,10 @@ fn attach_session_chain_request(
         .unwrap_or_else(|error| panic!("attach session operation {operation}: {error:?}"))
 }
 
+// Serverless requests accumulate xSync checkpoints across fresh attachments:
+// 65 used to exceed recovery, while >256 in one attachment could evade
+// compaction. The 257-checkpoint genesis case checks the 256 write watermark;
+// content is then rehydrated/finalized and verified from a separate cache.
 fn run_session_checkpoint_chain_limits(backend: &str, endpoint: &str, bucket: &str) {
     let suffix = unique_suffix();
     assert!(
@@ -5191,6 +5350,9 @@ fn run_session_checkpoint_chain_limits(backend: &str, endpoint: &str, bucket: &s
     );
 }
 
+// Serverless finalization must publish the compacted checkpoint, not merely
+// leave readable state in the writer's cache. This child starts a fresh VFS
+// and cache and verifies both final value and original seed data from storage.
 #[test]
 #[ignore = "child phase for session checkpoint chain regression"]
 fn session_chain_fresh_cache_child() {
@@ -5232,6 +5394,299 @@ fn session_chain_fresh_cache_child() {
     assert_eq!(payload, "session-chain");
     drop(database);
     vfs.detach(&alias).expect("detach fresh read VFS container");
+}
+
+// Share Google-emulator endpoint, bucket, auth, and VFS setup across standalone
+// finding tests so they all cross the same public Rust API boundary.
+fn google_review_vfs() -> (&'static BlockCacheVfs, String, String) {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage".to_owned();
+    ensure_google_bucket(&endpoint, &bucket);
+    let vfs = BlockCacheVfs::builder(shared_cache())
+        .expect("Google review VFS builder")
+        .config(Config::CacheSize(8 * 1024 * 1024))
+        .auth_callback(|provider, _account, _container| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init()
+        .expect("initialize Google review VFS");
+    (vfs, endpoint, bucket)
+}
+
+// Build a known-valid SQLite input for public API tests; its payload lets a
+// fresh attachment prove it read the intended uploaded database.
+fn create_review_seed_database(path: &Path) {
+    let seed = Connection::open(path).expect("create review seed database");
+    seed.execute_batch(
+        "CREATE TABLE payload(value TEXT NOT NULL);
+         INSERT INTO payload VALUES ('public-api-review-seed');",
+    )
+    .expect("write review seed database");
+    seed.close().expect("close review seed database");
+}
+
+// Probe publication through a separate process/cache: read-only flags prevent
+// SQLite from creating an empty replacement when a remote name cannot reopen.
+fn fresh_vfs_database_name_probe(
+    endpoint: &str,
+    bucket: &str,
+    prefix: &str,
+    remote_name: &str,
+    alias: &str,
+    expect_open: bool,
+) -> Option<String> {
+    let cache_root = tempfile::tempdir().expect("fresh database-name probe directory");
+    let cache = cache_root.path().join("cache");
+    std::fs::create_dir(&cache).expect("create fresh database-name probe cache");
+    let output = Command::new(std::env::current_exe().expect("locate emulator test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "database_name_fresh_vfs_child",
+            "--nocapture",
+        ])
+        .env("BCV_DATABASE_NAME_ENDPOINT", endpoint)
+        .env("BCV_DATABASE_NAME_BUCKET", bucket)
+        .env("BCV_DATABASE_NAME_PREFIX", prefix)
+        .env("BCV_DATABASE_NAME_REMOTE", remote_name)
+        .env("BCV_DATABASE_NAME_ALIAS", alias)
+        .env("BCV_DATABASE_NAME_CACHE", &cache)
+        .env("BCV_DATABASE_NAME_EXPECT_OPEN", expect_open.to_string())
+        .output()
+        .expect("spawn fresh database-name probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "fresh database-name probe failed for {remote_name:?}: status={}, stdout={stdout:?}, stderr={stderr:?}",
+        output.status
+    );
+    if expect_open {
+        assert!(
+            stdout.contains("DATABASE_NAME_OPEN_OK"),
+            "fresh database-name probe did not confirm open: stdout={stdout:?}, stderr={stderr:?}"
+        );
+        None
+    } else {
+        Some(
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("DATABASE_NAME_PROBE:"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "fresh database-name probe did not report its read-only probe result: stdout={stdout:?}, stderr={stderr:?}"
+                    )
+                })
+                .to_owned(),
+        )
+    }
+}
+
+// Child half of the create_database regression: a new VFS must decode the
+// published name from storage, and read-only opening distinguishes a real
+// database from an empty local file accidentally created by CREATE flags.
+#[test]
+#[ignore = "child phase for database-name review regression"]
+fn database_name_fresh_vfs_child() {
+    let (
+        Ok(endpoint),
+        Ok(bucket),
+        Ok(prefix),
+        Ok(remote_name),
+        Ok(alias),
+        Ok(cache),
+        Ok(expect_open),
+    ) = (
+        std::env::var("BCV_DATABASE_NAME_ENDPOINT"),
+        std::env::var("BCV_DATABASE_NAME_BUCKET"),
+        std::env::var("BCV_DATABASE_NAME_PREFIX"),
+        std::env::var("BCV_DATABASE_NAME_REMOTE"),
+        std::env::var("BCV_DATABASE_NAME_ALIAS"),
+        std::env::var("BCV_DATABASE_NAME_CACHE"),
+        std::env::var("BCV_DATABASE_NAME_EXPECT_OPEN"),
+    )
+    else {
+        return;
+    };
+    let expect_open = expect_open == "true";
+    let storage =
+        Storage::google_json_with_endpoint("test-project", format!("{bucket}/{prefix}"), &endpoint);
+    let vfs = BlockCacheVfs::builder(&cache)
+        .expect("fresh database-name VFS builder")
+        .auth_callback(|provider, _account, _container| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init()
+        .expect("initialize fresh database-name VFS");
+    vfs.attach(&AttachSpec::new(storage).alias(&alias))
+        .expect("attach database-name container through fresh VFS");
+    let path = format!("/{alias}/{remote_name}");
+    let probe_result = match vfs.open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Err(error) => Err(format!("read-only open failed: {error:?}")),
+        Ok(database) => match database.query_row("SELECT value FROM payload", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Err(error) => Err(format!("payload query failed: {error:?}")),
+            Ok(payload) if payload == "public-api-review-seed" => Ok(()),
+            Ok(payload) => Err(format!(
+                "payload mismatch: expected public-api-review-seed, got {payload:?}"
+            )),
+        },
+    };
+    match (expect_open, probe_result) {
+        (true, Ok(())) => println!("DATABASE_NAME_OPEN_OK"),
+        (true, Err(error)) => {
+            panic!("fresh VFS could not read valid remote name {remote_name:?} read-only: {error}")
+        }
+        (false, Ok(())) => {
+            println!("DATABASE_NAME_PROBE:read-only open succeeded and seed content matched");
+        }
+        (false, Err(error)) => println!("DATABASE_NAME_PROBE:{error}"),
+    }
+    vfs.detach(&alias)
+        .expect("detach database-name container from fresh VFS");
+}
+
+// A library caller can reasonably choose public attach_session and receive
+// Ok, then find that no database opens because the required scope was never
+// bound. Scoped attach on the same seed is the positive control for usability.
+#[test]
+#[ignore = "reproduces validated review finding"]
+fn google_json_emulator_public_attach_session_database_scope() {
+    let (vfs, endpoint, bucket) = google_review_vfs();
+    let suffix = unique_suffix();
+    let prefix = format!("{suffix}/public-attach-session");
+    let storage =
+        Storage::google_json_with_endpoint("test-project", format!("{bucket}/{prefix}"), &endpoint);
+    vfs.initialize_container(&storage)
+        .expect("initialize public attach_session test container");
+    let seed_directory = tempfile::tempdir().expect("public attach_session seed directory");
+    let seed_path = seed_directory.path().join("seed.sqlite");
+    create_review_seed_database(&seed_path);
+    vfs.create_database(&storage, &seed_path, "session.sqlite")
+        .expect("upload public attach_session seed database");
+
+    let scoped_alias = format!("scoped-review-{}", suffix.replace('-', "_"));
+    let scoped_session_id = Uuid::new_v4().to_string();
+    let scoped_spec = AttachSpec::new(storage.clone()).alias(&scoped_alias);
+    let scoped = attach_scoped_for_test(vfs, &scoped_spec, &scoped_session_id, 1)
+        .expect("scoped positive-control attachment");
+    let scoped_database = vfs
+        .open(format!("/{scoped_alias}/session.sqlite"))
+        .expect("open database through scoped positive-control attachment");
+    let scoped_payload: String = scoped_database
+        .query_row("SELECT value FROM payload", [], |row| row.get(0))
+        .expect("read seed through scoped positive-control attachment");
+    assert_eq!(scoped_payload, "public-api-review-seed");
+    drop(scoped_database);
+    drop(scoped);
+
+    let direct_alias = format!("direct-review-{}", suffix.replace('-', "_"));
+    let direct_session_id = Uuid::new_v4().to_string();
+    let direct_spec = AttachSpec::new(storage).alias(&direct_alias);
+    let direct = vfs
+        .attach_session(&direct_spec, &direct_session_id)
+        .expect("public lower-level attach_session should return an attachment");
+    assert_eq!(direct.session_id(), direct_session_id);
+    let direct_database = match vfs.open(format!("/{direct_alias}/session.sqlite")) {
+        Ok(database) => database,
+        Err(error) => panic!(
+            "desired behavior: public attach_session attachment should open its session.sqlite database; actual open error: {error:?}"
+        ),
+    };
+    let direct_payload: String = direct_database
+        .query_row("SELECT value FROM payload", [], |row| row.get(0))
+        .expect("read seed through public attach_session attachment");
+    assert_eq!(direct_payload, "public-api-review-seed");
+    drop(direct_database);
+    drop(direct);
+}
+
+// A caller-supplied slash or backslash name may be published but cannot be
+// addressed by a fresh VFS because those characters delimit VFS paths. The
+// valid one-component name is the control for this reopenability regression.
+#[test]
+#[ignore = "reproduces validated review finding"]
+fn google_json_emulator_create_database_rejects_path_separators() {
+    let (vfs, endpoint, bucket) = google_review_vfs();
+    let suffix = unique_suffix();
+    let seed_directory = tempfile::tempdir().expect("database-name seed directory");
+    let seed_path = seed_directory.path().join("seed.sqlite");
+    create_review_seed_database(&seed_path);
+
+    let valid_prefix = format!("{suffix}/database-name-valid");
+    let valid_storage = Storage::google_json_with_endpoint(
+        "test-project",
+        format!("{bucket}/{valid_prefix}"),
+        &endpoint,
+    );
+    vfs.initialize_container(&valid_storage)
+        .expect("initialize valid database-name control container");
+    vfs.create_database(&valid_storage, &seed_path, "valid.sqlite")
+        .expect("upload valid one-component control database name");
+    let valid_alias = format!("name-valid-{}", suffix.replace('-', "_"));
+    assert_eq!(
+        fresh_vfs_database_name_probe(
+            &endpoint,
+            &bucket,
+            &valid_prefix,
+            "valid.sqlite",
+            &valid_alias,
+            true,
+        ),
+        None,
+        "fresh cache must open the valid one-component control name"
+    );
+
+    let mut accepted_inaccessible_names = Vec::new();
+    for (index, remote_name) in ["nested/name.sqlite", r"nested\name.sqlite"]
+        .into_iter()
+        .enumerate()
+    {
+        let prefix = format!("{suffix}/database-name-separator-{index}");
+        let storage = Storage::google_json_with_endpoint(
+            "test-project",
+            format!("{bucket}/{prefix}"),
+            &endpoint,
+        );
+        vfs.initialize_container(&storage)
+            .unwrap_or_else(|error| panic!("initialize separator case {remote_name:?}: {error:?}"));
+        if vfs
+            .create_database(&storage, &seed_path, remote_name)
+            .is_ok()
+        {
+            let open_result = fresh_vfs_database_name_probe(
+                &endpoint,
+                &bucket,
+                &prefix,
+                remote_name,
+                &format!("name-invalid-{index}-{}", suffix.replace('-', "_")),
+                false,
+            )
+            .expect("fresh VFS probe returns its read-only result");
+            accepted_inaccessible_names.push(format!(
+                "{remote_name:?}: create_database returned Ok/publication succeeded; fresh VFS/cache probe: {open_result}"
+            ));
+        }
+    }
+    assert!(
+        accepted_inaccessible_names.is_empty(),
+        "desired behavior: create_database should reject slash- and backslash-containing names before upload; accepted names and their fresh read-only probe results: {}",
+        accepted_inaccessible_names.join("; ")
+    );
 }
 
 #[test]

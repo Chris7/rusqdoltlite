@@ -189,6 +189,18 @@ pub mod blockcachevfs {
             z_database: *const c_char,
             pz_err: *mut *mut c_char,
         ) -> c_int;
+        /// Copy a database in an attached container to a new manifest name.
+        ///
+        /// # Safety
+        /// `fs` must be live, all names must be NUL-terminated C strings, and
+        /// `pz_err` must be null or writable for an allocated error pointer.
+        pub fn sqlite3_bcvfs_copy(
+            fs: *mut sqlite3_bcvfs,
+            z_container: *const c_char,
+            z_from: *const c_char,
+            z_to: *const c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
     }
 }
 

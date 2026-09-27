@@ -1,5 +1,5 @@
 diff --git a/bcv_int.h b/bcv_int.h
-index 7c01e04..c4d63db 100644
+index 7c01e04..36a9148 100644
 --- a/bcv_int.h
 +++ b/bcv_int.h
 @@ -152,6 +152,9 @@ struct ManifestDb {
@@ -78,12 +78,15 @@ index 7c01e04..c4d63db 100644
  );
  Container *bcvfsFindContAlias(BcvCommon*, const char*, char **pzErr);
  void bcvCommonDestroy(BcvCommon *p);
-@@ -507,6 +539,15 @@ struct BcvContainer {
+@@ -507,6 +539,18 @@ struct BcvContainer {
    char *zCainfo;
  };
  
 +#define BCV_SESSION_GC_GUARD_WRITER 1
 +#define BCV_SESSION_GC_GUARD_SWEEP 2
++/* True for exact SQLite sidecar suffixes or DoltLite's local lock name;
++** near-misses remain independent manifest database names. */
++int bcvDatabaseNameIsReserved(const char*);
 +int bcvSessionGuardAcquire(
 +  BcvDispatch*, BcvContainer*, int, u8[16], char**
 +);
@@ -141,7 +144,7 @@ index 7c01e04..c4d63db 100644
  int bcvDispatchDelete(
    BcvDispatch *p,
 diff --git a/bcvutil.c b/bcvutil.c
-index 06f38da..568e8cd 100644
+index 06f38da..773c751 100644
 --- a/bcvutil.c
 +++ b/bcvutil.c
 @@ -15,12 +15,14 @@
@@ -418,6 +421,47 @@ index 06f38da..568e8cd 100644
        memcpy(pNewDb->zDName, pOldDb->zDName, BCV_DBNAME_SIZE);
    
        assert( pOldDb->nBlkLocalAlloc>0 
+@@ -1456,6 +1628,27 @@ static void bcvUploadOneBlock(BcvUploadJob *pJob){
+   } while( bRetry );
+ }
+ 
++/* SQLite opens these exact terminal names as companions of the stem DB.
++** DoltLite also uses ".<database>-lock" as a local-only lock sidecar. A
++** remote database with that exact name would shadow the local lock file.
++** Keep near-misses such as "repo.db-wal-old", "repo.db-lock", and
++** ".repo.db-lock-old" as independent databases. */
++int bcvDatabaseNameIsReserved(const char *zName){
++  static const char *const azSuffix[] = {"-wal", "-shm", "-journal"};
++  size_t nName = zName ? strlen(zName) : 0;
++  size_t i;
++  for(i=0; zName && i<sizeof(azSuffix)/sizeof(azSuffix[0]); i++){
++    size_t nSuffix = strlen(azSuffix[i]);
++    if( nName>=nSuffix
++     && memcmp(&zName[nName-nSuffix],azSuffix[i],nSuffix)==0
++    ) return 1;
++  }
++  if( zName && zName[0]=='.' && nName>6
++   && memcmp(&zName[nName-5],"-lock",5)==0
++  ) return 1;
++  return 0;
++}
++
+ /*
+ ** Buffer zRemote (nRemote bytes in size) contains a proposed name for a new
+ ** cloud database. This function checks that the database name is acceptable.
+@@ -1470,6 +1657,12 @@ static int bcvCheckDbname(sqlite3_bcv *p, const char *zRemote){
+         zRemote, BCV_DBNAME_SIZE-1
+     );
+   }
++  if( bcvDatabaseNameIsReserved(zRemote) ){
++    return bcvApiError(p, SQLITE_ERROR,
++        "database name \"%s\" is a reserved SQLite sidecar or local lock name",
++        zRemote
++    );
++  }
+   return SQLITE_OK;
+ }
+ 
 @@ -1537,6 +1709,7 @@ int sqlite3_bcv_upload(
    up.pDb = pDb = &pMan->aDb[pMan->nDb];
    pMan->nDb++;
@@ -3295,7 +3339,7 @@ index 1f5ccc8..39da077 100644
  } /* end of the extern "C" block */
  #endif
 diff --git a/blockcachevfs.c b/blockcachevfs.c
-index 38f8e20..61cd8e0 100644
+index 38f8e20..82034a4 100644
 --- a/blockcachevfs.c
 +++ b/blockcachevfs.c
 @@ -310,6 +310,10 @@ struct BcvDbPath {
@@ -3720,14 +3764,13 @@ index 38f8e20..61cd8e0 100644
          bcvfsEnterState(pFs, pCont, CONTAINER_STATE_POLL);
          rc = bcvfsContainerGetBcv(pFs, pCont, &pDisp, &pBcv, 0);
        }else{
-@@ -4222,6 +4496,39 @@ static int bcvfsOpenProxy(
+@@ -4222,6 +4496,29 @@ static int bcvfsOpenProxy(
    return rc;
  }
  
 +/* Session-owned aliases may expose only the database selected by the
-+** authorized request context. SQLite also opens the selected database's
-+** -journal/-wal/-shm and dot-lock sidecars; those are the only non-exact
-+** names this helper permits. */
++** authorized request context and its DoltLite lock marker. SQLite WAL and
++** journal sidecars are not used by scoped databases. */
 +static int bcvfsSessionDatabasePathAllowed(
 +  Container *pCont,
 +  const char *zDatabase
@@ -3744,15 +3787,6 @@ index 38f8e20..61cd8e0 100644
 +  if( nDb==nTarget+6 && zDatabase[0]=='.'
 +   && 0==memcmp(&zDatabase[1],zTarget,nTarget)
 +   && 0==memcmp(&zDatabase[nDb-5],"-lock",5)
-+  ) return 1;
-+  if( nDb==nTarget+4
-+   && 0==memcmp(zDatabase,zTarget,nTarget)
-+   && (0==memcmp(&zDatabase[nDb-4],"-wal",4)
-+       || 0==memcmp(&zDatabase[nDb-4],"-shm",4))
-+  ) return 1;
-+  if( nDb==nTarget+8
-+   && 0==memcmp(zDatabase,zTarget,nTarget)
-+   && 0==memcmp(&zDatabase[nDb-8],"-journal",8)
 +  ) return 1;
 +  return 0;
 +}
@@ -4345,6 +4379,22 @@ index 38f8e20..61cd8e0 100644
    return bcvfsUpload(pFs, 0, 0, "main", zCont, xBusy, pBusyArg, pzErr);
  }
  
+@@ -6844,6 +7435,15 @@ int sqlite3_bcvfs_copy(
+   int rc = SQLITE_OK;
+   char *zErr = 0;
+ 
++  /* A copied destination becomes a CBS manifest name without raw upload's
++  ** shared guard, so reject SQLite sidecars and local DoltLite lock names. */
++  if( bcvDatabaseNameIsReserved(zTo) ){
++    if( pzErr ) *pzErr = sqlite3_mprintf(
++        "database name is a reserved SQLite sidecar or local lock name"
++    );
++    return SQLITE_ERROR;
++  }
++
+   if( pFs->zPortnumber ){ 
+     rc = SQLITE_READONLY;
+     zErr = sqlite3_mprintf("vfs is readonly");
 @@ -6890,6 +7491,7 @@ int sqlite3_bcvfs_copy(
            pTo = &pMan->aDb[pMan->nDb++];
            pTo->iDbId = pFs->iNextLocalId++;
@@ -4353,7 +4403,7 @@ index 38f8e20..61cd8e0 100644
            memcpy(pTo->zDName, zTo, bcvStrlen(zTo));
            pTo->iVersion = 1;
            pTo->aBlkLocal = pTo->aBlkOrig = aBlkOrig;
-@@ -9548,3 +10150,6466 @@ int sqlite3_bcvfs_register_vtab(sqlite3 *db){
+@@ -9548,3 +10150,6473 @@ int sqlite3_bcvfs_register_vtab(sqlite3 *db){
    }
    return rc;
  }
@@ -6337,8 +6387,15 @@ index 38f8e20..61cd8e0 100644
 +  sqlite3_uint64 iSequence = 0;
 +  char *zPredecessorETag = 0;
 +  char *zBindErr = 0;
++  int rc = SQLITE_OK;
++  if( bcvDatabaseNameIsReserved(zDatabase) ){
++    return bcvSessionError(
++        SQLITE_MISUSE,pzErr,
++        "session target is a reserved SQLite sidecar or local lock name"
++    );
++  }
 +  memset(aPredecessor,0,sizeof(aPredecessor));
-+  int rc = sqlite3_bcvfs_attach_session(
++  rc = sqlite3_bcvfs_attach_session(
 +      pFs,zStorage,zAccount,zContainer,zAlias,zSessionId,flags,pzErr
 +  );
 +  if( rc==SQLITE_OK ){
