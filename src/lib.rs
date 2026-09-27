@@ -87,6 +87,14 @@ use crate::raw_statement::RawStatement;
 use crate::types::ValueRef;
 
 pub use crate::bind::BindIndex;
+#[cfg(all(
+    feature = "remote",
+    feature = "blockcachevfs",
+    not(target_arch = "wasm32")
+))]
+pub use crate::blockcachevfs::{
+    SessionOperationId, SessionOperationStatus, SESSION_OPERATION_ID_BYTES,
+};
 #[cfg(feature = "cache")]
 pub use crate::cache::CachedStatement;
 #[cfg(feature = "column_decltype")]
@@ -98,6 +106,14 @@ pub use crate::ffi::ErrorCode;
 #[cfg(feature = "load_extension")]
 pub use crate::load_extension_guard::LoadExtensionGuard;
 pub use crate::params::{params_from_iter, Params, ParamsFromIter};
+#[cfg(all(
+    feature = "remote",
+    feature = "blockcachevfs",
+    not(target_arch = "wasm32")
+))]
+pub use crate::remote_server::{
+    BlockCacheSessionOptions, SessionScope, SESSION_SCOPE_MAX_FIELD_BYTES,
+};
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 pub use crate::remote_server::{RemoteAuthenticator, RemoteServer, RemoteServerOptions};
 pub use crate::row::{AndThenRows, Map, MappedRows, Row, RowIndex, Rows};

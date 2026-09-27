@@ -55,9 +55,17 @@ pub mod blockcachevfs {
     pub const SQLITE_BCV_CURLVERBOSE: c_int = 4;
     pub const SQLITE_BCV_HTTPLOG_TIMEOUT: c_int = 5;
     pub const SQLITE_BCV_HTTPLOG_NENTRY: c_int = 6;
+    /// Proactively stage dirty blocks once this percentage of the cache is occupied.
+    pub const SQLITE_BCV_STAGEWATERMARK: c_int = 7;
 
     pub const SQLITE_BCV_ATTACH_SECURE: c_int = 0x0001;
     pub const SQLITE_BCV_ATTACH_IFNOT: c_int = 0x0002;
+    pub const SQLITE_BCVFS_SESSION_HASH_BYTES: usize = 32;
+    pub const SQLITE_BCVFS_SESSION_STATUS_NEW: c_int = 0;
+    pub const SQLITE_BCVFS_SESSION_STATUS_ACCEPTED: c_int = 1;
+    pub const SQLITE_BCVFS_SESSION_STATUS_COMMITTED: c_int = 2;
+    pub const SQLITE_BCVFS_SESSION_STATUS_FAILED: c_int = 3;
+    pub const SQLITE_BCVFS_SESSION_STATUS_CONFLICT: c_int = 4;
 
     unsafe extern "C" {
         pub fn sqlite3_bcvfs_create(
@@ -88,6 +96,36 @@ pub mod blockcachevfs {
             flags: c_int,
             pz_err: *mut *mut c_char,
         ) -> c_int;
+        pub fn sqlite3_bcvfs_attach_session(
+            fs: *mut sqlite3_bcvfs,
+            z_storage: *const c_char,
+            z_account: *const c_char,
+            z_container: *const c_char,
+            z_alias: *const c_char,
+            z_session_id: *const c_char,
+            flags: c_int,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_attach_session_scoped(
+            fs: *mut sqlite3_bcvfs,
+            z_storage: *const c_char,
+            z_account: *const c_char,
+            z_container: *const c_char,
+            z_alias: *const c_char,
+            z_session_id: *const c_char,
+            z_principal: *const c_char,
+            z_database: *const c_char,
+            z_operations: *const c_char,
+            a_operation_id: *const u8,
+            flags: c_int,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_detach_session(
+            fs: *mut sqlite3_bcvfs,
+            z_alias: *const c_char,
+            z_session_id: *const c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
         pub fn sqlite3_bcvfs_detach(
             fs: *mut sqlite3_bcvfs,
             z_alias: *const c_char,
@@ -103,6 +141,64 @@ pub mod blockcachevfs {
             z_container: *const c_char,
             busy: Option<sqlite3_bcvfs_busy_callback>,
             busy_ctx: *mut c_void,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_session_checkpoint(
+            fs: *mut sqlite3_bcvfs,
+            z_alias: *const c_char,
+            z_session_id: *const c_char,
+            checkpoint_hash: *mut u8,
+            pz_etag: *mut *mut c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_session_rehydrate(
+            fs: *mut sqlite3_bcvfs,
+            z_alias: *const c_char,
+            z_session_id: *const c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_session_upload(
+            fs: *mut sqlite3_bcvfs,
+            z_alias: *const c_char,
+            z_session_id: *const c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_session_finalize(
+            fs: *mut sqlite3_bcvfs,
+            z_alias: *const c_char,
+            z_session_id: *const c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_session_accept(
+            fs: *mut sqlite3_bcvfs,
+            z_alias: *const c_char,
+            z_session_id: *const c_char,
+            pz_etag: *mut *mut c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_session_operation_status(
+            fs: *mut sqlite3_bcvfs,
+            z_alias: *const c_char,
+            z_session_id: *const c_char,
+            p_status: *mut c_int,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_delete(
+            fs: *mut sqlite3_bcvfs,
+            z_container: *const c_char,
+            z_database: *const c_char,
+            pz_err: *mut *mut c_char,
+        ) -> c_int;
+        /// Copy a database in an attached container to a new manifest name.
+        ///
+        /// # Safety
+        /// `fs` must be live, all names must be NUL-terminated C strings, and
+        /// `pz_err` must be null or writable for an allocated error pointer.
+        pub fn sqlite3_bcvfs_copy(
+            fs: *mut sqlite3_bcvfs,
+            z_container: *const c_char,
+            z_from: *const c_char,
+            z_to: *const c_char,
             pz_err: *mut *mut c_char,
         ) -> c_int;
     }
@@ -134,6 +230,7 @@ pub mod bcvutil {
             z_local: *const c_char,
             z_remote: *const c_char,
         ) -> c_int;
+        pub fn sqlite3_bcv_cleanup(handle: *mut sqlite3_bcv, n_second: c_int) -> c_int;
         pub fn sqlite3_bcv_create_if_not_exists(
             handle: *mut sqlite3_bcv,
             sz_name: c_int,
@@ -161,6 +258,7 @@ mod remote {
         pub authKeysDir: *const c_char,
         pub audience: *const c_char,
         pub timeoutMs: c_int,
+        pub zVfsName: *const c_char,
     }
 
     unsafe extern "C" {

@@ -1,0 +1,26 @@
+# Local validation of the immutable session record format and object-key
+# boundary. Remote conditional PUT/ETag behavior is exercised by the backend
+# integration matrix when an emulator is configured.
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_session_records
+
+do_test 1.1 {
+  sqlite3_bcvfs_session_record_test
+} {}
+
+# Use a fresh UUID so a caller-supplied bucket may be reused safely. The
+# native command drives the provider module and checks create-only and exact
+# opaque ETag conditions, stale-write rejection, and scope-bound reads.
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir "bcvfs"]
+set nonce [expr {[clock clicks] & 0xFFFFFFFFFFFF}]
+set session_container [format "%s/session-cas-%012x" $D(container) $nonce]
+bcv_create_container $session_container
+set session_id [format "550e8400-e29b-41d4-a716-%012x" $nonce]
+do_test 2.1 {
+  $cmd session_backend_test $C(module) $C(user) $session_container $session_id
+} {}
+$cmd destroy
+
+finish_test

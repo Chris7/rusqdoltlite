@@ -1,0 +1,135 @@
+# Characterize the application database synchronous setting at the VFS layer.
+#
+# The test-only VFS makes cachefile.bcv volatile until xSync. This gives a
+# deterministic power-loss model for a process that exits without xClose.
+# When SQLite reaches xSync, synchronous=FULL flushes local cache payload
+# bytes; an OFF commit does not promise that boundary. Neither setting
+# publishes a remote manifest; upload remains explicit.
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_synchronous
+
+if {$::tcl_platform(platform)=="windows"} {
+  finish_test
+  return
+}
+
+bcv_install_vfs_wrapper
+
+proc synchronous_child {} {
+  global C
+  set container $::env(BCV_SYNCHRONOUS_CONTAINER)
+  set testdir $::env(BCV_SYNCHRONOUS_DIR)
+  set mode $::env(BCV_SYNCHRONOUS_MODE)
+  set cmd [bcvfs_create $testdir "bcvfs"]
+  # Keep one spare slot so this one-block update does not enter the streaming
+  # staged-cache path. The test isolates SQLite xSync from upload/eviction.
+  $cmd config cachesize [expr 4*$::D(blocksize)]
+  bcvfs_attach -alias child $cmd $container
+  sqlite3 db /child/synchronous.db -vfs bcvfs
+  bcv_cache_volatile 1
+
+  db eval "PRAGMA synchronous=$mode"
+  set pragma [db onecolumn {PRAGMA synchronous}]
+  bcv_metadata_sync_reset
+  db eval {
+    BEGIN IMMEDIATE;
+    UPDATE payload SET body=CAST(zeroblob(4095)||X'02' AS BLOB) WHERE id=0;
+    COMMIT;
+  }
+  # bcvfs presents the application database through its WAL-compatible
+  # interface. A checkpoint is the SQLite operation that reaches the main
+  # database xSync/cachefile boundary; an ordinary OFF commit deliberately
+  # does not promise that boundary.
+  if {$mode eq "FULL"} {
+    db eval {PRAGMA wal_checkpoint(TRUNCATE)}
+  }
+  set nCacheSync [bcv_cache_sync_count]
+  set nMetadataSync [bcv_metadata_sync_count]
+  set diagnostic "synchronous child mode=$mode pragma=$pragma cache_sync=$nCacheSync metadata_sync=$nMetadataSync"
+  puts stderr $diagnostic
+
+  # FULL must reach the cachefile xSync boundary; OFF deliberately does not.
+  # Encode a seam failure in the child status before the intentional exit.
+  if {$mode eq "FULL" && $nCacheSync==0} { bcv_test_crash_now 240 }
+  if {$mode eq "OFF" && $nCacheSync!=0} { bcv_test_crash_now 241 }
+  bcv_test_crash_now 230
+}
+
+proc synchronous_read_marker {testdir alias container} {
+  set cmd [bcvfs_create $testdir "bcvfs"]
+  $cmd config cachesize [expr 4*$::D(blocksize)]
+  bcvfs_attach -alias $alias $cmd $container
+  sqlite3 verify "/$alias/synchronous.db" -vfs bcvfs
+  set result [list \
+      [verify onecolumn {PRAGMA integrity_check}] \
+      {*}[verify eval {
+        SELECT count(*), hex(substr(body,1,4)), hex(substr(body,-1))
+        FROM payload WHERE id=0
+      }]]
+  verify close
+  $cmd destroy
+  return $result
+}
+
+if {[info exists ::env(BCV_SYNCHRONOUS_CHILD)]} {
+  synchronous_child
+  finish_test
+  return
+}
+
+set run_suffix [expr {
+  [info exists ::env(BLOCKCACHEVFS_TEST_SUFFIX)]
+    ? $::env(BLOCKCACHEVFS_TEST_SUFFIX)
+    : "[pid]"
+}]
+
+foreach testCase {off-crash full-crash} {
+  set container "bcv-synchronous-$run_suffix-$testCase"
+  set testdir "synchronous-testdir-$run_suffix-$testCase"
+  set mode [expr {$testCase eq "full-crash" ? "FULL" : "OFF"}]
+  bcv_mkdir $testdir
+  bcv_create_container $container
+  bcv_upload_new_db $container synchronous.db {
+    CREATE TABLE payload(id INTEGER PRIMARY KEY, body BLOB NOT NULL);
+    INSERT INTO payload VALUES(0, CAST(zeroblob(4095)||X'00' AS BLOB));
+  }
+
+  set envcmd [list env \
+      BCV_SYNCHRONOUS_CHILD=1 \
+      BCV_SYNCHRONOUS_CONTAINER=$container \
+      BCV_SYNCHRONOUS_DIR=$testdir \
+      BCV_SYNCHRONOUS_MODE=$mode]
+  set child [file normalize [info nameofexecutable]]
+  set script [file normalize [info script]]
+  set status [catch {exec {*}$envcmd $child $script} message options]
+  set observed [list $status {} {}]
+  if {$status} {
+    set errorcode [dict get $options -errorcode]
+    set observed [list $status [lindex $errorcode 0] [lindex $errorcode 2]]
+    puts stderr "synchronous child failed: $message"
+  }
+
+  do_test $testCase.1 {
+    set observed
+  } {1 CHILDSTATUS 230}
+
+  set remoteDir "synchronous-remote-$run_suffix-$testCase"
+  bcv_mkdir $remoteDir
+  set remoteMarker [synchronous_read_marker $remoteDir remote $container]
+  set expectedRemote {ok 1 00000000 00}
+  do_test $testCase.2.remote {
+    set remoteMarker
+  } $expectedRemote
+
+  set localMarker [synchronous_read_marker $testdir local $container]
+  # A local cache xSync is not a manifest publication. Reopening through
+  # the remote manifest therefore still reads the old generation; the child
+  # status/cache_sync assertion above is the durability-boundary check.
+  set expectedLocal {ok 1 00000000 00}
+  do_test $testCase.3.local {
+    set localMarker
+  } $expectedLocal
+}
+
+finish_test

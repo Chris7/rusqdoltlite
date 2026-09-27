@@ -1,0 +1,36 @@
+# Exercise session-bound xSync/final-checkpoint behavior against a CBS
+# provider.  The C command intentionally never calls sqlite3_bcvfs_upload.
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_session_checkpoint
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir "bcvfs"]
+set nonce [expr {[clock clicks] & 0xFFFFFFFFFFFF}]
+set session_container [format "%s/session-checkpoint-%012x" $D(container) $nonce]
+set wal_container [format "%s/session-checkpoint-wal-%012x" $D(container) $nonce]
+bcv_create_container $session_container
+bcv_create_container $wal_container
+bcv_upload_new_db $session_container checkpoint.db {
+  CREATE TABLE t(v);
+}
+bcv_upload_new_db $wal_container checkpoint.db {
+  CREATE TABLE t(v);
+}
+set session_id [format "550e8400-e29b-41d4-a716-%012x" $nonce]
+set wal_session_id [format "550e8400-e29b-41d4-a717-%012x" $nonce]
+set fresh_dir [file join testdir [format "session-checkpoint-fresh-%012x" $nonce]]
+bcv_mkdir $fresh_dir
+
+do_test 1.1 {
+  $cmd session_checkpoint_test bcvfs $C(module) $C(user) \
+      $wal_container $wal_session_id checkpoint.db $fresh_dir wal
+} {}
+
+do_test 1.2 {
+  $cmd session_checkpoint_test bcvfs $C(module) $C(user) \
+      $session_container $session_id checkpoint.db $fresh_dir nowal
+} {}
+
+$cmd destroy
+finish_test

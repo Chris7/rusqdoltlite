@@ -160,6 +160,65 @@ vfs.upload("data")?;
 # Ok(()) }
 ```
 
+### Bounded cache and explicit publication
+
+`Config::CacheSize` controls the block-payload capacity of the local
+`cachefile.bcv`. In bounded mode it must be positive and block-aligned. The
+VFS reuses a fixed set of on-disk slots and invalidates a slot's metadata
+before overwriting it, so evicting a block does not create another local
+payload file. On restart, persisted clean-slot mappings are discarded before
+the cache file is reconciled. A clean-only tail can therefore be invalidated
+and truncated, allowing a smaller limit; a retained dirty or unpublished
+high-water slot makes a smaller limit fail rather than silently discarding
+local data. There is no general online cache compaction. The cap applies to
+the payload file, not to all local disk usage. `blocksdb.bcv`
+staging metadata can grow with the number of changed blocks, and remote
+objects retained for a retry may also outlive a local slot.
+
+`Config::StageWatermark(percent)` controls when dirty blocks are proactively
+staged as the cache fills. The native VFS accepts percentages from 1 through
+100, inclusive, and defaults to 90; an invalid value makes VFS initialization
+fail. Staging uploads block objects but does not publish the manifest until an
+explicit `upload` call.
+
+When the cache reaches its write watermark, the VFS uploads complete block
+objects and records their container, database, logical block, generation, and
+object ID in local staged metadata. These object PUTs are deliberately not
+manifest publication. A staged block can therefore be evicted and later read
+back from the staged mapping without losing read-your-writes. Rewrites and
+truncates tombstone superseded or discarded staged generations in the local
+`staged_gc` table; their remote object IDs remain tracked for delayed garbage
+collection rather than being deleted immediately. At the next eligible
+manifest publication, those IDs are added to the manifest's existing delayed
+GC list; if publication fails, the tombstones remain available for retry. A
+failed block PUT leaves the local dirty copy available for retry.
+
+Call `BlockCacheVfs::upload` explicitly when the update is ready to become
+visible remotely. Database `xSync` forwards to the cachefile's `xSync`, so a
+completed `xSync` syncs local payload bytes only; it does not stage blocks or
+publish a manifest. Dirty bytes written before `xSync` are outside the
+committed local-durability guarantee if power is lost. `upload` stages any
+remaining dirty blocks, composes one manifest from the current local
+generations, and uses the provider's conditional manifest operation. Staged
+mappings are retained when a block PUT fails, a manifest CAS loses, or the
+manifest result is ambiguous, so the operation can be retried or reconciled.
+The publication path only attempts staged cleanup after a successful
+conditional manifest operation; retained mappings remain available if cleanup
+is interrupted.
+Applications should treat `upload` as the publication boundary and retry it
+after an interrupted operation.
+
+On startup, persisted clean-cache slot mappings are invalidated and published
+blocks are fetched again when needed. Dirty metadata and staged mappings are
+kept for local recovery; a clean cache hit from a previous process is not
+trusted as a durability record.
+
+The staging metadata path requests full SQLite synchronization and carries
+restart-recovery markers, but the bounded payload cap is not a general
+power-loss or secure-erasure guarantee. Use the crash and fault-injection
+tests for the supported recovery contract, and do not infer a total-disk
+bound from the `cachefile.bcv` size alone.
+
 ## In-process remote server
 
 Enable the `remote` feature to embed DoltLite's HTTP remote server:
@@ -168,6 +227,10 @@ Enable the `remote` feature to embed DoltLite's HTTP remote server:
 [dependencies]
 rusqlite = { package = "rusqdoltlite", version = "0.40.21", features = ["remote"] }
 ```
+
+The server uses SQLite's process-default VFS unless
+`RemoteServerOptions::vfs_name` selects a registered VFS. The named VFS is
+resolved at startup, and an unknown name prevents the server from starting.
 
 ```rust,no_run
 use rusqlite::{params, Connection, RemoteServer};

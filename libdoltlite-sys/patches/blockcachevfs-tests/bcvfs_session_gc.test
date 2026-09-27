@@ -1,0 +1,528 @@
+# Session-aware orphan cleanup must preserve live checkpoint manifests and
+# fail closed on malformed immutable candidate objects.  This fixture uses
+# the existing checkpoint test command to create a real open session/checkpoint
+# pair, then drives the low-level cleanup API against the same container.
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_session_gc
+
+proc read_binary_file {zPath} {
+  set in [open $zPath rb]
+  fconfigure $in -translation binary -encoding binary
+  set aData [read $in]
+  close $in
+  return $aData
+}
+
+proc write_binary_file {zPath aData} {
+  set out [open $zPath wb]
+  fconfigure $out -translation binary -encoding binary
+  puts -nonewline $out $aData
+  close $out
+}
+
+proc manifest_delete_names {aManifest} {
+  binary scan $aManifest @8I@12I@16I nDb nDelete nName
+  # MANIFEST_DBHDR_SIZE in bcvutil.c is six u32 fields plus 128 name bytes.
+  set iOffset [expr {24 + $nDb*152}]
+  set aName {}
+  for {set ii 0} {$ii<$nDelete} {incr ii} {
+    set iStart [expr {$iOffset + $ii*($nName+8)}]
+    set aBlock [string range $aManifest $iStart [expr {$iStart+$nName-1}]]
+    binary scan $aBlock H* zHex
+    lappend aName "[string toupper $zHex].bcv"
+  }
+  return $aName
+}
+
+proc manifest_live_names {aManifest} {
+  binary scan $aManifest @8I@12I@16I nDb nDelete nName
+  set aName {}
+  for {set ii 0} {$ii<$nDb} {incr ii} {
+    set iHeader [expr {24+$ii*152}]
+    set aHeader [string range $aManifest $iHeader [expr {$iHeader+151}]]
+    binary scan $aHeader I@4I@12I@16I iDb iParent iOff nBlockRaw
+    set nBlock [expr {$nBlockRaw & 0x7fffffff}]
+    if {$iParent==0} {
+      for {set jj 0} {$jj<$nBlock} {incr jj} {
+        set iStart [expr {$iOff + $jj*$nName}]
+        set aBlock [string range $aManifest $iStart [expr {$iStart+$nName-1}]]
+        binary scan $aBlock H* zHex
+        lappend aName "[string toupper $zHex].bcv"
+      }
+    }
+  }
+  return $aName
+}
+
+proc manifest_age_delete_list {aManifest iTimestamp} {
+  binary scan $aManifest @8I@12I@16I nDb nDelete nName
+  # MANIFEST_DBHDR_SIZE in bcvutil.c is six u32 fields plus 128 name bytes.
+  set iOffset [expr {24 + $nDb*152}]
+  set aStamp [binary format W $iTimestamp]
+  for {set ii 0} {$ii<$nDelete} {incr ii} {
+    set iStamp [expr {$iOffset + $ii*($nName+8) + $nName}]
+    set aManifest [string replace $aManifest $iStamp [expr {$iStamp+7}] $aStamp]
+  }
+  return $aManifest
+}
+
+bcv_mkdir testdir
+set cmd [bcvfs_create testdir "bcvfs"]
+set nonce [expr {[clock clicks] & 0xFFFFFFFFFFFF}]
+set session_container [format "%s/session-gc-%012x" $D(container) $nonce]
+set marker_container [format "%s/session-gc-marker-%012x" $D(container) $nonce]
+set malformed_container [format "%s/session-gc-malformed-%012x" $D(container) $nonce]
+set delete_list_container [format "%s/session-gc-delete-list-%012x" $D(container) $nonce]
+set expired_container [format "%s/session-gc-expired-%012x" $D(container) $nonce]
+set candidate_source_container [format "%s/session-gc-candidate-source-%012x" $D(container) $nonce]
+set orphan_queue_container [format "%s/session-gc-orphan-queue-%012x" $D(container) $nonce]
+set guard_container [format "%s/session-gc-guard-%012x" $D(container) $nonce]
+bcv_create_container $session_container
+bcv_create_container $marker_container
+bcv_create_container $malformed_container
+bcv_create_container $delete_list_container
+bcv_create_container $expired_container
+bcv_create_container $candidate_source_container
+bcv_create_container $orphan_queue_container
+bcv_create_container $guard_container
+bcv_upload_new_db $session_container gc.db {
+  CREATE TABLE t(v);
+}
+bcv_upload_new_db $marker_container marker.db {
+  CREATE TABLE t(v);
+}
+bcv_upload_new_db $malformed_container malformed.db {
+  CREATE TABLE t(v);
+}
+bcv_upload_new_db $delete_list_container delete-list.db {
+  CREATE TABLE t(v);
+  INSERT INTO t VALUES(randomblob(16384));
+}
+bcv_upload_new_db $expired_container expired.db {
+  CREATE TABLE t(v);
+}
+bcv_upload_new_db $candidate_source_container candidate-source.db {
+  CREATE TABLE t(v);
+  INSERT INTO t VALUES(randomblob(3*1024*1024));
+}
+bcv_upload_new_db $orphan_queue_container orphan-queue.db {
+  CREATE TABLE t(v);
+}
+bcv_upload_new_db $guard_container guard.db {
+  CREATE TABLE t(v);
+}
+set session_id [format "550e8400-e29b-41d4-a716-%012x" $nonce]
+set marker_session_id [format "550e8400-e29b-41d4-a717-%012x" $nonce]
+set shared_session_id [format "550e8400-e29b-41d4-a718-%012x" $nonce]
+set expired_session_id [format "550e8400-e29b-41d4-a719-%012x" $nonce]
+set fresh_dir [file join testdir [format "session-gc-fresh-%012x" $nonce]]
+set block_hex_chars [expr {$C(namebytes) * 2}]
+bcv_mkdir $fresh_dir
+
+# A real immutable checkpoint is enough to make the session namespace live;
+# cleanup must not rewrite the ordinary manifest while it is protecting that
+# checkpoint.  The raw block is deliberately not in either manifest.
+do_test 1.1 {
+  $cmd session_checkpoint_test bcvfs $C(module) $C(user) \
+      $session_container $session_id gc.db $fresh_dir nowal
+} {}
+
+set bcv [bcv_open $session_container]
+$bcv config find_orphans 1
+set manifest_before [file join $fresh_dir manifest-before.bcv]
+set manifest_after [file join $fresh_dir manifest-after.bcv]
+set marker_bcv [bcv_open $marker_container]
+$marker_bcv config find_orphans 1
+
+# A block may be uploaded before a session checkpoint/head exists. The
+# per-attempt marker must preserve that block even when cleanup is requested
+# with the historical zero grace interval.
+set marker_fixture [$cmd session_attempt_marker_test bcvfs $C(module) $C(user) \
+    $marker_container $marker_session_id marker.db $fresh_dir active $C(namebytes)]
+lassign $marker_fixture marker_path marker_name block_path block_hex
+set marker_block_name [format "%s.bcv" $block_hex]
+do_test 1.2 {
+  list [$marker_bcv put $marker_path $marker_name] \
+      [$marker_bcv cleanup 0]
+} {0 0}
+do_test 1.3 {
+  list [$marker_bcv put $block_path $marker_block_name] \
+      [$marker_bcv cleanup 0] \
+      [$marker_bcv get $marker_block_name [file join $fresh_dir marker-block-after.bcv]]
+} {0 0 0}
+
+# The same content-addressed block may be named by multiple session attempts.
+# An expired marker from a second session must not make a block disappear while
+# the first session's live marker still protects it.
+set shared_fixture [$cmd session_attempt_marker_test bcvfs $C(module) $C(user) \
+    $marker_container $shared_session_id marker.db $fresh_dir expired $C(namebytes)]
+lassign $shared_fixture shared_marker_path shared_marker_name shared_block_path shared_block_hex
+set shared_block_name [format "%s.bcv" $shared_block_hex]
+do_test 1.4 {
+  list [$marker_bcv put $shared_marker_path $shared_marker_name] \
+      [$marker_bcv put $shared_block_path $shared_block_name] \
+      [$marker_bcv cleanup 0] \
+      [$marker_bcv get $shared_block_name [file join $fresh_dir shared-block-after.bcv]]
+} {0 0 0 0}
+
+# A cleanup that observes an active SWEEP guard must fail closed. This is the
+# crash-recovery boundary: taking over a stale sweep from wall-clock expiry
+# would reopen the pre-head block deletion race.
+set guard_bcv [bcv_open $guard_container]
+$guard_bcv config find_orphans 1
+set guard_fixture [$cmd session_attempt_marker_test bcvfs $C(module) $C(user) \
+    $guard_container $shared_session_id guard.db $fresh_dir guard $C(namebytes)]
+lassign $guard_fixture guard_path guard_name guard_block_path guard_block_hex
+set guard_block_name [format "%s.bcv" $guard_block_hex]
+do_test 1.5 {
+  list [$guard_bcv put $guard_path $guard_name] \
+      [$guard_bcv put $guard_block_path $guard_block_name] \
+      [$guard_bcv cleanup 0] \
+      [$guard_bcv get $guard_block_name [file join $fresh_dir guard-block-after.bcv]]
+} {0 0 0 0}
+set guard_state_path [file join $fresh_dir sweep-guard-after.bcv]
+do_test 1.5.guard-state {
+  set rc [$guard_bcv get bcv-session/v1/guard.bcv $guard_state_path]
+  binary scan [read_binary_file $guard_state_path] @10c eMode
+  list $rc $eMode
+} {0 1}
+
+# Even a legacy, unscoped attachment must join the writer fence. Keep one VFS
+# and SQLite connection open across the guard transition: writes/checkpoints
+# under SWEEP are followed by more writes after IDLE, so the same local dirty
+# cache must eventually reach StageOne and produce durable staged blocks.
+set guard_stage_dir [file join testdir [format "session-gc-guard-stage-%012x" $nonce]]
+bcv_mkdir $guard_stage_dir
+set guard_stage_cmd [bcvfs_create $guard_stage_dir "guardvfs"]
+$guard_stage_cmd config cachesize [expr 2*$D(blocksize)]
+bcvfs_attach -alias guardstage $guard_stage_cmd $guard_container
+sqlite3 guard_db "/guardstage/guard.db" -vfs guardvfs
+do_test 1.6 {
+  set nWrite [expr {8*$::D(blocksize)}]
+  guard_db eval {PRAGMA synchronous=FULL}
+  sqlite3_bcvfs_register_vtab guard_db
+  guard_db eval "INSERT INTO t VALUES(randomblob($nWrite))"
+  guard_db eval {PRAGMA wal_checkpoint(TRUNCATE)}
+  set nRemoteWrites [guard_db eval {
+    SELECT count(*) FROM bcv_http_log WHERE method IN ('PUT','POST')
+  }]
+  list [guard_db errorcode] $nRemoteWrites
+} {0 0}
+
+set idle_guard_fixture [$cmd session_attempt_marker_test bcvfs $C(module) $C(user) \
+    $guard_container $shared_session_id guard.db $fresh_dir idle $C(namebytes)]
+lassign $idle_guard_fixture idle_guard_path idle_guard_name idle_block_path idle_block_hex
+do_test 1.6.idle-guard {
+  $guard_bcv put $idle_guard_path $idle_guard_name
+} 0
+do_test 1.6.idle-transition {
+  set nWrite [expr {8*$::D(blocksize)}]
+  set bCaught [catch {
+    guard_db eval "INSERT INTO t VALUES(randomblob($nWrite))"
+    guard_db eval {PRAGMA wal_checkpoint(TRUNCATE)}
+  }]
+  set nRemoteWrites [guard_db eval {
+    SELECT count(*) FROM bcv_http_log WHERE method IN ('PUT','POST')
+  }]
+  list $bCaught [guard_db errorcode] [expr {$nRemoteWrites>0}]
+} {0 0 1}
+guard_db close
+$guard_stage_cmd destroy
+$guard_bcv close
+do_test 1.6.idle-stage-state {
+  sqlite3 guard_stage_metadata [file join $guard_stage_dir blocksdb.bcv]
+  set stagedObjects [guard_stage_metadata eval {
+    SELECT hex(blockid) || '.bcv' FROM staged
+  }]
+  guard_stage_metadata close
+  set stage_bcv [bcv_open $guard_container]
+  set nObjectBytes 0
+  set ii 0
+  foreach zObject $stagedObjects {
+    set zLocal [file join $guard_stage_dir "guard-stage-object-$ii.bcv"]
+    if {[$stage_bcv get $zObject $zLocal]==0} {
+      set nObjectBytes [file size $zLocal]
+      if {$nObjectBytes==$::D(blocksize)} { break }
+    }
+    incr ii
+  }
+  $stage_bcv close
+  list [expr {[llength $stagedObjects]>0}] \
+      [expr {$nObjectBytes==$::D(blocksize)}]
+} {1 1}
+
+$marker_bcv close
+set orphan_path [file join $fresh_dir orphan-block.bcv]
+set orphan_name [string repeat f $block_hex_chars].bcv
+set out [open $orphan_path wb]
+fconfigure $out -translation binary -encoding binary
+puts -nonewline $out [string repeat O 512]
+close $out
+
+do_test 1.7 {
+  list [$bcv get manifest.bcv $manifest_before] \
+      [$bcv put $orphan_path $orphan_name]
+} {0 0}
+
+# nSecond=0 historically meant immediate deletion. A live checkpoint
+# suppresses both manifest-rewrite paths without overriding the caller's
+# cleanup-age threshold.
+do_test 1.8 {
+  $bcv cleanup 0
+} {0}
+
+do_test 1.9 {
+  list [$bcv get manifest.bcv $manifest_after] \
+      [expr {[read_binary_file $manifest_before] eq [read_binary_file $manifest_after]}] \
+      [$bcv get $orphan_name [file join $fresh_dir orphan-after.bcv]]
+} {0 1 0}
+
+$bcv close
+
+# A valid unreferenced candidate manifest is still inspected when general
+# orphan discovery is off. Its live database mapping reaches the block later
+# moved to the ordinary manifest delete-list.
+set delete_alias deletegc
+set delete_bcv [bcv_open $delete_list_container]
+$delete_bcv config find_orphans 0
+set delete_manifest_before [file join $fresh_dir delete-list-before.bcv]
+set delete_manifest_after [file join $fresh_dir delete-list-after.bcv]
+do_test 4.1 {
+  $delete_bcv get manifest.bcv $delete_manifest_before
+} {0}
+set candidate_manifest_data [read_binary_file $delete_manifest_before]
+set candidate_live_blocks [manifest_live_names $candidate_manifest_data]
+set active_candidate_session_id [format "550e8400-e29b-41d4-a720-%012x" $nonce]
+set active_candidate_fixture [$cmd session_candidate_test $delete_manifest_before \
+    $C(module) $C(user) $delete_list_container $active_candidate_session_id \
+    delete-list.db $fresh_dir active]
+lassign $active_candidate_fixture candidate_name candidate_checkpoint_path \
+    candidate_checkpoint_name
+set candidate_block_files {}
+set ii 0
+foreach zBlock $candidate_live_blocks {
+  lappend candidate_block_files \
+      [file join $fresh_dir "candidate-live-block-$ii.bcv"]
+  incr ii
+}
+do_test 4.2 {
+  set aStatus {}
+  set ii 0
+  foreach zBlock $candidate_live_blocks {
+    lappend aStatus [$delete_bcv get $zBlock [lindex $candidate_block_files $ii]]
+    incr ii
+  }
+  list [expr {[llength $candidate_live_blocks]>0}] \
+      [expr {[llength [lsearch -all -exact $aStatus 0]]==[llength $aStatus]}]
+} {1 1}
+bcvfs_attach -alias $delete_alias $cmd $delete_list_container
+$cmd delete $delete_alias delete-list.db
+$cmd upload $delete_alias
+do_test 4.3 {
+  $delete_bcv get manifest.bcv $delete_manifest_after
+} {0}
+set delete_blocks [manifest_delete_names [read_binary_file $delete_manifest_after]]
+set nCandidateLiveReachable 0
+foreach zBlock $delete_blocks {
+  if {[lsearch -exact $candidate_live_blocks $zBlock]>=0} {
+    incr nCandidateLiveReachable
+  }
+}
+do_test 4.4 {
+  list [expr {[llength $delete_blocks]>0}] \
+      [expr {$nCandidateLiveReachable==[llength $delete_blocks]}]
+} {1 1}
+do_test 4.5 {
+  set aStatus {}
+  set ii 0
+  foreach zBlock $delete_blocks {
+    set iCandidate [lsearch -exact $candidate_live_blocks $zBlock]
+    if {$iCandidate<0} {
+      lappend aStatus SQLITE_NOTFOUND
+    } else {
+      # Uploading the delete manifest may have already removed blocks. Restore
+      # their captured bytes so this test isolates candidate reachability from
+      # ordinary upload cleanup and age/grace behavior.
+      lappend aStatus [$delete_bcv put \
+          [lindex $candidate_block_files $iCandidate] $zBlock]
+    }
+    incr ii
+  }
+  list [expr {[llength $delete_blocks]>0}] \
+      [expr {[llength [lsearch -all -exact $aStatus 0]]==[llength $aStatus]}]
+} {1 1}
+do_test 4.6 {
+  list [$delete_bcv put $candidate_checkpoint_path $candidate_checkpoint_name] \
+      [$delete_bcv put $delete_manifest_before $candidate_name] \
+      [$delete_bcv get $candidate_name [file join $fresh_dir candidate-after-put.bcv]] \
+      [$delete_bcv get $candidate_checkpoint_name [file join $fresh_dir candidate-checkpoint-after-put.bcv]]
+} {0 0 0 0}
+do_test 4.7 {
+  $delete_bcv cleanup 0
+} {0}
+do_test 4.8 {
+  set aStatus {}
+  set ii 0
+  foreach zBlock $delete_blocks {
+    lappend aStatus [$delete_bcv get $zBlock [file join $fresh_dir "delete-list-kept-$ii.bcv"]]
+    incr ii
+  }
+  list [$delete_bcv get manifest.bcv $delete_manifest_after] \
+      [expr {[manifest_delete_names [read_binary_file $delete_manifest_after]] eq $delete_blocks}] \
+      [expr {[llength [lsearch -all -exact $aStatus 0]]==[llength $aStatus]}]
+} {0 1 1}
+$delete_bcv close
+
+# An expired unreferenced candidate checkpoint supplies a durable age for its
+# manifest, even when ordinary orphan discovery is disabled. Its blocks are
+# first queued in manifest.bcv and remain present until the requested age has
+# elapsed; use enough blocks to force orphan-vector growth past its initial 16.
+set candidate_source_bcv [bcv_open $candidate_source_container]
+set candidate_source_manifest [file join $fresh_dir candidate-source.manifest]
+do_test 5.1 {
+  $candidate_source_bcv get manifest.bcv $candidate_source_manifest
+} {0}
+set candidate_source_blocks [manifest_live_names [read_binary_file $candidate_source_manifest]]
+set candidate_source_block_files {}
+set ii 0
+foreach zBlock $candidate_source_blocks {
+  lappend candidate_source_block_files \
+      [file join $fresh_dir "orphan-source-block-$ii.bcv"]
+  incr ii
+}
+do_test 5.2 {
+  set aStatus {}
+  set ii 0
+  foreach zBlock $candidate_source_blocks {
+    lappend aStatus [$candidate_source_bcv get $zBlock [lindex $candidate_source_block_files $ii]]
+    incr ii
+  }
+  list [expr {[llength $candidate_source_blocks]>16}] \
+      [expr {[llength [lsearch -all -exact $aStatus 0]]==[llength $aStatus]}]
+} {1 1}
+$candidate_source_bcv close
+
+set orphan_session_id [format "550e8400-e29b-41d4-a721-%012x" $nonce]
+set orphan_candidate_fixture [$cmd session_candidate_test $candidate_source_manifest \
+    $C(module) $C(user) $orphan_queue_container $orphan_session_id \
+    candidate-source.db $fresh_dir expired]
+lassign $orphan_candidate_fixture orphan_candidate_name \
+    orphan_checkpoint_path orphan_checkpoint_name
+set orphan_bcv [bcv_open $orphan_queue_container]
+$orphan_bcv config find_orphans 0
+set queued_manifest_path [file join $fresh_dir candidate-queued.manifest]
+set aged_manifest_path [file join $fresh_dir candidate-aged.manifest]
+set deleted_manifest_path [file join $fresh_dir candidate-deleted.manifest]
+do_test 5.3 {
+  set aStatus {}
+  set ii 0
+  foreach zBlock $candidate_source_blocks {
+    lappend aStatus [$orphan_bcv put \
+        [lindex $candidate_source_block_files $ii] $zBlock]
+    incr ii
+  }
+  list [$orphan_bcv put $orphan_checkpoint_path $orphan_checkpoint_name] \
+      [$orphan_bcv put $candidate_source_manifest $orphan_candidate_name] \
+      [expr {[llength $candidate_source_blocks]>16}] \
+      [expr {[llength [lsearch -all -exact $aStatus 0]]==[llength $aStatus]}]
+} {0 0 1 1}
+do_test 5.4 {
+  list [$orphan_bcv cleanup 60] \
+      [$orphan_bcv get $orphan_candidate_name [file join $fresh_dir expired-candidate-after.bcv]] \
+      [$orphan_bcv get $orphan_checkpoint_name [file join $fresh_dir expired-candidate-checkpoint-after.bcv]]
+} {0 404 404}
+do_test 5.5 {
+  set aStatus {}
+  set ii 0
+  foreach zBlock $candidate_source_blocks {
+    lappend aStatus [$orphan_bcv get $zBlock \
+        [file join $fresh_dir "orphan-queued-block-$ii.bcv"]]
+    incr ii
+  }
+  $orphan_bcv get manifest.bcv $queued_manifest_path
+  set aQueued [manifest_delete_names [read_binary_file $queued_manifest_path]]
+  list [expr {[lsort $aQueued] eq [lsort $candidate_source_blocks]}] \
+      [expr {[llength $aQueued]>16}] \
+      [expr {[llength [lsearch -all -exact $aStatus 0]]==[llength $aStatus]}]
+} {1 1 1}
+do_test 5.6 {
+  write_binary_file $aged_manifest_path \
+      [manifest_age_delete_list [read_binary_file $queued_manifest_path] 0]
+  list [$orphan_bcv put $aged_manifest_path manifest.bcv] \
+      [$orphan_bcv cleanup 60] \
+      [$orphan_bcv get manifest.bcv $deleted_manifest_path]
+} {0 0 0}
+do_test 5.7 {
+  set aStatus {}
+  set ii 0
+  foreach zBlock $candidate_source_blocks {
+    lappend aStatus [$orphan_bcv get $zBlock \
+        [file join $fresh_dir "orphan-deleted-block-$ii.bcv"]]
+    incr ii
+  }
+  list [expr {[llength [manifest_delete_names [read_binary_file $deleted_manifest_path]]]==0}] \
+      [expr {[llength [lsearch -all -exact $aStatus 404]]==[llength $aStatus]}]
+} {1 1}
+$orphan_bcv close
+
+# An expired head is transitioned to a terminal state with an ETag CAS before
+# its checkpoint and head are swept. Both old records should be gone after the
+# cleanup grace interval has already elapsed.
+set expired_manifest_path [file join $fresh_dir expired-session-manifest.bcv]
+set expired_manifest_bcv [bcv_open $expired_container]
+do_test 2.0 {
+  $expired_manifest_bcv get manifest.bcv $expired_manifest_path
+} {0}
+$expired_manifest_bcv close
+set expired_fixture [$cmd session_expired_records_test bcvfs $C(module) $C(user) \
+    $expired_container $expired_session_id expired.db $fresh_dir $expired_manifest_path]
+lassign $expired_fixture expired_head_path expired_head_name \
+    expired_checkpoint_path expired_checkpoint_name
+set expired_bcv [bcv_open $expired_container]
+$expired_bcv config find_orphans 1
+do_test 2.1 {
+  list [$expired_bcv put $expired_head_path $expired_head_name] \
+      [$expired_bcv put $expired_checkpoint_path $expired_checkpoint_name] \
+      [$expired_bcv cleanup 0]
+} {0 0 0}
+do_test 2.2 {
+  list [$expired_bcv get $expired_head_name [file join $fresh_dir expired-head-after.bcv]] \
+      [$expired_bcv get $expired_checkpoint_name [file join $fresh_dir expired-checkpoint-after.bcv]]
+} {404 404}
+$expired_bcv close
+
+# A candidate PUT without a matching content hash is ambiguous.  Cleanup must
+# stop before deleting any ordinary object instead of trusting the key name.
+set bcv [bcv_open $malformed_container]
+$bcv config find_orphans 1
+set bad_candidate_path [file join $fresh_dir bad-candidate.bcv]
+set bad_orphan_path [file join $fresh_dir bad-orphan.bcv]
+set out [open $bad_candidate_path wb]
+fconfigure $out -translation binary -encoding binary
+puts -nonewline $out "not-a-manifest"
+close $out
+set out [open $bad_orphan_path wb]
+fconfigure $out -translation binary -encoding binary
+puts -nonewline $out [string repeat Q 512]
+close $out
+set bad_candidate_name [string repeat 1 64].bcv
+set bad_orphan_name [string repeat e $block_hex_chars].bcv
+
+do_test 3.1 {
+  list [$bcv put $bad_candidate_path \
+      "bcv-session/v1/candidate/$bad_candidate_name"] \
+      [$bcv put $bad_orphan_path $bad_orphan_name]
+} {0 0}
+
+do_test 3.2 {
+  $bcv cleanup 0
+} {11}
+
+do_test 3.3 {
+  $bcv get $bad_orphan_name [file join $fresh_dir bad-orphan-after.bcv]
+} {0}
+
+$bcv close
+$cmd destroy
+finish_test

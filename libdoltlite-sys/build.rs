@@ -94,6 +94,8 @@ mod build_bundled {
         println!("cargo:include={}/{lib_name}", manifest_dir.display());
         let source_file = "doltlite.c";
         println!("cargo:rerun-if-changed={lib_name}/{source_file}");
+        println!("cargo:rerun-if-changed={lib_name}/remote/doltlite_remotesrv.c");
+        println!("cargo:rerun-if-changed={lib_name}/remote/doltlite_remotesrv.h");
         println!("cargo:rerun-if-changed=patches");
         let upstream_source = manifest_dir.join(lib_name).join(source_file);
         let patched_source = apply_local_patches(
@@ -101,16 +103,17 @@ mod build_bundled {
             &manifest_dir.join("patches"),
             &Path::new(out_dir).join("patched-doltlite"),
         );
+        let staged_remote_dir = patched_source
+            .parent()
+            .expect("patched DoltLite source must have a parent directory");
+        let staged_remote_server = staged_remote_dir.join("doltlite_remotesrv.c");
         // Remote-auth server uses pthreads, unported to Windows/MSVC.
         let remote_supported = cfg!(feature = "remote")
             && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"))
             && !win_target();
         let remote_dir = Path::new(lib_name).join("remote");
         let auth_is_in_amalgamation = if remote_supported {
-            append_remote_server_if_missing(
-                &patched_source,
-                &manifest_dir.join(&remote_dir).join("doltlite_remotesrv.c"),
-            )
+            append_remote_server_if_missing(&patched_source, &staged_remote_server)
         } else {
             false
         };
@@ -140,6 +143,7 @@ mod build_bundled {
 
             println!("cargo:rerun-if-changed={}", remote_dir.display());
             cfg.define("DOLTLITE_HAVE_AUTH", None)
+                .include(staged_remote_dir)
                 .include(&remote_dir)
                 .include(&ed25519_dir)
                 .include(mbedtls_dir.join("include"))
@@ -586,6 +590,19 @@ mod build_bundled {
                 patched_source.display()
             )
         });
+        for sidecar in ["doltlite_remotesrv.c", "doltlite_remotesrv.h"] {
+            let upstream_sidecar = upstream_source
+                .parent()
+                .expect("DoltLite amalgamation must have a parent directory")
+                .join("remote")
+                .join(sidecar);
+            std::fs::copy(&upstream_sidecar, output_dir.join(sidecar)).unwrap_or_else(|error| {
+                panic!(
+                    "could not stage pristine DoltLite remote sidecar {}: {error}",
+                    upstream_sidecar.display()
+                )
+            });
+        }
 
         let mut patches = std::fs::read_dir(patch_dir)
             .unwrap_or_else(|error| {

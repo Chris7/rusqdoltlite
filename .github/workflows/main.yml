@@ -125,13 +125,15 @@ jobs:
           fi
       - name: Rust blockcachevfs feature tests
         run: cargo test --workspace --features blockcachevfs --all-targets --verbose
+      - name: Rust remote server VFS tests
+        run: cargo test --features 'blockcachevfs remote' --test remote_server --verbose
       - name: Start pinned emulator containers
         run: |
           set -euo pipefail
           docker run --detach \
             --name rusqdoltlite-blockcache-gcs \
             --publish 4443:4443 \
-            fsouza/fake-gcs-server:1.54.0 \
+            fsouza/fake-gcs-server:1.56.1 \
             -scheme http -port 4443 -backend memory
           docker run --detach \
             --name rusqdoltlite-blockcache-s3 \
