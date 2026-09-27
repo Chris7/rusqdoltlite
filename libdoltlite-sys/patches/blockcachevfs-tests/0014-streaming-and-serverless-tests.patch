@@ -1,17 +1,52 @@
 diff --git a/blockcachevfstest.c b/blockcachevfstest.c
-index 184169b..fd8b12e 100644
+index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef29f12c3c 100644
 --- a/blockcachevfstest.c
 +++ b/blockcachevfstest.c
-@@ -18,6 +18,8 @@
+@@ -18,6 +18,30 @@
  #include "sqlite3.h"
  #include <assert.h>
  #include <string.h>
 +#include <stdio.h>
 +#include <openssl/sha.h>
- #include <stdlib.h>
- #if !defined(_WIN32)
- # include <unistd.h>
-@@ -346,8 +348,6 @@ static int test_bcv_detach(
++#include <stdlib.h>
++#if !defined(_WIN32)
++# include <unistd.h>
++#endif
++
++/*
++** The test wrapper below deliberately makes metadata writes volatile until
++** xSync.  This is a small storage-layer model of power loss: a child that
++** exits without closing its files loses every write that was not covered by
++** an xSync, regardless of the host filesystem's page-cache behaviour.
++*/
++typedef struct BcvTestPending BcvTestPending;
++struct BcvTestPending {
++  int eType;
++  sqlite3_int64 iOfst;
++  sqlite3_int64 nByte;
++  unsigned char *aData;
++  BcvTestPending *pNext;
++};
++
++#define BCV_TEST_PENDING_WRITE    1
++#define BCV_TEST_PENDING_TRUNCATE 2
+ 
+ 
+ struct BcvTestGlobal {
+@@ -32,6 +56,12 @@ struct BcvTestGlobal {
+   int (*xRecv)(BCV_SOCKET_TYPE, void *, int);
+   int (*xSend)(BCV_SOCKET_TYPE, void *, int);
+ 
++  int nMetadataSync;
++  int nCacheSync;
++  int bCacheVolatile;
++  int iCrashAfterSync;
++  int bStagedMapSeen;
++
+   /* For curl-config-cb */
+   Tcl_Interp *interp;
+   Tcl_Obj *pScript;
+@@ -318,8 +348,6 @@ static int test_bcv_detach(
    return TCL_OK;
  }
  
@@ -20,7 +55,7 @@ index 184169b..fd8b12e 100644
  typedef struct TestBcv TestBcv;
  struct TestBcv {
    sqlite3_bcv *pBcv;
-@@ -428,6 +428,8 @@ static int test_bcv_cmd(
+@@ -400,6 +428,8 @@ static int test_bcv_cmd(
      { "errmsg",   0, "" },                  /* 8 */
      { "upload",   2, "LOCAL REMOTE" },      /* 9 */
      { "cleanup",  1, "MS" },                /* 10 */
@@ -29,7 +64,7 @@ index 184169b..fd8b12e 100644
      { 0, 0 }
    };
    int iCmd = 0;
-@@ -612,6 +614,20 @@ static int test_bcv_cmd(
+@@ -584,6 +614,20 @@ static int test_bcv_cmd(
        Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
        break;
      };
@@ -50,7 +85,148 @@ index 184169b..fd8b12e 100644
      default:
        assert( 0 );
    }
-@@ -1025,6 +1041,68 @@ struct TestBcvfs {
+@@ -818,6 +862,140 @@ static int test_bcv_ioerr_control(
+   return TCL_OK;
+ }
+ 
++/*
++** bcv_test_crash_event EVENT
++**
++** The runtime test patch calls bcv_test_event() at named streaming-write
++** boundaries.  Exiting from that callback is intentional: pending metadata
++** writes are still held by the wrapper and are discarded with the process.
++** Event 1 is after block PUT, event 2 after staged-map xSync, event 3 after
++** slot reuse, and event 4 after manifest PUT.
++*/
++int bcv_test_event(int eEvent){
++  if( eEvent==2 ){
++    /* Remember the staged-map boundary even when the test is waiting for
++    ** event 3. This prevents a generic later xWrite from masquerading as
++    ** slot reuse. */
++    g.bStagedMapSeen = 1;
++    if( g.iCrashAfterSync==-2 && g.nMetadataSync==0 ){
++#if !defined(_WIN32)
++      _exit(250);
++#endif
++    }
++  }
++  if( eEvent==3 && g.iCrashAfterSync==-3 && g.bStagedMapSeen==0 ){
++#if !defined(_WIN32)
++    _exit(251);
++#endif
++  }
++  if( g.iCrashAfterSync<0 && -g.iCrashAfterSync==eEvent ){
++#if !defined(_WIN32)
++    _exit(200+eEvent);
++#endif
++  }
++  return SQLITE_OK;
++}
++
++static int test_bcv_crash_event(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  int eEvent;
++  if( objc!=2 ){
++    Tcl_WrongNumArgs(interp, 1, objv, "EVENT");
++    return TCL_ERROR;
++  }
++  if( Tcl_GetIntFromObj(interp, objv[1], &eEvent) ) return TCL_ERROR;
++  g.iCrashAfterSync = -eEvent;
++  Tcl_SetObjResult(interp, Tcl_NewIntObj(eEvent));
++  return TCL_OK;
++}
++
++static int test_bcv_metadata_sync_count(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  if( objc!=1 ){
++    Tcl_WrongNumArgs(interp, 1, objv, "");
++    return TCL_ERROR;
++  }
++  Tcl_SetObjResult(interp, Tcl_NewIntObj(g.nMetadataSync));
++  return TCL_OK;
++}
++
++static int test_bcv_metadata_sync_reset(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  if( objc!=1 ){
++    Tcl_WrongNumArgs(interp, 1, objv, "");
++    return TCL_ERROR;
++  }
++  g.nMetadataSync = 0;
++  g.nCacheSync = 0;
++  g.bStagedMapSeen = 0;
++  return TCL_OK;
++}
++
++static int test_bcv_cache_sync_count(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  if( objc!=1 ){
++    Tcl_WrongNumArgs(interp, 1, objv, "");
++    return TCL_ERROR;
++  }
++  Tcl_SetObjResult(interp, Tcl_NewIntObj(g.nCacheSync));
++  return TCL_OK;
++}
++
++static int test_bcv_crash_now(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  int eCode = 230;
++  if( objc>2 ){
++    Tcl_WrongNumArgs(interp, 1, objv, "?EXITCODE?");
++    return TCL_ERROR;
++  }
++  if( objc==2 && Tcl_GetIntFromObj(interp, objv[1], &eCode) ){
++    return TCL_ERROR;
++  }
++#if !defined(_WIN32)
++  _exit(eCode);
++#else
++  Tcl_SetObjResult(interp, Tcl_NewIntObj(eCode));
++#endif
++  return TCL_OK;
++}
++
++static int test_bcv_cache_volatile(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  int bEnable;
++  if( objc!=2 ){
++    Tcl_WrongNumArgs(interp, 1, objv, "BOOLEAN");
++    return TCL_ERROR;
++  }
++  if( Tcl_GetBooleanFromObj(interp, objv[1], &bEnable) ) return TCL_ERROR;
++  g.bCacheVolatile = bEnable;
++  Tcl_SetObjResult(interp, Tcl_NewBooleanObj(bEnable));
++  return TCL_OK;
++}
++
+ /*
+ ** vfs_delete VFSNAME FILE
+ */
+@@ -863,6 +1041,68 @@ struct TestBcvfs {
    Tcl_Interp *interp;
  };
  
@@ -119,7 +295,7 @@ index 184169b..fd8b12e 100644
  static void bcvfsDestroy(ClientData clientData){
    TestBcvfs *pTest = (TestBcvfs*)clientData;
    sqlite3_bcvfs_destroy(pTest->pFs);
-@@ -1273,7 +1351,16 @@ static int bcvfsCommand(
+@@ -1111,7 +1351,16 @@ static int bcvfsCommand(
      "delete",           /* 10 */
      "prefetch_new",     /* 11 */
      "revert",           /* 12 */
@@ -137,7 +313,7 @@ index 184169b..fd8b12e 100644
    };
    TestBcvfs *pTest = (TestBcvfs*)clientData;
    int iCmd;
-@@ -1674,13 +1761,4385 @@ static int bcvfsCommand(
+@@ -1512,54 +1761,4426 @@ static int bcvfsCommand(
        }
        break;
      }
@@ -228,13 +404,23 @@ index 184169b..fd8b12e 100644
 +** cloud emulator.  Remote conditional PUTs are covered by the backend matrix;
 +** this command keeps malformed, cross-scope and path-construction cases in
 +** the ordinary CBS test binary as well.
-+*/
+ */
+-static int test_bcvfs_create(
 +static int test_bcvfs_session_record(
-+  ClientData clientData,
-+  Tcl_Interp *interp,
-+  int objc,
-+  Tcl_Obj *const objv[]
-+){
+   ClientData clientData,
+   Tcl_Interp *interp,
+   int objc,
+   Tcl_Obj *const objv[]
+ ){
+-  const char *zDir = 0;
+-  const char *zVfsname = 0;
+-  sqlite3_bcvfs *pNew = 0;
+-  TestBcvfs *pTest = 0;
+-  int rc = SQLITE_OK;
+-  Tcl_Obj *pCmd;
+-
+-  if( objc!=3 ){
+-    Tcl_WrongNumArgs(interp, 1, objv, "DIR VFSNAME");
 +  sqlite3_bcvfs_session_record in;
 +  sqlite3_bcvfs_session_record out;
 +  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
@@ -270,8 +456,8 @@ index 184169b..fd8b12e 100644
 +  (void)clientData;
 +  if( objc!=1 ){
 +    Tcl_WrongNumArgs(interp, 1, objv, "");
-+    return TCL_ERROR;
-+  }
+     return TCL_ERROR;
+   }
 +#define SESSION_TEST_FAIL(zMsg) do { \
 +    Tcl_SetObjResult(interp, Tcl_NewStringObj((zMsg), -1)); \
 +    rcRet = TCL_ERROR; \
@@ -594,7 +780,9 @@ index 184169b..fd8b12e 100644
 +    sqlite3_free(zErr);
 +    zErr = 0;
 +  }
-+
+ 
+-  zDir = Tcl_GetString(objv[1]);
+-  zVfsname = Tcl_GetString(objv[2]);
 +  aEncoded[SQLITE_BCVFS_SESSION_RECORD_HEADER_BYTES] ^= 0x01;
 +  rc = sqlite3_bcvfs_session_record_decode(
 +      aEncoded,nEncoded,zUuid,aScope,&out,&zErr
@@ -615,7 +803,11 @@ index 184169b..fd8b12e 100644
 +  SESSION_TEST_REQUIRE(rc==SQLITE_AUTH, "cross-session record was accepted");
 +  sqlite3_free(zErr);
 +  zErr = 0;
-+
+ 
+-  rc = sqlite3_bcvfs_create(zDir, zVfsname, &pNew, 0);
+-  if( rc!=SQLITE_OK ){
+-    Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+-    return TCL_ERROR;
 +  rc = sqlite3_bcvfs_session_object_name(
 +      SQLITE_BCVFS_SESSION_HEAD,zUuid,0,zName,sizeof(zName),&zErr
 +  );
@@ -667,8 +859,11 @@ index 184169b..fd8b12e 100644
 +    sqlite3_free(zErr);
 +    zErr = 0;
 +    sqlite3_free(aInvalid);
-+  }
-+
+   }
+ 
+-  pTest = (TestBcvfs*)ckalloc(sizeof(TestBcvfs));
+-  memset(pTest, 0, sizeof(TestBcvfs));
+-  pTest->pFs = pNew;
 +  {
 +    sqlite3_bcvfs_session_record accepted = in;
 +    unsigned char aHeadBody[128];
@@ -753,7 +948,10 @@ index 184169b..fd8b12e 100644
 +      }
 +    }
 +  }
-+
+ 
+-  pCmd = Tcl_ObjPrintf("bcvfs_%s", zVfsname);
+-  Tcl_CreateObjCommand(interp, 
+-      Tcl_GetString(pCmd), bcvfsCommand, (void*)pTest, bcvfsDestroy
 +  {
 +    sqlite3_bcvfs_session_record invalid = in;
 +    unsigned char *aInvalid = 0;
@@ -781,7 +979,9 @@ index 184169b..fd8b12e 100644
 +  in.nBody = SQLITE_BCVFS_SESSION_RECORD_MAX_BYTES;
 +  rc = sqlite3_bcvfs_session_record_encode(
 +      &in, &aEncoded, &nEncoded, aHash, &zErr
-+  );
+   );
+-  Tcl_SetObjResult(interp, pCmd);
+-  return TCL_OK;
 +  SESSION_TEST_REQUIRE(rc==SQLITE_TOOBIG, "oversize session record was accepted");
 +
 +  /* The publication manifest carries exact logical EOF metadata in a
@@ -859,8 +1059,10 @@ index 184169b..fd8b12e 100644
 +#undef SESSION_TEST_REQUIRE
 +#undef SESSION_TEST_FAIL
 +  return rcRet;
-+}
-+
+ }
+ 
+-typedef struct BcvTfsList BcvTfsList;
+-struct BcvTfsList {
 +/*
 +** $vfs session_backend_test MODULE ACCOUNT CONTAINER SESSION_ID
 +**
@@ -868,7 +1070,7 @@ index 184169b..fd8b12e 100644
 +** module. This intentionally uses a session head rather than manifest.bcv:
 +** create-if-absent, exact opaque ETag replacement, stale ETag rejection and
 +** scope-bound reads must all be enforced by the backend.
- */
++*/
 +static int test_bcvfs_session_backend(
 +  ClientData clientData,
 +  Tcl_Interp *interp,
@@ -4521,10 +4723,289 @@ index 184169b..fd8b12e 100644
 +  return rcRet;
 +}
 +
- static int test_bcvfs_create(
-   ClientData clientData,
-   Tcl_Interp *interp,
-@@ -2712,6 +7171,7 @@ const char *bcvtest_init(Tcl_Interp *interp){
++static int test_bcvfs_create(
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
++  const char *zDir = 0;
++  const char *zVfsname = 0;
++  sqlite3_bcvfs *pNew = 0;
++  TestBcvfs *pTest = 0;
++  int rc = SQLITE_OK;
++  Tcl_Obj *pCmd;
++
++  if( objc!=3 ){
++    Tcl_WrongNumArgs(interp, 1, objv, "DIR VFSNAME");
++    return TCL_ERROR;
++  }
++
++  zDir = Tcl_GetString(objv[1]);
++  zVfsname = Tcl_GetString(objv[2]);
++
++  rc = sqlite3_bcvfs_create(zDir, zVfsname, &pNew, 0);
++  if( rc!=SQLITE_OK ){
++    Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
++    return TCL_ERROR;
++  }
++
++  pTest = (TestBcvfs*)ckalloc(sizeof(TestBcvfs));
++  memset(pTest, 0, sizeof(TestBcvfs));
++  pTest->pFs = pNew;
++
++  pCmd = Tcl_ObjPrintf("bcvfs_%s", zVfsname);
++  Tcl_CreateObjCommand(interp, 
++      Tcl_GetString(pCmd), bcvfsCommand, (void*)pTest, bcvfsDestroy
++  );
++  Tcl_SetObjResult(interp, pCmd);
++  return TCL_OK;
++}
++
++typedef struct BcvTfsList BcvTfsList;
++struct BcvTfsList {
+   int nRef;                       /* Pointers to this structure */
+   int rc;
+   int nAlloc;
+@@ -2047,15 +6668,156 @@ typedef struct BcvTestFile BcvTestFile;
+ struct BcvTestFile {
+   sqlite3_file base;
+   sqlite3_file *pReal;
++  char *zName;
++  int bMetadata;
++  int bCache;
++  sqlite3_int64 nLogical;
++  BcvTestPending *pPending;
+ };
+ 
++static int bcvTestIsMetadata(const char *zName){
++  const char *zBase = zName ? strrchr(zName, '/') : 0;
++#ifdef _WIN32
++  const char *zBackslash = zName ? strrchr(zName, '\\') : 0;
++  if( zBase==0 || (zBackslash && zBackslash>zBase) ) zBase = zBackslash;
++#endif
++  zBase = zBase ? &zBase[1] : zName;
++  return zBase && (
++      strcmp(zBase, "blocksdb.bcv")==0
++   || strcmp(zBase, "blocksdb.bcv-journal")==0
++   || strcmp(zBase, "blocksdb.bcv-wal")==0
++  );
++}
++
++static int bcvTestIsCache(const char *zName){
++  const char *zBase = zName ? strrchr(zName, '/') : 0;
++#ifdef _WIN32
++  const char *zBackslash = zName ? strrchr(zName, '\\') : 0;
++  if( zBase==0 || (zBackslash && zBackslash>zBase) ) zBase = zBackslash;
++#endif
++  zBase = zBase ? &zBase[1] : zName;
++  return zBase && strcmp(zBase, "cachefile.bcv")==0;
++}
++
++static void bcvTestPendingFree(BcvTestFile *p){
++  BcvTestPending *pOp = p->pPending;
++  while( pOp ){
++    BcvTestPending *pNext = pOp->pNext;
++    sqlite3_free(pOp);
++    pOp = pNext;
++  }
++  p->pPending = 0;
++}
++
++static int bcvTestPendingWrite(
++  BcvTestFile *p, const void *aData, int nByte, sqlite3_int64 iOfst
++){
++  BcvTestPending *pOp = (BcvTestPending*)sqlite3_malloc(
++      sizeof(BcvTestPending) + (size_t)nByte
++  );
++  if( pOp==0 ) return SQLITE_NOMEM;
++  memset(pOp, 0, sizeof(BcvTestPending));
++  pOp->aData = (unsigned char*)&pOp[1];
++  memcpy(pOp->aData, aData, (size_t)nByte);
++  pOp->eType = BCV_TEST_PENDING_WRITE;
++  pOp->iOfst = iOfst;
++  pOp->nByte = nByte;
++  pOp->pNext = p->pPending;
++  p->pPending = pOp;
++  if( p->nLogical<iOfst+nByte ) p->nLogical = iOfst+nByte;
++  return SQLITE_OK;
++}
++
++static int bcvTestPendingTruncate(BcvTestFile *p, sqlite3_int64 nByte){
++  BcvTestPending *pOp = (BcvTestPending*)sqlite3_malloc(sizeof(BcvTestPending));
++  if( pOp==0 ) return SQLITE_NOMEM;
++  memset(pOp, 0, sizeof(BcvTestPending));
++  pOp->eType = BCV_TEST_PENDING_TRUNCATE;
++  pOp->nByte = nByte;
++  pOp->pNext = p->pPending;
++  p->pPending = pOp;
++  p->nLogical = nByte;
++  return SQLITE_OK;
++}
++
++static int bcvTestFlushPending(BcvTestFile *p){
++  BcvTestPending *pOp;
++  BcvTestPending **apOp = 0;
++  int nOp = 0;
++  int ii;
++  int rc = SQLITE_OK;
++
++  for(pOp=p->pPending; pOp; pOp=pOp->pNext) nOp++;
++  if( nOp==0 ) return SQLITE_OK;
++  apOp = (BcvTestPending**)sqlite3_malloc(sizeof(BcvTestPending*)*nOp);
++  if( apOp==0 ) return SQLITE_NOMEM;
++  for(pOp=p->pPending, ii=nOp-1; pOp; pOp=pOp->pNext, ii--){
++    apOp[ii] = pOp;
++  }
++  for(ii=0; ii<nOp && rc==SQLITE_OK; ii++){
++    pOp = apOp[ii];
++    if( pOp->eType==BCV_TEST_PENDING_WRITE ){
++      rc = p->pReal->pMethods->xWrite(
++          p->pReal, pOp->aData, (int)pOp->nByte, pOp->iOfst
++      );
++    }else{
++      rc = p->pReal->pMethods->xTruncate(p->pReal, pOp->nByte);
++    }
++  }
++  sqlite3_free(apOp);
++  return rc;
++}
++
++static void bcvTestOverlayRead(
++  BcvTestFile *p, void *pBuf, int iAmt, sqlite3_int64 iOfst
++){
++  BcvTestPending *pOp;
++  BcvTestPending **apOp;
++  int nOp = 0;
++  int ii;
++  sqlite3_int64 iEnd = iOfst + iAmt;
++  unsigned char *aOut = (unsigned char*)pBuf;
++  for(pOp=p->pPending; pOp; pOp=pOp->pNext) nOp++;
++  if( nOp==0 ) return;
++  apOp = (BcvTestPending**)sqlite3_malloc(sizeof(BcvTestPending*)*nOp);
++  if( apOp==0 ) return;
++  for(pOp=p->pPending, ii=nOp-1; pOp; pOp=pOp->pNext, ii--){
++    apOp[ii] = pOp;
++  }
++  /* Apply oldest writes first so a later overlapping write wins. */
++  for(ii=0; ii<nOp; ii++){
++    pOp = apOp[ii];
++    sqlite3_int64 iOpEnd;
++    sqlite3_int64 iStart;
++    sqlite3_int64 nCopy;
++    if( pOp->eType!=BCV_TEST_PENDING_WRITE ) continue;
++    iOpEnd = pOp->iOfst + pOp->nByte;
++    iStart = MAX(iOfst, pOp->iOfst);
++    if( iStart>=MIN(iEnd, iOpEnd) ) continue;
++    nCopy = MIN(iEnd, iOpEnd) - iStart;
++    memcpy(
++      &aOut[iStart-iOfst], &pOp->aData[iStart-pOp->iOfst], (size_t)nCopy
++    );
++  }
++  sqlite3_free(apOp);
++}
++
+ static int bcvTestClose(sqlite3_file *pFile){
+   BcvTestFile *p = (BcvTestFile*)pFile;
+   int rc = SQLITE_OK;
++  if( p->bMetadata || (p->bCache && g.bCacheVolatile) ){
++    /* A normal close is allowed to flush, while _exit()/SIGKILL bypasses
++    ** xClose and therefore drops the pending list. The latter is the
++    ** deterministic power-loss model used by the Tcl regression. */
++    rc = bcvTestFlushPending(p);
++  }
+   if( p->pReal->pMethods ){
+-    rc = p->pReal->pMethods->xClose(p->pReal);
++    int rc2 = p->pReal->pMethods->xClose(p->pReal);
++    if( rc==SQLITE_OK ) rc = rc2;
+     p->pReal->pMethods = 0;
+   }
++  bcvTestPendingFree(p);
++  sqlite3_free(p->zName);
+   return rc;
+ }
+ static int bcvTestRead(
+@@ -2065,10 +6827,18 @@ static int bcvTestRead(
+   sqlite3_int64 iOfst
+ ){
+   BcvTestFile *p = (BcvTestFile*)pFile;
++  int rc;
+   if( bcvIsIoerr() ){
+     return SQLITE_IOERR_READ;
+   }
+-  return p->pReal->pMethods->xRead(p->pReal, pBuf, iAmt, iOfst);
++  if( !p->bMetadata && !(p->bCache && g.bCacheVolatile) ){
++    return p->pReal->pMethods->xRead(p->pReal, pBuf, iAmt, iOfst);
++  }
++  memset(pBuf, 0, (size_t)iAmt);
++  rc = p->pReal->pMethods->xRead(p->pReal, pBuf, iAmt, iOfst);
++  bcvTestOverlayRead(p, pBuf, iAmt, iOfst);
++  if( iOfst+iAmt<=p->nLogical ) rc = SQLITE_OK;
++  return rc;
+ }
+ static int bcvTestWrite(
+   sqlite3_file *pFile, 
+@@ -2077,18 +6847,43 @@ static int bcvTestWrite(
+   sqlite3_int64 iOfst
+ ){
+   BcvTestFile *p = (BcvTestFile*)pFile;
++  if( p->bMetadata || (p->bCache && g.bCacheVolatile) ){
++    return bcvTestPendingWrite(p, pBuf, iAmt, iOfst);
++  }
+   return p->pReal->pMethods->xWrite(p->pReal, pBuf, iAmt, iOfst);
+ }
+ static int bcvTestTruncate(sqlite3_file *pFile, sqlite3_int64 size){
+   BcvTestFile *p = (BcvTestFile*)pFile;
++  if( p->bMetadata || (p->bCache && g.bCacheVolatile) ){
++    return bcvTestPendingTruncate(p, size);
++  }
+   return p->pReal->pMethods->xTruncate(p->pReal, size);
+ }
+ static int bcvTestSync(sqlite3_file *pFile, int flags){
+   BcvTestFile *p = (BcvTestFile*)pFile;
++  int rc;
++  if( p->bMetadata || p->bCache ){
++    if( p->bMetadata || g.bCacheVolatile ){
++      rc = bcvTestFlushPending(p);
++      if( rc==SQLITE_OK ) rc = p->pReal->pMethods->xSync(p->pReal, flags);
++      if( rc==SQLITE_OK ) bcvTestPendingFree(p);
++    }else{
++      rc = p->pReal->pMethods->xSync(p->pReal, flags);
++    }
++    if( rc==SQLITE_OK ){
++      if( p->bCache ) g.nCacheSync++;
++      else g.nMetadataSync++;
++    }
++    return rc;
++  }
+   return p->pReal->pMethods->xSync(p->pReal, flags);
+ }
+ static int bcvTestFileSize(sqlite3_file *pFile, sqlite3_int64 *pSize){
+   BcvTestFile *p = (BcvTestFile*)pFile;
++  if( p->bMetadata || (p->bCache && g.bCacheVolatile) ){
++    *pSize = p->nLogical;
++    return SQLITE_OK;
++  }
+   return p->pReal->pMethods->xFileSize(p->pReal, pSize);
+ }
+ static int bcvTestLock(sqlite3_file *pFile, int eLock){
+@@ -2193,8 +6988,15 @@ static int bcvTestOpen(
+   p->pReal = (sqlite3_file*)&p[1];
+   rc = pVfs2->xOpen(pVfs2, zName, p->pReal, flags, pFlags);
+   if( rc==SQLITE_OK ){
++    p->zName = sqlite3_mprintf("%s", zName ? zName : "");
++    p->bMetadata = bcvTestIsMetadata(zName);
++    p->bCache = bcvTestIsCache(zName);
++    if( p->bMetadata || p->bCache ){
++      rc = p->pReal->pMethods->xFileSize(p->pReal, &p->nLogical);
++    }
+     p->base.pMethods = &bcv_test_methods;
+   }
++  if( rc!=SQLITE_OK ) sqlite3_free(p->zName);
+   return rc;
+ }
+ static int bcvTestDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir){
+@@ -2369,12 +7171,19 @@ const char *bcvtest_init(Tcl_Interp *interp){
      { "bcv_oom_control", test_bcv_oom_control },
      { "bcv_socket_fault_control", test_bcv_socket_fault_control },
      { "sqlite3_bcvfs_create", test_bcvfs_create },
@@ -4532,3 +5013,20 @@ index 184169b..fd8b12e 100644
      { "sqlite3_bcvfs_register_vtab", test_bcvfs_register_vtab },
      { "sqlite3_extended_errcode", test_extended_errcode },
      { "sqlite3_status", test_status },
+ 
+     { "bcv_install_vfs_wrapper", test_bcv_install_vfs_wrapper },
+     { "bcv_ioerr_control", test_bcv_ioerr_control },
++    { "bcv_test_crash_event", test_bcv_crash_event },
++    { "bcv_metadata_sync_count", test_bcv_metadata_sync_count },
++    { "bcv_metadata_sync_reset", test_bcv_metadata_sync_reset },
++    { "bcv_cache_sync_count", test_bcv_cache_sync_count },
++    { "bcv_test_crash_now", test_bcv_crash_now },
++    { "bcv_cache_volatile", test_bcv_cache_volatile },
+     { "vfs_delete", test_vfs_delete },
+ 
+     { "bcv_curl_config_cb", test_bcv_curl_config_cb },
+@@ -2406,4 +7215,3 @@ const char *bcvtest_init(Tcl_Interp *interp){
+ 
+   return 0;
+ }
+-

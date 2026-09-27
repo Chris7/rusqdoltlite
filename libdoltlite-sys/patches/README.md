@@ -45,7 +45,8 @@ and retains CBS's stock behavior.
 
 The blockcache VFS patch series is applied separately to the staged CBS
 sources by `libdoltlite-sys/build.rs`, after the vendored VFS files have been
-copied to `OUT_DIR`. `0013-bounded-staged-cache.patch` gives
+copied to `OUT_DIR`. `0013-streaming-and-serverless.patch` combines the bounded
+staged-cache and serverless-upload-session changes. It gives
 `cachefile.bcv` a block-aligned hard payload-slot limit and reuses those slots
 instead of growing the file or allocating one local payload per evicted block.
 On restart, persisted clean-slot mappings are discarded before the cache file
@@ -82,3 +83,8 @@ defined by the corresponding fault-injection tests; this patch does not claim
 secure erasure or a bound on
 all local disk bytes. Staging metadata and retryable remote objects can grow
 independently of the bounded block-payload file.
+
+The CBS test-only changes live in the separate
+`blockcachevfs-tests/0014-streaming-and-serverless-tests.patch`; the emulator
+runner applies it after the production patch so `build.rs` never stages test
+sources into the library build.
