@@ -1,5 +1,6 @@
 #![cfg(feature = "blockcachevfs")]
 
+use std::ffi::{CStr, CString};
 #[cfg(feature = "remote")]
 use std::fs;
 #[cfg(feature = "remote")]
@@ -14,6 +15,7 @@ use std::path::Path;
 #[cfg(feature = "remote")]
 use std::path::PathBuf;
 use std::process::Command;
+use std::ptr;
 use std::sync::OnceLock;
 #[cfg(feature = "remote")]
 use std::sync::{
@@ -30,11 +32,13 @@ use rusqlite::blockcachevfs::{
     AttachSpec, BlockCacheVfs, Config, SessionAttachment, SessionOperationId, Storage,
     SESSION_OPERATION_ID_BYTES,
 };
+use rusqlite::ffi::{self, blockcachevfs as raw_bcv};
 #[cfg(feature = "remote")]
 use rusqlite::SessionOperationStatus;
 use rusqlite::{params, Connection};
 #[cfg(feature = "remote")]
 use rusqlite::{BlockCacheSessionOptions, RemoteServer, RemoteServerOptions, SessionScope};
+use uuid::Uuid;
 
 fn unique_suffix() -> String {
     format!(
@@ -479,7 +483,6 @@ fn session_operation_id(value: u8) -> SessionOperationId {
     SessionOperationId::new(operation_id).expect("valid emulator operation ID")
 }
 
-#[cfg(feature = "remote")]
 fn session_storage(backend: &str, endpoint: &str, bucket: &str, prefix: &str) -> Storage {
     let container = format!("{bucket}/{prefix}");
     match backend {
@@ -871,7 +874,7 @@ fn reference_adapter_route_selection_is_application_only() {
     );
 }
 
-fn run_bootstrap(backend: &str) {
+fn run_bootstrap(backend: &str) -> (String, String) {
     let suffix = unique_suffix();
     let endpoint = match backend {
         "google" => std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
@@ -986,6 +989,7 @@ fn run_bootstrap(backend: &str) {
     drop(db);
     vfs.detach(&third_alias)
         .expect("detach replacement database");
+    (endpoint, bucket)
 }
 
 fn run_session_ownership() {
@@ -4936,16 +4940,312 @@ fn run_generic_process_flow(backend: &str) {
     }
 }
 
+fn session_chain_sync_main_file(database: &Connection) {
+    let database_name = CString::new("main").expect("database name is NUL-free");
+    let mut file: *mut ffi::sqlite3_file = ptr::null_mut();
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            database.handle(),
+            database_name.as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            (&mut file as *mut *mut ffi::sqlite3_file).cast(),
+        )
+    };
+    assert_eq!(rc, ffi::SQLITE_OK, "obtain the main database VFS file");
+    assert!(!file.is_null(), "main database VFS file pointer is null");
+    let methods = unsafe { &*(*file).pMethods };
+    let x_sync = methods.xSync.expect("VFS implements xSync");
+    let rc = unsafe { x_sync(file, ffi::SQLITE_SYNC_FULL) };
+    assert_eq!(rc, ffi::SQLITE_OK, "VFS xSync failed");
+}
+
+fn session_chain_prepare_database(database: &Connection) {
+    // The seed is created in DELETE rollback-journal mode before upload;
+    // bcvfs rejects journal_mode PRAGMAs, so do not query or change it here.
+    // Keep UPDATE commits from issuing pager-driven xSync callbacks. The test
+    // invokes the main-file xSync explicitly once per intended checkpoint.
+    database
+        .execute_batch("PRAGMA synchronous=OFF;")
+        .expect("disable automatic sync for deterministic checkpoints");
+}
+
+fn session_chain_write_state(database: &Connection, value: i64) {
+    database
+        .execute("UPDATE checkpoint_state SET value = ?1", [value])
+        .expect("update checkpoint test state");
+}
+
+fn session_chain_read_state(database: &Connection) -> i64 {
+    database
+        .query_row("SELECT value FROM checkpoint_state", [], |row| row.get(0))
+        .expect("read checkpoint test state")
+}
+
+fn session_chain_accept(vfs: &'static BlockCacheVfs, alias: &str, session_id: &str) {
+    let vfs_name = CString::new(vfs.name()).expect("VFS name is NUL-free");
+    let native_vfs = unsafe { ffi::sqlite3_vfs_find(vfs_name.as_ptr()) };
+    assert!(
+        !native_vfs.is_null(),
+        "registered VFS must be discoverable by name"
+    );
+    let alias = CString::new(alias).expect("alias is NUL-free");
+    let session_id = CString::new(session_id).expect("session ID is NUL-free");
+    let mut etag = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    let rc = unsafe {
+        raw_bcv::sqlite3_bcvfs_session_accept(
+            native_vfs.cast(),
+            alias.as_ptr(),
+            session_id.as_ptr(),
+            &mut etag,
+            &mut error,
+        )
+    };
+    let message = if error.is_null() {
+        None
+    } else {
+        let message = unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ffi::sqlite3_free(error.cast()) };
+        Some(message)
+    };
+    if !etag.is_null() {
+        unsafe { ffi::sqlite3_free(etag.cast()) };
+    }
+    assert_eq!(rc, ffi::SQLITE_OK, "session acceptance failed: {message:?}");
+}
+
+fn session_chain_finalize(vfs: &'static BlockCacheVfs, alias: &str, session_id: &str) {
+    let vfs_name = CString::new(vfs.name()).expect("VFS name is NUL-free");
+    let native_vfs = unsafe { ffi::sqlite3_vfs_find(vfs_name.as_ptr()) };
+    assert!(
+        !native_vfs.is_null(),
+        "registered VFS must be discoverable by name"
+    );
+    let alias = CString::new(alias).expect("alias is NUL-free");
+    let session_id = CString::new(session_id).expect("session ID is NUL-free");
+    let mut error = ptr::null_mut();
+    let rc = unsafe {
+        raw_bcv::sqlite3_bcvfs_session_finalize(
+            native_vfs.cast(),
+            alias.as_ptr(),
+            session_id.as_ptr(),
+            &mut error,
+        )
+    };
+    let message = if error.is_null() {
+        None
+    } else {
+        let message = unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ffi::sqlite3_free(error.cast()) };
+        Some(message)
+    };
+    assert_eq!(
+        rc,
+        ffi::SQLITE_OK,
+        "session finalization failed: {message:?}"
+    );
+}
+
+fn attach_session_chain_request(
+    vfs: &'static BlockCacheVfs,
+    storage: &Storage,
+    alias: &str,
+    session_id: &str,
+    operation: u8,
+) -> SessionAttachment {
+    let spec = AttachSpec::new(storage.clone()).alias(alias);
+    attach_scoped_for_test(vfs, &spec, session_id, operation)
+        .unwrap_or_else(|error| panic!("attach session operation {operation}: {error:?}"))
+}
+
+fn run_session_checkpoint_chain_limits(backend: &str, endpoint: &str, bucket: &str) {
+    let suffix = unique_suffix();
+    assert!(
+        matches!(backend, "google" | "s3"),
+        "unknown backend {backend}"
+    );
+    let prefix = format!("{suffix}/session-chain");
+    let storage = session_storage(backend, endpoint, bucket, &prefix);
+    let vfs = BlockCacheVfs::builder(shared_cache())
+        .expect("VFS builder")
+        .config(Config::CacheSize(8 * 1024 * 1024))
+        .auth_callback(|provider, _account, _container| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init()
+        .expect("initialize block-cache VFS");
+    vfs.initialize_container(&storage)
+        .expect("initialize remote CBS container");
+
+    let seed_directory = tempfile::tempdir().expect("seed database directory");
+    let seed_path = seed_directory.path().join("seed.sqlite");
+    let seed = Connection::open(&seed_path).expect("create seed SQLite database");
+    seed.execute_batch(
+        "PRAGMA journal_mode=DELETE;
+         CREATE TABLE payload(value TEXT NOT NULL);
+         INSERT INTO payload VALUES ('session-chain');
+         CREATE TABLE checkpoint_state(value INTEGER NOT NULL);
+         INSERT INTO checkpoint_state VALUES (0);",
+    )
+    .expect("seed database");
+    seed.close().expect("close seed database");
+    vfs.create_database(&storage, &seed_path, "session.sqlite")
+        .expect("upload seed database");
+
+    let repeat_session_id = Uuid::new_v4().to_string();
+    let repeat_alias = format!("session-chain-repeat-{}", suffix.replace('-', "_"));
+    let first = attach_session_chain_request(vfs, &storage, &repeat_alias, &repeat_session_id, 1);
+    let database = vfs
+        .open(format!("/{repeat_alias}/session.sqlite"))
+        .expect("open database for 64 real xSync checkpoints");
+    for _ in 0..64 {
+        session_chain_sync_main_file(&database);
+    }
+    drop(database);
+    session_chain_accept(vfs, &repeat_alias, &repeat_session_id);
+    drop(first);
+
+    // The next request first rehydrates an exactly-64-checkpoint accepted
+    // chain, then adds checkpoint 65. A fresh request must rehydrate that
+    // longer chain as well.
+    let second = attach_session_chain_request(vfs, &storage, &repeat_alias, &repeat_session_id, 2);
+    let database = vfs
+        .open(format!("/{repeat_alias}/session.sqlite"))
+        .expect("open database for checkpoint 65");
+    session_chain_sync_main_file(&database);
+    drop(database);
+    session_chain_accept(vfs, &repeat_alias, &repeat_session_id);
+    drop(second);
+    let third = attach_session_chain_request(vfs, &storage, &repeat_alias, &repeat_session_id, 3);
+    drop(third);
+
+    // A separate genesis session crosses the production watermark in one
+    // attachment. Its compacted checkpoint has the all-zero captured
+    // predecessor; a subsequent request must rehydrate it, compact against
+    // that accepted nonzero checkpoint, and publish through new-operation
+    // finalization.
+    let compact_session_id = Uuid::new_v4().to_string();
+    let compact_alias = format!("session-chain-compact-{}", suffix.replace('-', "_"));
+    let first = attach_session_chain_request(vfs, &storage, &compact_alias, &compact_session_id, 1);
+    let database = vfs
+        .open(format!("/{compact_alias}/session.sqlite"))
+        .expect("open database for over-256 xSync checkpoint stress");
+    session_chain_prepare_database(&database);
+    for value in 1..=257 {
+        session_chain_write_state(&database, value);
+        session_chain_sync_main_file(&database);
+    }
+    drop(database);
+    session_chain_accept(vfs, &compact_alias, &compact_session_id);
+    drop(first);
+
+    let second =
+        attach_session_chain_request(vfs, &storage, &compact_alias, &compact_session_id, 2);
+    let database = vfs
+        .open(format!("/{compact_alias}/session.sqlite"))
+        .expect("reattached database after genesis compaction");
+    session_chain_prepare_database(&database);
+    assert_eq!(
+        session_chain_read_state(&database),
+        257,
+        "fresh request must recover the last genesis checkpoint"
+    );
+    session_chain_write_state(&database, 258);
+    session_chain_sync_main_file(&database);
+    drop(database);
+    session_chain_finalize(vfs, &compact_alias, &compact_session_id);
+    drop(second);
+
+    let fresh_cache_root = tempfile::tempdir().expect("fresh read cache directory");
+    let fresh_cache = fresh_cache_root.path().join("cache");
+    std::fs::create_dir(&fresh_cache).expect("create fresh read cache");
+    let status = Command::new(std::env::current_exe().expect("locate emulator test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "session_chain_fresh_cache_child",
+            "--nocapture",
+        ])
+        .env("BCV_SESSION_CHAIN_BACKEND", backend)
+        .env("BCV_SESSION_CHAIN_ENDPOINT", endpoint)
+        .env("BCV_SESSION_CHAIN_BUCKET", bucket)
+        .env("BCV_SESSION_CHAIN_PREFIX", &prefix)
+        .env("BCV_SESSION_CHAIN_CACHE", &fresh_cache)
+        .env(
+            "BCV_SESSION_CHAIN_ALIAS",
+            format!("session-chain-fresh-{suffix}"),
+        )
+        .status()
+        .expect("spawn fresh-cache session reader");
+    assert!(
+        status.success(),
+        "fresh-cache session reader failed: {status}"
+    );
+}
+
+#[test]
+#[ignore = "child phase for session checkpoint chain regression"]
+fn session_chain_fresh_cache_child() {
+    let (Ok(backend), Ok(endpoint), Ok(bucket), Ok(prefix), Ok(cache), Ok(alias)) = (
+        std::env::var("BCV_SESSION_CHAIN_BACKEND"),
+        std::env::var("BCV_SESSION_CHAIN_ENDPOINT"),
+        std::env::var("BCV_SESSION_CHAIN_BUCKET"),
+        std::env::var("BCV_SESSION_CHAIN_PREFIX"),
+        std::env::var("BCV_SESSION_CHAIN_CACHE"),
+        std::env::var("BCV_SESSION_CHAIN_ALIAS"),
+    ) else {
+        return;
+    };
+    let storage = session_storage(&backend, &endpoint, &bucket, &prefix);
+    let vfs = BlockCacheVfs::builder(&cache)
+        .expect("fresh read VFS builder")
+        .auth_callback(|provider, _account, _container| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init()
+        .expect("initialize fresh read VFS");
+    vfs.attach(&AttachSpec::new(storage).alias(&alias))
+        .expect("attach published container through fresh VFS");
+    let database = vfs
+        .open(format!("/{alias}/session.sqlite"))
+        .expect("open database through fresh VFS/cache");
+    assert_eq!(
+        session_chain_read_state(&database),
+        258,
+        "published manifest must expose the finalized state"
+    );
+    let payload: String = database
+        .query_row("SELECT value FROM payload", [], |row| row.get(0))
+        .expect("read original seed row through fresh VFS/cache");
+    assert_eq!(payload, "session-chain");
+    drop(database);
+    vfs.detach(&alias).expect("detach fresh read VFS container");
+}
+
 #[test]
 #[ignore = "requires the pinned local emulator containers"]
 fn google_json_emulator_bootstrap() {
-    run_bootstrap("google");
+    let (endpoint, bucket) = run_bootstrap("google");
+    run_session_checkpoint_chain_limits("google", &endpoint, &bucket);
 }
 
 #[test]
 #[ignore = "requires the pinned local emulator containers"]
 fn s3_emulator_bootstrap() {
-    run_bootstrap("s3");
+    let (endpoint, bucket) = run_bootstrap("s3");
+    run_session_checkpoint_chain_limits("s3", &endpoint, &bucket);
 }
 
 #[test]

@@ -426,7 +426,7 @@ index 06f38da..568e8cd 100644
    memset(pDb->zDName, 0, BCV_DBNAME_SIZE);
    pDb->iDbId = iDbId;
    memcpy(pDb->zDName, zRemote, nRemote);
-@@ -1894,62 +2067,2216 @@ int sqlite3_bcv_download(
+@@ -1894,62 +2067,2211 @@ int sqlite3_bcv_download(
      bcvApiError(p, rc, "");
    }
  
@@ -1088,11 +1088,6 @@ index 06f38da..568e8cd 100644
 +         ? (u64)pRec->nBody!=(u64)nManifest+(u64)nEtag+24+32
 +         : (u64)pRec->nBody!=(u64)nManifest+(u64)nEtag+24)
 +    ) return bcvSessionGcError(pzErr,SQLITE_CORRUPT,"invalid checkpoint body lengths");
-+    if( bCompacted && bcvSessionGcAllZero(&a[24+nEtag+nManifest],32) ){
-+      return bcvSessionGcError(
-+          pzErr,SQLITE_CORRUPT,"compacted checkpoint has no predecessor root"
-+      );
-+    }
 +    if( bCompacted
 +     && memcmp(&a[24+nEtag+nManifest],pRec->aPredecessor,32)!=0
 +    ){
@@ -2685,7 +2680,7 @@ index 06f38da..568e8cd 100644
  struct CollectCtx {
    int rc;
    char *zErr;
-@@ -1959,6 +4286,7 @@ struct CollectCtx {
+@@ -1959,6 +4281,7 @@ struct CollectCtx {
    int nDel;
    int nSeen;                      /* Number of invocations of bcvfsListCb */
    sqlite3_bcv *p;                 /* For logging messages */
@@ -2693,7 +2688,7 @@ index 06f38da..568e8cd 100644
  };
  
  /*
-@@ -1992,6 +4320,7 @@ struct DeleteCtx {
+@@ -1992,6 +4315,7 @@ struct DeleteCtx {
    i64 nProgressDone;
    i64 nProgressTotal;
    sqlite3_bcv *p;                 /* For errors and logging messages */
@@ -2701,7 +2696,7 @@ index 06f38da..568e8cd 100644
  };
  
  /*
-@@ -2080,6 +4409,16 @@ static int bcvfsListCb(void *pArg, int rc, char *zFile){
+@@ -2080,6 +4404,16 @@ static int bcvfsListCb(void *pArg, int rc, char *zFile){
    CollectCtx *pCtx = (CollectCtx*)pArg;
    if( rc==SQLITE_OK ){
      if( zFile ){
@@ -2718,7 +2713,7 @@ index 06f38da..568e8cd 100644
        int nName = NAMEBYTES(pCtx->pMan);
        u8 aBlk[BCV_MAX_NAMEBYTES];
        int eBlock = 0;   /* 0==not a block. 1==block in use. 2==stray block */
-@@ -2110,7 +4449,9 @@ static int bcvfsListCb(void *pArg, int rc, char *zFile){
+@@ -2110,7 +4444,9 @@ static int bcvfsListCb(void *pArg, int rc, char *zFile){
          }
          pWrite = &pCtx->aDel[pCtx->nDel*nGC];
          memcpy(pWrite, aBlk, nName);
@@ -2729,7 +2724,7 @@ index 06f38da..568e8cd 100644
          pCtx->nDel++;
        }
  
-@@ -2147,7 +4488,10 @@ static void bcvfsDeleteOneBlock(DeleteCtx *pCtx){
+@@ -2147,7 +4483,10 @@ static void bcvfsDeleteOneBlock(DeleteCtx *pCtx){
      for(ii=pCtx->iOld; ii<pCtx->nOld; ii++){
        int iOff = ii*pCtx->nGC;
        i64 iTime = (i64)bcvGetU64(&pCtx->aOld[iOff + pCtx->nName]);
@@ -2741,7 +2736,7 @@ index 06f38da..568e8cd 100644
  
        /* Do some debug logging */
        if( pCtx->p->nLogLevel>=BCV_LOGLEVEL_DEBUG ){
-@@ -2188,7 +4532,9 @@ static void bcvCleanupSetTotal(DeleteCtx *pCtx){
+@@ -2188,7 +4527,9 @@ static void bcvCleanupSetTotal(DeleteCtx *pCtx){
      for(ii=0; ii<pCtx->nOld; ii++){
        int iOff = ii*pCtx->nGC;
        i64 iTime = (i64)bcvGetU64(&pCtx->aOld[iOff + pCtx->nName]);
@@ -2752,7 +2747,7 @@ index 06f38da..568e8cd 100644
          pCtx->nProgressTotal++;
        }
      }
-@@ -2204,8 +4550,10 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
+@@ -2204,8 +4545,10 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
  
    CollectCtx ctx1;
    DeleteCtx ctx2;
@@ -2763,7 +2758,7 @@ index 06f38da..568e8cd 100644
    ctx1.p = p;
    ctx2.p = p;
  
-@@ -2221,22 +4569,74 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
+@@ -2221,22 +4564,74 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
  
    bcvExtraLogManifest(p, "Manifest downloaded for cleanup:", ctx1.pMan);
  
@@ -2846,7 +2841,7 @@ index 06f38da..568e8cd 100644
        int nGC = GCENTRYBYTES(ctx1.pMan);
        i64 nNew = ctx1.nDel + ctx1.pMan->nDelBlk;
        u8 *aNew = (u8*)bcvMallocRc(&p->errCode, nNew*nGC);
-@@ -2257,7 +4657,9 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
+@@ -2257,7 +4652,9 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
    }
  
    /* If there are any blocks on the delete list... */
@@ -2857,7 +2852,7 @@ index 06f38da..568e8cd 100644
      int ii = 0;
      ctx2.pDisp = pDisp;
      ctx2.pBcv = pBcv;
-@@ -2266,6 +4668,7 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
+@@ -2266,6 +4663,7 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
      ctx2.nGC = GCENTRYBYTES(ctx1.pMan);
      ctx2.nName = NAMEBYTES(ctx1.pMan);
      ctx2.pMan = ctx1.pMan;
@@ -2865,7 +2860,7 @@ index 06f38da..568e8cd 100644
      ctx2.aNew = (u8*)bcvMallocRc(&p->errCode, ctx2.nGC*ctx2.nOld);
      if( nSecond>0 ){
        ctx2.iDelTime = sqlite_timestamp() - (i64)nSecond * 1000;
-@@ -2300,14 +4703,139 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
+@@ -2300,14 +4698,139 @@ int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond){
      }
    }
  
@@ -3005,7 +3000,7 @@ index 06f38da..568e8cd 100644
  /*
  ** Delete the entire cloud storage container or bucket.
  */
-@@ -2489,6 +5017,8 @@ sqlite3_bcv_request *sqlite3_bcv_job_request(
+@@ -2489,6 +5012,8 @@ sqlite3_bcv_request *sqlite3_bcv_job_request(
      pNew->pApp = pApp;
      pNew->pNext = pJob->pPending;
      pNew->pJob = pJob;
@@ -3014,7 +3009,7 @@ index 06f38da..568e8cd 100644
      pNew->pCurl = curl_easy_init();
      pJob->pPending = pNew;
  
-@@ -2637,13 +5167,23 @@ void sqlite3_bcv_job_result(
+@@ -2637,13 +5162,23 @@ void sqlite3_bcv_job_result(
  
  void sqlite3_bcv_job_etag(sqlite3_bcv_job *p, const char *zETag){
    sqlite3_free(p->zETag);
@@ -3040,7 +3035,7 @@ index 06f38da..568e8cd 100644
  }
  
  /*
-@@ -2998,6 +5538,18 @@ void bcvDispatchFree(BcvDispatch *p){
+@@ -2998,6 +5533,18 @@ void bcvDispatchFree(BcvDispatch *p){
    }
  }
  
@@ -3059,7 +3054,7 @@ index 06f38da..568e8cd 100644
  static size_t bcvWriteFunction(
    char *pData, 
    size_t nSize, 
-@@ -3005,9 +5557,20 @@ static size_t bcvWriteFunction(
+@@ -3005,9 +5552,20 @@ static size_t bcvWriteFunction(
    void *pCtx
  ){
    BcvDispatchReq *pReq = (BcvDispatchReq*)pCtx;
@@ -3082,7 +3077,7 @@ index 06f38da..568e8cd 100644
  }
  
  static size_t bcvHeaderFunction(
-@@ -3017,7 +5580,19 @@ static size_t bcvHeaderFunction(
+@@ -3017,7 +5575,19 @@ static size_t bcvHeaderFunction(
    void *pCtx
  ){
    BcvDispatchReq *pReq = (BcvDispatchReq*)pCtx;
@@ -3103,7 +3098,7 @@ index 06f38da..568e8cd 100644
    char *pHdr = pData;
    int nHdr = nData;
  
-@@ -3037,7 +5612,7 @@ static size_t bcvHeaderFunction(
+@@ -3037,7 +5607,7 @@ static size_t bcvHeaderFunction(
      bcvBufferAppendRc(&pReq->rc, &pReq->hdr, "", 1);
    }
  
@@ -3112,7 +3107,7 @@ index 06f38da..568e8cd 100644
  }
  
  /*
-@@ -3398,6 +5973,7 @@ static void bcvDispatchRetryRequest(BcvDispatchReq *pReq, int iDelay){
+@@ -3398,6 +5968,7 @@ static void bcvDispatchRetryRequest(BcvDispatchReq *pReq, int iDelay){
    pReq->rc = 0;
    pReq->code = 0;
    pReq->iBody = 0;
@@ -3120,7 +3115,7 @@ index 06f38da..568e8cd 100644
    pReq->iRetryTime = iDelay ? (sqlite_timestamp() + iDelay) : 0;
    pReq->pNext = pReq->pJob->pPending;
    pReq->pJob->pPending = pReq;
-@@ -3534,6 +6110,8 @@ static BcvDispatchJob *bcvDispatchNewJob(
+@@ -3534,6 +6105,8 @@ static BcvDispatchJob *bcvDispatchNewJob(
    if( pJob ){
      pJob->pDispatch = p;
      pJob->eType = eType;
@@ -3129,7 +3124,7 @@ index 06f38da..568e8cd 100644
      pJob->pCbApp = pApp;
      pJob->pNext = p->pJobList;
      pJob->pCont = pCont;
-@@ -3567,19 +6145,24 @@ int bcvDispatchClientId(BcvDispatch *p, const char *z){
+@@ -3567,19 +6140,24 @@ int bcvDispatchClientId(BcvDispatch *p, const char *z){
    return SQLITE_OK;
  }
  
@@ -3155,7 +3150,7 @@ index 06f38da..568e8cd 100644
      int flags = 0;
      const void *pData = 0;
      int nData = 0;
-@@ -3604,6 +6187,41 @@ int bcvDispatchFetch(
+@@ -3604,6 +6182,41 @@ int bcvDispatchFetch(
    return rc;
  }
  
@@ -3197,7 +3192,7 @@ index 06f38da..568e8cd 100644
  int bcvDispatchDelete(
    BcvDispatch *p,
    BcvContainer *pCont,
-@@ -3623,18 +6241,23 @@ int bcvDispatchDelete(
+@@ -3623,18 +6236,23 @@ int bcvDispatchDelete(
  }
  
  
@@ -3222,7 +3217,7 @@ index 06f38da..568e8cd 100644
      if( p->xLog && sqlite3_stricmp(zFile, BCV_MANIFEST_FILE)==0 ){
        pJob->bLogEtag = 1;
      }
-@@ -3645,6 +6268,51 @@ int bcvDispatchPut(
+@@ -3645,6 +6263,51 @@ int bcvDispatchPut(
    return rc;
  }
  
@@ -4358,7 +4353,7 @@ index 38f8e20..61cd8e0 100644
            memcpy(pTo->zDName, zTo, bcvStrlen(zTo));
            pTo->iVersion = 1;
            pTo->aBlkLocal = pTo->aBlkOrig = aBlkOrig;
-@@ -9548,3 +10150,6455 @@ int sqlite3_bcvfs_register_vtab(sqlite3 *db){
+@@ -9548,3 +10150,6466 @@ int sqlite3_bcvfs_register_vtab(sqlite3 *db){
    }
    return rc;
  }
@@ -4401,22 +4396,29 @@ index 38f8e20..61cd8e0 100644
 +  'B','C','V','S','R','0','1','\0'
 +};
 +
-+/* Once the accepted session sequence reaches this bound, new request
-+** checkpoints are self-contained snapshots.  Test builds may lower the
-+** bound, but production keeps the immutable metadata bounded by the normal
-+** session-record size limit. */
++/* Compact before adding a checkpoint would exceed the reader's chain bound.
++** Test builds may lower the write threshold without changing record decoding.
++** Use the current sequence, including unaccepted xSync checkpoints, so one
++** attachment cannot create an unreadable chain. */
++#define BCV_SESSION_REHYDRATE_MAX_CHAIN 256
 +#ifndef BCV_SESSION_COMPACTION_THRESHOLD
 +# ifdef SQLITE_BCVFS_TESTING
 +#  define BCV_SESSION_COMPACTION_THRESHOLD 4
 +# else
-+#  define BCV_SESSION_COMPACTION_THRESHOLD 1024
++#  define BCV_SESSION_COMPACTION_THRESHOLD 256
 +# endif
++#endif
++#if BCV_SESSION_COMPACTION_THRESHOLD < 1 \
++ || BCV_SESSION_COMPACTION_THRESHOLD > BCV_SESSION_REHYDRATE_MAX_CHAIN
++# error "session compaction threshold must fit the reader chain bound"
 +#endif
 +
 +/* A HEAD retains only the tail since its most recent immutable history
 +** segment.  The segment itself contains the same bounded number of IDs and
-+** points at the previous segment by record hash. */
-+#define BCV_SESSION_MAX_HISTORY_OPERATIONS BCV_SESSION_COMPACTION_THRESHOLD
++** points at the previous segment by record hash. Keep the decode bound
++** independent of write compaction so existing 1024-operation records remain
++** readable. */
++#define BCV_SESSION_MAX_HISTORY_OPERATIONS 1024
 +
 +static void bcvSessionPutU16(unsigned char *a, unsigned int v){
 +  a[0] = (unsigned char)((v>>8)&0xFF);
@@ -5169,11 +5171,7 @@ index 38f8e20..61cd8e0 100644
 +    pBody->nManifest = (int)nManifest;
 +    if( bCompacted ){
 +      const unsigned char *aBase = &aBody[24+nEtag+nManifest];
-+      if( bcvSessionAllZero(aBase,SQLITE_BCVFS_SESSION_HASH_BYTES) ){
-+        return bcvSessionError(
-+            SQLITE_CORRUPT,pzErr,"compacted checkpoint has no predecessor root"
-+        );
-+      }
++      /* An all-zero base is the captured predecessor of a genesis request. */
 +      memcpy(pBody->aBaseCheckpointHash,aBase,SQLITE_BCVFS_SESSION_HASH_BYTES);
 +    }
 +    return bcvSessionValidEtagBytes(
@@ -6485,17 +6483,8 @@ index 38f8e20..61cd8e0 100644
 +  int rc;
 +  *paBody = 0;
 +  *pnBody = 0;
-+  bCompacted = pCont->iSessionExpectedSequence
-+      >= (sqlite3_uint64)BCV_SESSION_COMPACTION_THRESHOLD
-+      && pCont->iSessionSequence==pCont->iSessionExpectedSequence;
-+  if( bCompacted && bcvSessionAllZero(
-+      pCont->aSessionExpectedCheckpointHash,
-+      SQLITE_BCVFS_SESSION_HASH_BYTES
-+  ) ){
-+    return bcvSessionError(
-+        SQLITE_CORRUPT,pzErr,"compacted checkpoint has no accepted predecessor"
-+    );
-+  }
++  bCompacted = pCont->iSessionSequence
++      >= (sqlite3_uint64)(BCV_SESSION_COMPACTION_THRESHOLD-1);
 +  rc = bcvManifestDup(pCont->pMan,&pMan);
 +  if( rc!=SQLITE_OK ) return bcvSessionError(rc,pzErr,"could not duplicate session manifest");
 +  for(iDb=0; rc==SQLITE_OK && iDb<pMan->nDb; iDb++){
@@ -6784,14 +6773,15 @@ index 38f8e20..61cd8e0 100644
 +            pCont->zSessionOperations,record.aScopeHash,pzErr
 +        );
 +        if( rc==SQLITE_OK ) rc = rc2;
-+        if( pCont->iSessionExpectedSequence
-+               >= (sqlite3_uint64)BCV_SESSION_COMPACTION_THRESHOLD
-+         && pCont->iSessionSequence==pCont->iSessionExpectedSequence
++        if( pCont->iSessionSequence
++               >= (sqlite3_uint64)(BCV_SESSION_COMPACTION_THRESHOLD-1)
 +        ){
 +          /* The compacted body carries a complete snapshot. Keep one
 +          ** authenticated link to the predecessor checkpoint as well: the
 +          ** direct finalizer uses this header fence, while rehydration stops
-+          ** at the compacted body instead of walking the old chain. */
++          ** at the compacted body instead of walking the old chain. This is
++          ** the captured accepted predecessor, including zero for genesis,
++          ** even after multiple checkpoints within the same attachment. */
 +          memcpy(record.aPredecessorHash,
 +              pCont->aSessionExpectedCheckpointHash,
 +              sizeof(record.aPredecessorHash));
@@ -6944,8 +6934,6 @@ index 38f8e20..61cd8e0 100644
 + ** object store is the authority for that state; cachefile.bcv and blocksdb
 + ** are only scratch space and are deliberately discarded here.
 + */
-+ #define BCV_SESSION_REHYDRATE_MAX_CHAIN 64
-+
 + static int bcvfsSessionCopyEtag(
 +   const unsigned char *aEtag,
 +   int nEtag,
@@ -9352,6 +9340,7 @@ index 38f8e20..61cd8e0 100644
 +  unsigned char *aEncoded = 0;
 +  unsigned char aExpectedHeadHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
 +  unsigned char aCheckpointPredecessorHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++  unsigned char aAcceptedCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
 +  unsigned char aOperationId[SQLITE_BCVFS_SESSION_HASH_BYTES];
 +  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
 +  unsigned char aCheckpointHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
@@ -9374,6 +9363,7 @@ index 38f8e20..61cd8e0 100644
 +  if( pzErr ) *pzErr = 0;
 +  memset(aExpectedHeadHash,0,sizeof(aExpectedHeadHash));
 +  memset(aCheckpointPredecessorHash,0,sizeof(aCheckpointPredecessorHash));
++  memset(aAcceptedCheckpointHash,0,sizeof(aAcceptedCheckpointHash));
 +  memset(aOperationId,0,sizeof(aOperationId));
 +  memset(aScope,0,sizeof(aScope));
 +  memset(aCheckpointHash,0,sizeof(aCheckpointHash));
@@ -9423,6 +9413,8 @@ index 38f8e20..61cd8e0 100644
 +        iCheckpointExpectedSequence = pCont->iSessionSequence;
 +        memcpy(aCheckpointPredecessorHash,pCont->aSessionPredecessorHash,
 +            sizeof(aCheckpointPredecessorHash));
++        memcpy(aAcceptedCheckpointHash,pCont->aSessionExpectedCheckpointHash,
++            sizeof(aAcceptedCheckpointHash));
 +        memcpy(aExpectedHeadHash,pCont->aSessionExpectedHeadHash,
 +            sizeof(aExpectedHeadHash));
 +        memcpy(aOperationId,pCont->aSessionOperationId,
@@ -9547,8 +9539,6 @@ index 38f8e20..61cd8e0 100644
 +   || checkpoint.eState!=SQLITE_BCVFS_SESSION_OPEN
 +   || checkpoint.eOutcome!=SQLITE_BCVFS_SESSION_OUTCOME_NONE
 +   || checkpoint.iSequence!=iCheckpointExpectedSequence+1
-+   || memcmp(checkpoint.aPredecessorHash,aCheckpointPredecessorHash,
-+       sizeof(aCheckpointPredecessorHash))!=0
 +   || memcmp(checkpoint.aOperationId,aOperationId,sizeof(aOperationId))!=0
 +  ){
 +    rc = bcvSessionError(SQLITE_CONSTRAINT,pzErr,
@@ -9560,6 +9550,22 @@ index 38f8e20..61cd8e0 100644
 +      checkpoint.aBody,checkpoint.nBody,&checkpointBody,pzErr
 +  );
 +  if( rc!=SQLITE_OK ) goto session_finalize_done;
++  /* An ordinary checkpoint extends the immediate local predecessor. A
++  ** compacted snapshot skips that local chain and must fence the accepted
++  ** predecessor captured under the mutex, including zero at genesis. */
++  if( checkpointBody.bCompacted
++      ? (memcmp(checkpoint.aPredecessorHash,
++             checkpointBody.aBaseCheckpointHash,
++             sizeof(aAcceptedCheckpointHash))!=0
++         || memcmp(checkpointBody.aBaseCheckpointHash,aAcceptedCheckpointHash,
++             sizeof(aAcceptedCheckpointHash))!=0)
++      : memcmp(checkpoint.aPredecessorHash,aCheckpointPredecessorHash,
++             sizeof(aCheckpointPredecessorHash))!=0
++  ){
++    rc = bcvSessionError(SQLITE_CONSTRAINT,pzErr,
++        "session checkpoint does not match its current predecessor");
++    goto session_finalize_done;
++  }
 +  if( checkpointBody.nBaseManifestETag<=0
 +   || checkpointBody.nManifest<=0
 +  ){
