@@ -5194,16 +5194,16 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
        }
        if( pCont ){
          bcvfsLeaveState(pFs, pCont);
-@@ -3253,6 +4496,29 @@ static int bcvfsOpenProxy(
+@@ -3253,6 +4496,62 @@ static int bcvfsOpenProxy(
    return rc;
  }
  
-+/* Session-owned aliases may expose only the database selected by the
-+** authorized request context and its DoltLite lock marker. SQLite WAL and
-+** journal sidecars are not used by scoped databases. */
++/* Session-owned aliases may expose only the selected database, its DoltLite
++** lock marker, and the exact local WAL sidecar identified by SQLite flags. */
 +static int bcvfsSessionDatabasePathAllowed(
 +  Container *pCont,
-+  const char *zDatabase
++  const char *zDatabase,
++  int flags
 +){
 +  const char *zTarget;
 +  int nTarget;
@@ -5218,6 +5218,39 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
 +   && 0==memcmp(&zDatabase[1],zTarget,nTarget)
 +   && 0==memcmp(&zDatabase[nDb-5],"-lock",5)
 +  ) return 1;
++  /* SQLite uses a separately opened, local WAL sidecar for a database in
++  ** WAL mode. Stock bcvfs resolves that sidecar to its main ManifestDb by
++  ** stripping the final four characters, while its IO stays in the local
++  ** cache. Only the WAL-open flags authorize that exact target alias; a
++  ** MAIN_DB open of a remote database literally named target-wal remains
++  ** outside this session's scope. */
++  if( !(flags & SQLITE_OPEN_MAIN_DB)
++   && (flags & SQLITE_OPEN_WAL)
++   && nDb==nTarget+4
++   && 0==memcmp(&zDatabase[nTarget],"-wal",4)
++  ) return 1;
++  return 0;
++}
++
++/* SQLite checks these local sidecar names before opening a scoped database.
++** Report the probes absent; never look up a remote manifest entry. */
++static int bcvfsSessionSidecarProbe(Container *pCont, const char *zDatabase){
++  static const char *const azSuffix[] = { "-journal", "-wal" };
++  const char *zTarget;
++  int nTarget;
++  int ii;
++  if( pCont==0 || pCont->zSessionId==0 || zDatabase==0
++   || pCont->zSessionDatabase==0
++  ) return 0;
++  zTarget = pCont->zSessionDatabase;
++  nTarget = (int)strlen(zTarget);
++  for(ii=0; ii<(int)(sizeof(azSuffix)/sizeof(azSuffix[0])); ii++){
++    int nSuffix = (int)strlen(azSuffix[ii]);
++    if( (int)strlen(zDatabase)==nTarget+nSuffix
++     && 0==memcmp(zDatabase,zTarget,nTarget)
++     && 0==memcmp(&zDatabase[nTarget],azSuffix[ii],nSuffix)
++    ) return 1;
++  }
 +  return 0;
 +}
 +
@@ -5239,7 +5272,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
 -              ManifestDb *pDb;
 +              ManifestDb *pDb = 0;
                int bIsLock = 0;
-+              if( !bcvfsSessionDatabasePathAllowed(pCont,pPath->zDatabase) ){
++              if( !bcvfsSessionDatabasePathAllowed(pCont,pPath->zDatabase,flags) ){
 +                rc = SQLITE_AUTH;
 +              }
                if( nDb>6
@@ -5263,7 +5296,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
                  pRet->iFileDbId = pDb->iDbId;
                }
              }
-@@ -3465,18 +4739,29 @@ static int bcvfsAccess(
+@@ -3465,18 +4739,31 @@ static int bcvfsAccess(
        if( pPath->zContainer ){
          pCont = bcvfsFindContAlias(&pFs->c, pPath->zContainer, 0);
          if( pCont ){
@@ -5281,9 +5314,11 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
 +            *pResOut = 1;
 +          }
 +          if( rc==SQLITE_OK && pPath->zDatabase ){
-+            if( !bcvfsSessionDatabasePathAllowed(pCont,pPath->zDatabase) ){
++            if( !bcvfsSessionDatabasePathAllowed(pCont,pPath->zDatabase,0) ){
 +              *pResOut = 0;
-+              rc = SQLITE_AUTH;
++              if( !bcvfsSessionSidecarProbe(pCont,pPath->zDatabase) ){
++                rc = SQLITE_AUTH;
++              }
 +            }else{
 +              ManifestDb *pDb = bcvfsFindDatabase(
 +                  pCont->pMan, pPath->zDatabase, -1
@@ -5300,7 +5335,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    }
    sqlite3_free(pPath);
  
-@@ -3587,7 +4872,8 @@ Container *bcvContainerAlloc(
+@@ -3587,7 +4907,8 @@ Container *bcvContainerAlloc(
    const char *zStorage,
    const char *zAccount,
    const char *zContainer,
@@ -5310,7 +5345,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
  ){
    int nByte = sizeof(Container);;
    int nDir = strlen(p->zDir);
-@@ -3596,6 +4882,7 @@ Container *bcvContainerAlloc(
+@@ -3596,6 +4917,7 @@ Container *bcvContainerAlloc(
    nByte += strlen(zAccount) + 1;
    nByte += strlen(zContainer) + 1;
    nByte += strlen(zAlias) + 1;
@@ -5318,7 +5353,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    nByte += nDir + 1 + strlen(zAlias)*3 + 1;
  
    pCont = (Container*)bcvMallocRc(pRc, nByte);
-@@ -3605,6 +4892,8 @@ Container *bcvContainerAlloc(
+@@ -3605,6 +4927,8 @@ Container *bcvContainerAlloc(
      pCont->zStorage = bcvfsStoreString(&pCsr, zStorage);
      pCont->zAccount = bcvfsStoreString(&pCsr, zAccount);
      pCont->zContainer = bcvfsStoreString(&pCsr, zContainer);
@@ -5327,7 +5362,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
      pCont->zLocalDir = pCsr;
      memcpy(pCsr, p->zDir, nDir);
      pCsr[nDir] = BCV_PATH_SEPARATOR[0];
-@@ -3629,6 +4918,179 @@ static void bcvfsFinalize(int *pRc, sqlite3_stmt *p){
+@@ -3629,6 +4953,179 @@ static void bcvfsFinalize(int *pRc, sqlite3_stmt *p){
    }
  }
  
@@ -5507,7 +5542,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
  /*
  ** Usage:
  **
-@@ -3680,7 +5142,9 @@ static int no_blocks_leaked(BcvCommon *p){
+@@ -3680,7 +5177,9 @@ static int no_blocks_leaked(BcvCommon *p){
  */
  int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
    int rc = SQLITE_OK;
@@ -5518,7 +5553,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    const char *zSql2 = "SELECT * FROM block ORDER BY cachefilepos";
    const char *zSql4 = 
      "WITH ss(i) AS ("
-@@ -3694,11 +5158,40 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
+@@ -3694,11 +5193,40 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
  
    p->bdb = db;
    p->zDir = zFullDir;
@@ -5559,7 +5594,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
  
    /* Remove any entries that are not either cloud blocks or dirty blocks */
    bcvExecPrintf(&rc, p->bdb,
-@@ -3715,10 +5208,13 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
+@@ -3715,10 +5243,13 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
      const u8 *aMan = sqlite3_column_blob(p1, 4);
      int nMan = sqlite3_column_bytes(p1, 4);
      const char *zETag = (const char*)sqlite3_column_text(p1, 5);
@@ -5574,7 +5609,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
      if( pCont==0 ) break;
      pCont->pNext = p->pCList;
      p->pCList = pCont;
-@@ -3729,6 +5225,9 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
+@@ -3729,6 +5260,9 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
    bcvfsFinalize(&rc, p1);
    if( rc==SQLITE_OK && p->pCList ){
      p->szBlk = p->pCList->pMan->szBlk;
@@ -5584,7 +5619,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    }
  
    /* Load the contents of the "block" table into memory */
-@@ -3764,6 +5263,9 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
+@@ -3764,6 +5298,9 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
          }else{
            pNew->bValid = 1;
            pNew->bDirty = 1;
@@ -5594,7 +5629,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
            pNew->nName = NAMEBYTES(pCont->pMan);
            sqlite3_randomness(pNew->nName, pNew->aName);
            bcvfsManifestWrite(pManDb, iDbPos, pNew->aName, pNew->nName);
-@@ -3789,6 +5291,126 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
+@@ -3789,6 +5326,126 @@ int bcvfsCacheInit(BcvCommon *p, sqlite3 *db, char *zFullDir){
      }
    }
    bcvfsFinalize(&rc, p4);
@@ -5721,7 +5756,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    assert( no_blocks_leaked(p) );
    return rc;
  }
-@@ -3818,9 +5440,9 @@ sqlite3 *bcvOpenAndInitDb(int *pRc, const char *zDir, char **pzErr){
+@@ -3818,9 +5475,9 @@ sqlite3 *bcvOpenAndInitDb(int *pRc, const char *zDir, char **pzErr){
        rc = sqlite3_open_v2(zBlocksDb, &db, f, 0);
        sqlite3_free(zBlocksDb);
        if( rc==SQLITE_OK ){
@@ -5733,7 +5768,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
              "BEGIN EXCLUSIVE;"
              BCV_DATABASE_SCHEMA
              "COMMIT;", 0, 0, pzErr
-@@ -3981,6 +5603,7 @@ int sqlite3_bcvfs_create(
+@@ -3981,6 +5638,7 @@ int sqlite3_bcvfs_create(
    rc = sqlite3_initialize();
    pFs = (sqlite3_bcvfs*)bcvMallocRc(&rc, sizeof(sqlite3_bcvfs));
    if( rc!=SQLITE_OK ) return rc;
@@ -5741,7 +5776,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    pFs->zName = bcvStrdupRc(&rc, zName);
    memcpy(&pFs->base, &bcv_template, sizeof(bcv_template));
    pFs->base.zName = pFs->zName;
-@@ -4077,7 +5700,31 @@ int sqlite3_bcvfs_config(sqlite3_bcvfs *pFs, int op, sqlite3_int64 iVal){
+@@ -4077,7 +5735,31 @@ int sqlite3_bcvfs_config(sqlite3_bcvfs *pFs, int op, sqlite3_int64 iVal){
      ENTER_VFS_MUTEX; {
        switch( op ){
          case SQLITE_BCV_CACHESIZE:
@@ -5774,7 +5809,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
            break;
          case SQLITE_BCV_NREQUEST:
            pFs->nRequest = iVal;
-@@ -4116,6 +5763,10 @@ void bcvContainerFree(Container *pCont){
+@@ -4116,6 +5798,10 @@ void bcvContainerFree(Container *pCont){
      bcvManifestDeref(pCont->pMan);
      sqlite3_free(pCont->aBcv);
      bcvIntEncryptionKeyFree(pCont->pKey);
@@ -5785,7 +5820,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
      sqlite3_free(pCont);
    }
  }
-@@ -4144,8 +5795,17 @@ int bcvContainerDetachAndFree(BcvCommon *p, Container *pCont){
+@@ -4144,8 +5830,17 @@ int bcvContainerDetachAndFree(BcvCommon *p, Container *pCont){
    int rc = SQLITE_OK;
    bcvExecPrintf(&rc, p->bdb,
        "DELETE FROM container WHERE name=%Q;"
@@ -5804,7 +5839,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    );
    if( rc==SQLITE_OK ){
      Container **pp;
-@@ -4166,6 +5826,24 @@ void bcvCommonDestroy(BcvCommon *p){
+@@ -4166,6 +5861,24 @@ void bcvCommonDestroy(BcvCommon *p){
    assert( no_blocks_leaked(p) );
    sqlite3_finalize(p->pInsertBlock);
    sqlite3_finalize(p->pInsertCont);
@@ -5829,7 +5864,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    rc = sqlite3_close(p->bdb);
    assert( rc==SQLITE_OK );
  
-@@ -4201,9 +5879,13 @@ int sqlite3_bcvfs_destroy(sqlite3_bcvfs *pFs){
+@@ -4201,9 +5914,13 @@ int sqlite3_bcvfs_destroy(sqlite3_bcvfs *pFs){
    int rc = SQLITE_OK;
    if( pFs ){
      ENTER_VFS_MUTEX; {
@@ -5843,7 +5878,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
      }; LEAVE_VFS_MUTEX;
      if( rc==SQLITE_OK ){
        sqlite3_vfs_unregister(&pFs->base);
-@@ -4253,6 +5935,20 @@ int sqlite3_bcvfs_auth_callback(
+@@ -4253,6 +5970,20 @@ int sqlite3_bcvfs_auth_callback(
    return SQLITE_OK;
  }
  
@@ -5864,7 +5899,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
  /*
  ** Attach a new container to the VFS.
  **
-@@ -4281,10 +5977,13 @@ static int bcvfsAttach(
+@@ -4281,10 +6012,13 @@ static int bcvfsAttach(
    const char *zAccount,
    const char *zContainer,
    const char *zAliasArg,
@@ -5878,7 +5913,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    char *zErr = 0;
    const char *zAlias = zAliasArg ? zAliasArg : zContainer;
    BcvDispatch *pDisp = 0;
-@@ -4296,7 +5995,7 @@ static int bcvfsAttach(
+@@ -4296,7 +6030,7 @@ static int bcvfsAttach(
    ** cloud container. But do not link the new container into the main
    ** list yet.  */
    pCont = bcvContainerAlloc(
@@ -5887,7 +5922,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    );
    if( rc==SQLITE_OK ){
      ENTER_VFS_MUTEX; {
-@@ -4316,30 +6015,57 @@ static int bcvfsAttach(
+@@ -4316,30 +6050,57 @@ static int bcvfsAttach(
      if( rc==SQLITE_OK ){
        Container *pExisting = bcvfsFindContAlias(p, zAlias, 0);
        if( pExisting ){
@@ -5951,7 +5986,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    if( pCont && rc!=SQLITE_OK ){
      bcvContainerFree(pCont);
      bcvManifestDeref(pMan);
-@@ -4349,7 +6075,9 @@ static int bcvfsAttach(
+@@ -4349,7 +6110,9 @@ static int bcvfsAttach(
    }else{
      sqlite3_free(zErr);
    }
@@ -5962,7 +5997,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
      rc = SQLITE_OK;
    }
    return rc;
-@@ -4444,7 +6172,9 @@ int sqlite3_bcvfs_attach(
+@@ -4444,7 +6207,9 @@ int sqlite3_bcvfs_attach(
    if( pFs->zPortnumber ){
      rc = proxyAttach(pFs, zStorage, zAccount, zCont, zAlias, flags, &zErr);
    }else{
@@ -5973,7 +6008,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    }
  
    if( pzErr ){
-@@ -4455,7 +6185,126 @@ int sqlite3_bcvfs_attach(
+@@ -4455,7 +6220,126 @@ int sqlite3_bcvfs_attach(
    return rc;
  }
  
@@ -6101,7 +6136,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    BcvCommon *p = &pFs->c;
    int rc = SQLITE_OK;
  
-@@ -4463,6 +6312,16 @@ static int bcvfsDetach(sqlite3_bcvfs *pFs, const char *zAlias, char **pzErr){
+@@ -4463,6 +6347,16 @@ static int bcvfsDetach(sqlite3_bcvfs *pFs, const char *zAlias, char **pzErr){
      Container *pCont = bcvfsFindContAlias(p, zAlias, pzErr);
      if( pCont==0 ){
        rc = SQLITE_ERROR;
@@ -6118,7 +6153,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
      }else{
        if( pCont->nClient>0 ){
          rc = SQLITE_BUSY;
-@@ -4472,7 +6331,9 @@ static int bcvfsDetach(sqlite3_bcvfs *pFs, const char *zAlias, char **pzErr){
+@@ -4472,7 +6366,9 @@ static int bcvfsDetach(sqlite3_bcvfs *pFs, const char *zAlias, char **pzErr){
  
          /* Check for dirty blocks in the cache */
          sqlite3_stmt *pStmt = bcvfsPrepare(&rc, p,
@@ -6129,7 +6164,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
          );
          if( rc==SQLITE_OK ){
            sqlite3_bind_text(pStmt, 1, pCont->zName, -1, SQLITE_STATIC);
-@@ -4496,12 +6357,17 @@ static int bcvfsDetach(sqlite3_bcvfs *pFs, const char *zAlias, char **pzErr){
+@@ -4496,12 +6392,17 @@ static int bcvfsDetach(sqlite3_bcvfs *pFs, const char *zAlias, char **pzErr){
            }
          }
  
@@ -6149,7 +6184,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
            rc = bcvContainerDetachAndFree(p, pCont);
          }
        }
-@@ -4519,7 +6385,7 @@ int sqlite3_bcvfs_detach(sqlite3_bcvfs *pFs, const char *zAlias, char **pzErr){
+@@ -4519,7 +6420,7 @@ int sqlite3_bcvfs_detach(sqlite3_bcvfs *pFs, const char *zAlias, char **pzErr){
    if( pFs->zPortnumber ){
      return proxyDetach(pFs, zAlias, pzErr);
    }else{
@@ -6158,7 +6193,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    }
  }
  
-@@ -4658,6 +6524,7 @@ struct UploadBlockCtx {
+@@ -4658,6 +6559,7 @@ struct UploadBlockCtx {
  
  struct UploadCtx2 {
    sqlite3_bcvfs *pFs;
@@ -6166,7 +6201,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    sqlite3_file *pCacheFile;
    BcvContainer *pBcv;
    BcvDispatch *pDisp;
-@@ -4671,6 +6538,7 @@ struct UploadCtx2 {
+@@ -4671,6 +6573,7 @@ struct UploadCtx2 {
    int iDb;                        /* Current entry in aDb */
    int iBlk;                       /* Last block in aDb[iDb].pDb uploaded */
    ManifestHash *pMHash;           /* Hash of blocks except aDb[iDb].pDb */
@@ -6174,7 +6209,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
  
    int rc;                         /* Error code */
    char *zErrMsg;                  /* Error message */
-@@ -4695,6 +6563,7 @@ static void bcvfsUploadBlockDone(void *pArg, int rc, char *zETag){
+@@ -4695,6 +6598,7 @@ static void bcvfsUploadBlockDone(void *pArg, int rc, char *zETag){
  static void bcvfsUploadRecordAdd(
    int *pRc, 
    UploadCtx2 *pCtx, 
@@ -6182,7 +6217,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    const u8 *aOld,
    const u8 *aNew,
    int nName
-@@ -4704,6 +6573,7 @@ static void bcvfsUploadRecordAdd(
+@@ -4704,6 +6608,7 @@ static void bcvfsUploadRecordAdd(
    if( pNew ){
      pNew->aOldName = (u8*)&pNew[1];
      pNew->aNewName = &pNew->aOldName[nName];
@@ -6190,7 +6225,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
      memcpy(pNew->aOldName, aOld, nName);
      memcpy(pNew->aNewName, aNew, nName);
      pNew->pNext = pCtx->pRecord;
-@@ -4741,21 +6611,169 @@ static void bcvfsUploadDeleteBlockIf(UploadCtx2 *pCtx, int iBlk){
+@@ -4741,21 +6646,169 @@ static void bcvfsUploadDeleteBlockIf(UploadCtx2 *pCtx, int iBlk){
    }
  }
  
@@ -6373,7 +6408,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
  
    /* Find the next block to upload */
    if( rc==SQLITE_OK ){
-@@ -4782,14 +6800,79 @@ static void bcvfsUploadOneBlockTry(UploadCtx2 *pCtx, int *pbRetry){
+@@ -4782,14 +6835,79 @@ static void bcvfsUploadOneBlockTry(UploadCtx2 *pCtx, int *pbRetry){
  
    if( pDb && rc==SQLITE_OK ){
      CacheEntry *pEntry;
@@ -6454,7 +6489,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
  
      p = (UploadBlockCtx*)bcvMallocRc(&rc, sizeof(UploadBlockCtx) + nBuf);
      if( p ){
-@@ -4808,8 +6891,14 @@ static void bcvfsUploadOneBlockTry(UploadCtx2 *pCtx, int *pbRetry){
+@@ -4808,8 +6926,14 @@ static void bcvfsUploadOneBlockTry(UploadCtx2 *pCtx, int *pbRetry){
            *pbRetry = bSkip = 1;
          }
        }
@@ -6471,7 +6506,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
        if( rc==SQLITE_OK && bSkip==0 ){
          char zFile[BCV_MAX_FSNAMEBYTES];
          bcvBlockidToText(NAMEBYTES(pCtx->pMan), aNew, zFile);
-@@ -4829,6 +6918,11 @@ static void bcvfsUploadOneBlockTry(UploadCtx2 *pCtx, int *pbRetry){
+@@ -4829,6 +6953,11 @@ static void bcvfsUploadOneBlockTry(UploadCtx2 *pCtx, int *pbRetry){
          bcvfsUploadDeleteBlockIf(pCtx, pCtx->iBlk);
        }
      }
@@ -6483,7 +6518,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    }
  
    pCtx->rc = rc;
-@@ -4941,6 +7035,7 @@ static int bcvfsUpload(
+@@ -4941,6 +7070,7 @@ static int bcvfsUpload(
  
      memset(&ctx, 0, sizeof(ctx));
      ctx.pFs = pFs;
@@ -6491,7 +6526,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
      ctx.iDelTime = sqlite_timestamp();
  
      /* Put the container in UPLOAD state. Then duplicate the manifest file
-@@ -5112,9 +7207,30 @@ static int bcvfsUpload(
+@@ -5112,9 +7242,30 @@ static int bcvfsUpload(
          }
        }
  
@@ -6522,7 +6557,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
        }
  
        ENTER_VFS_MUTEX; {
-@@ -5124,6 +7240,33 @@ static int bcvfsUpload(
+@@ -5124,6 +7275,33 @@ static int bcvfsUpload(
          UploadRecord *pNext;
          if( rc==SQLITE_OK ){
            rc = bcvfsManifestMergeAndInstall(pFs, pCont, &ctx);
@@ -6556,7 +6591,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
          }
  
          /* If any local databases were uploaded by this operation, their
-@@ -5148,16 +7291,40 @@ static int bcvfsUpload(
+@@ -5148,16 +7326,40 @@ static int bcvfsUpload(
          }
  
          for(pRec=ctx.pRecord; pRec; pRec=pNext){
@@ -6605,7 +6640,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
            }
            sqlite3_free(pRec);
          }
-@@ -5237,6 +7404,21 @@ int sqlite3_bcvfs_upload(
+@@ -5237,6 +7439,21 @@ int sqlite3_bcvfs_upload(
    void *pBusyArg,                 /* First argument passed to xBusy */
    char **pzErr                    /* OUT: Error message */
  ){
@@ -6627,7 +6662,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    return bcvfsUpload(pFs, 0, 0, "main", zCont, xBusy, pBusyArg, pzErr);
  }
  
-@@ -5253,6 +7435,15 @@ int sqlite3_bcvfs_copy(
+@@ -5253,6 +7470,15 @@ int sqlite3_bcvfs_copy(
    int rc = SQLITE_OK;
    char *zErr = 0;
  
@@ -6643,7 +6678,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    if( pFs->zPortnumber ){ 
      rc = SQLITE_READONLY;
      zErr = sqlite3_mprintf("vfs is readonly");
-@@ -5299,6 +7490,7 @@ int sqlite3_bcvfs_copy(
+@@ -5299,6 +7525,7 @@ int sqlite3_bcvfs_copy(
            pTo = &pMan->aDb[pMan->nDb++];
            pTo->iDbId = pFs->iNextLocalId++;
            pTo->iParentId = pFrom->iDbId;
@@ -6651,7 +6686,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
            memcpy(pTo->zDName, zTo, bcvStrlen(zTo));
            pTo->iVersion = 1;
            pTo->aBlkLocal = pTo->aBlkOrig = aBlkOrig;
-@@ -5378,7 +7570,9 @@ static int bcvfsDeleteDatabase(
+@@ -5378,7 +7605,9 @@ static int bcvfsDeleteDatabase(
            pFs->c.pVfs->xDelete(pFs->c.pVfs, zWal, 0);
  
            /* Undirty any dirty blocks */
@@ -6662,7 +6697,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
  
            if( rc==SQLITE_OK ){
              rc = bcvDeleteBlocks(pMan, pDb - pMan->aDb);
-@@ -5849,7 +8043,7 @@ void sqlite3_bcvfs_prefetch_destroy(sqlite3_prefetch *p){
+@@ -5849,7 +8078,7 @@ void sqlite3_bcvfs_prefetch_destroy(sqlite3_prefetch *p){
  **   3. Install the old manifest (read from the blocksdb file).
  */ 
  int sqlite3_bcvfs_revert(sqlite3_bcvfs *pFs, const char *zCont, char **pzErr){
@@ -6671,7 +6706,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
    int rc = SQLITE_OK;
    char *zErr = 0;
  
-@@ -5870,6 +8064,10 @@ int sqlite3_bcvfs_revert(sqlite3_bcvfs *pFs, const char *zCont, char **pzErr){
+@@ -5870,6 +8099,10 @@ int sqlite3_bcvfs_revert(sqlite3_bcvfs *pFs, const char *zCont, char **pzErr){
        Manifest *pMan = pCont->pMan;
        Manifest *pNew = 0;
  
@@ -6682,7 +6717,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
        /* Load the old manifest from disk */
        aWrap = bcvMallocRc(&rc, sizeof(FileWrapper)*(pMan->nDb+1));
        pSel = bcvfsPrepare(&rc, &pFs->c, zSql);
-@@ -5963,8 +8161,8 @@ int sqlite3_bcvfs_revert(sqlite3_bcvfs *pFs, const char *zCont, char **pzErr){
+@@ -5963,8 +8196,8 @@ int sqlite3_bcvfs_revert(sqlite3_bcvfs *pFs, const char *zCont, char **pzErr){
        for(ii=0; rc==SQLITE_OK && ii<pMan->nDb; ii++){
          sqlite3_file *pFd = aWrap[ii].pWalFd;
          ManifestDb *pDb = &pMan->aDb[ii];
@@ -6693,7 +6728,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
            rc = pFd->pMethods->xTruncate(pFd, 0);
          }
        }
-@@ -5995,6 +8193,7 @@ int sqlite3_bcvfs_revert(sqlite3_bcvfs *pFs, const char *zCont, char **pzErr){
+@@ -5995,6 +8228,7 @@ int sqlite3_bcvfs_revert(sqlite3_bcvfs *pFs, const char *zCont, char **pzErr){
          bcvManifestDeref(pNew);
        }
  
@@ -6701,7 +6736,7 @@ index fc78a58746401fca4f3886d03af37f4efab344da..a7d0f5fed1d9fbab0681169355a36ec1
      }
  
    }; LEAVE_VFS_MUTEX;
-@@ -7951,4 +10150,6472 @@ int sqlite3_bcvfs_register_vtab(sqlite3 *db){
+@@ -7951,4 +10185,6472 @@ int sqlite3_bcvfs_register_vtab(sqlite3 *db){
    return rc;
  }
  

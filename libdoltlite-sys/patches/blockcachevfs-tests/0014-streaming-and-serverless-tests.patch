@@ -313,7 +313,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    };
    TestBcvfs *pTest = (TestBcvfs*)clientData;
    int iCmd;
-@@ -1512,54 +1761,4426 @@ static int bcvfsCommand(
+@@ -1512,54 +1761,4526 @@ static int bcvfsCommand(
        }
        break;
      }
@@ -1254,11 +1254,26 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +      aHashCheckpoint, zPrincipal,zDatabase,zOperations,"*",aEncodedCheckpoint,
 +      nEncodedCheckpoint, &zFetchedEtag, &zErr
 +  );
-+  SESSION_BACKEND_REQUIRE(
-+      rc==SQLITE_OK && zErr==0 && zFetchedEtag && zFetchedEtag[0]
-+          && !strcmp(zFetchedEtag,zCheckpointEtag),
-+      "identical checkpoint create was not reconciled"
-+  );
++  if( !(rc==SQLITE_OK && zErr==0 && zFetchedEtag && zFetchedEtag[0]
++          && !strcmp(zFetchedEtag,zCheckpointEtag)) ){
++    char *zDiag = sqlite3_mprintf(
++        "identical checkpoint create was not reconciled: rc=%d (%s), "
++        "error=%s, bytes=%d, returned-etag=%s (%d bytes), "
++        "first-etag=%s (%d bytes)",
++        rc,sqlite3_errstr(rc),zErr ? zErr : "none",nEncodedCheckpoint,
++        zFetchedEtag ? "present" : "missing",
++        zFetchedEtag ? (int)strlen(zFetchedEtag) : 0,
++        zCheckpointEtag ? "present" : "missing",
++        zCheckpointEtag ? (int)strlen(zCheckpointEtag) : 0
++    );
++    Tcl_SetObjResult(interp,Tcl_NewStringObj(
++        zDiag ? zDiag : "identical checkpoint create failed (diagnostic allocation failed)",
++        -1
++    ));
++    sqlite3_free(zDiag);
++    rcRet = TCL_ERROR;
++    goto session_backend_done;
++  }
 +  sqlite3_free(zFetchedEtag);
 +  zFetchedEtag = 0;
 +  sqlite3_free(zErr);
@@ -2328,6 +2343,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +  char *zErr = 0;
 +  char *zEtag = 0;
 +  char *zBaseEtag = 0;
++  char *zDiagnostic = 0;
 +  int nCheckpointData = 0;
 +  int nCheckpointBody = 0;
 +  int nHeadBody = 0;
@@ -2577,6 +2593,8 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +      rc==SQLITE_OK, "fresh overlay rehydration failed"
 +  );
 +  bFreshAttached = 1;
++  pSessionVfs = sqlite3_vfs_find(zFreshVfs);
++  SESSION_OVERLAY_REQUIRE(pSessionVfs!=0, "fresh overlay VFS lookup failed");
 +  {
 +    char *zFreshPath = sqlite3_mprintf("/fresh-overlay/%s",zDatabase);
 +    SESSION_OVERLAY_REQUIRE(zFreshPath!=0, "fresh overlay path allocation failed");
@@ -2587,10 +2605,28 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +    SESSION_OVERLAY_REQUIRE(
 +        rc==SQLITE_OK && dbFresh!=0, "fresh overlay database open failed"
 +    );
++  }
++  {
 +    rc = sqlite3_prepare_v2(
 +        dbFresh,"SELECT count(*) FROM t",-1,&pFreshStmt,0
 +    );
-+    SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "fresh overlay query failed");
++    if( rc!=SQLITE_OK ){
++      zDiagnostic = sqlite3_mprintf(
++          "fresh overlay query prepare failed: rc=%d extended-rc=%d "
++          "error=%s file=%s checkpoint-file-size=%lld manifest-bytes=%u",
++          rc,sqlite3_extended_errcode(dbFresh),sqlite3_errmsg(dbFresh),
++          sqlite3_db_filename(dbFresh,"main") ?
++              sqlite3_db_filename(dbFresh,"main") : "unknown",
++          (long long)checkpointBody.iFileSize,checkpointBody.nManifest
++      );
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          zDiagnostic ? zDiagnostic :
++              "fresh overlay query prepare failed (diagnostic allocation failed)",
++          -1
++      ));
++      rcRet = TCL_ERROR;
++      goto session_overlay_done;
++    }
 +    rc = sqlite3_step(pFreshStmt);
 +    nCount = (rc==SQLITE_ROW) ? sqlite3_column_int(pFreshStmt,0) : -1;
 +    SESSION_OVERLAY_REQUIRE(
@@ -2600,6 +2636,69 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +    pFreshStmt = 0;
 +    sqlite3_close(dbFresh);
 +    dbFresh = 0;
++  }
++  /* After the natural schema read has succeeded, isolate the flag check:
++  ** SQLite's real -wal sidecar open is accepted, but that literal name must
++  ** not be authorized as a separate remote database when marked MAIN_DB. */
++  {
++    char *zWalPath = sqlite3_mprintf(
++        "/fresh-overlay/%s-wal",zDatabase
++    );
++    sqlite3_file *pWalFile = 0;
++    sqlite3_file *pMainFile = 0;
++    int walFlags = SQLITE_OPEN_WAL|SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
++    int mainFlags = SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
++    int outFlags = 0;
++    int walCloseRc = SQLITE_ERROR;
++    SESSION_OVERLAY_REQUIRE(zWalPath!=0, "WAL sidecar path allocation failed");
++    pWalFile = (sqlite3_file*)sqlite3_malloc64(
++        (sqlite3_uint64)pSessionVfs->szOsFile
++    );
++    if( pWalFile==0 ){
++      sqlite3_free(zWalPath);
++      SESSION_OVERLAY_FAIL("WAL sidecar file allocation failed");
++    }
++    memset(pWalFile,0,(size_t)pSessionVfs->szOsFile);
++    rc = pSessionVfs->xOpen(pSessionVfs,zWalPath,pWalFile,walFlags,&outFlags);
++    if( pWalFile->pMethods ){
++      walCloseRc = pWalFile->pMethods->xClose(pWalFile);
++    }
++    if( walCloseRc==SQLITE_OK ){
++      (void)pSessionVfs->xDelete(pSessionVfs,zWalPath,0);
++    }
++    sqlite3_free(pWalFile);
++    if( !(rc==SQLITE_OK && walCloseRc==SQLITE_OK) ){
++      zDiagnostic = sqlite3_mprintf(
++          "WAL-flag sidecar open failed: rc=%d close-rc=%d",
++          rc,walCloseRc
++      );
++      Tcl_SetObjResult(interp,Tcl_NewStringObj(
++          zDiagnostic ? zDiagnostic : "WAL-flag sidecar open failed",
++          -1
++      ));
++      rcRet = TCL_ERROR;
++      sqlite3_free(zWalPath);
++      goto session_overlay_done;
++    }
++    pMainFile = (sqlite3_file*)sqlite3_malloc64(
++        (sqlite3_uint64)pSessionVfs->szOsFile
++    );
++    if( pMainFile==0 ){
++      sqlite3_free(zWalPath);
++      SESSION_OVERLAY_FAIL("sidecar main-database probe allocation failed");
++    }
++    memset(pMainFile,0,(size_t)pSessionVfs->szOsFile);
++    rc = pSessionVfs->xOpen(pSessionVfs,zWalPath,pMainFile,mainFlags,&outFlags);
++    if( pMainFile->pMethods ){
++      (void)pMainFile->pMethods->xClose(pMainFile);
++      (void)pSessionVfs->xDelete(pSessionVfs,zWalPath,0);
++    }
++    sqlite3_free(pMainFile);
++    sqlite3_free(zWalPath);
++    SESSION_OVERLAY_REQUIRE(
++        rc==SQLITE_AUTH,
++        "literal target-wal path was authorized as a main database"
++    );
 +  }
 +  rc = sqlite3_bcvfs_detach_session(
 +      pFresh,"fresh-overlay",zSessionId,&zErr
@@ -2825,6 +2924,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +  sqlite3_free(zImage);
 +  sqlite3_free(zFreshVfs);
 +  sqlite3_free(zBaseEtag);
++  sqlite3_free(zDiagnostic);
 +  sqlite3_free(aCheckpointData);
 +  sqlite3_free(aBadCheckpointBody);
 +  sqlite3_free(aHeadBody);
@@ -4767,7 +4867,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    int nRef;                       /* Pointers to this structure */
    int rc;
    int nAlloc;
-@@ -2047,15 +6668,156 @@ typedef struct BcvTestFile BcvTestFile;
+@@ -2047,15 +6768,156 @@ typedef struct BcvTestFile BcvTestFile;
  struct BcvTestFile {
    sqlite3_file base;
    sqlite3_file *pReal;
@@ -4925,7 +5025,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    return rc;
  }
  static int bcvTestRead(
-@@ -2065,10 +6827,18 @@ static int bcvTestRead(
+@@ -2065,10 +6927,18 @@ static int bcvTestRead(
    sqlite3_int64 iOfst
  ){
    BcvTestFile *p = (BcvTestFile*)pFile;
@@ -4945,7 +5045,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
  }
  static int bcvTestWrite(
    sqlite3_file *pFile, 
-@@ -2077,18 +6847,43 @@ static int bcvTestWrite(
+@@ -2077,18 +6947,43 @@ static int bcvTestWrite(
    sqlite3_int64 iOfst
  ){
    BcvTestFile *p = (BcvTestFile*)pFile;
@@ -4989,7 +5089,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    return p->pReal->pMethods->xFileSize(p->pReal, pSize);
  }
  static int bcvTestLock(sqlite3_file *pFile, int eLock){
-@@ -2193,8 +6988,15 @@ static int bcvTestOpen(
+@@ -2193,8 +7088,15 @@ static int bcvTestOpen(
    p->pReal = (sqlite3_file*)&p[1];
    rc = pVfs2->xOpen(pVfs2, zName, p->pReal, flags, pFlags);
    if( rc==SQLITE_OK ){
@@ -5005,7 +5105,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    return rc;
  }
  static int bcvTestDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir){
-@@ -2369,12 +7171,19 @@ const char *bcvtest_init(Tcl_Interp *interp){
+@@ -2369,12 +7271,19 @@ const char *bcvtest_init(Tcl_Interp *interp){
      { "bcv_oom_control", test_bcv_oom_control },
      { "bcv_socket_fault_control", test_bcv_socket_fault_control },
      { "sqlite3_bcvfs_create", test_bcvfs_create },
@@ -5025,7 +5125,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
      { "vfs_delete", test_vfs_delete },
  
      { "bcv_curl_config_cb", test_bcv_curl_config_cb },
-@@ -2406,4 +7215,3 @@ const char *bcvtest_init(Tcl_Interp *interp){
+@@ -2406,4 +7315,3 @@ const char *bcvtest_init(Tcl_Interp *interp){
  
    return 0;
  }

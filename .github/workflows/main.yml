@@ -133,7 +133,7 @@ jobs:
           docker run --detach \
             --name rusqdoltlite-blockcache-gcs \
             --publish 4443:4443 \
-            fsouza/fake-gcs-server:1.54.0 \
+            fsouza/fake-gcs-server:1.56.1 \
             -scheme http -port 4443 -backend memory
           docker run --detach \
             --name rusqdoltlite-blockcache-s3 \

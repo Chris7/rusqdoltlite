@@ -11,11 +11,11 @@ diff --git a/doltlite_remotesrv.c b/doltlite_remotesrv.c
    int activeFd[SERVER_WORKERS];
    int timeoutMs;
 +  sqlite3_vfs *pVfs;
-
+ 
    DoltliteTlsServer *tls;
    char *authKeysDir;
 @@ -943,10 +943,11 @@ static void remoteDbHandleCloseStore(RemoteDbHandle *h){
-
+ 
  static int remoteDbHandleOpenStore(
 +  DoltliteServer *pSrv,
    RemoteDbHandle *h,
@@ -26,10 +26,10 @@ diff --git a/doltlite_remotesrv.c b/doltlite_remotesrv.c
 +  sqlite3_vfs *pVfs = pSrv->pVfs;
    int flags;
    int rc;
-
+ 
 @@ -1071,6 +1071,6 @@ static int remoteDbAcquire(
    }
-
+ 
    if( !h->bOpen ){
 -    rc = remoteDbHandleOpenStore(h, zPath, bWritable);
 +    rc = remoteDbHandleOpenStore(pSrv, h, zPath, bWritable);
@@ -59,7 +59,7 @@ diff --git a/doltlite_remotesrv.c b/doltlite_remotesrv.c
    rc = pVfs->xAccess(pVfs, zDbPath, SQLITE_ACCESS_EXISTS, &exists);
    if( rc!=SQLITE_OK ){
 @@ -1355,5 +1355,7 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
-
+ 
    memset(pSrv, 0, sizeof(*pSrv));
    pSrv->listenFd = -1;
 +  pSrv->pVfs = sqlite3_vfs_find(o->zVfsName);
