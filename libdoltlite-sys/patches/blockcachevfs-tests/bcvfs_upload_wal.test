@@ -1,0 +1,89 @@
+# Exercise the real WAL checkpoint and publication path through CBS.
+#
+# The source database is put into WAL mode by stock SQLite. Attached writes
+# then create a genuine local -wal file; explicit upload must checkpoint those
+# frames into CBS main-file blocks and truncate that same sidecar before the
+# updated manifest is visible to a fresh VFS attachment.
+
+source [file join [file dirname [info script]] test_common.tcl]
+set testprefix bcvfs_upload_wal
+
+set container $D(container)
+set database wal-upload.db
+file delete -force wal-upload-seed.db wal-upload-seed.db-wal wal-upload-seed.db-shm
+sqlite3 seed wal-upload-seed.db
+set seed_mode [seed one {PRAGMA journal_mode=WAL}]
+if {$seed_mode!="wal"} { error "could not create WAL-mode upload seed" }
+seed eval {
+  CREATE TABLE payload(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+  INSERT INTO payload VALUES(1, 'seed');
+  PRAGMA wal_checkpoint(TRUNCATE);
+}
+seed close
+
+set fd [open wal-upload-seed.db rb]
+fconfigure $fd -translation binary -encoding binary
+set seed_header [read $fd 20]
+close $fd
+do_test 1.0 {
+  binary scan $seed_header @18cc write_version read_version
+  list $write_version $read_version
+} {2 2}
+
+bcv_create_container $container
+bcv_upload_database -container $container wal-upload-seed.db $database
+file delete -force wal-upload-seed.db wal-upload-seed.db-wal wal-upload-seed.db-shm
+
+bcv_mkdir testdir_wal_upload_local
+set local_cmd [bcvfs_create testdir_wal_upload_local bcvfs_wal_upload_local]
+set local_alias wal_local
+bcvfs_attach -alias $local_alias $local_cmd $container
+sqlite3 db /$local_alias/$database -vfs bcvfs_wal_upload_local
+db eval {PRAGMA wal_autocheckpoint=0}
+db eval {
+  BEGIN IMMEDIATE;
+  WITH RECURSIVE rows(id) AS (
+    SELECT 2 UNION ALL SELECT id+1 FROM rows WHERE id<129
+  )
+  INSERT INTO payload
+    SELECT id, printf('%04d:', id) || hex(zeroblob(4096)) FROM rows;
+  COMMIT;
+}
+
+set local_rows [db eval {SELECT id, body FROM payload ORDER BY id}]
+do_test 1.1 {
+  llength $local_rows
+} {258}
+
+set wal_path [file join testdir_wal_upload_local $local_alias "$database-wal"]
+set wal_size_before [file size $wal_path]
+do_test 1.2 {
+  expr {$wal_size_before > 32}
+} {1}
+
+db eval {PRAGMA bcv_upload}
+set wal_size_after [file size $wal_path]
+do_test 1.3 {
+  set wal_size_after
+} {0}
+set local_after_upload [db eval {SELECT id, body FROM payload ORDER BY id}]
+do_test 1.4 {
+  expr {$local_after_upload eq $local_rows}
+} {1}
+
+bcv_mkdir testdir_wal_upload_fresh
+set fresh_cmd [bcvfs_create testdir_wal_upload_fresh bcvfs_wal_upload_fresh]
+set fresh_alias wal_fresh
+bcvfs_attach -alias $fresh_alias $fresh_cmd $container
+sqlite3 fresh /$fresh_alias/$database -vfs bcvfs_wal_upload_fresh
+set fresh_rows [fresh eval {SELECT id, body FROM payload ORDER BY id}]
+do_test 1.5 {
+  expr {$fresh_rows eq $local_after_upload}
+} {1}
+
+fresh close
+db close
+$fresh_cmd destroy
+$local_cmd destroy
+file delete -force wal-upload-seed.db wal-upload-seed.db-wal wal-upload-seed.db-shm
+finish_test

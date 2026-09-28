@@ -16,6 +16,18 @@ if {$::tcl_platform(platform)=="windows"} {
 
 bcv_install_vfs_wrapper
 
+proc synchronous_upload_new_wal_db {container dbname sql} {
+  file delete -force synchronous-wal-seed.db synchronous-wal-seed.db-wal synchronous-wal-seed.db-shm
+  sqlite3 seed synchronous-wal-seed.db
+  set mode [seed one {PRAGMA journal_mode=WAL}]
+  if {$mode!="wal"} { error "could not create WAL-mode synchronous seed" }
+  seed eval $sql
+  seed eval {PRAGMA wal_checkpoint(TRUNCATE)}
+  seed close
+  bcv_upload_database -container $container synchronous-wal-seed.db $dbname
+  file delete -force synchronous-wal-seed.db synchronous-wal-seed.db-wal synchronous-wal-seed.db-shm
+}
+
 proc synchronous_child {} {
   global C
   set container $::env(BCV_SYNCHRONOUS_CONTAINER)
@@ -90,7 +102,7 @@ foreach testCase {off-crash full-crash} {
   set mode [expr {$testCase eq "full-crash" ? "FULL" : "OFF"}]
   bcv_mkdir $testdir
   bcv_create_container $container
-  bcv_upload_new_db $container synchronous.db {
+  synchronous_upload_new_wal_db $container synchronous.db {
     CREATE TABLE payload(id INTEGER PRIMARY KEY, body BLOB NOT NULL);
     INSERT INTO payload VALUES(0, CAST(zeroblob(4095)||X'00' AS BLOB));
   }

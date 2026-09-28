@@ -470,8 +470,8 @@ fn http_authorization_statuses_map_to_sqlite_auth() -> Result<()> {
 }
 
 #[test]
-fn http_conflict_maps_to_sqlite_busy() -> Result<()> {
-    assert_http_status_maps_to_sqlite(409, "Conflict", rusqlite::ffi::SQLITE_BUSY)
+fn http_conflict_maps_to_sqlite_busy_snapshot() -> Result<()> {
+    assert_http_status_maps_to_sqlite(409, "Conflict", rusqlite::ffi::SQLITE_BUSY_SNAPSHOT)
 }
 
 #[test]
@@ -541,7 +541,7 @@ fn concurrent_pushes_reject_one_stale_ref_update() -> Result<()> {
         matches!(
             result,
             Err(Error::SqliteFailure(code, _))
-                if matches!(code.extended_code, rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_ERROR)
+                if matches!(code.extended_code, rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_BUSY_SNAPSHOT | rusqlite::ffi::SQLITE_ERROR)
         )
     }));
     Ok(())

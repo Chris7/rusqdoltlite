@@ -1230,6 +1230,16 @@ fn run_bootstrap(backend: &str) -> (String, String) {
         .execute_batch("CREATE TABLE bootstrap(value TEXT); INSERT INTO bootstrap VALUES ('ok');")
         .expect("seed local SQLite database");
     local.close().expect("close local SQLite database");
+    let local_header = std::fs::read(&local_path).expect("read local SQLite database");
+    assert!(
+        local_header.len() >= 20,
+        "local database header is truncated"
+    );
+    assert_eq!(
+        &local_header[18..20],
+        &[0, 0],
+        "the DoltLite seed should retain its sealed chunk-store header"
+    );
     vfs.create_database(&storage, &local_path, "bootstrap.sqlite")
         .expect("upload initial database");
     assert_reserved_remote_database_names_rejected(&vfs, &storage, &local_path);
@@ -1257,6 +1267,7 @@ fn run_bootstrap(backend: &str) -> (String, String) {
         .query_row("SELECT value FROM bootstrap", [], |row| row.get(0))
         .expect("read created database");
     assert_eq!(value, "ok");
+    assert_vfs_header_passthrough(&db, &local_header[..20]);
     db.execute("INSERT INTO bootstrap VALUES ('updated')", [])
         .expect("write created database");
     drop(db);
@@ -1268,6 +1279,7 @@ fn run_bootstrap(backend: &str) -> (String, String) {
         .expect("re-attach created database");
     let path = format!("/{second_alias}/bootstrap.sqlite");
     let db = vfs.open(&path).expect("re-open created database");
+    assert_vfs_header_passthrough(&db, &local_header[..20]);
     let count: i64 = db
         .query_row("SELECT count(*) FROM bootstrap", [], |row| row.get(0))
         .expect("read uploaded database");
@@ -1299,6 +1311,33 @@ fn run_bootstrap(backend: &str) -> (String, String) {
     vfs.detach(&third_alias)
         .expect("detach replacement database");
     (endpoint, bucket)
+}
+
+fn assert_vfs_header_passthrough(database: &Connection, expected: &[u8]) {
+    assert_eq!(expected.len(), 20);
+    assert_eq!(read_vfs_header(database).as_slice(), expected);
+}
+
+fn read_vfs_header(database: &Connection) -> [u8; 20] {
+    let database_name = CString::new("main").expect("database name is NUL-free");
+    let mut file: *mut ffi::sqlite3_file = ptr::null_mut();
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            database.handle(),
+            database_name.as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            (&mut file as *mut *mut ffi::sqlite3_file).cast(),
+        )
+    };
+    assert_eq!(rc, ffi::SQLITE_OK, "obtain the CBS main-file handle");
+    assert!(!file.is_null(), "CBS main-file handle is null");
+
+    let methods = unsafe { &*(*file).pMethods };
+    let x_read = methods.xRead.expect("CBS VFS implements xRead");
+    let mut actual = [0u8; 20];
+    let rc = unsafe { x_read(file, actual.as_mut_ptr().cast(), actual.len() as i32, 0) };
+    assert_eq!(rc, ffi::SQLITE_OK, "read the CBS database header directly");
+    actual
 }
 
 // A user can pass these names to create_database or directly to the scoped

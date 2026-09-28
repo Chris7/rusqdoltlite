@@ -1,0 +1,37 @@
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -2422,10 +2422,3 @@ static int bcvfsReadWriteDatabase(
+         rc = pCF->pMethods->xRead(pCF, pBuf, iAmt, iOff);
+         if( rc==SQLITE_OK ) pEntry->bStageReuse = 0;
+-        if( iOfst==0 ){
+-        /* Force database to look like a wal database */
+-        if( iAmt>=20 ){
+-          ((u8*)pBuf)[18] = 0x02;
+-          ((u8*)pBuf)[19] = 0x02;
+-        }
+-      }
+     }
+@@ -2731,7 +2724,2 @@ static int bcvfsProxyRead(
+-    if( iOfst==0 ){
+-      /* Force database to look like a wal database */
+-      ((u8*)pBuf)[18] = 0x02;
+-      ((u8*)pBuf)[19] = 0x02;
+-    }
+   }
+   return rc;
+@@ -7244,8 +7232,13 @@ static int bcvfsUpload(
+         rc = sqlite3_wal_checkpoint_v2(
+             pUp->db, zDbPragma, SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt
+         );
+         pFile->bHoldCkpt = 0;
+-        assert( rc!=SQLITE_OK || (nLog==nCkpt && nLog==0) );
++        /* A checkpoint with no WAL present reports -1/-1; any already-dirty
++        ** main-file blocks are still uploaded directly. WAL databases must
++        ** be fully truncated with the held checkpointer lock retained until
++        ** publication completes. */
++        assert( rc!=SQLITE_OK || ((nLog==-1 && nCkpt==-1)
++                             || (nLog==nCkpt && nLog==0)) );
+         if( rc!=SQLITE_OK ){
+           ctx.zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(pUp->db));
+         }

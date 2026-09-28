@@ -87,7 +87,11 @@ git -C "$tmp/src" apply \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0012-s3-tls-and-verbose-logging.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0013-streaming-and-serverless.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0014-cbs-create-upload.patch" \
-  "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0014-streaming-and-serverless-tests.patch"
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0015-preserve-database-header.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0014-streaming-and-serverless-tests.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0015-wal-mode-fixtures.patch"
+git -C "$tmp" apply \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0015-poll-wal-fixture.patch"
 
 export BLOCKCACHEVFS_CBS_BASE_CONFIG="$checkout/test/config.tcl"
 cp "$repo_root/tools/blockcachevfs-cbs-config.tcl" "$tmp/test/config.tcl"
@@ -107,6 +111,8 @@ cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_accepta
   "$tmp/test/bcvfs_session_acceptance.test"
 cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_gc.test" \
   "$tmp/test/bcvfs_session_gc.test"
+cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_upload_wal.test" \
+  "$tmp/test/bcvfs_upload_wal.test"
 cp "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/bcvfs_session_compaction.test" \
   "$tmp/test/bcvfs_session_compaction.test"
 # Keep the power-loss regression in the backend matrix without changing the

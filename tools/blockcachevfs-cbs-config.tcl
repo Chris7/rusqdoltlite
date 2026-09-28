@@ -12,6 +12,7 @@ set _tests {
   util_api1.test
   util_upload2.test
   bcvfs_poll1.test
+  bcvfs_upload_wal.test
 }
 
 set _configs {}

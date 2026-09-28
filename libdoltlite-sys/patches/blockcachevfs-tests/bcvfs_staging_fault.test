@@ -14,6 +14,18 @@ if {$::tcl_platform(platform)=="windows"} {
 
 bcv_install_vfs_wrapper
 
+proc staging_upload_new_wal_db {container dbname sql} {
+  file delete -force staging-wal-seed.db staging-wal-seed.db-wal staging-wal-seed.db-shm
+  sqlite3 seed staging-wal-seed.db
+  set mode [seed one {PRAGMA journal_mode=WAL}]
+  if {$mode!="wal"} { error "could not create WAL-mode staging seed" }
+  seed eval $sql
+  seed eval {PRAGMA wal_checkpoint(TRUNCATE)}
+  seed close
+  bcv_upload_database -container $container staging-wal-seed.db $dbname
+  file delete -force staging-wal-seed.db staging-wal-seed.db-wal staging-wal-seed.db-shm
+}
+
 proc staging_fault_child {} {
   global C
   set container $::env(BCV_STAGING_CONTAINER)
@@ -82,7 +94,7 @@ foreach event {1 2 3 4} {
   set testdir "staging-fault-testdir-$run_suffix-$event"
   bcv_mkdir $testdir
   bcv_create_container $container
-  bcv_upload_new_db $container staging.db {
+  staging_upload_new_wal_db $container staging.db {
     CREATE TABLE payload(id INTEGER PRIMARY KEY, body BLOB NOT NULL);
     INSERT INTO payload VALUES(0, zeroblob(4096));
     WITH RECURSIVE c(i) AS (
@@ -167,7 +179,7 @@ set detach_container "bcv-staged-detach-$run_suffix"
 set detach_dir "staging-detach-testdir-$run_suffix"
 bcv_mkdir $detach_dir
 bcv_create_container $detach_container
-bcv_upload_new_db $detach_container staging.db {
+staging_upload_new_wal_db $detach_container staging.db {
   CREATE TABLE payload(id INTEGER PRIMARY KEY, body BLOB NOT NULL);
   WITH RECURSIVE c(i) AS (
     SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<1000

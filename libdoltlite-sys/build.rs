@@ -565,6 +565,10 @@ mod build_bundled {
             .define("doltliteConnOpen", "doltliteBundledClientConnOpen")
             .define("doltliteConnWriteAll", "doltliteBundledClientConnWriteAll")
             .define("doltliteConnRead", "doltliteBundledClientConnRead")
+            .define(
+                "doltliteConnSetTimeout",
+                "doltliteBundledClientConnSetTimeout",
+            )
             .define("doltliteConnClose", "doltliteBundledClientConnClose")
             .include(remote_dir)
             .include(mbedtls_dir.join("include"))

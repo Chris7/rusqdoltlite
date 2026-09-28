@@ -1,0 +1,101 @@
+diff --git a/blockcachevfstest.c b/blockcachevfstest.c
+--- a/blockcachevfstest.c
++++ b/blockcachevfstest.c
+@@ -2919,6 +2919,88 @@
+   return rc;
+ }
+ 
++/* Build a real WAL-mode SQLite image outside the block-cache VFS. The WAL is
++** checkpointed and truncated before the main database image is copied. */
++static int bcvfsSessionBuildWalImage(
++  const char *zPath,
++  char **pzErr
++){
++  sqlite3 *db = 0;
++  sqlite3_stmt *pStmt = 0;
++  char *zSqlErr = 0;
++  char zSql[128];
++  int rc = SQLITE_OK;
++  int ii;
++  if( pzErr ) *pzErr = 0;
++  rc = sqlite3_open_v2(
++      zPath,&db,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,0
++  );
++  if( rc==SQLITE_OK ) rc = sqlite3_prepare_v2(
++      db,"PRAGMA journal_mode=WAL",-1,&pStmt,0
++  );
++  if( rc==SQLITE_OK ){
++    rc = sqlite3_step(pStmt);
++    if( rc==SQLITE_ROW ){
++      const unsigned char *zMode = sqlite3_column_text(pStmt,0);
++      if( zMode==0 || sqlite3_stricmp((const char*)zMode,"wal")!=0 ){
++        rc = SQLITE_ERROR;
++      }else{
++        rc = SQLITE_OK;
++      }
++    }
++  }
++  if( pStmt ){
++    int rcFinalize = sqlite3_finalize(pStmt);
++    pStmt = 0;
++    if( rc==SQLITE_OK ) rc = rcFinalize;
++  }
++  if( rc==SQLITE_OK ) rc = sqlite3_exec(
++      db,
++      "PRAGMA synchronous=FULL;"
++      "CREATE TABLE t(v);"
++      "BEGIN;",
++      0,0,&zSqlErr
++  );
++  for(ii=0; rc==SQLITE_OK && ii<4096; ii++){
++    sqlite3_snprintf(
++        sizeof(zSql),zSql,"INSERT INTO t(v) VALUES('row-%04d')",ii
++    );
++    rc = sqlite3_exec(db,zSql,0,0,&zSqlErr);
++  }
++  if( rc==SQLITE_OK ) rc = sqlite3_exec(db,"COMMIT;",0,0,&zSqlErr);
++  if( rc==SQLITE_OK ) rc = sqlite3_prepare_v2(
++      db,"PRAGMA wal_checkpoint(TRUNCATE)",-1,&pStmt,0
++  );
++  if( rc==SQLITE_OK ){
++    rc = sqlite3_step(pStmt);
++    if( rc==SQLITE_ROW ){
++      int nBusy = sqlite3_column_int(pStmt,0);
++      int nLog = sqlite3_column_int(pStmt,1);
++      int nCheckpointed = sqlite3_column_int(pStmt,2);
++      rc = nBusy==0 && nLog==0 && nCheckpointed==0
++          ? SQLITE_OK : SQLITE_BUSY;
++    }
++  }
++  if( pStmt ){
++    int rcFinalize = sqlite3_finalize(pStmt);
++    pStmt = 0;
++    if( rc==SQLITE_OK ) rc = rcFinalize;
++  }
++  if( rc!=SQLITE_OK && pzErr && *pzErr==0 ){
++    *pzErr = zSqlErr ? zSqlErr : sqlite3_mprintf(
++        "could not build WAL-mode SQLite image (rc=%d): %s",
++        rc,db ? sqlite3_errmsg(db) : "open failed"
++    );
++    zSqlErr = 0;
++  }
++  sqlite3_free(zSqlErr);
++  if( db ){
++    int rcClose = sqlite3_close(db);
++    if( rc==SQLITE_OK ) rc = rcClose;
++  }
++  return rc;
++}
++
+ /* Copy a complete ordinary SQLite image into an already-open block-cache
+ ** file. The source is read with the default SQLite VFS, avoiding stdio path
+ ** and encoding differences in the upstream CBS test harness. */
+@@ -3852,7 +3934,7 @@
+   SESSION_OVERLAY_REQUIRE(zPath!=0, "session overlay path allocation failed");
+   zImage = sqlite3_mprintf("%s/session-overlay-image.db",zFreshDir);
+   SESSION_OVERLAY_REQUIRE(zImage!=0, "session overlay image path allocation failed");
+-  rc = bcvfsSessionBuildImage(zImage,1,&zErr);
++  rc = bcvfsSessionBuildWalImage(zImage,&zErr);
+   SESSION_OVERLAY_REQUIRE(rc==SQLITE_OK, "session overlay image build failed");
+   pRaw = (sqlite3_file*)sqlite3_malloc64(
+       (sqlite3_uint64)pSessionVfs->szOsFile

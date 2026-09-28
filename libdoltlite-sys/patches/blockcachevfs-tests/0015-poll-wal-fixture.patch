@@ -1,0 +1,96 @@
+diff --git a/test/bcvfs_poll1.test b/test/bcvfs_poll1.test
+--- a/test/bcvfs_poll1.test
++++ b/test/bcvfs_poll1.test
+@@ -7,9 +7,24 @@
+ source [file join [file dirname [info script]] test_common.tcl]
+ set testprefix bcvfs_poll1
+ 
++# These cases exercise WAL polling and corrupt-WAL recovery. Since CBS now
++# preserves SQLite's stored header bytes, seed them with a real WAL-mode
++# database rather than relying on VFS header rewriting.
++proc bcv_upload_new_wal_db {container dbname sql} {
++  file delete -force tmpccd.db tmpccd.db-wal tmpccd.db-shm
++  sqlite3 ccd tmpccd.db
++  set mode [ccd one {PRAGMA journal_mode=WAL}]
++  if {$mode!="wal"} { error "could not create WAL-mode test database" }
++  ccd eval $sql
++  ccd eval {PRAGMA wal_checkpoint(TRUNCATE)}
++  ccd close
++  bcv_upload_database -container $container tmpccd.db $dbname
++  file delete -force tmpccd.db tmpccd.db-wal tmpccd.db-shm
++}
++
+ 
+ bcv_create_container mycont
+-bcv_upload_new_db mycont xyz.db {
++bcv_upload_new_wal_db mycont xyz.db {
+   CREATE TABLE t1(x);
+   CREATE INDEX i1 ON t1(x);
+   INSERT INTO t1 VALUES(2), (4), (6);
+@@ -105,7 +120,7 @@
+ #-------------------------------------------------------------------------
+ #
+ bcv_create_container mycont
+-bcv_upload_new_db mycont xyz.db {
++bcv_upload_new_wal_db mycont xyz.db {
+   CREATE TABLE t1(x);
+   CREATE INDEX i1 ON t1(x);
+   INSERT INTO t1 VALUES(2), (4), (6);
+@@ -120,7 +135,7 @@
+   SELECT * FROM t1
+ } {2 4 6}
+ 
+-bcv_upload_new_db mycont xyz2.db {
++bcv_upload_new_wal_db mycont xyz2.db {
+   CREATE TABLE t2(y);
+   INSERT INTO t2 VALUES(1), (2), (3);
+ }
+@@ -143,11 +158,11 @@
+   SELECT * FROM t1
+ } {1 {disk I/O error}}
+ 
+-bcv_upload_new_db mycont test.db1 {
++bcv_upload_new_wal_db mycont test.db1 {
+   CREATE TABLE t1(a);
+   INSERT INTO t1 VALUES('db1');
+ }
+-bcv_upload_new_db mycont test.db2 {
++bcv_upload_new_wal_db mycont test.db2 {
+   CREATE TABLE t1(a);
+   INSERT INTO t1 VALUES('db2');
+ }
+@@ -186,7 +201,7 @@
+ #-------------------------------------------------------------------------
+ #
+ bcv_create_container cont1
+-bcv_upload_new_db cont1 t1.db {
++bcv_upload_new_wal_db cont1 t1.db {
+   CREATE TABLE t1(x);
+   INSERT INTO t1 VALUES(1), (2);
+ }
+@@ -219,7 +234,7 @@
+ # Test that when a manifest is polled, local changes are not lost.
+ #
+ bcv_create_container cont1
+-bcv_upload_new_db cont1 t1.db {
++bcv_upload_new_wal_db cont1 t1.db {
+   CREATE TABLE t1(x);
+   INSERT INTO t1 VALUES(1), (2);
+ }
+@@ -240,6 +255,6 @@
+   SELECT container, database, nblock, ncache, 0 FROM bcv_database
+ } {cont1 t1.db 1 1 0}
+ 
+-bcv_upload_new_db cont1 t2.db {
++bcv_upload_new_wal_db cont1 t2.db {
+   CREATE TABLE t2(y);
+ } 
+@@ -321,7 +336,7 @@
+ #-------------------------------------------------------------------------
+ 
+ bcv_create_container cont1
+-bcv_upload_new_db cont1 t1.db {
++bcv_upload_new_wal_db cont1 t1.db {
+   CREATE TABLE t1(x);
+   INSERT INTO t1 VALUES(1), (2), (3), (4);
+ }

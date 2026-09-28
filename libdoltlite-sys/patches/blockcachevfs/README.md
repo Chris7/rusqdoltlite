@@ -65,7 +65,8 @@ manifest's blocks.
 
 `0008-safe-wal-header-read.patch` bounds CBS's WAL-header byte adjustments to
 the requested read buffer. This avoids writing beyond short SQLite header
-reads used by clients such as DoltLite.
+reads used by clients such as DoltLite; the final patch below removes the
+header mutation entirely.
 
 `0009-doltlite-lock-sidecar.patch` recognizes DoltLite's `.<db>-lock`
 sidecar as an internal local lock file when the inner database exists in the
@@ -91,3 +92,13 @@ The Rust build applies it after the preceding CBS patches. The CBS integration
 passes DoltLite's private no-seed flag for its checkpoint-only open; the flag is
 defined by `../0005-doltlite-no-seed.patch`, and normal application opens retain
 their existing seed behavior. Callers add schema and data before upload.
+
+`0015-preserve-database-header.patch` removes CBS's legacy byte-18/19 WAL-mode
+rewrite from both database and proxy reads. CBS now returns stored database
+header bytes unchanged; DoltLite seals its chunk-store header, so changing those
+bytes invalidates the file. Uploads retain the `SQLITE_CHECKPOINT_TRUNCATE`
+path and its held checkpointer snapshot lock for WAL databases. SQLite may
+report `(-1, -1)` when a successful checkpoint finds no WAL present; the upload
+path accepts that result and uploads any already-dirty main-file blocks without
+requiring a `-wal` file. This does not imply that attached rollback-journal
+writes are supported.

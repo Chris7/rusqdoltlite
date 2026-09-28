@@ -6,6 +6,18 @@
 source [file join [file dirname [info script]] test_common.tcl]
 set testprefix bcvfs_session_gc
 
+proc session_gc_upload_new_wal_db {container dbname sql} {
+  file delete -force session-gc-wal-seed.db session-gc-wal-seed.db-wal session-gc-wal-seed.db-shm
+  sqlite3 seed session-gc-wal-seed.db
+  set mode [seed one {PRAGMA journal_mode=WAL}]
+  if {$mode!="wal"} { error "could not create WAL-mode session GC seed" }
+  seed eval $sql
+  seed eval {PRAGMA wal_checkpoint(TRUNCATE)}
+  seed close
+  bcv_upload_database -container $container session-gc-wal-seed.db $dbname
+  file delete -force session-gc-wal-seed.db session-gc-wal-seed.db-wal session-gc-wal-seed.db-shm
+}
+
 proc read_binary_file {zPath} {
   set in [open $zPath rb]
   fconfigure $in -translation binary -encoding binary
@@ -109,7 +121,7 @@ bcv_upload_new_db $candidate_source_container candidate-source.db {
 bcv_upload_new_db $orphan_queue_container orphan-queue.db {
   CREATE TABLE t(v);
 }
-bcv_upload_new_db $guard_container guard.db {
+session_gc_upload_new_wal_db $guard_container guard.db {
   CREATE TABLE t(v);
 }
 set session_id [format "550e8400-e29b-41d4-a716-%012x" $nonce]
