@@ -1,0 +1,63 @@
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -494575,6 +494575,60 @@
+   if( pLock ) chunkStoreUnlock((ChunkStore*)pLock);
+ }
+ 
++/* Materialize a valid empty DoltLite store without a SQL write. A SQL write
++** before the first refs-if creates an unborn local branch with a zero tip. */
++SQLITE_API int SQLITE_APICALL sqlite3_doltlite_bcvfs_initialize_empty_store(
++  sqlite3 *db,
++  const char *zDb
++){
++  Btree *pBtree;
++  ChunkStore *pStore;
++  int rc;
++  if( !db || !zDb || !zDb[0] ) return SQLITE_MISUSE;
++
++  sqlite3_mutex_enter(db->mutex);
++  if( !db->bSkipDoltSeed ){
++    sqlite3_mutex_leave(db->mutex);
++    return SQLITE_MISUSE;
++  }
++  pBtree = sqlite3DbNameToBtree(db, zDb);
++  pStore = doltliteBtreeChunkStore(pBtree);
++  if( !pStore ){
++    sqlite3_mutex_leave(db->mutex);
++    return SQLITE_NOTFOUND;
++  }
++  if( pStore->isMemory || pStore->isBuffer || pStore->isSharedMemory ){
++    sqlite3_mutex_leave(db->mutex);
++    return SQLITE_MISUSE;
++  }
++
++  do {
++    rc = chunkStoreLockAndRefresh(pStore);
++  }while( rc==SQLITE_BUSY && sqlite3InvokeBusyHandler(&db->busyHandler) );
++  if( rc==SQLITE_OK ){
++    if( pStore->readOnly || pStore->movedReadOnly ){
++      rc = SQLITE_READONLY;
++    }else if( pStore->notADatabase || pStore->corruptMidStream
++       || pStore->refs.nBranches!=0 || pStore->refs.nTags!=0
++       || pStore->refs.nRemotes!=0 || pStore->refs.nTracking!=0
++       || pStore->refs.nSequences!=0
++       || !prollyHashIsEmpty(&pStore->refs.refsHash)
++       || pStore->index.nChunks!=0
++       || pStore->staging.nPending!=0 || pStore->staging.nRecent!=0
++       || pStore->staging.nRecentUncommitted!=0 ){
++      rc = SQLITE_CONSTRAINT;
++    }else{
++      rc = chunkStoreSetDefaultBranch(pStore, "main");
++      if( rc==SQLITE_OK ) rc = chunkStoreSerializeRefs(pStore);
++      if( rc==SQLITE_OK ) rc = chunkStoreCommit(pStore);
++      if( rc!=SQLITE_OK ) chunkStoreRollback(pStore);
++    }
++    chunkStoreUnlock(pStore);
++  }
++  sqlite3_mutex_leave(db->mutex);
++  return rc;
++}
++
+ int doltliteBtreeSerialize(
+   Btree *p,
+   const char *zBranch,

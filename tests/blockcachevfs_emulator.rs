@@ -962,6 +962,39 @@ fn request_route(path: &str) -> &str {
 }
 
 #[cfg(feature = "remote")]
+fn session_request_path(path: &str) -> Option<(&str, String)> {
+    let suffix = path.strip_prefix("/capability/")?;
+    let (session_id, native_path) = suffix.split_once('/')?;
+    if session_id.is_empty() || !native_path.contains('/') {
+        return None;
+    }
+    Some((session_id, format!("/{native_path}")))
+}
+
+#[cfg(feature = "remote")]
+fn request_with_path(request: &[u8], path: &str) -> Option<Vec<u8>> {
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let header = String::from_utf8_lossy(&request[..header_end]);
+    let request_line_end = header.find("\r\n")?;
+    let mut parts = header[..request_line_end].split_ascii_whitespace();
+    let method = parts.next()?;
+    let _original_path = parts.next()?;
+    let version = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let mut rewritten = Vec::with_capacity(request.len());
+    rewritten.extend_from_slice(format!("{method} {path} {version}\r\n").as_bytes());
+    rewritten.extend_from_slice(header[request_line_end + 2..].as_bytes());
+    rewritten.extend_from_slice(b"\r\n\r\n");
+    rewritten.extend_from_slice(&request[header_end + 4..]);
+    Some(rewritten)
+}
+
+#[cfg(feature = "remote")]
 fn chunk_batch_stats(body: &[u8]) -> String {
     let mut offset = 0;
     let mut count = 0_usize;
@@ -2523,7 +2556,8 @@ impl StorageFaultProxy {
                     let body = format!("storage fault proxy error: {error}");
                     let response = format!(
                         "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(), body
+                        body.len(),
+                        body
                     );
                     let _ = stream.write_all(response.as_bytes());
                 }
@@ -2872,8 +2906,7 @@ fn storage_fault_target(method: &str, path: &str, body: &[u8]) -> Option<Storage
 #[cfg(feature = "remote")]
 #[test]
 fn storage_fault_target_classifies_google_and_s3_uploads() {
-    let google_checkpoint =
-        "http://proxy/upload/storage/v1/b/bucket/o?uploadType=media&name=prefix%2Fbcv-session%2Fv1%2Fcheckpoint%2Fsession%2Fhash.bcv";
+    let google_checkpoint = "http://proxy/upload/storage/v1/b/bucket/o?uploadType=media&name=prefix%2Fbcv-session%2Fv1%2Fcheckpoint%2Fsession%2Fhash.bcv";
     assert_eq!(
         storage_fault_target("POST", google_checkpoint, &[]),
         Some(StorageFaultTarget::XSyncCheckpoint)
@@ -6158,7 +6191,8 @@ fn google_uri_connection_uploads_and_isolates_vfs_lifetimes() {
     let missing_uri = format!(
         "gcs://{bucket}/{prefix}?vfs=blockcachevfs&project=test-project&access_token=private-token&endpoint={endpoint}&database=missing.db"
     );
-    let error = Connection::open(&missing_uri).expect_err("missing database must not be created");
+    let error = Connection::open_with_flags(&missing_uri, no_create_flags())
+        .expect_err("missing database without CREATE must not be created");
     assert_eq!(
         error.sqlite_extended_error_code(),
         Some(rusqlite::ffi::SQLITE_NOTFOUND)
@@ -6168,8 +6202,8 @@ fn google_uri_connection_uploads_and_isolates_vfs_lifetimes() {
     let missing_container_uri = format!(
         "gcs://{bucket}/{suffix}/missing-container?vfs=blockcachevfs&project=test-project&access_token=container-secret&endpoint={endpoint}"
     );
-    let error = Connection::open(&missing_container_uri)
-        .expect_err("missing CBS manifest must not be initialized by open");
+    let error = Connection::open_with_flags(&missing_container_uri, no_create_flags())
+        .expect_err("missing CBS manifest without CREATE must not be initialized");
     assert_eq!(
         error.sqlite_extended_error_code(),
         Some(rusqlite::ffi::SQLITE_NOTFOUND)
@@ -6253,8 +6287,8 @@ fn s3_uri_connection_uploads_existing_prefixed_database() {
     verify.close().expect("close verification connection");
 
     let missing_database_uri = format!("{uri}&database=missing.db");
-    let error = Connection::open(missing_database_uri)
-        .expect_err("open must not create a missing S3 database");
+    let error = Connection::open_with_flags(missing_database_uri, no_create_flags())
+        .expect_err("open without CREATE must not create a missing S3 database");
     assert_eq!(
         error.sqlite_extended_error_code(),
         Some(rusqlite::ffi::SQLITE_NOTFOUND)
@@ -6270,8 +6304,8 @@ fn s3_uri_connection_uploads_existing_prefixed_database() {
         encode_first_byte(secret_access_key),
         encode_query_value(session_token),
     );
-    let error = Connection::open(missing_container_uri)
-        .expect_err("open must not initialize a missing S3 CBS prefix");
+    let error = Connection::open_with_flags(missing_container_uri, no_create_flags())
+        .expect_err("open without CREATE must not initialize a missing S3 CBS prefix");
     assert_eq!(
         error.sqlite_extended_error_code(),
         Some(rusqlite::ffi::SQLITE_NOTFOUND)
@@ -6461,6 +6495,768 @@ fn remote_request(port: u16, method: &str, path: &str, body: &[u8]) -> Vec<u8> {
         .read_to_end(&mut response)
         .expect("read remote server response");
     response
+}
+
+#[cfg(feature = "remote")]
+fn remote_server_database_uri(backend: &str, endpoint: &str, bucket: &str, prefix: &str) -> String {
+    match backend {
+        "google" => format!(
+            "gcs://{bucket}/{prefix}?vfs=blockcachevfs&project=test-project&access_token=remote-server-token&endpoint={endpoint}&database=remote.db"
+        ),
+        "s3" => format!(
+            "s3://{bucket}/{prefix}?vfs=blockcachevfs&region=us-east-1&access_id=remote-server-access&secret_access_key=remote-server-secret&endpoint={endpoint}&database=remote.db"
+        ),
+        _ => unreachable!("unknown remote server backend {backend}"),
+    }
+}
+
+#[cfg(feature = "remote")]
+fn run_uri_remote_server_push_workflow(backend: &str) {
+    let suffix = unique_suffix();
+    let endpoint = match backend {
+        "google" => std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+            .unwrap_or_else(|_| "http://127.0.0.1:4443".into()),
+        "s3" => std::env::var("BLOCKCACHEVFS_S3_EMULATOR")
+            .unwrap_or_else(|_| "http://127.0.0.1:4566".into()),
+        _ => unreachable!("unknown remote server backend {backend}"),
+    };
+    let bucket = match backend {
+        "google" => "app_storage".to_owned(),
+        "s3" => format!("rust-remoteserver-{suffix}"),
+        _ => unreachable!("unknown remote server backend {backend}"),
+    };
+    if backend == "google" {
+        ensure_google_bucket(&endpoint, &bucket);
+    } else {
+        ensure_s3_bucket(&endpoint, &bucket);
+    }
+
+    let prefix = format!("{suffix}/uri/remote-server/");
+    for (name, flags) in [
+        (
+            "readonly",
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ),
+        (
+            "readwrite",
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ),
+    ] {
+        let missing_prefix = format!("{prefix}missing-{name}/");
+        let missing_uri = remote_server_database_uri(backend, &endpoint, &bucket, &missing_prefix);
+        let options = RemoteServerOptions::new().database_open_flags(flags);
+        let error = RemoteServer::start_with_options(&missing_uri, &options)
+            .expect_err("non-creating URI flags must leave a missing database absent");
+        assert_eq!(
+            error.sqlite_extended_error_code(),
+            Some(ffi::SQLITE_NOTFOUND),
+            "a missing remote database should preserve SQLITE_NOTFOUND: {error:?}"
+        );
+        for credential in [
+            "remote-server-token",
+            "remote-server-access",
+            "remote-server-secret",
+        ] {
+            assert!(!error.to_string().contains(credential));
+            assert!(!format!("{error:?}").contains(credential));
+        }
+        let listing = list_session_objects(backend, &endpoint, &bucket, &missing_prefix);
+        assert!(
+            !session_listing_contains_object_prefix(backend, &listing, &missing_prefix),
+            "a failed non-creating open must not create cloud objects"
+        );
+    }
+
+    let uri = remote_server_database_uri(backend, &endpoint, &bucket, &prefix);
+    let writable_flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let writable_options = RemoteServerOptions::new().database_open_flags(writable_flags);
+    let temp = tempfile::tempdir().expect("remote server workflow tempdir");
+    let source = Connection::open(temp.path().join("source.db"))
+        .expect("create local DoltLite source database");
+    source
+        .execute_batch(
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO widgets VALUES(1, 'first value');",
+        )
+        .expect("write first source commit");
+    let _: i64 = source
+        .query_row("SELECT dolt_add('-A')", [], |row| row.get(0))
+        .expect("stage first source commit");
+    let _: String = source
+        .query_row("SELECT dolt_commit('-m', 'first')", [], |row| row.get(0))
+        .expect("commit first source changes");
+
+    let first_server = RemoteServer::start_with_options(&uri, &writable_options)
+        .expect("start URI-owned remote server");
+    for credential in [
+        "remote-server-token",
+        "remote-server-access",
+        "remote-server-secret",
+    ] {
+        assert!(!format!("{first_server:?}").contains(credential));
+    }
+    let empty_refs = remote_request(first_server.port(), "GET", "/remote.db/refs", &[]);
+    assert!(
+        empty_refs.starts_with(b"HTTP/1.1 404 "),
+        "opening a new cloud URI must not seed a synthetic main ref: {}",
+        String::from_utf8_lossy(&empty_refs[..empty_refs.len().min(200)])
+    );
+    let remote_url = first_server.database_url("remote.db");
+    let _: i64 = source
+        .query_row(
+            "SELECT dolt_remote('add', 'origin', ?1)",
+            params![remote_url],
+            |row| row.get(0),
+        )
+        .expect("add first cloud-backed remote");
+    let _: i64 = source
+        .query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))
+        .expect("push first commit to the cloud-backed server");
+    let first_hash: String = source
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("read first source branch hash");
+    let mut first_server = first_server;
+    first_server
+        .upload()
+        .expect("publish first remote protocol push");
+    first_server
+        .close()
+        .expect("close the URI-owned server after publication");
+
+    let readonly_flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let verify_first = Connection::open_with_flags(&uri, readonly_flags)
+        .expect("reopen the published database through a fresh SQL connection");
+    let first_count: i64 = verify_first
+        .query_row("SELECT count(*) FROM widgets", [], |row| row.get(0))
+        .expect("read first published row");
+    let published_first_hash: String = verify_first
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("read first published branch hash");
+    assert_eq!(first_count, 1);
+    assert_eq!(published_first_hash, first_hash);
+    verify_first.close().expect("close fresh SQL reader");
+
+    source
+        .execute("INSERT INTO widgets VALUES(2, 'second value')", [])
+        .expect("write second source change");
+    let _: String = source
+        .query_row("SELECT dolt_commit('-A', '-m', 'second')", [], |row| {
+            row.get(0)
+        })
+        .expect("commit second source changes");
+    let second_server = RemoteServer::start_with_options(&uri, &writable_options)
+        .expect("reopen URI-owned server for the second push");
+    let second_remote_url = second_server.database_url("remote.db");
+    let _: i64 = source
+        .query_row(
+            "SELECT dolt_remote('set-url', 'origin', ?1)",
+            params![second_remote_url],
+            |row| row.get(0),
+        )
+        .expect("point source remote at the second server");
+    let _: i64 = source
+        .query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))
+        .expect("push second commit using the published refs CAS state");
+    let second_hash: String = source
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("read second source branch hash");
+    let mut second_server = second_server;
+    second_server
+        .upload()
+        .expect("publish the second remote protocol push");
+    second_server
+        .close()
+        .expect("close the URI-owned server after its second publication");
+
+    let verify_second = Connection::open_with_flags(&uri, readonly_flags)
+        .expect("open a fresh SQL reader after the second publication");
+    let second_count: i64 = verify_second
+        .query_row("SELECT count(*) FROM widgets", [], |row| row.get(0))
+        .expect("read both published rows");
+    let published_second_hash: String = verify_second
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("read second published branch hash");
+    assert_eq!(second_count, 2);
+    assert_eq!(published_second_hash, second_hash);
+    verify_second
+        .close()
+        .expect("close second fresh SQL reader");
+
+    let readonly_options = RemoteServerOptions::new().database_open_flags(readonly_flags);
+    let read_server = RemoteServer::start_with_options(&uri, &readonly_options)
+        .expect("start a read-only URI-owned server for clone");
+    let clone = Connection::open(temp.path().join("clone.db")).expect("create clone database");
+    let _: i64 = clone
+        .query_row(
+            "SELECT dolt_clone(?1)",
+            params![read_server.database_url("remote.db")],
+            |row| row.get(0),
+        )
+        .expect("clone from the published cloud-backed remote");
+    let clone_count: i64 = clone
+        .query_row("SELECT count(*) FROM widgets", [], |row| row.get(0))
+        .expect("read cloned rows");
+    assert_eq!(clone_count, 2);
+    clone.close().expect("close clone database");
+    read_server
+        .close()
+        .expect("close read-only URI-owned server");
+    source.close().expect("close source database");
+}
+
+#[cfg(feature = "remote")]
+fn start_uri_session_server(
+    uri: &str,
+    session_id: &str,
+    operation_id: SessionOperationId,
+) -> rusqlite::Result<RemoteServer> {
+    let scope = SessionScope::new("emulator-transfer", "remote.db", "push,read")?;
+    let session = BlockCacheSessionOptions::for_uri(session_id, scope, operation_id)?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    RemoteServer::start_with_options(
+        uri,
+        &RemoteServerOptions::new()
+            .database_open_flags(flags)
+            .blockcache_session(session),
+    )
+}
+
+#[cfg(feature = "remote")]
+struct UriSessionHttpProxy {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    reject_commits: Arc<AtomicBool>,
+    rejected_commits: Arc<AtomicUsize>,
+    completed_refs_if: Arc<AtomicUsize>,
+    published_commits: Arc<AtomicUsize>,
+    failure: Arc<Mutex<Option<String>>>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "remote")]
+impl UriSessionHttpProxy {
+    fn start(uri: &str) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind URI session proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("configure URI session proxy");
+        let port = listener
+            .local_addr()
+            .expect("URI session proxy address")
+            .port();
+        let uri = uri.to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reject_commits = Arc::new(AtomicBool::new(true));
+        let rejected_commits = Arc::new(AtomicUsize::new(0));
+        let completed_refs_if = Arc::new(AtomicUsize::new(0));
+        let published_commits = Arc::new(AtomicUsize::new(0));
+        let failure = Arc::new(Mutex::new(None));
+
+        let thread_stop = Arc::clone(&stop);
+        let thread_reject_commits = Arc::clone(&reject_commits);
+        let thread_rejected_commits = Arc::clone(&rejected_commits);
+        let thread_completed_refs_if = Arc::clone(&completed_refs_if);
+        let thread_published_commits = Arc::clone(&published_commits);
+        let thread_failure = Arc::clone(&failure);
+        let join = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => {
+                        if let Ok(mut failure) = thread_failure.lock() {
+                            *failure = Some(format!("accept failed: {error}"));
+                        }
+                        break;
+                    }
+                };
+                if let Err(error) = stream.set_read_timeout(Some(HTTP_TEST_TIMEOUT)) {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(format!("set request timeout failed: {error}"));
+                    }
+                    break;
+                }
+                let Some(request) = read_http_request(&mut stream) else {
+                    continue;
+                };
+                let (method, path, body) = request_parts(&request);
+                let Some((session_id, native_path)) = session_request_path(&path) else {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(format!(
+                            "request path={path} has no capability session prefix"
+                        ));
+                    }
+                    let _ = stream.write_all(&empty_http_response(400));
+                    continue;
+                };
+                let route = request_route(&native_path);
+                if request_header(&request, "Idempotency-Token").is_some() {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(format!(
+                            "native request route={route} unexpectedly carried Idempotency-Token"
+                        ));
+                    }
+                    let _ = stream.write_all(&empty_http_response(400));
+                    continue;
+                }
+                let Some(native_request) = request_with_path(&request, &native_path) else {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(format!("could not rewrite request path for {route}"));
+                    }
+                    let _ = stream.write_all(&empty_http_response(400));
+                    continue;
+                };
+                if route == "commit" && thread_reject_commits.load(Ordering::Acquire) {
+                    thread_rejected_commits.fetch_add(1, Ordering::AcqRel);
+                    let _ = stream.write_all(&empty_http_response(503));
+                    continue;
+                }
+
+                let mutation = matches!(route, "chunks" | "refs-if" | "commit");
+                let operation_id = if mutation {
+                    match SessionOperationId::from_request(&method, &native_path, &body) {
+                        Ok(operation_id) => operation_id,
+                        Err(error) => {
+                            if let Ok(mut failure) = thread_failure.lock() {
+                                *failure = Some(format!("derive mutation operation ID: {error}"));
+                            }
+                            let _ = stream.write_all(&empty_http_response(400));
+                            continue;
+                        }
+                    }
+                } else {
+                    SessionOperationId::random()
+                };
+                let mut server = match start_uri_session_server(&uri, session_id, operation_id) {
+                    Ok(server) => server,
+                    Err(error) => {
+                        if let Ok(mut failure) = thread_failure.lock() {
+                            *failure =
+                                Some(format!("start URI session server for {route}: {error}"));
+                        }
+                        let _ = stream.write_all(&empty_http_response(500));
+                        continue;
+                    }
+                };
+                let response = if !mutation {
+                    let native_request = send_http_request_raw_with_timeout(
+                        server.port(),
+                        &native_request,
+                        SESSION_HTTP_TEST_TIMEOUT,
+                    );
+                    if let Err(error) = server.quiesce().and_then(|()| server.close()) {
+                        if let Ok(mut failure) = thread_failure.lock() {
+                            *failure = Some(format!("close read request {route}: {error}"));
+                        }
+                        empty_http_response(500)
+                    } else {
+                        native_request
+                    }
+                } else {
+                    match server.operation_status() {
+                        Err(error) => {
+                            let _ = server.quiesce();
+                            let _ = server.close();
+                            if let Ok(mut failure) = thread_failure.lock() {
+                                *failure =
+                                    Some(format!("read operation status for {route}: {error}"));
+                            }
+                            empty_http_response(500)
+                        }
+                        Ok(SessionOperationStatus::New) => {
+                            let native_request = send_http_request_raw_with_timeout(
+                                server.port(),
+                                &native_request,
+                                SESSION_HTTP_TEST_TIMEOUT,
+                            );
+                            let status = http_status(&native_request);
+                            if status >= 400 {
+                                if let Ok(mut failure) = thread_failure.lock() {
+                                    *failure = Some(format!(
+                                        "native route={route} method={method} returned {status}: {}",
+                                        String::from_utf8_lossy(&native_request)
+                                            .chars()
+                                            .take(512)
+                                            .collect::<String>()
+                                    ));
+                                }
+                                let _ = server.quiesce();
+                                let _ = server.close();
+                                native_request
+                            } else {
+                                let completion = if route == "commit" {
+                                    server.upload()
+                                } else {
+                                    server.complete_request()
+                                };
+                                let result = completion.and_then(|()| server.close());
+                                if let Err(error) = result {
+                                    if let Ok(mut failure) = thread_failure.lock() {
+                                        *failure =
+                                            Some(format!("complete mutation {route}: {error}"));
+                                    }
+                                    empty_http_response(500)
+                                } else {
+                                    if route == "refs-if" {
+                                        thread_completed_refs_if.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                    if route == "commit" {
+                                        thread_published_commits.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                    native_request
+                                }
+                            }
+                        }
+                        Ok(SessionOperationStatus::Accepted) if route == "commit" => {
+                            let result = server.upload().and_then(|()| server.close());
+                            if let Err(error) = result {
+                                if let Ok(mut failure) = thread_failure.lock() {
+                                    *failure = Some(format!("publish accepted /commit: {error}"));
+                                }
+                                empty_http_response(500)
+                            } else {
+                                thread_published_commits.fetch_add(1, Ordering::AcqRel);
+                                empty_http_response(200)
+                            }
+                        }
+                        Ok(
+                            SessionOperationStatus::Accepted | SessionOperationStatus::Committed,
+                        ) => {
+                            let result = server.quiesce().and_then(|()| server.close());
+                            if let Err(error) = result {
+                                if let Ok(mut failure) = thread_failure.lock() {
+                                    *failure =
+                                        Some(format!("close accepted retry {route}: {error}"));
+                                }
+                                empty_http_response(500)
+                            } else {
+                                empty_http_response(200)
+                            }
+                        }
+                        Ok(SessionOperationStatus::Failed | SessionOperationStatus::Conflict) => {
+                            let _ = server.quiesce();
+                            let _ = server.close();
+                            empty_http_response(409)
+                        }
+                    }
+                };
+                if let Err(error) = stream.write_all(&response) {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(format!("write response for {route}: {error}"));
+                    }
+                }
+            }
+        });
+
+        Self {
+            port,
+            stop,
+            reject_commits,
+            rejected_commits,
+            completed_refs_if,
+            published_commits,
+            failure,
+            join: Some(join),
+        }
+    }
+
+    fn allow_commits(&self) {
+        self.reject_commits.store(false, Ordering::Release);
+    }
+
+    fn database_url(&self, session_id: &str, database: &str) -> String {
+        format!(
+            "http://127.0.0.1:{}/capability/{session_id}/{database}",
+            self.port
+        )
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.failure.lock().expect("lock URI proxy failure").clone()
+    }
+
+    fn rejected_commit_count(&self) -> usize {
+        self.rejected_commits.load(Ordering::Acquire)
+    }
+
+    fn completed_refs_if_count(&self) -> usize {
+        self.completed_refs_if.load(Ordering::Acquire)
+    }
+
+    fn published_commit_count(&self) -> usize {
+        self.published_commits.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Drop for UriSessionHttpProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(join) = self.join.take() {
+            if let Err(panic) = join.join() {
+                if let Ok(mut failure) = self.failure.lock() {
+                    if failure.is_none() {
+                        *failure = Some(format!("URI proxy thread panic: {panic:?}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+fn request_header(request: &[u8], wanted: &str) -> Option<String> {
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let header = String::from_utf8_lossy(&request[..header_end]);
+    header.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case(wanted)
+            .then(|| value.trim().to_owned())
+    })
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_publication_recovers_after_ordinary_upload() {
+    let suffix = unique_suffix();
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let prefix = format!("{suffix}/uri/session-publication-interoperability/");
+    let uri = remote_server_database_uri("google", &endpoint, bucket, &prefix);
+    let write_flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let read_flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+    let initial = Connection::open_with_flags(&uri, write_flags)
+        .expect("create URI database before session publication");
+    initial
+        .execute_batch("PRAGMA user_version = 1;")
+        .expect("write initial ordinary URI database version");
+    initial
+        .upload()
+        .expect("publish initial ordinary URI database");
+    initial
+        .close()
+        .expect("close initial ordinary URI database");
+
+    let mut first =
+        start_uri_session_server(&uri, &Uuid::new_v4().to_string(), session_operation_id(1))
+            .expect("start first session publication");
+    first
+        .complete_request()
+        .expect("accept first session publication");
+    first.upload().expect("publish first session head");
+    first.close().expect("close first session publisher");
+
+    // An ordinary URI upload legitimately advances the manifest after the
+    // terminal session record was committed. A fresh session must be able to
+    // publish against this newly captured base.
+    let ordinary = Connection::open_with_flags(&uri, write_flags)
+        .expect("open ordinary URI writer after session publication");
+    ordinary
+        .execute_batch("PRAGMA user_version = 2;")
+        .expect("write ordinary URI database version");
+    ordinary
+        .upload()
+        .expect("publish ordinary URI update after session publication");
+    ordinary
+        .close()
+        .expect("close ordinary URI writer after session publication");
+
+    let mut fresh =
+        start_uri_session_server(&uri, &Uuid::new_v4().to_string(), session_operation_id(2))
+            .expect("start fresh session after ordinary upload");
+    fresh
+        .complete_request()
+        .expect("accept fresh session after ordinary upload");
+    fresh
+        .upload()
+        .expect("publish fresh session after ordinary upload");
+    fresh.close().expect("close fresh session publisher");
+    let positive_reader =
+        Connection::open_with_flags(&uri, read_flags).expect("read the fresh session publication");
+    let published_version: i64 = positive_reader
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read ordinary update published by the fresh session");
+    assert_eq!(published_version, 2);
+    positive_reader
+        .close()
+        .expect("close fresh session publication reader");
+
+    // Once a session has accepted its candidate, a later ordinary upload
+    // changes its captured base. That stale candidate must still be rejected.
+    let mut stale =
+        start_uri_session_server(&uri, &Uuid::new_v4().to_string(), session_operation_id(3))
+            .expect("start session for stale-base check");
+    stale
+        .complete_request()
+        .expect("accept candidate for stale-base check");
+    let external = Connection::open_with_flags(&uri, write_flags)
+        .expect("open external URI writer after candidate acceptance");
+    external
+        .execute_batch("PRAGMA user_version = 3;")
+        .expect("write external URI update after candidate acceptance");
+    external
+        .upload()
+        .expect("publish external update after candidate acceptance");
+    external
+        .close()
+        .expect("close external URI writer after candidate acceptance");
+    let error = stale
+        .upload()
+        .expect_err("reject a session candidate whose base manifest is stale");
+    assert_eq!(
+        error.sqlite_extended_error_code(),
+        Some(ffi::SQLITE_CONSTRAINT),
+        "stale base should remain a session conflict: {error:?}"
+    );
+    stale.close().expect("close stale session publisher");
+
+    let reader = Connection::open_with_flags(&uri, read_flags)
+        .expect("read the external manifest after stale-base rejection");
+    let user_version: i64 = reader
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read external manifest version");
+    assert_eq!(user_version, 3);
+    reader.close().expect("close external manifest reader");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_handoff_keeps_accepted_graph_private_until_upload() {
+    let suffix = unique_suffix();
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let prefix = format!("{suffix}/uri/session-handoff/");
+    let uri = remote_server_database_uri("google", &endpoint, bucket, &prefix);
+    let read_only_flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let temp = tempfile::tempdir().expect("URI session workflow tempdir");
+    let source = Connection::open(temp.path().join("source.db"))
+        .expect("create URI session source database");
+    source
+        .execute_batch(
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO widgets VALUES(1, 'accepted');",
+        )
+        .expect("create source row");
+    let _: String = source
+        .query_row("SELECT dolt_commit('-A', '-m', 'accepted')", [], |row| {
+            row.get(0)
+        })
+        .expect("commit source row");
+
+    let session_id = Uuid::new_v4().to_string();
+    let proxy = UriSessionHttpProxy::start(&uri);
+    let _: i64 = source
+        .query_row(
+            "SELECT dolt_remote('add', 'origin', ?1)",
+            params![proxy.database_url(&session_id, "remote.db")],
+            |row| row.get(0),
+        )
+        .expect("add URI session proxy remote");
+    let first_push: rusqlite::Result<i64> =
+        source.query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0));
+    assert!(
+        first_push.is_err(),
+        "the injected first /commit must fail: {first_push:?}"
+    );
+    assert!(
+        proxy.rejected_commit_count() > 0,
+        "first push error={first_push:?}; refs-if completions={}; proxy failure={:?}",
+        proxy.completed_refs_if_count(),
+        proxy.failure()
+    );
+    assert!(
+        proxy.completed_refs_if_count() > 0,
+        "the refs-if request must be durably accepted before the injected /commit failure"
+    );
+    assert_eq!(proxy.published_commit_count(), 0);
+    assert!(
+        proxy.failure().is_none(),
+        "proxy failure: {:?}",
+        proxy.failure()
+    );
+
+    let unpublished = Connection::open_with_flags(&uri, read_only_flags)
+        .expect("read the fresh published database after accepted refs-if");
+    let unpublished_branches: i64 = unpublished
+        .query_row("SELECT count(*) FROM dolt_branches", [], |row| row.get(0))
+        .expect("read published branch list before commit");
+    assert_eq!(unpublished_branches, 0);
+    unpublished
+        .close()
+        .expect("close SQL reader before publication");
+
+    proxy.allow_commits();
+    let retry: i64 = source
+        .query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))
+        .expect("retry the push with the same capability URL");
+    let _ = retry;
+    assert!(proxy.published_commit_count() > 0);
+    assert!(
+        proxy.failure().is_none(),
+        "proxy failure: {:?}",
+        proxy.failure()
+    );
+
+    let published = Connection::open_with_flags(&uri, read_only_flags)
+        .expect("open ordinary reader after terminal publication");
+    let published_branches: i64 = published
+        .query_row("SELECT count(*) FROM dolt_branches", [], |row| row.get(0))
+        .expect("read published branch list");
+    let published_rows: i64 = published
+        .query_row("SELECT count(*) FROM widgets", [], |row| row.get(0))
+        .expect("read graph rows from published push");
+    assert_eq!(published_branches, 1);
+    assert_eq!(published_rows, 1);
+    published
+        .close()
+        .expect("close ordinary reader after publication");
+    source.close().expect("close URI session source database");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_remote_server_publishes_repeated_pushes() {
+    run_uri_remote_server_push_workflow("google");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local S3 emulator container"]
+fn s3_uri_remote_server_publishes_repeated_pushes() {
+    run_uri_remote_server_push_workflow("s3");
 }
 
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]

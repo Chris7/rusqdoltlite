@@ -1,0 +1,54 @@
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -14613,14 +14613,13 @@
+       ** the immutable candidate recovery path; expiry is not a lease that
+       ** permits takeover or deletion of a pending fence. */
+     }else if( pub.eState==SQLITE_BCVFS_SESSION_COMMITTED ){
+-      /* A committed head may be reused only after proving that its exact
+-      ** candidate is still the visible manifest and that the new request's
+-      ** base ETag is the provider version now being replaced. A committed
+-      ** record is immutable history, so its old TTL does not prevent a new
+-      ** candidate from renewing the publication lease after lineage proof. */
++      /* A committed head is terminal history. A new candidate may replace it
++      ** when its captured base ETag still matches the live provider manifest;
++      ** the conditional manifest write below prevents a stale candidate from
++      ** replacing a manifest changed since that checkpoint. The committed
++      ** record's old TTL does not prevent lease renewal after base ETag verification. */
+       {
+         sqlite3_bcvfs_session_body pubBody;
+-        unsigned char aPublishedHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
+         rc = sqlite3_bcvfs_session_body_decode(
+             pub.eType,pub.eState,pub.zSessionId,
+             pub.aBody,pub.nBody,&pubBody,pzErr
+@@ -14628,20 +14627,17 @@
+         if( rc==SQLITE_OK ) rc = bcvfsSessionManifestFetch(
+             pFs,zAlias,&aManifest,&nManifest,&zManifestETag,pzErr
+         );
+-        if( rc==SQLITE_OK ){
+-          SHA256_CTX sha;
+-          SHA256_Init(&sha);
+-          SHA256_Update(&sha,aManifest,nManifest);
+-          SHA256_Final(aPublishedHash,&sha);
+-          if( memcmp(aPublishedHash,pubBody.aCandidateManifestHash,
+-              sizeof(aPublishedHash))!=0
+-           || strcmp(zManifestETag,zBaseETag)!=0
+-          ){
+-            rc = bcvSessionError(
+-                SQLITE_CONSTRAINT,pzErr,
+-                "published manifest does not match the committed publication head"
+-            );
+-          }
++        /* A terminal publication record describes history, not a permanent
++        ** lock on the manifest. An ordinary CBS upload may legitimately
++        ** replace that published version. A fresh session may supersede the
++        ** terminal record only when the live manifest still has the exact
++        ** ETag captured as this candidate's base; ManifestPut below remains
++        ** conditional on that same ETag. */
++        if( rc==SQLITE_OK && strcmp(zManifestETag,zBaseETag)!=0 ){
++          rc = bcvSessionError(
++              SQLITE_CONSTRAINT,pzErr,
++              "manifest changed since the session checkpoint"
++          );
+         }
+         if( rc!=SQLITE_OK ) goto session_publish_done;
+       }

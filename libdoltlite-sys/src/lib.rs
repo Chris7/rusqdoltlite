@@ -143,6 +143,19 @@ pub mod blockcachevfs {
             busy_ctx: *mut c_void,
             pz_err: *mut *mut c_char,
         ) -> c_int;
+        /// Initialize an empty DoltLite store without creating a zero-tip branch.
+        ///
+        /// The connection must have been opened with DoltLite's private no-seed
+        /// flag. This serializes and commits an empty refs table for the named
+        /// SQLite schema.
+        ///
+        /// # Safety
+        /// `db` must be a live SQLite connection and `z_db` must point to a
+        /// NUL-terminated schema name valid for that connection.
+        pub fn sqlite3_doltlite_bcvfs_initialize_empty_store(
+            db: *mut sqlite3,
+            z_db: *const c_char,
+        ) -> c_int;
         pub fn sqlite3_bcvfs_session_checkpoint(
             fs: *mut sqlite3_bcvfs,
             z_alias: *const c_char,

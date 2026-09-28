@@ -88,6 +88,7 @@ git -C "$tmp/src" apply \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0013-streaming-and-serverless.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0014-cbs-create-upload.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0015-preserve-database-header.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0016-session-publication-after-ordinary-upload.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0014-streaming-and-serverless-tests.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0015-wal-mode-fixtures.patch"
 git -C "$tmp" apply \
