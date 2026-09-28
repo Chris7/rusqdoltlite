@@ -26,13 +26,19 @@ To update DoltLite:
 matches. A failed build is an upgrade-review signal, not permission to silently
 skip a local change.
 
-Each patch owns one independently removable behavior. The numbered core
+Keep each patch scoped to one source tree. A behavior may have coordinated
+parts in the DoltLite and CBS series; apply each series directly to its own
+staged source tree and document any dependency between them. The numbered core
 patches apply to `doltlite.c`; remote-server sidecar patches apply to the
 staged `doltlite_remotesrv.c` and `doltlite_remotesrv.h` files before the
 server is appended to the amalgamation. Currently, `0001` and `0002` add
 `dolt_remote('set-url', ...)`, `0003` adds the CBS upload lock hooks, and
 `0004-remote-server-vfs.patch` lets each native remote server select an
 optional named SQLite VFS while preserving the process default when omitted.
+`0005-doltlite-no-seed.patch` adds an internal open flag that lets the CBS
+checkpoint connection skip DoltLite's initial graph seed without changing
+ordinary application opens. Patches under `blockcachevfs/` apply only to the
+staged CBS sources; patches in this directory apply only to DoltLite sources.
 
 Keep new behavior isolated the same way so an upstreamed fix can be removed
 without rebasing unrelated changes.
@@ -89,8 +95,8 @@ The CBS test-only changes live in the separate
 runner applies it after the production patch so `build.rs` never stages test
 sources into the library build.
 
-`0005-cbs-create-upload.patch` lets CBS create and upload a new local database
-before remote blocks exist. Its DoltLite hunk skips the initial seed commit for
-CBS checkpoint-only opens; ordinary application opens keep their seed behavior.
-The Rust build applies the DoltLite hunk after the remote-server patch and only
-the `blockcachevfs.c` hunk after the existing CBS patch series.
+`blockcachevfs/0014-cbs-create-upload.patch` lets CBS create and upload a new
+local database before remote blocks exist. The separate DoltLite patch above
+lets the CBS checkpoint-only open skip the initial seed commit; ordinary
+application opens keep their seed behavior. Each patch series is applied
+directly to its own staged source tree.

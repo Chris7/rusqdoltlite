@@ -80,7 +80,7 @@ cp "$DOLTLITE_LIB_DIR/remote/doltlite_remotesrv.c" \
   "$PATCH_CHECK_DIR/"
 (
   cd "$PATCH_CHECK_DIR" || exit 1
-  git apply --check --exclude=blockcachevfs.c "$SCRIPT_DIR"/patches/*.patch
+  git apply --check "$SCRIPT_DIR"/patches/*.patch
 )
 
 # Regenerate bindgen file for doltlite.h

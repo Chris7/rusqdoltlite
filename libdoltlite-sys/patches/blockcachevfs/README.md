@@ -85,9 +85,9 @@ abort the upload. The Rust build enables this integration with the
 `BCV_DOLTLITE_INTEGRATION` define; standalone CBS builds therefore retain the
 stock path without requiring DoltLite symbols.
 
-`../0005-cbs-create-upload.patch` lets SQLite `CREATE` initialize a new local
+`0014-cbs-create-upload.patch` lets SQLite `CREATE` initialize a new local
 database and supports checkpointing and uploading it before remote blocks exist.
-The Rust build applies only its `blockcachevfs.c` hunk after the numbered CBS
-patches. The integrated DoltLite checkpoint-only open skips the initial seed
-commit; normal application opens retain their existing behavior. Callers add
-schema and data before upload.
+The Rust build applies it after the preceding CBS patches. The CBS integration
+passes DoltLite's private no-seed flag for its checkpoint-only open; the flag is
+defined by `../0005-doltlite-no-seed.patch`, and normal application opens retain
+their existing seed behavior. Callers add schema and data before upload.
