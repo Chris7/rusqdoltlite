@@ -384,6 +384,11 @@ pub struct Connection {
     #[cfg(feature = "cache")]
     cache: StatementCache,
     transaction_behavior: TransactionBehavior,
+    #[cfg(all(
+        feature = "blockcachevfs",
+        not(all(target_family = "wasm", target_os = "unknown"))
+    ))]
+    cbs: Option<crate::blockcachevfs::ConnectionVfs>,
 }
 
 unsafe impl Send for Connection {}
@@ -458,6 +463,35 @@ impl Connection {
     /// - The database is stored in memory by default.
     /// - Persistent VFS (Virtual File Systems) is optional,
     ///   see <https://github.com/Spxg/sqlite-wasm-rs> for details
+    ///
+    #[cfg_attr(
+        all(
+            feature = "blockcachevfs",
+            not(all(target_family = "wasm", target_os = "unknown"))
+        ),
+        doc = concat!(
+            "When the `blockcachevfs` feature is enabled, a `gcs://` or `s3://` path ",
+            "opens a cloud-backed SQLite database. GCS uses ",
+            "`gcs://<bucket>/<prefix>?vfs=blockcachevfs&project=<project>&access_token=<token>`. ",
+            "S3 uses ",
+            "`s3://<bucket>/<prefix>?vfs=blockcachevfs&region=<region>&access_id=<id>&secret_access_key=<secret>`; ",
+            "`session_token` is optional for S3. Credentials and other query values ",
+            "containing reserved URI characters must be percent encoded. If omitted, ",
+            "`endpoint` uses Google Cloud Storage's JSON API endpoint for GCS and the ",
+            "regional AWS S3 endpoint for S3. Set `endpoint` to override either with ",
+            "a compatible HTTP endpoint, such as a local emulator. `database` defaults ",
+            "to `default.db`; names matching `.<name>-lock` are reserved for CBS lock ",
+            "files. The URI is parsed by rusqdoltlite and is not passed to SQLite or ",
+            "included in connection debug output. With `SQLITE_OPEN_CREATE`, opening ",
+            "initializes a missing CBS container and database and opens it with SQLite's ",
+            "normal create behavior. This creates an empty SQLite database with no ",
+            "application schema or data; rusqdoltlite does not write application PRAGMAs ",
+            "or run migrations. Application schema and data remain the caller's ",
+            "responsibility. Without CREATE, missing containers or databases return ",
+            "`SQLITE_NOTFOUND`. Changes remain local until [`Connection::upload`] ",
+            "succeeds. Protect the URI itself because it contains credentials."
+        )
+    )]
     #[inline]
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let flags = OpenFlags::default();
@@ -486,12 +520,44 @@ impl Connection {
     /// string or if the underlying SQLite open call fails.
     #[inline]
     pub fn open_with_flags<P: AsRef<Path>>(path: P, flags: OpenFlags) -> Result<Self> {
+        #[cfg(all(
+            feature = "blockcachevfs",
+            not(all(target_family = "wasm", target_os = "unknown"))
+        ))]
+        if let Some(uri) = path
+            .as_ref()
+            .to_str()
+            .filter(|path| path.starts_with("gcs://") || path.starts_with("s3://"))
+        {
+            return crate::blockcachevfs::open_connection_uri(uri, flags);
+        }
+
+        #[cfg(not(all(
+            feature = "blockcachevfs",
+            not(all(target_family = "wasm", target_os = "unknown"))
+        )))]
+        if path
+            .as_ref()
+            .to_str()
+            .is_some_and(|path| path.starts_with("gcs://") || path.starts_with("s3://"))
+        {
+            return Err(Error::SqliteFailure(
+                ffi::Error::new(ffi::SQLITE_MISUSE),
+                Some("gcs:// and s3:// URIs require the blockcachevfs feature".into()),
+            ));
+        }
+
         let c_path = path_to_cstring(path.as_ref())?;
         InnerConnection::open_with_flags(&c_path, flags, None).map(|db| Self {
             db: RefCell::new(db),
             #[cfg(feature = "cache")]
             cache: StatementCache::with_capacity(STATEMENT_CACHE_DEFAULT_CAPACITY),
             transaction_behavior: TransactionBehavior::Deferred,
+            #[cfg(all(
+                feature = "blockcachevfs",
+                not(all(target_family = "wasm", target_os = "unknown"))
+            ))]
+            cbs: None,
         })
     }
 
@@ -511,6 +577,16 @@ impl Connection {
         flags: OpenFlags,
         vfs: V,
     ) -> Result<Self> {
+        if path
+            .as_ref()
+            .to_str()
+            .is_some_and(|path| path.starts_with("gcs://") || path.starts_with("s3://"))
+        {
+            return Err(Error::SqliteFailure(
+                ffi::Error::new(ffi::SQLITE_MISUSE),
+                Some("open CBS URIs with Connection::open".into()),
+            ));
+        }
         let c_path = path_to_cstring(path.as_ref())?;
         let c_vfs = vfs.as_cstr()?;
         InnerConnection::open_with_flags(&c_path, flags, Some(&c_vfs)).map(|db| Self {
@@ -518,6 +594,11 @@ impl Connection {
             #[cfg(feature = "cache")]
             cache: StatementCache::with_capacity(STATEMENT_CACHE_DEFAULT_CAPACITY),
             transaction_behavior: TransactionBehavior::Deferred,
+            #[cfg(all(
+                feature = "blockcachevfs",
+                not(all(target_family = "wasm", target_os = "unknown"))
+            ))]
+            cbs: None,
         })
     }
 
@@ -828,17 +909,50 @@ impl Connection {
     /// This is functionally equivalent to the `Drop` implementation for
     /// `Connection` except that on failure, it returns an error and the
     /// connection itself (presumably so closing can be attempted again).
+    #[cfg_attr(
+        all(
+            feature = "blockcachevfs",
+            not(all(target_family = "wasm", target_os = "unknown"))
+        ),
+        doc = concat!(
+            "For CBS connections, call [`Connection::upload`] before closing when ",
+            "changes should be published. If pending local changes prevent ",
+            "detaching, SQLite is closed and this method returns the connection ",
+            "so it can still upload and retry close; other SQL operations are ",
+            "no longer available."
+        )
+    )]
     ///
     /// # Failure
     ///
     /// Will return `Err` if the underlying SQLite call fails.
     #[expect(clippy::result_large_err)]
     #[inline]
-    pub fn close(self) -> Result<(), (Self, Error)> {
+    #[cfg_attr(
+        not(all(
+            feature = "blockcachevfs",
+            not(all(target_family = "wasm", target_os = "unknown"))
+        )),
+        expect(unused_mut, reason = "CBS cleanup needs mutable connection ownership")
+    )]
+    pub fn close(mut self) -> Result<(), (Self, Error)> {
         #[cfg(feature = "cache")]
         self.flush_prepared_statement_cache();
-        let r = self.db.borrow_mut().close();
-        r.map_err(move |err| (self, err))
+        let close_result = self.db.borrow_mut().close();
+        if let Err(error) = close_result {
+            return Err((self, error));
+        }
+        #[cfg(all(
+            feature = "blockcachevfs",
+            not(all(target_family = "wasm", target_os = "unknown"))
+        ))]
+        if let Some(mut cbs) = self.cbs.take() {
+            if let Err(error) = cbs.close() {
+                self.cbs = Some(cbs);
+                return Err((self, error));
+            }
+        }
+        Ok(())
     }
 
     /// Enable loading of SQLite extensions from both SQL queries and Rust.
@@ -994,6 +1108,11 @@ impl Connection {
             #[cfg(feature = "cache")]
             cache: StatementCache::with_capacity(STATEMENT_CACHE_DEFAULT_CAPACITY),
             transaction_behavior: TransactionBehavior::Deferred,
+            #[cfg(all(
+                feature = "blockcachevfs",
+                not(all(target_family = "wasm", target_os = "unknown"))
+            ))]
+            cbs: None,
         })
     }
 
@@ -1043,6 +1162,11 @@ impl Connection {
             #[cfg(feature = "cache")]
             cache: StatementCache::with_capacity(STATEMENT_CACHE_DEFAULT_CAPACITY),
             transaction_behavior: TransactionBehavior::Deferred,
+            #[cfg(all(
+                feature = "blockcachevfs",
+                not(all(target_family = "wasm", target_os = "unknown"))
+            ))]
+            cbs: None,
         })
     }
 
@@ -1442,6 +1566,20 @@ mod test {
 
         let db = checked_memory_handle();
         db.close().unwrap();
+    }
+
+    #[cfg(not(feature = "blockcachevfs"))]
+    #[test]
+    fn cloud_connection_uri_requires_blockcachevfs_feature() {
+        let error = Connection::open(
+            "gcs://bucket/prefix?vfs=blockcachevfs&project=project&access_token=token",
+        )
+        .expect_err("a cloud URI must not fall through to a local SQLite path");
+
+        assert_eq!(error.sqlite_error_code(), Some(ffi::ErrorCode::ApiMisuse));
+        assert!(error
+            .to_string()
+            .contains("gcs:// and s3:// URIs require the blockcachevfs feature"));
     }
 
     #[cfg_attr(
