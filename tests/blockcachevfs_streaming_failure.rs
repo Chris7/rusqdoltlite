@@ -484,7 +484,7 @@ fn failure_phase_one() {
         .config(Config::HttpTimeout(1))
         .init()
         .expect("initialize block-cache VFS");
-    if let Err(error) = vfs.initialize_container(&storage) {
+    if let Err(error) = vfs.initialize_container(&storage, None) {
         panic!(
             "initialize remote CBS container through proxy (requests={}, puts={}): {error:?}",
             proxy.requests(),

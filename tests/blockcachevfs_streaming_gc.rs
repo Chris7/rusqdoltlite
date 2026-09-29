@@ -425,7 +425,7 @@ fn setup(backend: &str, vfs: &'static BlockCacheVfs) -> (String, String, Storage
     } else {
         Storage::s3_with_endpoint("test", &container, "us-east-1", &endpoint)
     };
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize GC test container");
 
     let local_dir = tempfile::tempdir().expect("local seed directory");

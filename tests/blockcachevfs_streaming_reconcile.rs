@@ -131,7 +131,7 @@ fn create_published_populated_database(vfs: &BlockCacheVfs, storage: &Storage) {
 }
 
 fn stage_large_update(vfs: &BlockCacheVfs, storage: &Storage, alias: &str) {
-    vfs.initialize_container(storage)
+    vfs.initialize_container(storage, None)
         .expect("initialize reconcile-test container");
     seed_database(vfs, storage);
     vfs.attach(&AttachSpec::new(storage.clone()).alias(alias))
@@ -342,7 +342,7 @@ fn run_clean_cache_stage_phase() {
     };
     let vfs = new_vfs(&cache, CACHE_BYTES).expect("initialize clean-cache VFS");
     let remote = storage(&endpoint, &container);
-    vfs.initialize_container(&remote)
+    vfs.initialize_container(&remote, None)
         .expect("initialize clean-cache container");
     create_published_populated_database(vfs, &remote);
     vfs.attach(&AttachSpec::new(remote).alias("clean_cache"))
@@ -407,7 +407,7 @@ fn run_dirty_cache_stage_phase(alias: &str) {
     };
     let vfs = new_dirty_fixture_vfs(&cache).expect("initialize dirty-cache VFS");
     let remote = storage(&endpoint, &container);
-    vfs.initialize_container(&remote)
+    vfs.initialize_container(&remote, None)
         .expect("initialize dirty-cache container");
     create_published_populated_database(vfs, &remote);
     vfs.attach(&AttachSpec::new(remote).alias(alias))
