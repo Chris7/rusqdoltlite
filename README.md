@@ -114,6 +114,14 @@ All containers attached to one VFS/cache must use the same block size, and its
 local cache size must be at least one block and an exact multiple of the block
 size.
 
+`gcs://` and `s3://` connection URIs also accept the optional
+`block_size=<decimal bytes>` query option. For example, append
+`&block_size=65536` to either URI to request 64 KiB blocks when the URI creates
+a missing container manifest. Omitting it uses the native 4 MiB default. URI
+block sizes follow the same validation rules above; an existing manifest's
+block size remains authoritative even when the URI specifies another valid
+size.
+
 The S3 authentication callback returns the secret access key. For temporary
 credentials, return `secret-access-key\nsession-token` using the helper above;
 the session token is signed as `x-amz-security-token` and is never put in the

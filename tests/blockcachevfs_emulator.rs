@@ -330,6 +330,47 @@ fn run_uri_auto_create(backend: &str) {
         .expect("read the winner's persisted row");
     assert!(value == "left" || value == "right");
     winner.close().expect("close the winning database");
+
+    let small_prefix = format!("{suffix}/uri/create-small/");
+    let small_base_uri = uri_for_container(backend, &endpoint, &bucket, &small_prefix);
+    let small_uri = format!("{small_base_uri}&block_size=65536");
+    let small_database = Connection::open(&small_uri)
+        .expect("URI block_size should initialize a 64 KiB CBS manifest");
+    small_database
+        .execute_batch(
+            "CREATE TABLE sample(value TEXT NOT NULL); INSERT INTO sample VALUES ('uri-small-block');",
+        )
+        .expect("write a database through the small-block URI");
+    small_database
+        .upload()
+        .expect("upload the small-block URI database");
+    small_database
+        .close()
+        .expect("close the uploaded small-block URI database");
+
+    let manifest_object = format!("{small_prefix}manifest.bcv");
+    let small_manifest = fetch_session_object(backend, &endpoint, &bucket, &manifest_object);
+    assert_eq!(
+        be_u32(&small_manifest, 4),
+        64 * 1024,
+        "the URI block_size must be persisted in the new manifest"
+    );
+
+    let existing_uri = format!("{small_base_uri}&block_size=131072");
+    let existing_database = Connection::open(&existing_uri)
+        .expect("a valid URI block_size must not override an existing manifest");
+    let value: String = existing_database
+        .query_row("SELECT value FROM sample", [], |row| row.get(0))
+        .expect("read small-block data through a fresh URI cache");
+    assert_eq!(value, "uri-small-block");
+    existing_database
+        .close()
+        .expect("close the fresh-cache URI reader");
+    assert_eq!(
+        small_manifest,
+        fetch_session_object(backend, &endpoint, &bucket, &manifest_object),
+        "an existing manifest must remain unchanged when URI block_size differs"
+    );
 }
 
 fn encode_query_value(value: &str) -> String {

@@ -1406,6 +1406,7 @@ struct CloudConnectionUri {
     database: String,
     storage: CloudStorageUri,
     endpoint: Option<String>,
+    block_size: Option<u32>,
 }
 
 enum CloudStorageUri {
@@ -1465,7 +1466,7 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
             return Err(sanitize_cloud_error(error, &credentials_to_redact));
         }
 
-        let initialization_error = vfs.initialize_container(&storage, None).err();
+        let initialization_error = vfs.initialize_container(&storage, uri.block_size).err();
         if let Err(attach_error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
             let error =
                 initialization_error.unwrap_or_else(|| normalize_container_not_found(attach_error));
@@ -1585,6 +1586,20 @@ impl CloudConnectionUri {
         if vfs != "blockcachevfs" {
             return Err(cbs_uri_error("CBS URI must select vfs=blockcachevfs"));
         }
+        let block_size = options
+            .remove("block_size")
+            .map(|value| {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(cbs_uri_error("invalid CBS block_size"));
+                }
+                let block_size = value
+                    .parse::<u32>()
+                    .map_err(|_| cbs_uri_error("invalid CBS block_size"))?;
+                validate_container_block_size(block_size)
+                    .map_err(|_| cbs_uri_error("invalid CBS block_size"))?;
+                Ok(block_size)
+            })
+            .transpose()?;
         let storage = if scheme == "gcs" {
             let project = options
                 .remove("project")
@@ -1673,6 +1688,7 @@ impl CloudConnectionUri {
             database,
             storage,
             endpoint,
+            block_size,
         })
     }
 
@@ -2357,6 +2373,7 @@ mod tests {
         )
         .expect("valid GCS URI without endpoint");
         assert!(gcs.endpoint.is_none());
+        assert_eq!(gcs.block_size, None);
         let gcs_storage = gcs.storage_for_container("bucket/repository");
         assert_eq!(gcs_storage.provider, "google?api=json");
         assert_eq!(gcs_storage.account, "project");
@@ -2366,6 +2383,7 @@ mod tests {
         )
         .expect("valid S3 URI without endpoint");
         assert!(s3.endpoint.is_none());
+        assert_eq!(s3.block_size, None);
         let s3_storage = s3.storage_for_container("bucket/repository");
         assert_eq!(s3_storage.provider, "s3?region=us-west-2");
         assert_eq!(s3_storage.account, "access");
@@ -2391,6 +2409,67 @@ mod tests {
                 .provider,
             "s3?region=us-west-2&endpoint=http://127.0.0.1:4566"
         );
+    }
+
+    #[test]
+    fn cloud_connection_uri_block_size_is_decimal_bytes_for_both_providers() {
+        let provider_queries = [
+            (
+                "gcs",
+                "vfs=blockcachevfs&project=project&access_token=gcs-secret",
+            ),
+            (
+                "s3",
+                "vfs=blockcachevfs&region=us-east-1&access_id=access&secret_access_key=s3-secret",
+            ),
+        ];
+
+        for (scheme, query) in provider_queries {
+            let base_uri = format!("{scheme}://bucket/repository?{query}");
+            assert_eq!(
+                CloudConnectionUri::parse(&base_uri)
+                    .expect("valid URI without an explicit block size")
+                    .block_size,
+                None,
+                "omitting block_size should use the native default for {scheme}"
+            );
+            assert_eq!(
+                CloudConnectionUri::parse(&format!("{base_uri}&block_size=65536"))
+                    .expect("valid URI with an explicit block size")
+                    .block_size,
+                Some(64 * 1024)
+            );
+
+            for invalid in [
+                "",
+                "0",
+                "zero",
+                "65536KiB",
+                "4294967296",
+                "16384",
+                "32769",
+                "32770",
+                "49152",
+                "2147483648",
+            ] {
+                let error = CloudConnectionUri::parse(&format!("{base_uri}&block_size={invalid}"))
+                    .err()
+                    .expect("invalid block_size must fail during URI parsing");
+                assert!(
+                    error.to_string().contains("invalid CBS block_size"),
+                    "block_size errors should be generic: {error}"
+                );
+                assert!(!error.to_string().contains("gcs-secret"));
+                assert!(!error.to_string().contains("s3-secret"));
+            }
+
+            let duplicate = CloudConnectionUri::parse(&format!(
+                "{base_uri}&block_size=65536&block_size=131072"
+            ))
+            .err()
+            .expect("duplicate block_size options must be rejected");
+            assert!(duplicate.to_string().contains("duplicate CBS URI option"));
+        }
     }
 
     #[test]
