@@ -928,17 +928,8 @@ impl Connection {
     /// Will return `Err` if the underlying SQLite call fails.
     #[expect(clippy::result_large_err)]
     #[inline]
-    #[cfg_attr(
-        not(all(
-            feature = "blockcachevfs",
-            not(all(target_family = "wasm", target_os = "unknown"))
-        )),
-        expect(unused_mut, reason = "CBS cleanup needs mutable connection ownership")
-    )]
     pub fn close(mut self) -> Result<(), (Self, Error)> {
-        #[cfg(feature = "cache")]
-        self.flush_prepared_statement_cache();
-        let close_result = self.db.borrow_mut().close();
+        let close_result = self.close_sql_handle();
         if let Err(error) = close_result {
             return Err((self, error));
         }
@@ -953,6 +944,18 @@ impl Connection {
             }
         }
         Ok(())
+    }
+
+    /// Close SQLite's handle while retaining any connection-owned VFS resources.
+    ///
+    /// This is used by RemoteServer after its native workers stop and before
+    /// session checkpointing, acceptance, or publication. The connection must
+    /// not be used for SQL again; its CBS owner remains available for upload
+    /// and final teardown.
+    pub(crate) fn close_sql_handle(&mut self) -> Result<()> {
+        #[cfg(feature = "cache")]
+        self.flush_prepared_statement_cache();
+        self.db.borrow_mut().close()
     }
 
     /// Enable loading of SQLite extensions from both SQL queries and Rust.

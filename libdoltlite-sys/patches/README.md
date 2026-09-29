@@ -37,8 +37,15 @@ server is appended to the amalgamation. Currently, `0001` and `0002` add
 optional named SQLite VFS while preserving the process default when omitted.
 `0005-doltlite-no-seed.patch` adds an internal open flag that lets the CBS
 checkpoint connection skip DoltLite's initial graph seed without changing
-ordinary application opens. Patches under `blockcachevfs/` apply only to the
-staged CBS sources; patches in this directory apply only to DoltLite sources.
+ordinary application opens. `0006-http-noop-push-commit.patch` finalizes a
+successful no-op HTTP push through `/commit`, allowing capability-scoped remote
+sessions to publish their accepted refs check. `0007-bcvfs-empty-store-initialization.patch`
+adds a NO_SEED-only native helper that commits an empty refs table for a new
+CBS DoltLite store without a SQL write that would create an unborn zero-tip
+branch. `0008-http-upload-batch-16mb.patch` reduces the maximum buffered HTTP
+upload batch from 32 MiB to 16 MiB.
+Patches under `blockcachevfs/` apply only to the staged CBS sources; patches in
+this directory apply only to DoltLite sources.
 
 Keep new behavior isolated the same way so an upstreamed fix can be removed
 without rebasing unrelated changes.
@@ -100,3 +107,10 @@ local database before remote blocks exist. The separate DoltLite patch above
 lets the CBS checkpoint-only open skip the initial seed commit; ordinary
 application opens keep their seed behavior. Each patch series is applied
 directly to its own staged source tree.
+
+`blockcachevfs/0016-session-publication-after-ordinary-upload.patch` lets a
+fresh session replace an older terminal `COMMITTED` publication record after
+an ordinary, non-session upload advances the manifest. It still requires the
+live manifest ETag to equal the fresh session's captured base, and the
+conditional manifest write preserves stale-base rejection. Pending
+`PUBLISHING` records remain fenced.

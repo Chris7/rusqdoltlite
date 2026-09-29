@@ -627,6 +627,9 @@ mod build_bundled {
             .collect::<Vec<_>>();
         patches.sort();
         assert!(!patches.is_empty(), "the local DoltLite patch set is empty");
+        for patch in &patches {
+            println!("cargo:rerun-if-changed={}", patch.display());
+        }
 
         let ceiling = output_dir
             .parent()

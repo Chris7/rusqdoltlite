@@ -7,8 +7,10 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+use sha2::{Digest, Sha256};
 
 use crate::error::{check, Error};
 use crate::{Connection, OpenFlags, Result};
@@ -489,6 +491,48 @@ pub const SESSION_OPERATION_ID_BYTES: usize = raw::SQLITE_BCVFS_SESSION_HASH_BYT
 pub struct SessionOperationId([u8; SESSION_OPERATION_ID_BYTES]);
 
 impl SessionOperationId {
+    /// Derive an operation identifier from the exact HTTP request fields.
+    ///
+    /// Length-prefixing each field makes the encoding unambiguous. Identical
+    /// method, target, and body bytes produce the same identifier so a caller
+    /// can retry one request without advancing the session twice.
+    ///
+    /// # Arguments
+    ///
+    /// * `method` - Exact HTTP method bytes.
+    /// * `target` - Exact request-target bytes, including the path and query.
+    /// * `body` - Exact HTTP request body bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the resulting digest is the reserved all-zero ID.
+    pub fn from_request(method: &str, target: &str, body: &[u8]) -> Result<Self> {
+        let mut digest = Sha256::new();
+        digest.update(b"rusqdoltlite-session-operation-v1\0");
+        for field in [method.as_bytes(), target.as_bytes(), body] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        Self::new(digest.finalize())
+    }
+
+    /// Create a fresh opaque operation identifier from SQLite's native
+    /// randomness source.
+    #[must_use]
+    pub fn random() -> Self {
+        let mut operation_id = [0_u8; SESSION_OPERATION_ID_BYTES];
+        unsafe {
+            crate::ffi::sqlite3_randomness(
+                operation_id.len() as c_int,
+                operation_id.as_mut_ptr().cast::<c_void>(),
+            );
+        }
+        if operation_id.iter().all(|byte| *byte == 0) {
+            operation_id[SESSION_OPERATION_ID_BYTES - 1] = 1;
+        }
+        Self(operation_id)
+    }
+
     /// Validate and store a fixed-size, non-zero operation identifier.
     pub fn new(operation_id: impl AsRef<[u8]>) -> Result<Self> {
         let operation_id = operation_id.as_ref();
@@ -548,16 +592,29 @@ impl SessionOperationStatus {
     }
 }
 
+enum SessionVfs {
+    Static(&'static BlockCacheVfs),
+    Owned(Arc<BlockCacheVfs>),
+}
+
+impl SessionVfs {
+    fn get(&self) -> &BlockCacheVfs {
+        match self {
+            Self::Static(vfs) => vfs,
+            Self::Owned(vfs) => vfs,
+        }
+    }
+}
+
 /// A block-cache attachment owned by one server/application session.
 ///
 /// The attachment stores its session identity locally and never changes a
-/// process-wide "current session".  Its alias is attached with `IFNOT`
-/// disabled, so an existing alias can never be silently reused by a session
-/// with a different storage context. A second live owner is rejected because
-/// the current CBS container is a mutable request overlay; same-session reuse
-/// is permitted only after the prior owner has released it.
+/// process-wide current session. Its alias is attached with IFNOT disabled,
+/// so an existing alias cannot be silently reused under another storage
+/// context. A second live owner is rejected while the mutable request overlay
+/// is active; same-session reuse is allowed after the prior owner releases it.
 pub struct SessionAttachment {
-    vfs: &'static BlockCacheVfs,
+    vfs: SessionVfs,
     alias: String,
     session_id: SessionId,
     operation_id: Option<SessionOperationId>,
@@ -573,6 +630,10 @@ impl fmt::Debug for SessionAttachment {
 }
 
 impl SessionAttachment {
+    fn vfs(&self) -> &BlockCacheVfs {
+        self.vfs.get()
+    }
+
     /// Return the validated session identifier bound to this attachment.
     #[must_use]
     pub fn session_id(&self) -> &str {
@@ -595,7 +656,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_operation_status(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut status,
@@ -623,7 +684,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_checkpoint(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 checkpoint_hash.as_mut_ptr(),
@@ -649,7 +710,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_accept(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut etag,
@@ -673,7 +734,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_upload(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut err,
@@ -693,7 +754,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_finalize(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut err,
@@ -718,7 +779,7 @@ impl Drop for SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_detach_session(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut err,
@@ -1062,7 +1123,7 @@ impl BlockCacheVfs {
         result_with_err(rc, &mut err)?;
 
         Ok(SessionAttachment {
-            vfs: self,
+            vfs: SessionVfs::Static(self),
             alias: alias_text,
             session_id,
             operation_id: None,
@@ -1084,6 +1145,31 @@ impl BlockCacheVfs {
         operations: &str,
         operation_id: &SessionOperationId,
     ) -> Result<SessionAttachment> {
+        let (session_id, alias) = self.attach_session_scoped_inner(
+            spec,
+            session_id,
+            principal,
+            database,
+            operations,
+            operation_id,
+        )?;
+        Ok(SessionAttachment {
+            vfs: SessionVfs::Static(self),
+            alias,
+            session_id,
+            operation_id: Some(*operation_id),
+        })
+    }
+
+    fn attach_session_scoped_inner(
+        &self,
+        spec: &AttachSpec,
+        session_id: impl AsRef<str>,
+        principal: &str,
+        database: &str,
+        operations: &str,
+        operation_id: &SessionOperationId,
+    ) -> Result<(SessionId, String)> {
         let session_id = SessionId::new(session_id)?;
         if self.is_daemon() {
             return Err(Error::SqliteFailure(
@@ -1126,10 +1212,29 @@ impl BlockCacheVfs {
             )
         };
         result_with_err(rc, &mut err)?;
+        Ok((session_id, alias_text))
+    }
 
+    pub(crate) fn attach_session_scoped_owned(
+        self: &Arc<Self>,
+        spec: &AttachSpec,
+        session_id: impl AsRef<str>,
+        principal: &str,
+        database: &str,
+        operations: &str,
+        operation_id: &SessionOperationId,
+    ) -> Result<SessionAttachment> {
+        let (session_id, alias) = self.attach_session_scoped_inner(
+            spec,
+            session_id,
+            principal,
+            database,
+            operations,
+            operation_id,
+        )?;
         Ok(SessionAttachment {
-            vfs: self,
-            alias: alias_text,
+            vfs: SessionVfs::Owned(Arc::clone(self)),
+            alias,
             session_id,
             operation_id: Some(*operation_id),
         })
@@ -1341,31 +1446,46 @@ impl BlockCacheVfs {
 
 /// CBS resources retained for the lifetime of a URI-opened connection.
 pub(crate) struct ConnectionVfs {
-    vfs: BlockCacheVfs,
+    vfs: Arc<BlockCacheVfs>,
     alias: String,
     path: String,
     directory: String,
     attached: bool,
+    session: Option<SessionAttachment>,
     cache_directory: std::path::PathBuf,
 }
 
 impl ConnectionVfs {
     pub(crate) fn close(&mut self) -> Result<()> {
+        // Session detachment preserves its durable accepted head. It must
+        // happen after SQLite closes the database and before VFS destruction.
+        self.session.take();
         if self.attached {
             self.vfs.detach(&self.alias)?;
             self.attached = false;
         }
-        let rc = unsafe { raw::sqlite3_bcvfs_destroy(self.vfs.fs) };
+        let vfs = Arc::get_mut(&mut self.vfs).ok_or_else(|| {
+            Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_BUSY),
+                Some("CBS VFS still has live session owners".into()),
+            )
+        })?;
+        let rc = unsafe { raw::sqlite3_bcvfs_destroy(vfs.fs) };
         if rc != crate::ffi::SQLITE_OK {
             return Err(Error::SqliteFailure(
                 crate::ffi::Error::new(rc),
                 Some("cannot destroy CBS VFS while it has open clients".into()),
             ));
         }
-        self.vfs.fs = ptr::null_mut();
-        self.vfs._auth.take();
+        vfs.fs = ptr::null_mut();
+        vfs._auth.take();
         let _ = std::fs::remove_dir_all(&self.cache_directory);
         Ok(())
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn session(&self) -> Option<&SessionAttachment> {
+        self.session.as_ref()
     }
 }
 
@@ -1373,13 +1493,17 @@ impl Drop for ConnectionVfs {
     fn drop(&mut self) {
         // Dropping never uploads changes. After SQLite drops its DB field, a
         // dirty connection can destroy its VFS and discard its local cache.
-        // Explicit close reports detach failures so callers can upload first.
-        if self.close().is_err() && !self.vfs.fs.is_null() {
-            let rc = unsafe { raw::sqlite3_bcvfs_destroy(self.vfs.fs) };
-            if rc == crate::ffi::SQLITE_OK {
-                self.vfs.fs = ptr::null_mut();
-                self.vfs._auth.take();
-                let _ = std::fs::remove_dir_all(&self.cache_directory);
+        // Explicit close reports errors returned while destroying resources.
+        if self.close().is_err() {
+            if let Some(vfs) = Arc::get_mut(&mut self.vfs) {
+                if !vfs.fs.is_null() {
+                    let rc = unsafe { raw::sqlite3_bcvfs_destroy(vfs.fs) };
+                    if rc == crate::ffi::SQLITE_OK {
+                        vfs.fs = ptr::null_mut();
+                        vfs._auth.take();
+                        let _ = std::fs::remove_dir_all(&self.cache_directory);
+                    }
+                }
             }
         }
     }
@@ -1406,8 +1530,118 @@ enum CloudStorageUri {
     },
 }
 
+pub(crate) struct UriSessionContext {
+    pub(crate) session_id: SessionId,
+    pub(crate) principal: String,
+    pub(crate) target_database: String,
+    pub(crate) operations: String,
+    pub(crate) operation_id: SessionOperationId,
+}
+
 pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connection> {
+    open_connection_uri_inner(uri, flags, None)
+}
+
+#[cfg(feature = "remote")]
+pub(crate) fn open_connection_uri_with_session(
+    uri: &str,
+    flags: OpenFlags,
+    session: UriSessionContext,
+) -> Result<Connection> {
+    open_connection_uri_inner(uri, flags, Some(session))
+}
+
+fn bootstrap_session_database(
+    vfs: &BlockCacheVfs,
+    storage: &Storage,
+    alias: &str,
+    database: &str,
+    flags: OpenFlags,
+    create: bool,
+    credentials_to_redact: &[String],
+) -> Result<()> {
+    let spec = AttachSpec::new(storage.clone());
+    let bootstrap_spec = spec.clone().alias(alias);
+    if let Err(error) = vfs.attach(&bootstrap_spec) {
+        let error = normalize_container_not_found(error);
+        let missing = matches!(
+            &error,
+            Error::SqliteFailure(native, _)
+                if native.extended_code == crate::ffi::SQLITE_NOTFOUND
+        );
+        if !create || !missing {
+            return Err(sanitize_cloud_error(error, credentials_to_redact));
+        }
+        let initialization_error = vfs.initialize_container(storage).err();
+        if let Err(attach_error) = vfs.attach(&bootstrap_spec) {
+            let error =
+                initialization_error.unwrap_or_else(|| normalize_container_not_found(attach_error));
+            return Err(sanitize_cloud_error(error, credentials_to_redact));
+        }
+    }
+
+    let bootstrap = (|| {
+        let root = vfs.open(format!("/{alias}"))?;
+        let exists = root.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bcv_database WHERE container = ?1 AND database = ?2)",
+            crate::params![alias, database],
+            |row| row.get::<_, bool>(0),
+        );
+        if let Err((root, error)) = root.close() {
+            drop(root);
+            return Err(error);
+        }
+        let exists = exists?;
+        if !exists {
+            if !create {
+                return Err(Error::SqliteFailure(
+                    crate::ffi::Error::new(crate::ffi::SQLITE_NOTFOUND),
+                    Some("CBS database not found".into()),
+                ));
+            }
+            let path = format!("/{alias}/{database}");
+            let empty = vfs.open_with_flags(path, flags)?;
+            // Materialize an empty Dolt store without the SQL seed commit.
+            // The native helper only accepts NO_SEED handles with no refs or
+            // chunks, then registers default main with zero branches.
+            // SAFETY: `empty` owns this live SQLite handle; the helper accepts
+            // the named main schema and does not retain the handle.
+            check(unsafe {
+                raw::sqlite3_doltlite_bcvfs_initialize_empty_store(empty.handle(), c"main".as_ptr())
+            })?;
+            empty.close().map_err(|(_, error)| error)?;
+            vfs.upload(alias)?;
+        }
+        Ok(())
+    })();
+    let detach = vfs.detach(alias);
+    match (bootstrap, detach) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(sanitize_cloud_error(error, credentials_to_redact)),
+        (Ok(()), Err(error)) => Err(sanitize_cloud_error(error, credentials_to_redact)),
+    }
+}
+
+fn open_connection_uri_inner(
+    uri: &str,
+    flags: OpenFlags,
+    session: Option<UriSessionContext>,
+) -> Result<Connection> {
     let uri = CloudConnectionUri::parse(uri)?;
+    if let Some(session) = session.as_ref() {
+        if session.target_database != uri.database {
+            return Err(cbs_uri_error(
+                "session scope target database does not match the cloud URI",
+            ));
+        }
+        if !flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE)
+            || flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY)
+        {
+            return Err(cbs_uri_error(
+                "session-owned cloud URIs require a writable database open",
+            ));
+        }
+    }
     let id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let mut cache_directory = CacheDirectoryGuard::new(create_cache_directory(id)?);
 
@@ -1423,10 +1657,12 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
     };
 
     let name = format!("rusqdoltlite-bcvfs-{}-{id}", std::process::id());
-    let vfs = BlockCacheVfs::builder(cache_directory.path())?
-        .name(&name)?
-        .auth_callback(move |_storage, _account, _container| Ok(auth_secret.clone()))
-        .build()?;
+    let vfs = Arc::new(
+        BlockCacheVfs::builder(cache_directory.path())?
+            .name(&name)?
+            .auth_callback(move |_storage, _account, _container| Ok(auth_secret.clone()))
+            .build()?,
+    );
 
     let container = if uri.prefix.is_empty() {
         uri.bucket.clone()
@@ -1434,33 +1670,66 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
         format!("{}/{}", uri.bucket, uri.prefix)
     };
     let storage = uri.storage_for_container(&container);
-    let alias = format!("cbs_{}_{}", std::process::id(), id);
-    let path = format!("/{alias}/{}", uri.database);
-    let directory = format!("/{alias}");
     let create = flags.contains(OpenFlags::SQLITE_OPEN_CREATE)
         && !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY);
-    if let Err(error) = vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias)) {
-        let error = normalize_container_not_found(error);
-        let missing = matches!(
-            &error,
-            Error::SqliteFailure(native, _)
-                if native.extended_code == crate::ffi::SQLITE_NOTFOUND
-        );
-        if !create || !missing {
-            return Err(sanitize_cloud_error(error, &credentials_to_redact));
-        }
 
-        let initialization_error = vfs.initialize_container(&storage).err();
-        if let Err(attach_error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
-            let error =
-                initialization_error.unwrap_or_else(|| normalize_container_not_found(attach_error));
-            return Err(sanitize_cloud_error(error, &credentials_to_redact));
+    let (alias, session_attachment, attached) = if let Some(session) = session.as_ref() {
+        let mut spec = AttachSpec::new(storage.clone());
+        let alias = session_alias(&spec, &session.session_id)?;
+        spec.alias = Some(alias.clone());
+        bootstrap_session_database(
+            &vfs,
+            &storage,
+            &alias,
+            &uri.database,
+            flags,
+            create,
+            &credentials_to_redact,
+        )?;
+        let attachment = vfs
+            .attach_session_scoped_owned(
+                &spec,
+                session.session_id.as_str(),
+                &session.principal,
+                &session.target_database,
+                &session.operations,
+                &session.operation_id,
+            )
+            .map_err(|error| {
+                sanitize_cloud_error(normalize_container_not_found(error), &credentials_to_redact)
+            })?;
+        (alias, Some(attachment), false)
+    } else {
+        let alias = format!("cbs_{}_{}", std::process::id(), id);
+        if let Err(error) = vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias)) {
+            let error = normalize_container_not_found(error);
+            let missing = matches!(
+                &error,
+                Error::SqliteFailure(native, _)
+                    if native.extended_code == crate::ffi::SQLITE_NOTFOUND
+            );
+            if !create || !missing {
+                return Err(sanitize_cloud_error(error, &credentials_to_redact));
+            }
+
+            let initialization_error = vfs.initialize_container(&storage).err();
+            if let Err(attach_error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
+                let error = initialization_error
+                    .unwrap_or_else(|| normalize_container_not_found(attach_error));
+                return Err(sanitize_cloud_error(error, &credentials_to_redact));
+            }
         }
-    }
+        (alias, None, true)
+    };
+    let path = format!("/{alias}/{}", uri.database);
+    let directory = format!("/{alias}");
     let control = match vfs.open(&directory) {
         Ok(control) => control,
         Err(error) => {
-            let _ = vfs.detach(&alias);
+            drop(session_attachment);
+            if attached {
+                let _ = vfs.detach(&alias);
+            }
             return Err(sanitize_cloud_error(error, &credentials_to_redact));
         }
     };
@@ -1473,17 +1742,26 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
         Ok(value) => value,
         Err(error) => {
             let _ = control.close();
-            let _ = vfs.detach(&alias);
+            drop(session_attachment);
+            if attached {
+                let _ = vfs.detach(&alias);
+            }
             return Err(sanitize_cloud_error(error, &credentials_to_redact));
         }
     };
     if let Err((control, error)) = control.close() {
         drop(control);
-        let _ = vfs.detach(&alias);
+        drop(session_attachment);
+        if attached {
+            let _ = vfs.detach(&alias);
+        }
         return Err(sanitize_cloud_error(error, &credentials_to_redact));
     }
     if !database_exists && !create {
-        let _ = vfs.detach(&alias);
+        drop(session_attachment);
+        if attached {
+            let _ = vfs.detach(&alias);
+        }
         return Err(Error::SqliteFailure(
             crate::ffi::Error::new(crate::ffi::SQLITE_NOTFOUND),
             Some("CBS database not found".into()),
@@ -1492,7 +1770,10 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
     let mut connection = match vfs.open_with_flags(&path, flags) {
         Ok(connection) => connection,
         Err(error) => {
-            let _ = vfs.detach(&alias);
+            drop(session_attachment);
+            if attached {
+                let _ = vfs.detach(&alias);
+            }
             return Err(sanitize_cloud_error(error, &credentials_to_redact));
         }
     };
@@ -1501,7 +1782,8 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
         alias,
         path,
         directory,
-        attached: true,
+        attached,
+        session: session_attachment,
         cache_directory: cache_directory.take(),
     });
     Ok(connection)
@@ -1907,6 +2189,11 @@ impl Connection {
     pub fn blockcachevfs_name(&self) -> Option<&str> {
         self.cbs.as_ref().map(|cbs| cbs.vfs.name())
     }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn blockcache_session(&self) -> Option<&SessionAttachment> {
+        self.cbs.as_ref().and_then(ConnectionVfs::session)
+    }
 }
 
 struct BcvHandle(*mut raw_util::sqlite3_bcv);
@@ -2179,6 +2466,25 @@ mod tests {
         let operation_id =
             SessionOperationId::new(operation_id).expect("non-zero operation ID should pass");
         assert_eq!(operation_id.as_bytes()[SESSION_OPERATION_ID_BYTES - 1], 1);
+    }
+
+    #[test]
+    fn request_operation_ids_are_stable_and_length_framed() {
+        let first = SessionOperationId::from_request("PUT", "/repo.db/refs-if", b"body")
+            .expect("derive operation ID");
+        let retry = SessionOperationId::from_request("PUT", "/repo.db/refs-if", b"body")
+            .expect("derive retry operation ID");
+        assert_eq!(first, retry);
+        assert_ne!(
+            first,
+            SessionOperationId::from_request("POST", "/repo.db/refs-if", b"body")
+                .expect("derive changed-method operation ID")
+        );
+        assert_ne!(
+            SessionOperationId::from_request("ab", "c", b"").expect("derive first framing"),
+            SessionOperationId::from_request("a", "bc", b"").expect("derive second framing")
+        );
+        assert_ne!(SessionOperationId::random(), SessionOperationId::random());
     }
 
     #[test]

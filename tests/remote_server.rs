@@ -156,7 +156,24 @@ fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
     assert_eq!(tracking_hash, branch_hash);
     assert!(server_root.join("origin.db").exists());
 
+    server.close()?;
+
     Ok(())
+}
+
+#[cfg(not(feature = "blockcachevfs"))]
+#[test]
+fn remote_server_rejects_cloud_uris_without_blockcachevfs() {
+    let token = "private-token";
+    let uri = format!("gcs://bucket/prefix?vfs=blockcachevfs&project=test&access_token={token}");
+    let error = RemoteServer::start(uri).expect_err("cloud server URIs require blockcachevfs");
+    assert!(matches!(
+        error,
+        Error::SqliteFailure(code, _)
+            if code.extended_code == ffi::SQLITE_MISUSE
+    ));
+    assert!(!format!("{error:?}").contains(token));
+    assert!(!error.to_string().contains(token));
 }
 
 #[test]
