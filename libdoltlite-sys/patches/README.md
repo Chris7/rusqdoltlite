@@ -42,7 +42,8 @@ successful no-op HTTP push through `/commit`, allowing capability-scoped remote
 sessions to publish their accepted refs check. `0007-bcvfs-empty-store-initialization.patch`
 adds a NO_SEED-only native helper that commits an empty refs table for a new
 CBS DoltLite store without a SQL write that would create an unborn zero-tip
-branch.
+branch. `0008-http-upload-batch-16mb.patch` reduces the maximum buffered HTTP
+upload batch from 32 MiB to 16 MiB.
 Patches under `blockcachevfs/` apply only to the staged CBS sources; patches in
 this directory apply only to DoltLite sources.
 

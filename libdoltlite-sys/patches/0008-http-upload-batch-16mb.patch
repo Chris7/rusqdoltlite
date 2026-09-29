@@ -1,0 +1,12 @@
+diff --git a/doltlite.c b/doltlite.c
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -564675,7 +564675,7 @@
+ 
+ #define HTTP_RESP_MAX_BYTES ((i64)128 * 1024 * 1024)
+ #define HTTP_HEADER_MAX_BYTES ((i64)64 * 1024)
+-#define HTTP_UPLOAD_BATCH_MAX ((i64)32 * 1024 * 1024)
++#define HTTP_UPLOAD_BATCH_MAX ((i64)16 * 1024 * 1024)
+ #define HTTP_TIMEOUT_MS 30000
+ #define HTTP_BUSY_RETRY_MAX 20
+ #define HTTP_BUSY_RETRY_MS 50
