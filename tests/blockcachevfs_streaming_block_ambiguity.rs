@@ -589,7 +589,7 @@ fn phase_one() {
     let proxy = BlockPutAmbiguityProxy::start(&endpoint);
     set_proxy(&proxy.url);
     let vfs = new_vfs(&cache);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize block ambiguity container through proxy");
 
     let local_dir = tempfile::tempdir().expect("local seed database directory");
@@ -728,7 +728,7 @@ fn failure_phase_one() {
     let proxy = BlockPutAmbiguityProxy::start(&endpoint);
     set_proxy(&proxy.url);
     let vfs = new_vfs(&cache);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize block ambiguity failure container through proxy");
 
     let local_dir = tempfile::tempdir().expect("local failure seed directory");
@@ -860,7 +860,7 @@ fn open_upload_phase() {
     let proxy = BlockPutAmbiguityProxy::start(&endpoint);
     set_proxy(&proxy.url);
     let vfs = new_vfs(&cache);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize open-upload container");
 
     let local_dir = tempfile::tempdir().expect("local open-upload seed directory");
@@ -940,7 +940,7 @@ fn combined_phase_one() {
     let proxy = BlockPutAmbiguityProxy::start(&endpoint);
     set_proxy(&proxy.url);
     let vfs = new_vfs(&cache);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize combined open-upload container");
 
     let local_dir = tempfile::tempdir().expect("local combined seed directory");
