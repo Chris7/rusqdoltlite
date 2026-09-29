@@ -1,7 +1,6 @@
 #![cfg(feature = "blockcachevfs")]
 
 use std::ffi::{CStr, CString};
-#[cfg(feature = "remote")]
 use std::fs;
 #[cfg(feature = "remote")]
 use std::io::{self, Read as _, Write as _};
@@ -22,6 +21,7 @@ use std::sync::{
     Mutex,
 };
 use std::sync::{mpsc, Arc, Barrier, OnceLock};
+#[cfg(feature = "remote")]
 use std::thread;
 use std::time::Duration;
 #[cfg(feature = "remote")]
@@ -131,7 +131,7 @@ fn run_uri_auto_create(backend: &str) {
         })
         .init_owned()
         .expect("initialize empty database VFS");
-    vfs.initialize_container(&empty_storage)
+    vfs.initialize_container(&empty_storage, None)
         .expect("initialize empty database container");
     let empty_alias = format!("empty_{}", std::process::id());
     vfs.attach(&AttachSpec::new(empty_storage.clone()).alias(&empty_alias))
@@ -418,7 +418,6 @@ fn ensure_s3_bucket(endpoint: &str, bucket: &str) {
     );
 }
 
-#[cfg(feature = "remote")]
 fn encode_component(value: &str) -> String {
     value
         .bytes()
@@ -431,7 +430,6 @@ fn encode_component(value: &str) -> String {
         .collect()
 }
 
-#[cfg(feature = "remote")]
 fn fetch_google_object(endpoint: &str, bucket: &str, object: &str) -> Vec<u8> {
     let body = tempfile::NamedTempFile::new().expect("Google object temporary file");
     let url = format!(
@@ -463,7 +461,6 @@ fn fetch_google_object(endpoint: &str, bucket: &str, object: &str) -> Vec<u8> {
     fs::read(body.path()).expect("read Google object body")
 }
 
-#[cfg(feature = "remote")]
 fn encode_path(value: &str) -> String {
     value
         .split('/')
@@ -472,7 +469,6 @@ fn encode_path(value: &str) -> String {
         .join("/")
 }
 
-#[cfg(feature = "remote")]
 fn fetch_s3_object(endpoint: &str, bucket: &str, object: &str) -> Vec<u8> {
     let body = tempfile::NamedTempFile::new().expect("S3 object temporary file");
     let url = format!(
@@ -505,7 +501,6 @@ fn fetch_s3_object(endpoint: &str, bucket: &str, object: &str) -> Vec<u8> {
     fs::read(body.path()).expect("read S3 object body")
 }
 
-#[cfg(feature = "remote")]
 fn fetch_session_object(backend: &str, endpoint: &str, bucket: &str, object: &str) -> Vec<u8> {
     match backend {
         "google" => fetch_google_object(endpoint, bucket, object),
@@ -604,7 +599,6 @@ fn first_google_object_name(listing: &str, prefix: &str) -> Option<String> {
     Some(tail[..tail.find('"')?].to_owned())
 }
 
-#[cfg(feature = "remote")]
 fn be_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes(
         bytes[offset..offset + 4]
@@ -1219,8 +1213,19 @@ fn run_bootstrap(backend: &str) -> (String, String) {
         .init()
         .expect("initialize block-cache VFS");
 
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize remote CBS container");
+    let initial_manifest = fetch_session_object(
+        backend,
+        &endpoint,
+        &bucket,
+        &format!("{prefix}/manifest.bcv"),
+    );
+    assert_eq!(
+        be_u32(&initial_manifest, 4),
+        4 * 1024 * 1024,
+        "None should retain CBS's 4 MiB default block size"
+    );
     vfs.cleanup(&storage, std::time::Duration::from_secs(300))
         .expect("scheduled cleanup should use the independent CBS management API");
     let local_dir = tempfile::tempdir().expect("local database directory");
@@ -1243,8 +1248,24 @@ fn run_bootstrap(backend: &str) -> (String, String) {
     vfs.create_database(&storage, &local_path, "bootstrap.sqlite")
         .expect("upload initial database");
     assert_reserved_remote_database_names_rejected(&vfs, &storage, &local_path);
-    vfs.initialize_container(&storage)
+    let manifest_before_reinitialize = fetch_session_object(
+        backend,
+        &endpoint,
+        &bucket,
+        &format!("{prefix}/manifest.bcv"),
+    );
+    vfs.initialize_container(&storage, None)
         .expect_err("existing CBS manifest must not be replaced");
+    assert_eq!(
+        manifest_before_reinitialize,
+        fetch_session_object(
+            backend,
+            &endpoint,
+            &bucket,
+            &format!("{prefix}/manifest.bcv")
+        ),
+        "rejected initialization must leave the existing manifest unchanged"
+    );
     let alias = format!("bootstrap_{backend}_{}", std::process::id());
     vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias))
         .expect("attach created database");
@@ -1310,7 +1331,105 @@ fn run_bootstrap(backend: &str) -> (String, String) {
     drop(db);
     vfs.detach(&third_alias)
         .expect("detach replacement database");
+    run_small_block_size_lifecycle(backend, &endpoint, &bucket);
     (endpoint, bucket)
+}
+
+fn run_small_block_size_lifecycle(backend: &str, endpoint: &str, bucket: &str) {
+    const BLOCK_SIZE: u32 = 64 * 1024;
+    const CACHE_SIZE: i64 = 4 * 64 * 1024;
+
+    let prefix = format!("{}/small-block-size", unique_suffix());
+    let container = format!("{bucket}/{prefix}");
+    let storage = match backend {
+        "google" => Storage::google_json_with_endpoint("test-project", &container, endpoint),
+        "s3" => Storage::s3_with_endpoint("test", &container, "us-east-1", endpoint),
+        _ => unreachable!(),
+    };
+
+    let writer_cache = tempfile::tempdir().expect("small-block writer cache directory");
+    let writer = BlockCacheVfs::builder(writer_cache.path())
+        .expect("small-block writer VFS builder")
+        .config(Config::CacheSize(CACHE_SIZE))
+        .auth_callback(|provider, _, _| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init_owned()
+        .expect("initialize independent small-block writer VFS");
+
+    writer
+        .initialize_container(&storage, Some(BLOCK_SIZE))
+        .expect("initialize a new 64 KiB block container");
+    let manifest_key = format!("{prefix}/manifest.bcv");
+    let manifest_before_reinitialize =
+        fetch_session_object(backend, endpoint, bucket, &manifest_key);
+    assert_eq!(
+        be_u32(&manifest_before_reinitialize, 4),
+        BLOCK_SIZE,
+        "explicit block size should be persisted in the manifest header"
+    );
+    writer
+        .initialize_container(&storage, None)
+        .expect_err("default initialization must preserve the existing small-block manifest");
+    assert_eq!(
+        manifest_before_reinitialize,
+        fetch_session_object(backend, endpoint, bucket, &manifest_key),
+        "rejected initialization must leave the small-block manifest unchanged"
+    );
+
+    let writer_alias = format!("small_writer_{}", std::process::id());
+    writer
+        .attach(&AttachSpec::new(storage.clone()).alias(&writer_alias))
+        .expect("attach the small-block container with a four-block local cache");
+    let database = writer
+        .open(format!("/{writer_alias}/small.sqlite"))
+        .expect("create database in the small-block container");
+    database
+        .execute_batch(
+            "CREATE TABLE sample(value TEXT NOT NULL); INSERT INTO sample VALUES ('small-block');",
+        )
+        .expect("write database using small blocks");
+    drop(database);
+    writer
+        .upload(&writer_alias)
+        .expect("upload small-block database");
+    writer
+        .detach(&writer_alias)
+        .expect("detach small-block writer");
+    drop(writer);
+
+    let reader_cache = tempfile::tempdir().expect("small-block reader cache directory");
+    let reader = BlockCacheVfs::builder(reader_cache.path())
+        .expect("small-block reader VFS builder")
+        .config(Config::CacheSize(CACHE_SIZE))
+        .auth_callback(|provider, _, _| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init_owned()
+        .expect("initialize a fresh small-block reader VFS");
+    let reader_alias = format!("small_reader_{}", std::process::id());
+    reader
+        .attach(&AttachSpec::new(storage).alias(&reader_alias))
+        .expect("reattach small-block manifest with a fresh cache");
+    let database = reader
+        .open(format!("/{reader_alias}/small.sqlite"))
+        .expect("open uploaded small-block database");
+    let value: String = database
+        .query_row("SELECT value FROM sample", [], |row| row.get(0))
+        .expect("read database from the uploaded small-block manifest");
+    assert_eq!(value, "small-block");
+    drop(database);
+    reader
+        .detach(&reader_alias)
+        .expect("detach small-block reader");
 }
 
 fn assert_vfs_header_passthrough(database: &Connection, expected: &[u8]) {
@@ -1496,7 +1615,7 @@ fn run_session_ownership() {
         .init()
         .expect("initialize block-cache VFS");
 
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize remote CBS container");
     let local_dir = tempfile::tempdir().expect("local database directory");
     let local_path = local_dir.path().join("seed.sqlite");
@@ -1762,7 +1881,7 @@ fn run_session_server() {
         })
         .init()
         .expect("initialize block-cache VFS");
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize remote CBS container");
     let local_dir = tempfile::tempdir().expect("local database directory");
     let local_path = local_dir.path().join("seed.sqlite");
@@ -3012,7 +3131,7 @@ fn run_session_fault_case(
     } = context;
     let prefix = format!("{base_prefix}/{}", window.label());
     let storage = session_storage(backend, storage_endpoint, bucket, &prefix);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .unwrap_or_else(|error| panic!("initialize {} storage: {error:?}", window.label()));
 
     let seed_dir = tempfile::tempdir().expect("fault-window seed directory");
@@ -3619,7 +3738,7 @@ fn run_session_crash_case(backend: &str, endpoint: &str, bucket: &str, window: S
         .init()
         .expect("initialize crash parent VFS");
     parent_vfs
-        .initialize_container(&direct_storage)
+        .initialize_container(&direct_storage, None)
         .unwrap_or_else(|error| panic!("initialize {} storage: {error:?}", window.label()));
     let seed_dir = tempfile::tempdir().expect("crash seed directory");
     let seed_path = seed_dir.path().join("seed.sqlite");
@@ -4035,7 +4154,7 @@ fn run_session_concurrency_matrix() {
         })
         .init()
         .expect("initialize race VFS");
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize race storage");
     let seed_dir = tempfile::tempdir().expect("race seed directory");
     let seed_path = seed_dir.path().join("seed.sqlite");
@@ -4708,7 +4827,7 @@ fn run_session_http_flow_in_process(backend: &str) {
         })
         .init()
         .expect("initialize block-cache VFS");
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize remote CBS container");
 
     // The HTTP server exposes a DoltLite repository, so seed the object
@@ -5200,7 +5319,7 @@ fn run_generic_phase_one() {
     };
     let storage = session_storage(&backend, &endpoint, &bucket, &prefix);
     let vfs = generic_vfs(&cache);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize generic session container");
     let seed_dir = tempfile::tempdir().expect("generic seed directory");
     let seed_path = seed_dir.path().join("seed.sqlite");
@@ -5584,7 +5703,7 @@ fn run_session_checkpoint_chain_limits(backend: &str, endpoint: &str, bucket: &s
         })
         .init()
         .expect("initialize block-cache VFS");
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize remote CBS container");
 
     let seed_directory = tempfile::tempdir().expect("seed database directory");
@@ -5914,7 +6033,7 @@ fn google_json_emulator_public_attach_session_database_scope() {
     let prefix = format!("{suffix}/public-attach-session");
     let storage =
         Storage::google_json_with_endpoint("test-project", format!("{bucket}/{prefix}"), &endpoint);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize public attach_session test container");
     let seed_directory = tempfile::tempdir().expect("public attach_session seed directory");
     let seed_path = seed_directory.path().join("seed.sqlite");
@@ -5976,7 +6095,7 @@ fn google_json_emulator_create_database_rejects_path_separators() {
         format!("{bucket}/{valid_prefix}"),
         &endpoint,
     );
-    vfs.initialize_container(&valid_storage)
+    vfs.initialize_container(&valid_storage, None)
         .expect("initialize valid database-name control container");
     vfs.create_database(&valid_storage, &seed_path, "valid.sqlite")
         .expect("upload valid one-component control database name");
@@ -6005,7 +6124,7 @@ fn google_json_emulator_create_database_rejects_path_separators() {
             format!("{bucket}/{prefix}"),
             &endpoint,
         );
-        vfs.initialize_container(&storage)
+        vfs.initialize_container(&storage, None)
             .unwrap_or_else(|error| panic!("initialize separator case {remote_name:?}: {error:?}"));
         if vfs
             .create_database(&storage, &seed_path, remote_name)
@@ -6051,7 +6170,7 @@ fn google_uri_connection_uploads_and_isolates_vfs_lifetimes() {
         .init_owned()
         .expect("initialize an owned CBS VFS");
     bootstrap_vfs
-        .initialize_container(&storage)
+        .initialize_container(&storage, None)
         .expect("initialize the prefixed CBS container");
 
     let local_dir = tempfile::tempdir().expect("local seed directory");
@@ -6200,7 +6319,7 @@ fn s3_uri_connection_uploads_existing_prefixed_database() {
         .init_owned()
         .expect("initialize an owned CBS VFS");
     bootstrap_vfs
-        .initialize_container(&storage)
+        .initialize_container(&storage, None)
         .expect("initialize the trailing-slash S3 prefix");
 
     let local_dir = tempfile::tempdir().expect("local seed directory");
@@ -6488,7 +6607,7 @@ fn google_upload_of_direct_remote_chunks_does_not_create_refs() {
         .auth_callback(|_, _, _| Ok("test-token".to_owned()))
         .init_owned()
         .expect("initialize CBS VFS");
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize remote CBS container");
     let alias = format!("remote_{}", std::process::id());
     vfs.attach(&AttachSpec::new(storage).alias(&alias))

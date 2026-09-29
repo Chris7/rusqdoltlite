@@ -225,7 +225,7 @@ fn setup_two_databases(
     let bucket = format!("rust-streaming-pressure-{suffix}");
     let container = format!("{bucket}/{suffix}/cbs");
     let storage = direct_storage(endpoint, &container);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize pressure-test container");
 
     let local_dir = tempfile::tempdir().expect("local seed directory");
@@ -250,7 +250,7 @@ fn setup_three_databases(
     let bucket = format!("rust-streaming-pressure-pinned-{suffix}");
     let container = format!("{bucket}/{suffix}/cbs");
     let storage = direct_storage(endpoint, &container);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize pinned-pressure container");
 
     let local_dir = tempfile::tempdir().expect("pinned-pressure seed directory");
@@ -847,7 +847,7 @@ fn run_failed_put(vfs: &'static BlockCacheVfs, endpoint: &str, cache: &Path) {
     let bucket = format!("rust-streaming-pressure-failure-{suffix}");
     let container = format!("{bucket}/{suffix}/cbs");
     let direct = direct_storage(endpoint, &container);
-    vfs.initialize_container(&direct)
+    vfs.initialize_container(&direct, None)
         .expect("initialize failed-put container");
     let local_dir = tempfile::tempdir().expect("failed-put seed directory");
     let local_path = local_dir.path().join("seed.sqlite");

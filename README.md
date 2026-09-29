@@ -89,7 +89,7 @@ let vfs = BlockCacheVfs::builder("cache")?
     .auth_callback(|_, _, _| Ok("test-token".to_owned()))
     .init()?;
 let storage = Storage::google_json("test-project", "bucket/tenant-a");
-vfs.initialize_container(&storage)?; // fails if the storage/prefix exists
+vfs.initialize_container(&storage, None)?; // uses the 4 MiB default; fails if it exists
 vfs.create_database(&storage, "seed.sqlite", "database.sqlite")?;
 vfs.attach(&AttachSpec::new(storage).alias("tenant-a"))?;
 # Ok(()) }
@@ -99,6 +99,20 @@ vfs.attach(&AttachSpec::new(storage).alias("tenant-a"))?;
 existing manifest causes an error and remains unchanged. `create_database`
 requires a non-empty, valid SQLite file; after attachment, use `upload` to
 flush changes to that existing remote database.
+
+`initialize_container` uses CBS's default block size of 4 MiB. Applications
+creating a new container can choose a smaller size in bytes:
+
+```rust,no_run
+vfs.initialize_container(&storage, Some(256 * 1024))?; // 256 KiB
+```
+
+Explicit block sizes must be powers of two, at least 32 KiB, and fit in the
+native signed C `int`. The choice is stored in the new manifest; existing
+manifests are rejected unchanged and cannot be resized through initialization.
+All containers attached to one VFS/cache must use the same block size, and its
+local cache size must be at least one block and an exact multiple of the block
+size.
 
 The S3 authentication callback returns the secret access key. For temporary
 credentials, return `secret-access-key\nsession-token` using the helper above;

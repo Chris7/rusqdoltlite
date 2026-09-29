@@ -16,6 +16,8 @@ use crate::{Connection, OpenFlags, Result};
 use crate::ffi::bcvutil as raw_util;
 use crate::ffi::blockcachevfs as raw;
 
+const MIN_CONTAINER_BLOCK_SIZE: u32 = 32 * 1024;
+
 /// An error returned by an authentication callback.
 #[derive(Debug, Clone)]
 pub struct AuthError(
@@ -1196,10 +1198,23 @@ impl BlockCacheVfs {
     /// call it for a new storage container or prefix. CBS also attempts to
     /// create a provider bucket when its backend supports that operation; for
     /// providers where bucket creation is privileged, create it with the
-    /// provider's management API first.
-    pub fn initialize_container(&self, storage: &Storage) -> Result<()> {
+    /// provider's management API first. Pass `None` to use CBS's native
+    /// default block size of 4 MiB. An explicit `Some(block_size)` is measured
+    /// in bytes and must be a power of two, at least 32 KiB, and representable
+    /// as the native signed C `int`. The choice applies only when creating a
+    /// new manifest. If a manifest already exists, initialization fails and
+    /// leaves it unchanged, regardless of its block size.
+    ///
+    /// Every container attached to one VFS/cache must use the same block size.
+    /// Configure the local cache to hold at least one block and to be an exact
+    /// multiple of the block size.
+    pub fn initialize_container(&self, storage: &Storage, block_size: Option<u32>) -> Result<()> {
+        let block_size = block_size
+            .map(validate_container_block_size)
+            .transpose()?
+            .unwrap_or(0);
         let handle = self.open_bcv(storage, "initialize_container")?;
-        let rc = unsafe { raw_util::sqlite3_bcv_create_if_not_exists(handle.0, 0, 0) };
+        let rc = unsafe { raw_util::sqlite3_bcv_create_if_not_exists(handle.0, 0, block_size) };
         bcv_result("initialize_container", rc, &handle)
     }
 
@@ -1450,7 +1465,7 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
             return Err(sanitize_cloud_error(error, &credentials_to_redact));
         }
 
-        let initialization_error = vfs.initialize_container(&storage).err();
+        let initialization_error = vfs.initialize_container(&storage, None).err();
         if let Err(attach_error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
             let error =
                 initialization_error.unwrap_or_else(|| normalize_container_not_found(attach_error));
@@ -1919,6 +1934,22 @@ impl Drop for BcvHandle {
     }
 }
 
+fn validate_container_block_size(block_size: u32) -> Result<c_int> {
+    if block_size < MIN_CONTAINER_BLOCK_SIZE || !block_size.is_power_of_two() {
+        return Err(container_block_size_error());
+    }
+    c_int::try_from(block_size).map_err(|_| container_block_size_error())
+}
+
+fn container_block_size_error() -> Error {
+    Error::SqliteFailure(
+        crate::ffi::Error::new(crate::ffi::SQLITE_RANGE),
+        Some(
+            "initialize_container: block size must be a power of two, at least 32768 bytes, and fit in a signed C int".into(),
+        ),
+    )
+}
+
 fn bcv_result(operation: &str, rc: c_int, handle: &BcvHandle) -> Result<()> {
     if rc == crate::ffi::SQLITE_OK {
         Ok(())
@@ -2056,6 +2087,40 @@ unsafe extern "C" fn auth_trampoline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_block_size_accepts_supported_boundaries() {
+        assert_eq!(validate_container_block_size(32 * 1024).unwrap(), 32 * 1024);
+        assert_eq!(validate_container_block_size(64 * 1024).unwrap(), 64 * 1024);
+        assert_eq!(
+            validate_container_block_size(1 << 30).unwrap(),
+            1 << 30,
+            "the largest representable power-of-two block size should be accepted"
+        );
+    }
+
+    #[test]
+    fn invalid_container_block_sizes_fail_before_opening_management_handle() -> Result<()> {
+        let directory = tempfile::tempdir().expect("temporary CBS directory");
+        let vfs = BlockCacheVfs::builder(directory.path())?
+            .auth_callback(|_, _, _| panic!("invalid sizes must fail before authentication"))
+            .init_owned()?;
+        let invalid_storage = Storage::new("google\0?api=json", "project", "bucket");
+
+        for block_size in [0, 16 * 1024, 32 * 1024 + 2, 48 * 1024, 1 << 31] {
+            let error = vfs
+                .initialize_container(&invalid_storage, Some(block_size))
+                .expect_err("invalid block size should be rejected");
+            assert!(
+                matches!(&error, Error::SqliteFailure(native, Some(message))
+                    if native.extended_code == crate::ffi::SQLITE_RANGE
+                        && message.contains("block size")),
+                "invalid block size {block_size} should fail validation before storage handling: {error:?}"
+            );
+        }
+
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

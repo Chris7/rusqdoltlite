@@ -310,7 +310,7 @@ fn restart_phase_one() {
     };
     let storage = restart_storage(&endpoint, &container);
     let vfs = new_vfs(&cache);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize restart-test container");
 
     let local_dir = tempfile::tempdir().expect("local database directory");
@@ -536,7 +536,7 @@ fn crash_phase_one() {
     let marker = required_env(MARKER_ENV);
     let storage = restart_storage(&endpoint, &container);
     let vfs = new_vfs(&cache);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize abrupt-termination container");
 
     let local_dir = tempfile::tempdir().expect("local database directory");
