@@ -272,6 +272,7 @@ mod remote {
         pub audience: *const c_char,
         pub timeoutMs: c_int,
         pub zVfsName: *const c_char,
+        pub bSessionLoopbackTransfer: c_int,
     }
 
     unsafe extern "C" {

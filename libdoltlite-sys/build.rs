@@ -96,6 +96,7 @@ mod build_bundled {
         println!("cargo:rerun-if-changed={lib_name}/{source_file}");
         println!("cargo:rerun-if-changed={lib_name}/remote/doltlite_remotesrv.c");
         println!("cargo:rerun-if-changed={lib_name}/remote/doltlite_remotesrv.h");
+        println!("cargo:rerun-if-changed={lib_name}/remote/doltlite_tls.c");
         println!("cargo:rerun-if-changed=patches");
         let upstream_source = manifest_dir.join(lib_name).join(source_file);
         let patched_source = apply_local_patches(
@@ -107,6 +108,7 @@ mod build_bundled {
             .parent()
             .expect("patched DoltLite source must have a parent directory");
         let staged_remote_server = staged_remote_dir.join("doltlite_remotesrv.c");
+        let staged_remote_tls = staged_remote_dir.join("doltlite_tls.c");
         // Remote-auth server uses pthreads, unported to Windows/MSVC.
         let remote_supported = cfg!(feature = "remote")
             && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"))
@@ -291,7 +293,7 @@ mod build_bundled {
             println!("cargo:rustc-link-lib=crypt32");
         }
         if remote_supported && auth_is_in_amalgamation {
-            compile_server_tls(&remote_dir);
+            compile_server_tls(&remote_dir, &staged_remote_tls);
         }
 
         println!("cargo:lib_dir={out_dir}");
@@ -554,10 +556,10 @@ mod build_bundled {
         auth_is_in_amalgamation
     }
 
-    fn compile_server_tls(remote_dir: &Path) {
+    fn compile_server_tls(remote_dir: &Path, staged_tls_source: &Path) {
         let mbedtls_dir = remote_dir.join("mbedtls");
         let mut cfg = cc::Build::new();
-        cfg.file(remote_dir.join("doltlite_tls.c"))
+        cfg.file(staged_tls_source)
             .define(
                 "doltliteConnOpenTimeout",
                 "doltliteBundledClientConnOpenTimeout",
@@ -594,7 +596,11 @@ mod build_bundled {
                 patched_source.display()
             )
         });
-        for sidecar in ["doltlite_remotesrv.c", "doltlite_remotesrv.h"] {
+        for sidecar in [
+            "doltlite_remotesrv.c",
+            "doltlite_remotesrv.h",
+            "doltlite_tls.c",
+        ] {
             let upstream_sidecar = upstream_source
                 .parent()
                 .expect("DoltLite amalgamation must have a parent directory")

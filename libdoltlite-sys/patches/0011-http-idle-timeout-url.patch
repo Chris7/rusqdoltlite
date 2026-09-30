@@ -1,0 +1,102 @@
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -564839,6 +564839,8 @@
+ #define HTTP_UPLOAD_BATCH_MAX ((i64)16 * 1024 * 1024)
+ /* Idle time allowed without transport progress during an HTTP request. */
+ #define HTTP_TIMEOUT_MS 30000
++#define HTTP_CONNECT_TIMEOUT_MS 30000
++#define HTTP_MAX_IDLE_TIMEOUT_MS (5 * 60 * 1000)
+ #define HTTP_BUSY_RETRY_MAX 20
+ #define HTTP_BUSY_RETRY_MS 50
+ 
+@@ -565652,7 +565654,8 @@
+ 
+   timeoutMs = p->timeoutMs;
+   if( !p->pConn ){
+-    p->pConn = httpConnOpen(p->zHost, p->port, p->useTls, timeoutMs);
++    p->pConn = httpConnOpen(p->zHost, p->port, p->useTls,
++                            HTTP_CONNECT_TIMEOUT_MS);
+   }
+   if( !p->pConn ){
+     httpSetLastError(p, "could not connect to remote");
+@@ -566307,11 +566310,22 @@
+   int useTls;
+   int nUserPath;
+   int nBasePath;
++  const char *zQueryStart;
+   const char *zTimeout;
+-  uint64_t timeoutMs;
++  uint64_t timeoutMs = HTTP_TIMEOUT_MS;
+ 
+   if( !zUrl ) return 0;
+ 
++  zTimeout = getenv("DOLTLITE_HTTP_TIMEOUT_MS");
++  if( zTimeout && zTimeout[0] ){
++    if( doltliteParseDecimal(
++          zTimeout, zTimeout+strlen(zTimeout), 0x7fffffff, &timeoutMs)
++          !=DOLTLITE_DECIMAL_OK
++     || timeoutMs==0 ){
++      timeoutMs = HTTP_TIMEOUT_MS;
++    }
++  }
++
+   if( strncmp(zUrl, "https://", 8) == 0 ){
+ #ifndef DOLTLITE_HAVE_AUTH
+     return 0;
+@@ -566333,13 +566347,13 @@
+   zPathStart = 0;
+   {
+     const char *c = zHostStart;
+-    while( *c && *c != ':' && *c != '/' ) c++;
++    while( *c && *c != ':' && *c != '/' && *c != '?' ) c++;
+     nHost = (int)(c - zHostStart);
+     if( *c == ':' ){
+       uint64_t value;
+       zPortStart = c + 1;
+       c = zPortStart;
+-      while( *c && *c != '/' ) c++;
++      while( *c && *c != '/' && *c != '?' ) c++;
+       if( doltliteParseDecimal(zPortStart, c, 65535, &value)
+           !=DOLTLITE_DECIMAL_OK
+        || value==0 ){
+@@ -566356,7 +566370,22 @@
+ 
+   nUserPath = 0;
+   if( zPathStart ){
+-    nUserPath = (int)strlen(zPathStart);
++    zQueryStart = strchr(zPathStart, '?');
++    if( zQueryStart ){
++      static const char zIdleTimeoutQuery[] = "?http_idle_timeout_ms=";
++      const char *zValue = zQueryStart + sizeof(zIdleTimeoutQuery) - 1;
++      if( strncmp(zQueryStart, zIdleTimeoutQuery,
++                  sizeof(zIdleTimeoutQuery) - 1)!=0
++       || doltliteParseDecimal(
++            zValue, zUrl + strlen(zUrl), HTTP_MAX_IDLE_TIMEOUT_MS,
++            &timeoutMs)!=DOLTLITE_DECIMAL_OK
++       || timeoutMs==0 ){
++        return 0;
++      }
++    }
++    nUserPath = zQueryStart
++              ? (int)(zQueryStart - zPathStart)
++              : (int)strlen(zPathStart);
+ 
+     while( nUserPath > 0 && zPathStart[nUserPath-1] == '/' ){
+       nUserPath--;
+@@ -566376,16 +566405,6 @@
+   p->zHost[nHost] = 0;
+ 
+   p->port = port;
+-  timeoutMs = HTTP_TIMEOUT_MS;
+-  zTimeout = getenv("DOLTLITE_HTTP_TIMEOUT_MS");
+-  if( zTimeout && zTimeout[0] ){
+-    if( doltliteParseDecimal(
+-          zTimeout, zTimeout+strlen(zTimeout), 0x7fffffff, &timeoutMs)
+-          !=DOLTLITE_DECIMAL_OK
+-     || timeoutMs==0 ){
+-      timeoutMs = HTTP_TIMEOUT_MS;
+-    }
+-  }
+   p->timeoutMs = (int)timeoutMs;
+ 
+   nBasePath = nUserPath;

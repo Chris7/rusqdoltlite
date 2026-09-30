@@ -1,0 +1,219 @@
+--- a/bcv_int.h
++++ b/bcv_int.h
+@@ -76,7 +76,7 @@
+ #define BCV_MIN_MD5_NAMEBYTES        24
+ 
+ #define BCV_FSNAMEBYTES(namebytes) (((namebytes)*2)+4+1)
+-#define BCV_MAX_FSNAMEBYTES BCV_FSNAMEBYTES(BCV_MAX_NAMEBYTES)
++#define BCV_MAX_FSNAMEBYTES (BCV_FSNAMEBYTES(BCV_MAX_NAMEBYTES) + 7)
+ 
+ #define NAMEBYTES(pManifest)    ((pManifest)->nNamebytes)
+ #define GCENTRYBYTES(pManifest) (NAMEBYTES(pManifest) + 8)
+--- a/bcvutil.c
++++ b/bcvutil.c
+@@ -1372,8 +1372,9 @@
+ ** in size.
+ */
+ void bcvBlockidToText(int nName, const u8 *pBlk, char *aBuf){
+-  hex_encode(pBlk, nName, aBuf, 1);
+-  memcpy(&aBuf[nName*2], ".bcv", 5);
++  memcpy(aBuf, "blocks/", 7);
++  hex_encode(pBlk, nName, &aBuf[7], 1);
++  memcpy(&aBuf[7+nName*2], ".bcv", 5);
+ }
+ 
+ static sqlite3_bcv sqlite3_bcv_oom_handle = {
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -647,8 +647,9 @@
+ ** in size.
+ */
+ void bcvfsBlockidToText(const u8 *pBlk, int nBlk, char *aBuf){
+-  hex_encode(pBlk, nBlk, aBuf, 1);
+-  memcpy(&aBuf[nBlk*2], ".bcv", 5);
++  memcpy(aBuf, "blocks/", 7);
++  hex_encode(pBlk, nBlk, &aBuf[7], 1);
++  memcpy(&aBuf[7+nBlk*2], ".bcv", 5);
+ }
+ 
+ /*
+@@ -1483,8 +1484,9 @@
+ }
+ 
+ static void bcvfsBlockidToName(const u8 *pBlk, int nBlk, char *aBuf){
+-  hex_encode(pBlk, nBlk, aBuf, 1);
+-  memcpy(&aBuf[nBlk*2], ".bcv", 5);
++  memcpy(aBuf, "blocks/", 7);
++  hex_encode(pBlk, nBlk, &aBuf[7], 1);
++  memcpy(&aBuf[7+nBlk*2], ".bcv", 5);
+ }
+ 
+ /* 
+@@ -1708,6 +1710,8 @@
+ struct BcvfsStageCtx {
+   int rc;
+   char *zErr;
++  const u8 *aExpected;
++  int nExpected;
+ };
+ 
+ static void bcvfsStageDone(void *pArg, int rc, char *zETag){
+@@ -1717,14 +1721,39 @@
+   pCtx->rc = rc;
+ }
+ 
++static void bcvfsStageExistingDone(
++  void *pArg,
++  int rc,
++  char *zETag,
++  const u8 *aData,
++  int nData,
++  const u8 *aHdrs,
++  int nHdrs
++){
++  BcvfsStageCtx *pCtx = (BcvfsStageCtx*)pArg;
++  (void)zETag;
++  (void)aHdrs;
++  (void)nHdrs;
++  if( rc==SQLITE_OK
++   && (aData==0 || nData!=pCtx->nExpected
++       || memcmp(aData,pCtx->aExpected,(size_t)pCtx->nExpected)!=0)
++  ){
++    rc = SQLITE_CORRUPT;
++    pCtx->zErr = sqlite3_mprintf(
++        "existing immutable block does not match its content ID"
++    );
++  }
++  pCtx->rc = rc;
++}
++
+ /* These are defined with the other container-state helpers below. */
+ static void bcvfsEnterState(sqlite3_bcvfs*, Container*, int);
+ static void bcvfsLeaveState(sqlite3_bcvfs*, Container*);
+ static int bcvSessionAllZero(const unsigned char*, int);
+ static int bcvSessionUuidDecode(const char*, unsigned char[16]);
+ 
+-/* A session block is uploaded under the ordinary content-addressed CBS key,
+-** before the immutable checkpoint that will reference it.  Put a durable,
++/* A session block is uploaded under its content-addressed blocks/ key,
++** before the immutable checkpoint that will reference it. Put a durable,
+ ** expiring marker first so orphan cleanup can protect that block throughout a
+ ** long request, even when no session head or checkpoint exists yet. */
+ #define BCVFS_SESSION_ATTEMPT_BODY_BYTES 172
+@@ -1838,9 +1867,6 @@
+   BcvfsStageCtx ctx;
+   Container *pCont = 0;
+   int bState = 0;
+-
+-  u8 aGuardOwner[16];
+-  char *zGuardETag = 0;
+ 
+   memset(&ctx, 0, sizeof(ctx));
+   ENTER_VFS_MUTEX; {
+@@ -1943,50 +1969,51 @@
+       }
+     } LEAVE_VFS_MUTEX;
+   }
++  if( rc==SQLITE_OK && pCont->zSessionId ){
++    if( !pCont->bSessionContext ){
++      /* A legacy session attachment has no authenticated scope or
++      ** operation fence. Do not PUT a block that GC cannot protect. */
++      rc = SQLITE_AUTH;
++    }else{
++      u8 aScopeHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++      char *zScopeErr = 0;
++      rc = sqlite3_bcvfs_session_scope_hash(
++          pCont->zStorage,pCont->zAccount,pCont->zContainer,
++          pCont->zSessionPrincipal,pCont->zSessionDatabase,
++          pCont->zSessionOperations,aScopeHash,&zScopeErr
++      );
++      sqlite3_free(zScopeErr);
++      if( rc==SQLITE_OK ){
++        /* The marker PUT must complete before the block PUT is queued. */
++        rc = bcvfsSessionProtectBlock(
++            pDisp,pBcv,pCont->zSessionId,pCont->aSessionOperationId,
++            aScopeHash,aNew,nName
++        );
++      }
++    }
++  }
+   if( rc==SQLITE_OK ){
+-    if( pCont->zSessionId ){
+-      if( !pCont->bSessionContext ){
+-        /* A legacy session attachment has no authenticated scope or
+-        ** operation fence. Do not PUT a block that GC cannot protect. */
+-        rc = SQLITE_AUTH;
+-      }else{
+-        u8 aScopeHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
+-        char *zScopeErr = 0;
+-        rc = sqlite3_bcvfs_session_scope_hash(
+-            pCont->zStorage,pCont->zAccount,pCont->zContainer,
+-            pCont->zSessionPrincipal,pCont->zSessionDatabase,
+-            pCont->zSessionOperations,aScopeHash,&zScopeErr
+-        );
+-        sqlite3_free(zScopeErr);
+-        if( rc==SQLITE_OK ){
+-          /* The marker PUT must complete before the block PUT is queued. */
+-          rc = bcvfsSessionProtectBlock(
+-              pDisp,pBcv,pCont->zSessionId,pCont->aSessionOperationId,
+-              aScopeHash,aNew,nName
+-          );
+-        }
+-      }
+-    }
+-    if( rc==SQLITE_OK ){
+-      rc = bcvSessionGuardAcquire(
+-          pDisp,pBcv,BCV_SESSION_GC_GUARD_WRITER,
+-          aGuardOwner,&zGuardETag
+-      );
+-      sqlite3_free(zGuardETag);
+-      zGuardETag = 0;
+-    }
+-  }
+-  if( rc==SQLITE_OK ){
++    ctx.aExpected = aBuf;
++    ctx.nExpected = pCommon->szBlk;
+     rc = bcvDispatchPut(
+-        pDisp, pBcv, zFile, 0, aBuf, pCommon->szBlk,
+-        (void*)&ctx, bcvfsStageDone
++        pDisp, pBcv, zFile, pCont->zSessionId ? "*" : 0,
++        aBuf, pCommon->szBlk, (void*)&ctx, bcvfsStageDone
+     );
+   }
+-  if( rc==SQLITE_OK ){
+-    rc = bcvDispatchRunAll(pDisp);
+-  }
+-  if( rc==SQLITE_OK ){
+-    rc = ctx.rc;
++  if( rc==SQLITE_OK ) rc = bcvDispatchRunAll(pDisp);
++  if( rc==SQLITE_OK ) rc = ctx.rc;
++  if( rc==HTTP_PRECONDITION_FAILED && pCont->zSessionId ){
++    /* A content-addressed block may already exist from another transfer.
++    ** Keep client CAB writes create-only and accept that immutable object only
++    ** after verifying its exact bytes. */
++    sqlite3_free(ctx.zErr);
++    ctx.zErr = 0;
++    ctx.rc = SQLITE_OK;
++    rc = bcvDispatchFetch(
++        pDisp,pBcv,zFile,0,0,(void*)&ctx,bcvfsStageExistingDone
++    );
++    if( rc==SQLITE_OK ) rc = bcvDispatchRunAll(pDisp);
++    if( rc==SQLITE_OK ) rc = ctx.rc;
+   }
+ 
+   ENTER_VFS_MUTEX; {
+@@ -6502,9 +6529,11 @@
+ */ 
+ int bcvfsNameToBlockid(Manifest *p, const char *zName, u8 *aBlk){
+   int nName = strlen(zName);
+-  int nExpect = BCV_FSNAMEBYTES(NAMEBYTES(p));
+-  if( nName==nExpect-1 && 0==memcmp(".bcv", &zName[nExpect-1-4], 4) ){
+-    if( hex_decode(zName, nName-4, aBlk)==0 ) return 0;
++  int nExpect = BCV_FSNAMEBYTES(NAMEBYTES(p)) + 7;
++  if( nName==nExpect-1 && 0==memcmp("blocks/",zName,7)
++   && 0==memcmp(".bcv", &zName[nExpect-1-4], 4)
++  ){
++    if( hex_decode(&zName[7], nName-7-4, aBlk)==0 ) return 0;
+   }
+   return 1;
+ }

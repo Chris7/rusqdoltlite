@@ -4,6 +4,7 @@ use std::{
     ffi::{c_char, c_int, c_void, CString},
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
+    process::Command,
     ptr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -106,12 +107,38 @@ impl Drop for CountingVfs {
 fn send_http_request(port: u16, request: &[u8]) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to remote server");
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(15)))
         .expect("read timeout");
     stream.write_all(request).expect("write request");
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read response");
     response
+}
+
+fn post_chunk_batch(port: u16, body: &[u8]) -> String {
+    let header = format!(
+        "POST /large.db/chunks HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to remote server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("read timeout");
+    stream.write_all(header.as_bytes()).expect("write headers");
+    stream.write_all(body).expect("write chunk batch");
+    let mut response = Vec::new();
+    loop {
+        let mut buffer = [0_u8; 1024];
+        let count = stream.read(&mut buffer).expect("read response headers");
+        if count == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..count]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8(response).expect("HTTP response headers are UTF-8")
 }
 
 #[test]
@@ -157,6 +184,38 @@ fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
     assert!(server_root.join("origin.db").exists());
 
     server.close()?;
+
+    Ok(())
+}
+
+#[test]
+fn remote_server_keeps_the_public_chunk_limit() -> Result<()> {
+    const LARGE_CHUNK_BYTES: u32 = 64 * 1024 * 1024 + 1;
+    const EMPTY_PROLLY_HASH: [u8; 20] = [
+        0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc, 0xc9,
+        0x49, 0x9b, 0xcb, 0x25, 0xc9,
+    ];
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let default_root = temp.path().join("default");
+    std::fs::create_dir(&default_root).expect("default server directory");
+    let default = RemoteServer::start(&default_root)?;
+
+    let mut empty_chunk = EMPTY_PROLLY_HASH.to_vec();
+    empty_chunk.extend_from_slice(&0_u32.to_le_bytes());
+    let response = post_chunk_batch(default.port(), &empty_chunk);
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "empty chunk should initialize the test database: {response}"
+    );
+
+    let mut large_chunk = vec![0_u8; 24];
+    large_chunk[20..24].copy_from_slice(&LARGE_CHUNK_BYTES.to_le_bytes());
+    let default_response = post_chunk_batch(default.port(), &large_chunk);
+    assert!(
+        default_response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+        "the default 64 MiB chunk cap should remain unchanged: {default_response}"
+    );
 
     Ok(())
 }
@@ -477,6 +536,189 @@ fn assert_http_status_maps_to_sqlite(status: u16, reason: &str, expected_code: i
         error,
         Error::SqliteFailure(code, _) if code.extended_code == expected_code
     ));
+    Ok(())
+}
+
+fn spawn_delayed_http_404(delay: Duration) -> (String, thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 1024];
+            let count = stream.read(&mut buffer).expect("read request");
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request_line = String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        thread::sleep(delay);
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        request_line
+    });
+    (format!("http://{address}/default.db"), server)
+}
+
+fn spawn_progressing_http_404(
+    interval: Duration,
+    body_bytes: usize,
+) -> (String, thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request");
+        stream.set_nodelay(true).expect("disable Nagle buffering");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 1024];
+            let count = stream.read(&mut buffer).expect("read request");
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request_line = String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let response = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {body_bytes}\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(response.as_bytes());
+        for _ in 0..body_bytes {
+            thread::sleep(interval);
+            if stream.write_all(b"x").is_err() {
+                break;
+            }
+        }
+        request_line
+    });
+    (format!("http://{address}/default.db"), server)
+}
+
+fn test_http_idle_timeout_requires_progress() -> Result<()> {
+    let connection = Connection::open_in_memory()?;
+    let (progressing_url, progressing_server) =
+        spawn_progressing_http_404(Duration::from_millis(100), 8);
+    let progressing_url = format!("{progressing_url}?http_idle_timeout_ms=500");
+    let _: i64 = connection.query_row(
+        "SELECT dolt_remote('add', 'origin', ?1)",
+        params![progressing_url],
+        |row| row.get(0),
+    )?;
+    let progress_started = std::time::Instant::now();
+    let progressing_error = connection
+        .query_row::<i64, _, _>("SELECT dolt_fetch('origin', 'main')", [], |row| row.get(0))
+        .expect_err("a 404 response should fail the fetch");
+    assert!(
+        matches!(
+            progressing_error,
+            Error::SqliteFailure(code, _) if code.extended_code != ffi::SQLITE_IOERR
+        ),
+        "active response progress must keep the request alive: {progressing_error:?}"
+    );
+    assert!(progress_started.elapsed() >= Duration::from_millis(650));
+    assert_eq!(
+        progressing_server
+            .join()
+            .expect("progressing-response server thread"),
+        "GET /default.db/refs HTTP/1.1"
+    );
+
+    let (configured_stall_url, configured_stall_server) =
+        spawn_delayed_http_404(Duration::from_millis(750));
+    let configured_stall_url = format!("{configured_stall_url}?http_idle_timeout_ms=500");
+    let _: i64 = connection.query_row(
+        "SELECT dolt_remote('set-url', 'origin', ?1)",
+        params![configured_stall_url],
+        |row| row.get(0),
+    )?;
+    let configured_stall_error = connection
+        .query_row::<i64, _, _>("SELECT dolt_fetch('origin', 'main')", [], |row| row.get(0))
+        .expect_err("an idle server should exceed the URL-configured timeout");
+    assert!(
+        matches!(
+            configured_stall_error,
+            Error::SqliteFailure(code, _) if code.extended_code == ffi::SQLITE_IOERR
+        ),
+        "a stalled URL-configured request should still time out: {configured_stall_error:?}"
+    );
+    assert_eq!(
+        configured_stall_server
+            .join()
+            .expect("URL-configured stalled-response server thread"),
+        "GET /default.db/refs HTTP/1.1"
+    );
+
+    let (stalled_url, stalled_server) = spawn_delayed_http_404(Duration::from_millis(750));
+    let _: i64 = connection.query_row(
+        "SELECT dolt_remote('set-url', 'origin', ?1)",
+        params![stalled_url],
+        |row| row.get(0),
+    )?;
+    let env_stalled_error = connection
+        .query_row::<i64, _, _>("SELECT dolt_fetch('origin', 'main')", [], |row| row.get(0))
+        .expect_err("an idle server should exceed the environment default");
+    assert!(
+        matches!(
+            env_stalled_error,
+            Error::SqliteFailure(code, _) if code.extended_code == ffi::SQLITE_IOERR
+        ),
+        "a stalled request should still time out from the environment default: {env_stalled_error:?}"
+    );
+    assert_eq!(
+        stalled_server
+            .join()
+            .expect("environment-configured stalled-response server thread"),
+        "GET /default.db/refs HTTP/1.1"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn http_idle_timeout_requires_progress() -> Result<()> {
+    const CHILD_MARKER: &str = "DOLTLITE_HTTP_IDLE_TIMEOUT_TEST_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        return test_http_idle_timeout_requires_progress();
+    }
+
+    let output = Command::new(std::env::current_exe().expect("test executable path"))
+        .args([
+            "--exact",
+            "http_idle_timeout_requires_progress",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .env("DOLTLITE_HTTP_TIMEOUT_MS", "100")
+        .output()
+        .expect("run isolated idle-timeout test process");
+    assert!(
+        output.status.success(),
+        "idle-timeout subprocess failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     Ok(())
 }
 

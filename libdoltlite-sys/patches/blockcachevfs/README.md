@@ -102,3 +102,23 @@ report `(-1, -1)` when a successful checkpoint finds no WAL present; the upload
 path accepts that result and uploads any already-dirty main-file blocks without
 requiring a `-wal` file. This does not imply that attached rollback-journal
 writes are supported.
+
+`0017-session-block-prefix.patch` places every new block read and write under
+`blocks/<block-id>.bcv`. Session writes use create-only PUTs; when an immutable
+object already exists, CBS verifies its exact bytes before accepting it. The
+layout has no flat-key fallback.
+
+`0018-stage-guard-fence.patch` keeps the mutable cleanup guard server-owned.
+Before a session block PUT, the client reads the guard ETag, writes its own
+session-scoped attempt marker, then reads the guard again. It proceeds only
+when both snapshots show the same idle generation (or both show that no guard
+exists). It retries guard transitions for up to 12 seconds. Cleanup changes the
+idle epoch when releasing its sweep, so a sweep that starts and ends between
+the two reads is still detected on stores whose ETags are content-derived.
+
+`0019-gcs-crc32c-integrity.patch` sends CRC32C for every Google JSON media
+upload and requires the matching `X-Goog-Hash` checksum on full-object
+downloads before CBS consumes the body. Block reads also require the configured
+full block size before writing into cache. Conditional 304 responses retain
+the existing not-modified behavior. The same JSON media transport covers block
+objects, session metadata, and the manifest.
