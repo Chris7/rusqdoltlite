@@ -65,10 +65,13 @@ pub mod blockcachevfs {
         pz_auth_token: *mut *mut c_char,
     ) -> c_int;
 
-    /// One completed block upload event. `reused` is non-zero only after an
-    /// immutable existing object passed exact-byte verification.
+    /// Upload progress event with block and full-block-byte counts.
     pub type sqlite3_bcvfs_upload_progress_callback =
-        unsafe extern "C" fn(*mut c_void, c_int, sqlite3_int64);
+        unsafe extern "C" fn(*mut c_void, c_int, sqlite3_int64, sqlite3_int64);
+
+    /// A safe, credential-free terminal storage failure observed by the VFS.
+    pub type sqlite3_bcvfs_storage_failure_callback =
+        unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int);
 
     /// Busy callback used by an upload checkpoint.
     pub type sqlite3_bcvfs_busy_callback = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
@@ -83,6 +86,20 @@ pub mod blockcachevfs {
     pub const SQLITE_BCV_STAGEWATERMARK: c_int = 7;
     pub const SQLITE_BCV_AUTH_REQUEST: c_int = 0;
     pub const SQLITE_BCV_AUTH_UNAUTHORIZED: c_int = 1;
+    pub const SQLITE_BCVFS_UPLOAD_PROGRESS_UPLOADED_BLOCK: c_int = 1;
+    pub const SQLITE_BCVFS_UPLOAD_PROGRESS_REUSED_BLOCK: c_int = 2;
+    pub const SQLITE_BCVFS_UPLOAD_PROGRESS_PLAN: c_int = 3;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE: c_int = 0;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_HTTP: c_int = 1;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE: c_int = 1;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_BLOCK_READ: c_int = 2;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_STAGE_PUT: c_int = 3;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_VERIFY_EXISTING: c_int = 4;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_PROTECT_SESSION: c_int = 5;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_FINAL_PUT: c_int = 6;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_SESSION_CHECKPOINT: c_int = 7;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_SESSION_ACCEPT: c_int = 8;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_SESSION_PUBLISH: c_int = 9;
 
     pub const SQLITE_BCV_ATTACH_SECURE: c_int = 0x0001;
     pub const SQLITE_BCV_ATTACH_IFNOT: c_int = 0x0002;
@@ -122,6 +139,11 @@ pub mod blockcachevfs {
             fs: *mut sqlite3_bcvfs,
             progress_ctx: *mut c_void,
             progress: Option<sqlite3_bcvfs_upload_progress_callback>,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_storage_failure_callback(
+            fs: *mut sqlite3_bcvfs,
+            failure_ctx: *mut c_void,
+            failure: Option<sqlite3_bcvfs_storage_failure_callback>,
         ) -> c_int;
         pub fn sqlite3_bcvfs_attach(
             fs: *mut sqlite3_bcvfs,

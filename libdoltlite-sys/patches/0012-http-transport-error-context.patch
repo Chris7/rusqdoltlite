@@ -1,0 +1,144 @@
+Subject: [PATCH] Report safe context for Dolt HTTP transport failures
+Base: DoltLite v0.50.12
+
+Preserve fixed transport phase and configured idle-timeout context when socket
+writes, reads, or response parsing fail. Never copy request credentials, URLs,
+response headers, or provider response bodies into these diagnostics.
+
+diff --git a/doltlite.c b/doltlite.c
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -564862,6 +564862,15 @@
+   }
+ }
+ 
++/* Report only fixed phase names and configured limits.  Never include a URL,
++** request header, response body, or credential in transport diagnostics. */
++static void httpSetTransportError(HttpRemote *p, const char *zPhase){
++  httpClearLastError(p);
++  p->zLastError = sqlite3_mprintf(
++      "%s failed (socket error; configured idle timeout %d ms)",
++      zPhase, p->timeoutMs);
++}
++
+ static char *httpJsonStringField(const u8 *p, int n, const char *zKey){
+   char zNeedle[64];
+   int nNeedle;
+@@ -565261,6 +565270,7 @@
+ }
+ 
+ static int readHttpResponse(
++  HttpRemote *pRemote,
+   HttpConn *conn,
+   u8 **ppOut,
+   int *pnOut,
+@@ -565307,6 +565317,7 @@
+     n = httpConnRead(conn, pBuf+nUsed, nRead);
+     if( n<0 ){
+       *pTransportError = 1;
++      httpSetTransportError(pRemote, "reading remote HTTP response");
+       rc = SQLITE_IOERR;
+       break;
+     }
+@@ -565314,6 +565325,9 @@
+       *pCloseConnection = 1;
+       if( !headersParsed || (nTarget>=0 && nUsed!=nTarget) ){
+         *pTransportError = 1;
++        httpSetLastError(pRemote, !headersParsed
++            ? "remote closed the connection before sending HTTP response headers"
++            : "remote closed the connection before completing the HTTP response body");
+         rc = SQLITE_PROTOCOL;
+       }
+       break;
+@@ -565326,7 +565340,12 @@
+         if( pBuf[i]=='\r' && pBuf[i+1]=='\n'
+          && pBuf[i+2]=='\r' && pBuf[i+3]=='\n' ){
+           rc = httpParseResponseHeaders(pBuf, (int)nUsed, &info);
+-          if( rc!=SQLITE_OK ) break;
++          if( rc!=SQLITE_OK ){
++            if( rc==SQLITE_PROTOCOL ){
++              httpSetLastError(pRemote, "remote returned malformed HTTP response headers");
++            }
++            break;
++          }
+           headersParsed = 1;
+           *pCloseConnection = info.closeConnection;
+           if( info.contentLength>=0 ){
+@@ -565339,13 +565358,17 @@
+       }
+       if( rc!=SQLITE_OK ) break;
+       if( !headersParsed && nUsed>=HTTP_HEADER_MAX_BYTES ){
++        httpSetLastError(pRemote, "remote HTTP response headers exceeded the size limit");
+         rc = SQLITE_TOOBIG;
+         break;
+       }
+     }
+   }
+ 
+-  if( rc==SQLITE_OK && !headersParsed ) rc = SQLITE_PROTOCOL;
++  if( rc==SQLITE_OK && !headersParsed ){
++    httpSetLastError(pRemote, "remote returned an incomplete HTTP response");
++    rc = SQLITE_PROTOCOL;
++  }
+   if( rc==SQLITE_OK && info.contentLength<0 ) *pCloseConnection = 1;
+   if( rc==SQLITE_OK ){
+     u8 *pNew;
+@@ -565356,6 +565379,9 @@
+     }
+   }
+   if( rc!=SQLITE_OK ){
++    if( rc==SQLITE_TOOBIG && !pRemote->zLastError ){
++      httpSetLastError(pRemote, "remote HTTP response exceeded the size limit");
++    }
+     sqlite3_free(pBuf);
+     return rc;
+   }
+@@ -565663,6 +565689,7 @@
+   }
+   if( httpConnSetTimeout(p->pConn, timeoutMs)!=0 ){
+     *pTransportError = 1;
++    httpSetTransportError(p, "configuring the remote HTTP socket timeout");
+     httpDisconnect(p);
+     return SQLITE_IOERR;
+   }
+@@ -565706,6 +565733,7 @@
+   sqlite3_free(zHdr);
+   if( rc != SQLITE_OK ){
+     *pTransportError = 1;
++    httpSetTransportError(p, "sending remote HTTP request headers");
+     httpDisconnect(p);
+     return rc;
+   }
+@@ -565716,6 +565744,7 @@
+       int nWrite = nRemain>0x7fffffff ? 0x7fffffff : (int)nRemain;
+       if( httpConnWriteAll(p->pConn, pBody+off, nWrite) ){
+         *pTransportError = 1;
++        httpSetTransportError(p, "sending remote HTTP request body");
+         httpDisconnect(p);
+         return SQLITE_IOERR;
+       }
+@@ -565723,7 +565752,7 @@
+     }
+   }
+ 
+-  rc = readHttpResponse(p->pConn, &pRaw, &nRaw, &closeConnection,
++  rc = readHttpResponse(p, p->pConn, &pRaw, &nRaw, &closeConnection,
+                         pTransportError);
+   if( rc != SQLITE_OK ){
+     httpDisconnect(p);
+@@ -565732,7 +565761,14 @@
+   if( closeConnection ) httpDisconnect(p);
+   rc = httpParseResponse(pRaw, nRaw, pStatus, ppResp, pnResp);
+   sqlite3_free(pRaw);
+-  if( rc!=SQLITE_OK ) httpDisconnect(p);
++  if( rc!=SQLITE_OK ){
++    if( rc==SQLITE_PROTOCOL && !p->zLastError ){
++      httpSetLastError(p, "remote returned a malformed HTTP response");
++    }else if( rc==SQLITE_TOOBIG && !p->zLastError ){
++      httpSetLastError(p, "remote HTTP response exceeded the size limit");
++    }
++    httpDisconnect(p);
++  }
+   return rc;
+ }
+ 

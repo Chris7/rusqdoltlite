@@ -37,10 +37,25 @@ impl std::error::Error for AuthError {}
 pub type AuthCallback =
     dyn Fn(&str, &str, &str) -> std::result::Result<String, AuthError> + Send + Sync + 'static;
 
+/// Fixed block-work total once the final staging plan is known.
+///
+/// The plan counts all complete-block work for the VFS attachment, including
+/// blocks already uploaded or verified as reused and blocks still to stage.
+/// `bytes` is the full block payload size for that work; it does not predict
+/// network bytes because some objects may be reused.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UploadPlan {
+    /// Total number of complete blocks in the plan.
+    pub blocks: u64,
+    /// Total full-size block payload bytes in the plan.
+    pub bytes: u64,
+}
+
 /// Cumulative complete-block upload progress for one VFS attachment.
 ///
-/// The VFS cannot know the graph's final block count while DoltLite is still
-/// producing data, so this snapshot intentionally has no total or percentage.
+/// `expected` is unknown while DoltLite is still producing data. It becomes
+/// available after the explicit final checkpoint has quiesced the WAL and
+/// counted the remaining dirty blocks.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UploadProgress {
     /// Number of blocks created successfully in cloud storage.
@@ -51,7 +66,122 @@ pub struct UploadProgress {
     pub reused_blocks: u64,
     /// Bytes in existing immutable blocks accepted after exact-byte verification.
     pub reused_bytes: u64,
+    /// Fixed total block-work plan, available after final staging is planned.
+    pub expected: Option<UploadPlan>,
 }
+
+/// Storage operation where a session-owned VFS first observed a terminal failure.
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageFailurePhase {
+    /// Reading or updating the VFS's local block cache.
+    LocalBlockCache,
+    /// Fetching a content-addressed block from the object store.
+    BlockRead,
+    /// Creating a content-addressed block before checkpoint publication.
+    StageBlockPut,
+    /// Reading and verifying an immutable object that already existed.
+    VerifyExistingBlock,
+    /// Writing the session's durable block-protection marker.
+    ProtectSessionBlock,
+    /// Creating a content-addressed block during final manifest upload.
+    FinalBlockPut,
+    /// Creating or validating a session checkpoint.
+    SessionCheckpoint,
+    /// Accepting a session checkpoint.
+    SessionAccept,
+    /// Publishing a session checkpoint to the database manifest.
+    SessionPublish,
+}
+
+#[cfg(feature = "remote")]
+impl StorageFailurePhase {
+    fn from_raw(value: c_int) -> Option<Self> {
+        match value {
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE => Some(Self::LocalBlockCache),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_BLOCK_READ => Some(Self::BlockRead),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_STAGE_PUT => Some(Self::StageBlockPut),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_VERIFY_EXISTING => Some(Self::VerifyExistingBlock),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_PROTECT_SESSION => Some(Self::ProtectSessionBlock),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_FINAL_PUT => Some(Self::FinalBlockPut),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_SESSION_CHECKPOINT => Some(Self::SessionCheckpoint),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_SESSION_ACCEPT => Some(Self::SessionAccept),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_SESSION_PUBLISH => Some(Self::SessionPublish),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalBlockCache => "local block cache",
+            Self::BlockRead => "block read",
+            Self::StageBlockPut => "staged block upload",
+            Self::VerifyExistingBlock => "existing block verification",
+            Self::ProtectSessionBlock => "session block protection",
+            Self::FinalBlockPut => "final block upload",
+            Self::SessionCheckpoint => "session checkpoint",
+            Self::SessionAccept => "session acceptance",
+            Self::SessionPublish => "session publication",
+        }
+    }
+}
+
+/// Safe error code category captured at a terminal storage boundary.
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageFailureCause {
+    /// The object store returned an HTTP status code.
+    HttpStatus(u16),
+    /// SQLite or the CBS VFS returned an extended SQLite result code.
+    SqliteCode(i32),
+}
+
+/// Credential-free snapshot of the first terminal storage failure in a server attempt.
+///
+/// The snapshot records the first low-level storage failure reported by the
+/// session-owned VFS. It is useful diagnostic context, not proof that no other
+/// failure contributed to a higher-level operation. It contains no provider
+/// URL, credentials, or response body.
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageFailure {
+    /// Operation that first reported a terminal storage failure.
+    pub phase: StorageFailurePhase,
+    /// Safe failure category and numeric code.
+    pub cause: StorageFailureCause,
+}
+
+#[cfg(feature = "remote")]
+impl StorageFailure {
+    fn from_raw(phase: c_int, kind: c_int, code: c_int) -> Option<Self> {
+        let phase = StorageFailurePhase::from_raw(phase)?;
+        let cause = match kind {
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_HTTP => {
+                StorageFailureCause::HttpStatus(u16::try_from(code).ok()?)
+            }
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE => StorageFailureCause::SqliteCode(code),
+            _ => return None,
+        };
+        Some(Self { phase, cause })
+    }
+}
+
+#[cfg(feature = "remote")]
+impl fmt::Display for StorageFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.cause {
+            StorageFailureCause::HttpStatus(status) => {
+                write!(f, "{} failed with HTTP {status}", self.phase.as_str())
+            }
+            StorageFailureCause::SqliteCode(code) => {
+                write!(f, "{} failed with SQLite code {code}", self.phase.as_str())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) type StorageFailureSlot = Arc<Mutex<Option<StorageFailure>>>;
 
 #[cfg(feature = "remote")]
 pub(crate) type UploadProgressCallback = dyn Fn(UploadProgress) + Send + Sync + 'static;
@@ -64,17 +194,33 @@ struct UploadProgressState {
 
 #[cfg(feature = "remote")]
 impl UploadProgressState {
-    fn report(&self, reused: bool, bytes: u64) {
+    fn report(&self, event: c_int, blocks: u64, bytes: u64) {
         let mut current = self
             .current
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reused {
-            current.reused_blocks = current.reused_blocks.saturating_add(1);
-            current.reused_bytes = current.reused_bytes.saturating_add(bytes);
-        } else {
-            current.uploaded_blocks = current.uploaded_blocks.saturating_add(1);
-            current.uploaded_bytes = current.uploaded_bytes.saturating_add(bytes);
+        match event {
+            raw::SQLITE_BCVFS_UPLOAD_PROGRESS_UPLOADED_BLOCK => {
+                current.uploaded_blocks = current.uploaded_blocks.saturating_add(blocks);
+                current.uploaded_bytes = current.uploaded_bytes.saturating_add(bytes);
+            }
+            raw::SQLITE_BCVFS_UPLOAD_PROGRESS_REUSED_BLOCK => {
+                current.reused_blocks = current.reused_blocks.saturating_add(blocks);
+                current.reused_bytes = current.reused_bytes.saturating_add(bytes);
+            }
+            raw::SQLITE_BCVFS_UPLOAD_PROGRESS_PLAN => {
+                current.expected = Some(UploadPlan {
+                    blocks: current
+                        .uploaded_blocks
+                        .saturating_add(current.reused_blocks)
+                        .saturating_add(blocks),
+                    bytes: current
+                        .uploaded_bytes
+                        .saturating_add(current.reused_bytes)
+                        .saturating_add(bytes),
+                });
+            }
+            _ => return,
         }
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (self.callback)(*current);
@@ -934,6 +1080,8 @@ pub struct Builder {
     auth_refresh: Option<Box<AuthRefreshCallback>>,
     #[cfg(feature = "remote")]
     upload_progress: Option<Arc<UploadProgressCallback>>,
+    #[cfg(feature = "remote")]
+    storage_failure: Option<StorageFailureSlot>,
     config: Vec<Config>,
 }
 
@@ -943,6 +1091,8 @@ struct AuthState {
     refresh_callback: Option<Box<AuthRefreshCallback>>,
     #[cfg(feature = "remote")]
     upload_progress: Option<UploadProgressState>,
+    #[cfg(feature = "remote")]
+    storage_failure: Option<StorageFailureSlot>,
 }
 
 impl Builder {
@@ -956,6 +1106,8 @@ impl Builder {
             auth_refresh: None,
             #[cfg(feature = "remote")]
             upload_progress: None,
+            #[cfg(feature = "remote")]
+            storage_failure: None,
             config: Vec::new(),
         })
     }
@@ -1000,6 +1152,12 @@ impl Builder {
         callback: Arc<UploadProgressCallback>,
     ) -> Self {
         self.upload_progress = Some(callback);
+        self
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn storage_failure_slot(mut self, slot: StorageFailureSlot) -> Self {
+        self.storage_failure = Some(slot);
         self
     }
 
@@ -1074,6 +1232,8 @@ impl Builder {
                 callback,
                 current: Mutex::new(UploadProgress::default()),
             }),
+            #[cfg(feature = "remote")]
+            storage_failure: self.storage_failure,
         });
         let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
         let rc = unsafe { raw::sqlite3_bcvfs_auth_callback(fs, auth_ptr, Some(auth_trampoline)) };
@@ -1102,6 +1262,20 @@ impl Builder {
                     fs,
                     auth_ptr,
                     Some(upload_progress_trampoline),
+                )
+            };
+            if let Err(error) = check(rc) {
+                return Err(destroy_failed(fs, auth, error));
+            }
+        }
+        #[cfg(feature = "remote")]
+        if auth.storage_failure.is_some() {
+            let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
+            let rc = unsafe {
+                raw::sqlite3_bcvfs_storage_failure_callback(
+                    fs,
+                    auth_ptr,
+                    Some(storage_failure_trampoline),
                 )
             };
             if let Err(error) = check(rc) {
@@ -1671,6 +1845,8 @@ pub(crate) struct UriSessionContext {
     pub(crate) auth_refresh: Option<Arc<AuthRefreshCallback>>,
     #[cfg(feature = "remote")]
     pub(crate) upload_progress: Option<Arc<UploadProgressCallback>>,
+    #[cfg(feature = "remote")]
+    pub(crate) storage_failure: StorageFailureSlot,
 }
 
 pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connection> {
@@ -1800,6 +1976,10 @@ fn open_connection_uri_inner(
         .as_ref()
         .and_then(|session| session.upload_progress.as_ref().map(Arc::clone));
     #[cfg(feature = "remote")]
+    let storage_failure = session
+        .as_ref()
+        .map(|session| Arc::clone(&session.storage_failure));
+    #[cfg(feature = "remote")]
     if auth_refresh.is_some() && !matches!(&uri.storage, CloudStorageUri::Google { .. }) {
         return Err(cbs_uri_error(
             "credential refresh callbacks require a GCS URI",
@@ -1834,6 +2014,10 @@ fn open_connection_uri_inner(
     #[cfg(feature = "remote")]
     if let Some(callback) = upload_progress {
         builder = builder.upload_progress_callback(callback);
+    }
+    #[cfg(feature = "remote")]
+    if let Some(slot) = storage_failure {
+        builder = builder.storage_failure_slot(slot);
     }
     let vfs = Arc::new(builder.build()?);
 
@@ -2516,16 +2700,44 @@ unsafe extern "C" fn auth_trampoline(
 #[cfg(feature = "remote")]
 unsafe extern "C" fn upload_progress_trampoline(
     ctx: *mut c_void,
-    reused: c_int,
+    event: c_int,
+    blocks: crate::ffi::sqlite3_int64,
     bytes: crate::ffi::sqlite3_int64,
 ) {
-    if ctx.is_null() || bytes < 0 {
+    if ctx.is_null() || blocks < 0 || bytes < 0 {
         return;
     }
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let state = unsafe { &*(ctx as *const AuthState) };
         if let Some(progress) = state.upload_progress.as_ref() {
-            progress.report(reused != 0, bytes as u64);
+            progress.report(event, blocks as u64, bytes as u64);
+        }
+    }));
+}
+
+#[cfg(feature = "remote")]
+unsafe extern "C" fn storage_failure_trampoline(
+    ctx: *mut c_void,
+    phase: c_int,
+    kind: c_int,
+    code: c_int,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &*(ctx as *const AuthState) };
+        let Some(slot) = state.storage_failure.as_ref() else {
+            return;
+        };
+        let Some(failure) = StorageFailure::from_raw(phase, kind, code) else {
+            return;
+        };
+        let mut stored = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stored.is_none() {
+            *stored = Some(failure);
         }
     }));
 }

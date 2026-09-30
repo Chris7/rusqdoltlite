@@ -3,8 +3,8 @@
 #[cfg(feature = "blockcachevfs")]
 use crate::blockcachevfs::{
     session_alias, AttachSpec, AuthError, AuthRefreshCallback, AuthRefreshReason, BlockCacheVfs,
-    SessionAttachment, SessionOperationId, SessionOperationStatus, UploadProgressCallback,
-    UriSessionContext,
+    SessionAttachment, SessionOperationId, SessionOperationStatus, StorageFailure,
+    StorageFailureSlot, UploadProgressCallback, UriSessionContext,
 };
 use crate::error::error_from_sqlite_code;
 use crate::{ffi, path_to_cstring, Result};
@@ -17,7 +17,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 #[cfg(feature = "blockcachevfs")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "blockcachevfs")]
@@ -337,12 +337,16 @@ impl BlockCacheSessionOptions {
     ///
     /// The callback runs synchronously on the native upload thread after a
     /// complete block PUT succeeds or an existing immutable block passes an
-    /// exact-byte check. This can be the remote request thread or a thread
+    /// exact-byte check. It also reports a fixed `expected` plan after the
+    /// explicit final checkpoint has quiesced the WAL and counted remaining
+    /// dirty blocks. The plan includes already uploaded and verified-reused
+    /// blocks; its byte count is full block payload bytes, not predicted network
+    /// traffic, and excludes WAL, checkpoint, manifest, and other metadata
+    /// requests. `expected` stays `None` while DoltLite is producing data. A
+    /// complete block-work plan can reach 100% before the session manifest is
+    /// accepted or published. This can be the remote request thread or a thread
     /// checkpointing the database. Do not re-enter this VFS or connection from
-    /// the callback. Snapshots belong to this VFS attachment and include blocks
-    /// flushed during checkpointing; the graph's final block count is unknown
-    /// while DoltLite is still producing blocks, so no percentage or total is
-    /// reported. Panics are contained and never alter upload or publication
+    /// the callback. Panics are contained and never alter upload or publication
     /// results. Keep the callback quick. This option is supported only for
     /// URI-backed session options.
     ///
@@ -360,11 +364,12 @@ impl BlockCacheSessionOptions {
     /// )?
     /// .upload_progress_callback(|progress: UploadProgress| {
     ///     eprintln!(
-    ///         "Uploaded {} blocks ({} bytes); reused {} blocks ({} bytes)",
+    ///         "Uploaded {} blocks ({} bytes); reused {} blocks ({} bytes); plan {:?}",
     ///         progress.uploaded_blocks,
     ///         progress.uploaded_bytes,
     ///         progress.reused_blocks,
     ///         progress.reused_bytes,
+    ///         progress.expected,
     ///     );
     /// });
     /// let _ = session;
@@ -441,7 +446,7 @@ impl BlockCacheSessionOptions {
         }
     }
 
-    fn uri_context(&self) -> UriSessionContext {
+    fn uri_context(&self, storage_failure: StorageFailureSlot) -> UriSessionContext {
         UriSessionContext {
             session_id: self.session_id.clone(),
             principal: self.scope.principal().to_owned(),
@@ -450,6 +455,7 @@ impl BlockCacheSessionOptions {
             operation_id: self.operation_id,
             auth_refresh: self.auth_refresh.as_ref().map(Arc::clone),
             upload_progress: self.upload_progress.as_ref().map(Arc::clone),
+            storage_failure,
         }
     }
 }
@@ -725,6 +731,8 @@ pub struct RemoteServer {
     session: Option<SessionAttachment>,
     #[cfg(feature = "blockcachevfs")]
     database: Option<Connection>,
+    #[cfg(feature = "blockcachevfs")]
+    storage_failure: Option<StorageFailureSlot>,
     raw: Option<NonNull<ffi::DoltliteServer>>,
     scheme: &'static str,
     bind_address: String,
@@ -799,7 +807,7 @@ impl RemoteServer {
         #[cfg(not(feature = "blockcachevfs"))]
         let session_loopback_transfer = false;
         #[cfg(feature = "blockcachevfs")]
-        let (database, uri_directory, uri_vfs_name) = match cloud_uri {
+        let (database, uri_directory, uri_vfs_name, storage_failure) = match cloud_uri {
             Some(uri) => {
                 if options.vfs_name.is_some() {
                     return Err(remote_server_error(
@@ -808,6 +816,7 @@ impl RemoteServer {
                     ));
                 }
                 let session = options.blockcache_session.as_ref();
+                let storage_failure = session.map(|_| Arc::new(Mutex::new(None)));
                 if let Some(session) = session {
                     if !session.is_uri() {
                         return Err(remote_server_error(
@@ -829,7 +838,11 @@ impl RemoteServer {
                     crate::blockcachevfs::open_connection_uri_with_session(
                         uri,
                         flags,
-                        session.uri_context(),
+                        session.uri_context(Arc::clone(
+                            storage_failure
+                                .as_ref()
+                                .expect("should have a storage-failure slot for a URI session"),
+                        )),
                     )?
                 } else {
                     Connection::open_with_flags(uri, flags)?
@@ -852,7 +865,12 @@ impl RemoteServer {
                         )
                     })?
                     .to_owned();
-                (Some(database), Some(directory), Some(vfs_name))
+                (
+                    Some(database),
+                    Some(directory),
+                    Some(vfs_name),
+                    storage_failure,
+                )
             }
             None => {
                 if options
@@ -865,7 +883,7 @@ impl RemoteServer {
                         "URI session options require a GCS or S3 database URI",
                     ));
                 }
-                (None, None, None)
+                (None, None, None, None)
             }
         };
         #[cfg(not(feature = "blockcachevfs"))]
@@ -1038,6 +1056,8 @@ impl RemoteServer {
             session,
             #[cfg(feature = "blockcachevfs")]
             database,
+            #[cfg(feature = "blockcachevfs")]
+            storage_failure,
             raw: Some(raw),
             scheme: if certificate_file.is_some() {
                 "https"
@@ -1068,6 +1088,23 @@ impl RemoteServer {
     pub fn database_connection(&self) -> Option<&Connection> {
         self.raw.as_ref()?;
         self.database.as_ref()
+    }
+
+    /// Return the first terminal storage failure recorded by this server's
+    /// session-owned cloud VFS, if one was observed.
+    ///
+    /// The snapshot contains only an operation phase and a typed HTTP or
+    /// SQLite code. It never includes provider URLs, credentials, or response
+    /// bodies. This accessor applies only to session-owned cloud-URI servers;
+    /// other server forms return `None`. Read it before closing the server.
+    #[cfg(feature = "blockcachevfs")]
+    #[must_use]
+    pub fn first_storage_error(&self) -> Option<StorageFailure> {
+        self.storage_failure.as_ref().and_then(|slot| {
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
     }
 
     /// Stop accepting requests and wait for all native workers to finish.
@@ -1219,9 +1256,12 @@ impl RemoteServer {
     }
 
     /// Returns an HTTP remote URL for a database file in the served directory.
-    /// URI-backed session loopback URLs carry a five-minute idle timeout for
-    /// large object-store commits; other remotes use DoltLite's ordinary
-    /// 30-second default, subject to its environment override.
+    /// Cleartext URI-backed session loopback URLs disable the HTTP idle
+    /// timeout because the local server may spend an extended period writing
+    /// cloud blocks before returning its response. The TCP connect timeout
+    /// remains bounded. TLS session URLs retain the five-minute idle timeout;
+    /// other remotes use DoltLite's ordinary 30-second default, subject to its
+    /// environment override.
     #[must_use]
     pub fn database_url(&self, database: &str) -> String {
         let url = format!(
@@ -1229,7 +1269,12 @@ impl RemoteServer {
             self.scheme, self.bind_address, self.port
         );
         if self.session_loopback_transfer {
-            format!("{url}?http_idle_timeout_ms={SESSION_LOOPBACK_HTTP_IDLE_TIMEOUT_MS}")
+            let timeout_ms = if self.scheme == "http" {
+                0
+            } else {
+                SESSION_LOOPBACK_HTTP_IDLE_TIMEOUT_MS
+            };
+            format!("{url}?http_idle_timeout_ms={timeout_ms}")
         } else {
             url
         }
@@ -1361,24 +1406,29 @@ mod tests {
     }
 
     #[test]
-    fn database_url_extends_idle_timeout_only_for_session_loopback() {
-        let make_server = |session_loopback_transfer| RemoteServer {
+    fn database_url_disables_idle_timeout_only_for_clear_session_loopback() {
+        let make_server = |scheme, session_loopback_transfer| RemoteServer {
             session: None,
             database: None,
+            storage_failure: None,
             raw: None,
-            scheme: "http",
+            scheme,
             bind_address: "127.0.0.1".to_owned(),
             port: 1234,
             session_loopback_transfer,
         };
 
         assert_eq!(
-            make_server(false).database_url("default.db"),
+            make_server("http", false).database_url("default.db"),
             "http://127.0.0.1:1234/default.db"
         );
         assert_eq!(
-            make_server(true).database_url("default.db"),
-            "http://127.0.0.1:1234/default.db?http_idle_timeout_ms=300000"
+            make_server("http", true).database_url("default.db"),
+            "http://127.0.0.1:1234/default.db?http_idle_timeout_ms=0"
+        );
+        assert_eq!(
+            make_server("https", true).database_url("default.db"),
+            "https://127.0.0.1:1234/default.db?http_idle_timeout_ms=300000"
         );
     }
 

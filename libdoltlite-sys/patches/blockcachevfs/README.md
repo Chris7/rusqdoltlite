@@ -154,5 +154,23 @@ reuse counts and bytes for one URI-owned VFS. Events cover streaming staging,
 checkpoint flushes, and ordinary block uploads. The callback runs synchronously
 on the thread doing native upload work; panics are ignored and cannot change
 storage or publication results. Callers should keep it quick and must not
-re-enter the same VFS or connection. No total is available while the graph is
-still producing blocks.
+re-enter the same VFS or connection. Its expected total remains unknown while
+the graph is producing blocks; the following plan patch fills it after the
+explicit final checkpoint counts remaining dirty blocks.
+
+`0023-storage-failure-diagnostics.patch` lets a session-owned URI VFS retain a
+credential-free first terminal storage failure with an explicit operation
+phase and HTTP-status or SQLite-code cause. It covers block transfers, local
+cache I/O, session protection, checkpoint and accepted-head records, and
+publication writes. Transient retries, a missing cleanup guard, expected head
+CAS conflicts, and verified immutable-object reuse are not recorded as
+failures. No URL, credential, or provider response text enters the snapshot.
+
+`0024-upload-plan-progress.patch` extends the 0022 progress callback with a
+fixed block-work plan. After the explicit final checkpoint has quiesced the
+WAL, CBS counts the target container's remaining unpinned dirty blocks and
+reports that remainder alongside already completed upload/reuse counts. The
+plan's block and byte totals include both newly uploaded and verified-reused
+blocks; bytes are full block payload sizes, not predicted network traffic, and
+do not include WAL or publication metadata. No plan is reported while the
+producer is active or when dirty entries are blocked.
