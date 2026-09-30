@@ -2,8 +2,8 @@
 
 #[cfg(feature = "blockcachevfs")]
 use crate::blockcachevfs::{
-    session_alias, AttachSpec, BlockCacheVfs, SessionAttachment, SessionOperationId,
-    SessionOperationStatus, UriSessionContext,
+    session_alias, AttachSpec, AuthError, AuthRefreshCallback, AuthRefreshReason, BlockCacheVfs,
+    SessionAttachment, SessionOperationId, SessionOperationStatus, UriSessionContext,
 };
 use crate::error::error_from_sqlite_code;
 use crate::{ffi, path_to_cstring, Result};
@@ -15,6 +15,8 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
+#[cfg(feature = "blockcachevfs")]
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "blockcachevfs")]
@@ -185,6 +187,7 @@ pub struct BlockCacheSessionOptions {
     session_id: crate::blockcachevfs::SessionId,
     scope: SessionScope,
     operation_id: SessionOperationId,
+    auth_refresh: Option<Arc<AuthRefreshCallback>>,
 }
 
 #[cfg(feature = "blockcachevfs")]
@@ -210,6 +213,7 @@ impl fmt::Debug for BlockCacheSessionOptions {
             .field("session_id", &self.session_id)
             .field("scope", &self.scope)
             .field("operation_id", &self.operation_id)
+            .field("auth_callback_configured", &self.auth_refresh.is_some())
             .finish()
     }
 }
@@ -242,6 +246,7 @@ impl BlockCacheSessionOptions {
             session_id,
             scope,
             operation_id,
+            auth_refresh: None,
         })
     }
 
@@ -271,7 +276,53 @@ impl BlockCacheSessionOptions {
             session_id: crate::blockcachevfs::SessionId::new(session_id)?,
             scope,
             operation_id,
+            auth_refresh: None,
         })
+    }
+
+    /// Supply credentials for a session-owned Google Cloud Storage URI.
+    ///
+    /// The callback runs once while the URI-owned VFS attaches its storage
+    /// container, before each cloud request, and again after an authorization
+    /// failure. It should return the current token for the requested storage
+    /// identity. This keeps credentials out of the server loop and lets an
+    /// open database continue after a short-lived token expires. The callback
+    /// is supported only by [`Self::for_uri`] with a GCS URI; using it with a
+    /// static VFS session or S3 URI causes server startup to fail.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rusqlite::blockcachevfs::AuthRefreshReason;
+    /// use rusqlite::{BlockCacheSessionOptions, SessionOperationId, SessionScope};
+    ///
+    /// # fn main() -> rusqlite::Result<()> {
+    /// let scope = SessionScope::new("alice", "default.db", "read,write")?;
+    /// let operation = SessionOperationId::from_request("POST", "/default.db/commit", b"")?;
+    /// let session = BlockCacheSessionOptions::for_uri(
+    ///     "9c539f0e-3913-4875-9f93-23627c3c015d",
+    ///     scope,
+    ///     operation,
+    /// )?
+    /// .auth_callback(|_storage, _project, _container, reason| match reason {
+    ///     AuthRefreshReason::Request | AuthRefreshReason::Unauthorized => {
+    ///         Ok("current-access-token".to_owned())
+    ///     }
+    /// });
+    /// let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn auth_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, &str, &str, AuthRefreshReason) -> std::result::Result<String, AuthError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.auth_refresh = Some(Arc::new(callback));
+        self
     }
 
     /// Return the caller-authorized context carried by this payload.
@@ -298,6 +349,12 @@ impl BlockCacheSessionOptions {
     }
 
     fn attach(&self) -> Result<SessionAttachment> {
+        if self.auth_refresh.is_some() {
+            return Err(remote_server_error(
+                ffi::SQLITE_MISUSE,
+                "credential refresh callbacks require a session-owned GCS URI",
+            ));
+        }
         match &self.target {
             BlockCacheSessionTarget::Vfs {
                 vfs, attachment, ..
@@ -330,6 +387,7 @@ impl BlockCacheSessionOptions {
             target_database: self.scope.target_database().to_owned(),
             operations: self.scope.operations().to_owned(),
             operation_id: self.operation_id,
+            auth_refresh: self.auth_refresh.as_ref().map(Arc::clone),
         }
     }
 }

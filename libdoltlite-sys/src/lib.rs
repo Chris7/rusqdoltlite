@@ -55,6 +55,16 @@ pub mod blockcachevfs {
         pz_auth_token: *mut *mut c_char,
     ) -> c_int;
 
+    /// Request-boundary credential refresh callback for session-owned cloud VFSes.
+    pub type sqlite3_bcvfs_auth_refresh_callback = unsafe extern "C" fn(
+        p_ctx: *mut c_void,
+        z_storage: *const c_char,
+        z_account: *const c_char,
+        z_container: *const c_char,
+        reason: c_int,
+        pz_auth_token: *mut *mut c_char,
+    ) -> c_int;
+
     /// Busy callback used by an upload checkpoint.
     pub type sqlite3_bcvfs_busy_callback = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 
@@ -66,6 +76,8 @@ pub mod blockcachevfs {
     pub const SQLITE_BCV_HTTPLOG_NENTRY: c_int = 6;
     /// Proactively stage dirty blocks once this percentage of the cache is occupied.
     pub const SQLITE_BCV_STAGEWATERMARK: c_int = 7;
+    pub const SQLITE_BCV_AUTH_REQUEST: c_int = 0;
+    pub const SQLITE_BCV_AUTH_UNAUTHORIZED: c_int = 1;
 
     pub const SQLITE_BCV_ATTACH_SECURE: c_int = 0x0001;
     pub const SQLITE_BCV_ATTACH_IFNOT: c_int = 0x0002;
@@ -95,6 +107,11 @@ pub mod blockcachevfs {
             fs: *mut sqlite3_bcvfs,
             auth_ctx: *mut c_void,
             auth: Option<sqlite3_bcvfs_auth_callback>,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_auth_refresh_callback(
+            fs: *mut sqlite3_bcvfs,
+            auth_ctx: *mut c_void,
+            auth: Option<sqlite3_bcvfs_auth_refresh_callback>,
         ) -> c_int;
         pub fn sqlite3_bcvfs_attach(
             fs: *mut sqlite3_bcvfs,

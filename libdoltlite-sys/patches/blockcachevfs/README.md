@@ -128,3 +128,22 @@ static curl build. It preserves `CLOUDSQLITE_CAINFO`, honors `SSL_CERT_FILE`
 and `SSL_CERT_DIR`, and otherwise selects readable conventional CA file and
 directory locations without weakening peer or hostname verification. The
 standalone CBS build keeps its upstream curl configuration.
+
+`0021-cloud-auth-refresh-callback.patch` adds request-boundary Bearer-token
+refresh for session-owned Google JSON connections. CBS asks for a current
+token immediately before dispatching each HTTP request, then after a 401 or
+403 asks for a forced replacement and replays that same request once. The
+replay preserves its body and generation preconditions; a second denial is
+terminal. Callback errors become a generic SQLite authorization I/O error,
+and token-bearing headers are not included in CBS verbose HTTP output. The
+static authentication callback and Google XML/S3 paths keep their existing
+behavior.
+
+This keeps a live `upload()` retry safe when it resumes from local dirty
+manifest state: immutable block objects already accepted by the server remain
+valid, and an exact same-byte create-only replay is accepted. A fresh process
+can rehydrate only an accepted durable session checkpoint/head. Unaccepted
+local overlay-to-block mappings are disposable and rebuilt by Gen from its
+durable local graph; session attempt markers do not reconstruct that mapping,
+so the VFS does not promise bandwidth-free resume for every block staged
+before acceptance.

@@ -37,6 +37,24 @@ impl std::error::Error for AuthError {}
 pub type AuthCallback =
     dyn Fn(&str, &str, &str) -> std::result::Result<String, AuthError> + Send + Sync + 'static;
 
+/// Why a session-owned cloud VFS is requesting an authentication token.
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthRefreshReason {
+    /// A cloud request is about to be handed to the HTTP dispatcher; the
+    /// provider may renew a token before the request starts.
+    Request,
+    /// The cloud provider rejected a request; the provider must fetch fresh
+    /// credentials before the same request is retried.
+    Unauthorized,
+}
+
+#[cfg(feature = "remote")]
+pub(crate) type AuthRefreshCallback = dyn Fn(&str, &str, &str, AuthRefreshReason) -> std::result::Result<String, AuthError>
+    + Send
+    + Sync
+    + 'static;
+
 /// Encode temporary S3 credentials for the CBS authentication callback.
 ///
 /// CBS receives the access key in [`Storage::s3`] and the value returned by
@@ -867,11 +885,15 @@ pub struct Builder {
     directory: std::path::PathBuf,
     name: CString,
     auth: Box<AuthCallback>,
+    #[cfg(feature = "remote")]
+    auth_refresh: Option<Box<AuthRefreshCallback>>,
     config: Vec<Config>,
 }
 
 struct AuthState {
     callback: Box<AuthCallback>,
+    #[cfg(feature = "remote")]
+    refresh_callback: Option<Box<AuthRefreshCallback>>,
 }
 
 impl Builder {
@@ -881,6 +903,8 @@ impl Builder {
             directory: directory.as_ref().to_owned(),
             name: CString::new("rusqdoltlite-bcvfs").map_err(Error::NulError)?,
             auth: Box::new(|_, _, _| Err(AuthError("no CBS auth callback configured".into()))),
+            #[cfg(feature = "remote")]
+            auth_refresh: None,
             config: Vec::new(),
         })
     }
@@ -904,6 +928,18 @@ impl Builder {
         F: Fn(&str, &str, &str) -> std::result::Result<String, AuthError> + Send + Sync + 'static,
     {
         self.auth = Box::new(callback);
+        self
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn auth_refresh_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, &str, &str, AuthRefreshReason) -> std::result::Result<String, AuthError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.auth_refresh = Some(Box::new(callback));
         self
     }
 
@@ -971,11 +1007,27 @@ impl Builder {
 
         let mut auth = Box::new(AuthState {
             callback: self.auth,
+            #[cfg(feature = "remote")]
+            refresh_callback: self.auth_refresh,
         });
         let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
         let rc = unsafe { raw::sqlite3_bcvfs_auth_callback(fs, auth_ptr, Some(auth_trampoline)) };
         if let Err(error) = check(rc) {
             return Err(destroy_failed(fs, auth, error));
+        }
+        #[cfg(feature = "remote")]
+        if auth.refresh_callback.is_some() {
+            let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
+            let rc = unsafe {
+                raw::sqlite3_bcvfs_auth_refresh_callback(
+                    fs,
+                    auth_ptr,
+                    Some(auth_refresh_trampoline),
+                )
+            };
+            if let Err(error) = check(rc) {
+                return Err(destroy_failed(fs, auth, error));
+            }
         }
         for config in &self.config {
             let (op, value) = config.raw();
@@ -1536,6 +1588,8 @@ pub(crate) struct UriSessionContext {
     pub(crate) target_database: String,
     pub(crate) operations: String,
     pub(crate) operation_id: SessionOperationId,
+    #[cfg(feature = "remote")]
+    pub(crate) auth_refresh: Option<Arc<AuthRefreshCallback>>,
 }
 
 pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connection> {
@@ -1656,13 +1710,43 @@ fn open_connection_uri_inner(
         } => (auth_secret.clone(), credentials_to_redact.clone()),
     };
 
+    #[cfg(feature = "remote")]
+    let auth_refresh = session
+        .as_ref()
+        .and_then(|session| session.auth_refresh.as_ref().map(Arc::clone));
+    #[cfg(feature = "remote")]
+    if auth_refresh.is_some() && !matches!(&uri.storage, CloudStorageUri::Google { .. }) {
+        return Err(cbs_uri_error(
+            "credential refresh callbacks require a GCS URI",
+        ));
+    }
+
     let name = format!("rusqdoltlite-bcvfs-{}-{id}", std::process::id());
-    let vfs = Arc::new(
-        BlockCacheVfs::builder(cache_directory.path())?
-            .name(&name)?
-            .auth_callback(move |_storage, _account, _container| Ok(auth_secret.clone()))
-            .build()?,
-    );
+    #[cfg(feature = "remote")]
+    let auth_refresh_for_initial = auth_refresh.as_ref().map(Arc::clone);
+    let mut builder = BlockCacheVfs::builder(cache_directory.path())?
+        .name(&name)?
+        .auth_callback(move |storage, account, container| {
+            #[cfg(feature = "remote")]
+            if let Some(callback) = auth_refresh_for_initial.as_ref() {
+                let token = callback(storage, account, container, AuthRefreshReason::Request)
+                    .map_err(|_| AuthError("session URI credential provider failed".to_owned()))?;
+                if !valid_refresh_token(&token) {
+                    return Err(AuthError(
+                        "session URI credential provider returned an invalid token".to_owned(),
+                    ));
+                }
+                return Ok(token);
+            }
+            Ok(auth_secret.clone())
+        });
+    #[cfg(feature = "remote")]
+    if let Some(callback) = auth_refresh {
+        builder = builder.auth_refresh_callback(move |storage, account, container, reason| {
+            callback(storage, account, container, reason)
+        });
+    }
+    let vfs = Arc::new(builder.build()?);
 
     let container = if uri.prefix.is_empty() {
         uri.bucket.clone()
@@ -2336,6 +2420,65 @@ unsafe extern "C" fn auth_trampoline(
         ptr::copy_nonoverlapping(token.as_ptr(), ptr, token.len());
         *ptr.add(token.len()) = 0;
         *out = ptr.cast();
+    }
+    crate::ffi::SQLITE_OK
+}
+
+#[cfg(feature = "remote")]
+fn valid_refresh_token(token: &str) -> bool {
+    !token.is_empty() && !token.contains(['\r', '\n']) && !token.as_bytes().contains(&0)
+}
+
+#[cfg(feature = "remote")]
+unsafe extern "C" fn auth_refresh_trampoline(
+    ctx: *mut c_void,
+    storage: *const c_char,
+    account: *const c_char,
+    container: *const c_char,
+    reason: c_int,
+    out: *mut *mut c_char,
+) -> c_int {
+    if out.is_null() || ctx.is_null() {
+        return crate::ffi::SQLITE_IOERR_AUTH;
+    }
+    unsafe { *out = ptr::null_mut() };
+    if storage.is_null() || account.is_null() || container.is_null() {
+        return crate::ffi::SQLITE_IOERR_AUTH;
+    }
+    let reason = match reason {
+        raw::SQLITE_BCV_AUTH_REQUEST => AuthRefreshReason::Request,
+        raw::SQLITE_BCV_AUTH_UNAUTHORIZED => AuthRefreshReason::Unauthorized,
+        _ => return crate::ffi::SQLITE_IOERR_AUTH,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &*(ctx as *const AuthState) };
+        let callback = state.refresh_callback.as_ref()?;
+        let storage = unsafe { CStr::from_ptr(storage) }.to_str().ok()?;
+        let account = unsafe { CStr::from_ptr(account) }.to_str().ok()?;
+        let container = unsafe { CStr::from_ptr(container) }.to_str().ok()?;
+        callback(storage, account, container, reason).ok()
+    }));
+    let Some(Some(token)) = result.ok() else {
+        return crate::ffi::SQLITE_IOERR_AUTH;
+    };
+    if !valid_refresh_token(&token) {
+        return crate::ffi::SQLITE_IOERR_AUTH;
+    }
+    let Some(length) = token
+        .len()
+        .checked_add(1)
+        .and_then(|v| c_int::try_from(v).ok())
+    else {
+        return crate::ffi::SQLITE_TOOBIG;
+    };
+    let token_ptr = unsafe { crate::ffi::sqlite3_malloc(length) }.cast::<u8>();
+    if token_ptr.is_null() {
+        return crate::ffi::SQLITE_NOMEM;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(token.as_ptr(), token_ptr, token.len());
+        *token_ptr.add(token.len()) = 0;
+        *out = token_ptr.cast();
     }
     crate::ffi::SQLITE_OK
 }
