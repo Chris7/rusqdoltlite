@@ -65,6 +65,11 @@ pub mod blockcachevfs {
         pz_auth_token: *mut *mut c_char,
     ) -> c_int;
 
+    /// One completed block upload event. `reused` is non-zero only after an
+    /// immutable existing object passed exact-byte verification.
+    pub type sqlite3_bcvfs_upload_progress_callback =
+        unsafe extern "C" fn(*mut c_void, c_int, sqlite3_int64);
+
     /// Busy callback used by an upload checkpoint.
     pub type sqlite3_bcvfs_busy_callback = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 
@@ -112,6 +117,11 @@ pub mod blockcachevfs {
             fs: *mut sqlite3_bcvfs,
             auth_ctx: *mut c_void,
             auth: Option<sqlite3_bcvfs_auth_refresh_callback>,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_upload_progress_callback(
+            fs: *mut sqlite3_bcvfs,
+            progress_ctx: *mut c_void,
+            progress: Option<sqlite3_bcvfs_upload_progress_callback>,
         ) -> c_int;
         pub fn sqlite3_bcvfs_attach(
             fs: *mut sqlite3_bcvfs,

@@ -33,7 +33,7 @@ use rusqlite::blockcachevfs::{
     SESSION_OPERATION_ID_BYTES,
 };
 #[cfg(feature = "remote")]
-use rusqlite::blockcachevfs::{AuthError, AuthRefreshReason};
+use rusqlite::blockcachevfs::{AuthError, AuthRefreshReason, UploadProgress};
 use rusqlite::ffi::{self, blockcachevfs as raw_bcv};
 #[cfg(feature = "remote")]
 use rusqlite::SessionOperationStatus;
@@ -2531,6 +2531,8 @@ enum StorageFaultAction {
     Forbidden,
     AlwaysUnauthorized,
     AlwaysForbidden,
+    CreateThenReject,
+    CreateCorruptedThenReject,
 }
 
 #[cfg(feature = "remote")]
@@ -2549,6 +2551,8 @@ impl StorageFaultAction {
             Self::Forbidden => 10,
             Self::AlwaysUnauthorized => 11,
             Self::AlwaysForbidden => 12,
+            Self::CreateThenReject => 13,
+            Self::CreateCorruptedThenReject => 14,
         }
     }
 }
@@ -2807,6 +2811,13 @@ fn handle_storage_fault_connection(
             {
                 Some(403)
             }
+            value
+                if value == StorageFaultAction::Reject.code()
+                    || value == StorageFaultAction::CreateThenReject.code()
+                    || value == StorageFaultAction::CreateCorruptedThenReject.code() =>
+            {
+                Some(412)
+            }
             _ => None,
         }
     } else {
@@ -2834,19 +2845,18 @@ fn handle_storage_fault_connection(
                 injected_status,
             });
     }
-    if fault_now {
-        if let Some(status) = injected_status {
-            write!(
-                stream,
-                "HTTP/1.1 {status} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                if status == 401 {
-                    "Unauthorized"
-                } else {
-                    "Forbidden"
-                }
-            )?;
-            return Ok(());
-        }
+    if fault_now && matches!(injected_status, Some(401 | 403)) {
+        let status = injected_status.expect("matched injected authentication status");
+        write!(
+            stream,
+            "HTTP/1.1 {status} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            if status == 401 {
+                "Unauthorized"
+            } else {
+                "Forbidden"
+            }
+        )?;
+        return Ok(());
     }
     if fault_now
         && controls.action.load(Ordering::Acquire) == StorageFaultAction::KillProcess.code()
@@ -2858,6 +2868,55 @@ fn handle_storage_fault_connection(
             let _ = Command::new("kill").args(["-KILL", &pid]).status();
         }
         let _ = stream.shutdown(Shutdown::Both);
+        return Ok(());
+    }
+    if fault_now
+        && controls.action.load(Ordering::Acquire) == StorageFaultAction::CreateThenReject.code()
+    {
+        let created =
+            forward_storage_proxy_request(authority, &method, &request_target, &headers, &body)?;
+        let created_status = http_status(&created);
+        if !(200..300).contains(&created_status) {
+            return Err(io::Error::other(
+                "test proxy could not pre-create the immutable block",
+            ));
+        }
+        stream.write_all(
+            b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(());
+    }
+    if fault_now
+        && controls.action.load(Ordering::Acquire)
+            == StorageFaultAction::CreateCorruptedThenReject.code()
+    {
+        let Some(first) = body.first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "test proxy cannot corrupt an empty immutable block",
+            ));
+        };
+        let mut corrupted_body = body.clone();
+        corrupted_body[0] = *first ^ 0x01;
+        let checksum = format!("crc32c={}", test_crc32c_base64(&corrupted_body));
+        let mut corrupted_headers = headers.clone();
+        set_test_header(&mut corrupted_headers, "x-goog-hash", &checksum);
+        let created = forward_storage_proxy_request(
+            authority,
+            &method,
+            &request_target,
+            &corrupted_headers,
+            &corrupted_body,
+        )?;
+        let created_status = http_status(&created);
+        if !(200..300).contains(&created_status) {
+            return Err(io::Error::other(
+                "test proxy could not pre-create the corrupted immutable block",
+            ));
+        }
+        stream.write_all(
+            b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
         return Ok(());
     }
     if fault_now && controls.action.load(Ordering::Acquire) == StorageFaultAction::Reject.code() {
@@ -7332,6 +7391,31 @@ fn start_graph_uri_session_server(
 }
 
 #[cfg(feature = "remote")]
+fn start_uri_session_server_with_progress<F>(
+    uri: &str,
+    session_id: &str,
+    operation_id: SessionOperationId,
+    callback: F,
+) -> rusqlite::Result<RemoteServer>
+where
+    F: Fn(UploadProgress) + Send + Sync + 'static,
+{
+    let scope = SessionScope::new("emulator-transfer", "remote.db", "push,read")?;
+    let session = BlockCacheSessionOptions::for_uri(session_id, scope, operation_id)?
+        .upload_progress_callback(callback);
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    RemoteServer::start_with_options(
+        uri,
+        &RemoteServerOptions::new()
+            .database_open_flags(flags)
+            .blockcache_session(session),
+    )
+}
+
+#[cfg(feature = "remote")]
 fn start_uri_session_server_with_auth<F>(
     uri: &str,
     session_id: &str,
@@ -7362,6 +7446,25 @@ fn seed_uri_session_fault_data(database: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE fault_data(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
          INSERT INTO fault_data VALUES (1, 'seed');",
     )
+}
+
+#[cfg(feature = "remote")]
+fn configure_uri_session_test_cache(database: &Connection) {
+    let vfs_name = CString::new(
+        database
+            .blockcachevfs_name()
+            .expect("URI session exposes its CBS VFS name"),
+    )
+    .expect("CBS VFS name is NUL-free");
+    let native_vfs = unsafe { ffi::sqlite3_vfs_find(vfs_name.as_ptr()) };
+    assert!(!native_vfs.is_null(), "URI session VFS must be registered");
+    for (option, value) in [
+        (raw_bcv::SQLITE_BCV_CACHESIZE, 8 * 1024 * 1024),
+        (raw_bcv::SQLITE_BCV_STAGEWATERMARK, 50),
+    ] {
+        let rc = unsafe { raw_bcv::sqlite3_bcvfs_config(native_vfs.cast(), option, value) };
+        assert_eq!(rc, ffi::SQLITE_OK, "configure the URI test VFS cache");
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -8288,6 +8391,257 @@ fn google_uri_session_remote_server_accepts_chunk_over_public_request_limit() {
         String::from_utf8_lossy(&response[..response.len().min(200)])
     );
     server.close().expect("close URI-session remote server");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_reports_complete_block_upload_progress() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let proxy = StorageFaultProxy::start(&endpoint);
+
+    let prefix = format!("{}/uri/upload-progress/", unique_suffix());
+    let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+    let progress_events = Arc::new(Mutex::new(Vec::<UploadProgress>::new()));
+    let callback_events = Arc::clone(&progress_events);
+    let panic_once = Arc::new(AtomicBool::new(true));
+    let callback_panic_once = Arc::clone(&panic_once);
+    let session_id = Uuid::new_v4().to_string();
+    let operation_id =
+        SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+            .expect("derive upload-progress operation ID");
+    let mut server =
+        start_uri_session_server_with_progress(&uri, &session_id, operation_id, move |progress| {
+            callback_events
+                .lock()
+                .expect("lock upload progress events")
+                .push(progress);
+            if callback_panic_once.swap(false, Ordering::AcqRel) {
+                panic!("test that upload progress panics are contained");
+            }
+        })
+        .expect("start upload-progress URI session");
+    let database = server
+        .database_connection()
+        .expect("URI session exposes its SQLite anchor");
+    configure_uri_session_test_cache(database);
+    seed_uri_session_fault_data(database).expect("seed upload-progress database");
+    let baseline = progress_events
+        .lock()
+        .expect("lock initial upload progress")
+        .last()
+        .copied()
+        .unwrap_or_default();
+    progress_events
+        .lock()
+        .expect("lock upload progress events")
+        .clear();
+    proxy.configure(
+        StorageFaultTarget::BlockPut,
+        StorageFaultAction::CreateThenReject,
+    );
+    proxy.clear_block_put_observations();
+    proxy.arm();
+    let stage_result = stage_session_update(database);
+    proxy.disarm();
+    assert!(
+        stage_result.is_ok(),
+        "write enough data to produce multiple blocks: {stage_result:?}; matched={}; observations={:?}; progress={:?}",
+        proxy.matched(),
+        proxy.block_put_observations(),
+        progress_events
+            .lock()
+            .expect("lock upload progress after staging error")
+            .as_slice()
+    );
+    server
+        .complete_request()
+        .expect("checkpoint blocks and accept a verified immutable reuse");
+
+    let observations = proxy.block_put_observations();
+    let reused = observations
+        .iter()
+        .find(|observation| observation.injected_status == Some(412))
+        .expect("proxy should create one block then return a precondition failure");
+    let created_puts = observations
+        .iter()
+        .filter(|observation| observation.injected_status.is_none())
+        .collect::<Vec<_>>();
+    assert!(
+        created_puts.len() >= 2,
+        "expected multi-block PUTs: {observations:?}"
+    );
+    let events = progress_events
+        .lock()
+        .expect("lock upload progress events")
+        .clone();
+    assert!(
+        !events.is_empty(),
+        "successful blocks should report progress"
+    );
+    assert!(
+        events.windows(2).all(|pair| {
+            pair[0].uploaded_blocks <= pair[1].uploaded_blocks
+                && pair[0].uploaded_bytes <= pair[1].uploaded_bytes
+                && pair[0].reused_blocks <= pair[1].reused_blocks
+                && pair[0].reused_bytes <= pair[1].reused_bytes
+        }),
+        "progress snapshots should be cumulative: {events:?}"
+    );
+    let final_progress = *events.last().expect("at least one progress event");
+    assert_eq!(
+        final_progress.uploaded_blocks - baseline.uploaded_blocks,
+        created_puts.len() as u64,
+        "only complete successful block PUTs should count as uploaded"
+    );
+    assert_eq!(
+        final_progress.uploaded_bytes - baseline.uploaded_bytes,
+        created_puts
+            .iter()
+            .map(|put| put.payload_bytes as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(final_progress.reused_blocks - baseline.reused_blocks, 1);
+    assert_eq!(
+        final_progress.reused_bytes - baseline.reused_bytes,
+        reused.payload_bytes as u64,
+        "a 412 should count as reuse only after reading and matching the complete object"
+    );
+    server.close().expect("close upload-progress URI session");
+
+    let rejected_prefix = format!("{}/uri/upload-progress-rejected/", unique_suffix());
+    let rejected_uri = remote_server_database_uri("google", &proxy.url, bucket, &rejected_prefix);
+    let rejected_events = Arc::new(Mutex::new(Vec::<UploadProgress>::new()));
+    let callback_rejected_events = Arc::clone(&rejected_events);
+    let rejected_session_id = Uuid::new_v4().to_string();
+    let rejected_operation = SessionOperationId::from_request(
+        "POST",
+        "/remote.db/commit",
+        rejected_session_id.as_bytes(),
+    )
+    .expect("derive rejected-progress operation ID");
+    let rejected_server = start_uri_session_server_with_progress(
+        &rejected_uri,
+        &rejected_session_id,
+        rejected_operation,
+        move |progress| {
+            callback_rejected_events
+                .lock()
+                .expect("lock rejected upload progress events")
+                .push(progress);
+        },
+    )
+    .expect("start rejected-upload URI session");
+    let database = rejected_server
+        .database_connection()
+        .expect("rejected URI session exposes its SQLite anchor");
+    seed_uri_session_fault_data(database).expect("seed rejected-upload database");
+    configure_uri_session_test_cache(database);
+    rejected_events
+        .lock()
+        .expect("lock pre-rejection upload progress events")
+        .clear();
+    proxy.configure(StorageFaultTarget::BlockPut, StorageFaultAction::Reject);
+    proxy.clear_block_put_observations();
+    proxy.arm();
+    let rejected_result =
+        stage_session_small_update(database, "FULL").and_then(|_| database.execute_batch("COMMIT"));
+    proxy.disarm();
+    assert!(
+        rejected_result.is_err(),
+        "a rejected block with no matching object must fail; matched={}; observations={:?}",
+        proxy.matched(),
+        proxy.block_put_observations()
+    );
+    assert!(
+        proxy
+            .block_put_observations()
+            .iter()
+            .any(|observation| observation.injected_status == Some(412)),
+        "proxy should reject the block PUT"
+    );
+    assert!(
+        rejected_events
+            .lock()
+            .expect("lock rejected upload progress events")
+            .is_empty(),
+        "failed PUTs and missing-object verification must not advance progress"
+    );
+
+    let corrupt_prefix = format!("{}/uri/upload-progress-corrupt/", unique_suffix());
+    let corrupt_uri = remote_server_database_uri("google", &proxy.url, bucket, &corrupt_prefix);
+    let corrupt_events = Arc::new(Mutex::new(Vec::<UploadProgress>::new()));
+    let callback_corrupt_events = Arc::clone(&corrupt_events);
+    let corrupt_session_id = Uuid::new_v4().to_string();
+    let corrupt_operation = SessionOperationId::from_request(
+        "POST",
+        "/remote.db/commit",
+        corrupt_session_id.as_bytes(),
+    )
+    .expect("derive corrupt-progress operation ID");
+    let corrupt_server = start_uri_session_server_with_progress(
+        &corrupt_uri,
+        &corrupt_session_id,
+        corrupt_operation,
+        move |progress| {
+            callback_corrupt_events
+                .lock()
+                .expect("lock corrupt upload progress events")
+                .push(progress);
+        },
+    )
+    .expect("start corrupt-upload URI session");
+    let database = corrupt_server
+        .database_connection()
+        .expect("corrupt URI session exposes its SQLite anchor");
+    configure_uri_session_test_cache(database);
+    seed_uri_session_fault_data(database).expect("seed corrupt-upload database");
+    let baseline = corrupt_events
+        .lock()
+        .expect("lock initial corrupt upload progress")
+        .last()
+        .copied()
+        .unwrap_or_default();
+    corrupt_events
+        .lock()
+        .expect("lock corrupt upload progress events")
+        .clear();
+    proxy.configure(
+        StorageFaultTarget::BlockPut,
+        StorageFaultAction::CreateCorruptedThenReject,
+    );
+    proxy.clear_block_put_observations();
+    proxy.arm();
+    let corrupt_result =
+        stage_session_small_update(database, "FULL").and_then(|_| database.execute_batch("COMMIT"));
+    proxy.disarm();
+    let corrupt_error = corrupt_result.expect_err("mismatched existing bytes must fail staging");
+    assert_eq!(
+        corrupt_error.sqlite_error_code(),
+        Some(ffi::ErrorCode::DatabaseCorrupt),
+        "a valid CRC32C cannot make bytes with the wrong content ID reusable"
+    );
+    assert!(
+        proxy
+            .block_put_observations()
+            .iter()
+            .any(|observation| observation.injected_status == Some(412)),
+        "proxy should create a mismatching object then return a precondition failure"
+    );
+    let corrupt_progress = corrupt_events
+        .lock()
+        .expect("lock corrupt upload progress events");
+    assert!(
+        corrupt_progress.iter().all(|progress| {
+            progress.reused_blocks == baseline.reused_blocks
+                && progress.reused_bytes == baseline.reused_bytes
+        }),
+        "wrong existing bytes must not count as reuse: {corrupt_progress:?}"
+    );
 }
 
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]

@@ -147,3 +147,12 @@ local overlay-to-block mappings are disposable and rebuilt by Gen from its
 durable local graph; session attempt markers do not reconstruct that mapping,
 so the VFS does not promise bandwidth-free resume for every block staged
 before acceptance.
+
+`0022-upload-progress-callback.patch` adds an optional callback for completed
+block uploads. It reports cumulative created-block and exact-byte-verified
+reuse counts and bytes for one URI-owned VFS. Events cover streaming staging,
+checkpoint flushes, and ordinary block uploads. The callback runs synchronously
+on the thread doing native upload work; panics are ignored and cannot change
+storage or publication results. Callers should keep it quick and must not
+re-enter the same VFS or connection. No total is available while the graph is
+still producing blocks.

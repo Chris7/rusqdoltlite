@@ -37,6 +37,51 @@ impl std::error::Error for AuthError {}
 pub type AuthCallback =
     dyn Fn(&str, &str, &str) -> std::result::Result<String, AuthError> + Send + Sync + 'static;
 
+/// Cumulative complete-block upload progress for one VFS attachment.
+///
+/// The VFS cannot know the graph's final block count while DoltLite is still
+/// producing data, so this snapshot intentionally has no total or percentage.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UploadProgress {
+    /// Number of blocks created successfully in cloud storage.
+    pub uploaded_blocks: u64,
+    /// Bytes in blocks created successfully in cloud storage.
+    pub uploaded_bytes: u64,
+    /// Number of existing immutable blocks accepted after exact-byte verification.
+    pub reused_blocks: u64,
+    /// Bytes in existing immutable blocks accepted after exact-byte verification.
+    pub reused_bytes: u64,
+}
+
+#[cfg(feature = "remote")]
+pub(crate) type UploadProgressCallback = dyn Fn(UploadProgress) + Send + Sync + 'static;
+
+#[cfg(feature = "remote")]
+struct UploadProgressState {
+    callback: Arc<UploadProgressCallback>,
+    current: Mutex<UploadProgress>,
+}
+
+#[cfg(feature = "remote")]
+impl UploadProgressState {
+    fn report(&self, reused: bool, bytes: u64) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reused {
+            current.reused_blocks = current.reused_blocks.saturating_add(1);
+            current.reused_bytes = current.reused_bytes.saturating_add(bytes);
+        } else {
+            current.uploaded_blocks = current.uploaded_blocks.saturating_add(1);
+            current.uploaded_bytes = current.uploaded_bytes.saturating_add(bytes);
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.callback)(*current);
+        }));
+    }
+}
+
 /// Why a session-owned cloud VFS is requesting an authentication token.
 #[cfg(feature = "remote")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -887,6 +932,8 @@ pub struct Builder {
     auth: Box<AuthCallback>,
     #[cfg(feature = "remote")]
     auth_refresh: Option<Box<AuthRefreshCallback>>,
+    #[cfg(feature = "remote")]
+    upload_progress: Option<Arc<UploadProgressCallback>>,
     config: Vec<Config>,
 }
 
@@ -894,6 +941,8 @@ struct AuthState {
     callback: Box<AuthCallback>,
     #[cfg(feature = "remote")]
     refresh_callback: Option<Box<AuthRefreshCallback>>,
+    #[cfg(feature = "remote")]
+    upload_progress: Option<UploadProgressState>,
 }
 
 impl Builder {
@@ -905,6 +954,8 @@ impl Builder {
             auth: Box::new(|_, _, _| Err(AuthError("no CBS auth callback configured".into()))),
             #[cfg(feature = "remote")]
             auth_refresh: None,
+            #[cfg(feature = "remote")]
+            upload_progress: None,
             config: Vec::new(),
         })
     }
@@ -940,6 +991,15 @@ impl Builder {
             + 'static,
     {
         self.auth_refresh = Some(Box::new(callback));
+        self
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn upload_progress_callback(
+        mut self,
+        callback: Arc<UploadProgressCallback>,
+    ) -> Self {
+        self.upload_progress = Some(callback);
         self
     }
 
@@ -1009,6 +1069,11 @@ impl Builder {
             callback: self.auth,
             #[cfg(feature = "remote")]
             refresh_callback: self.auth_refresh,
+            #[cfg(feature = "remote")]
+            upload_progress: self.upload_progress.map(|callback| UploadProgressState {
+                callback,
+                current: Mutex::new(UploadProgress::default()),
+            }),
         });
         let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
         let rc = unsafe { raw::sqlite3_bcvfs_auth_callback(fs, auth_ptr, Some(auth_trampoline)) };
@@ -1023,6 +1088,20 @@ impl Builder {
                     fs,
                     auth_ptr,
                     Some(auth_refresh_trampoline),
+                )
+            };
+            if let Err(error) = check(rc) {
+                return Err(destroy_failed(fs, auth, error));
+            }
+        }
+        #[cfg(feature = "remote")]
+        if auth.upload_progress.is_some() {
+            let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
+            let rc = unsafe {
+                raw::sqlite3_bcvfs_upload_progress_callback(
+                    fs,
+                    auth_ptr,
+                    Some(upload_progress_trampoline),
                 )
             };
             if let Err(error) = check(rc) {
@@ -1590,6 +1669,8 @@ pub(crate) struct UriSessionContext {
     pub(crate) operation_id: SessionOperationId,
     #[cfg(feature = "remote")]
     pub(crate) auth_refresh: Option<Arc<AuthRefreshCallback>>,
+    #[cfg(feature = "remote")]
+    pub(crate) upload_progress: Option<Arc<UploadProgressCallback>>,
 }
 
 pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connection> {
@@ -1715,6 +1796,10 @@ fn open_connection_uri_inner(
         .as_ref()
         .and_then(|session| session.auth_refresh.as_ref().map(Arc::clone));
     #[cfg(feature = "remote")]
+    let upload_progress = session
+        .as_ref()
+        .and_then(|session| session.upload_progress.as_ref().map(Arc::clone));
+    #[cfg(feature = "remote")]
     if auth_refresh.is_some() && !matches!(&uri.storage, CloudStorageUri::Google { .. }) {
         return Err(cbs_uri_error(
             "credential refresh callbacks require a GCS URI",
@@ -1745,6 +1830,10 @@ fn open_connection_uri_inner(
         builder = builder.auth_refresh_callback(move |storage, account, container, reason| {
             callback(storage, account, container, reason)
         });
+    }
+    #[cfg(feature = "remote")]
+    if let Some(callback) = upload_progress {
+        builder = builder.upload_progress_callback(callback);
     }
     let vfs = Arc::new(builder.build()?);
 
@@ -2422,6 +2511,23 @@ unsafe extern "C" fn auth_trampoline(
         *out = ptr.cast();
     }
     crate::ffi::SQLITE_OK
+}
+
+#[cfg(feature = "remote")]
+unsafe extern "C" fn upload_progress_trampoline(
+    ctx: *mut c_void,
+    reused: c_int,
+    bytes: crate::ffi::sqlite3_int64,
+) {
+    if ctx.is_null() || bytes < 0 {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &*(ctx as *const AuthState) };
+        if let Some(progress) = state.upload_progress.as_ref() {
+            progress.report(reused != 0, bytes as u64);
+        }
+    }));
 }
 
 #[cfg(feature = "remote")]

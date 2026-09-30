@@ -3,7 +3,8 @@
 #[cfg(feature = "blockcachevfs")]
 use crate::blockcachevfs::{
     session_alias, AttachSpec, AuthError, AuthRefreshCallback, AuthRefreshReason, BlockCacheVfs,
-    SessionAttachment, SessionOperationId, SessionOperationStatus, UriSessionContext,
+    SessionAttachment, SessionOperationId, SessionOperationStatus, UploadProgressCallback,
+    UriSessionContext,
 };
 use crate::error::error_from_sqlite_code;
 use crate::{ffi, path_to_cstring, Result};
@@ -188,6 +189,7 @@ pub struct BlockCacheSessionOptions {
     scope: SessionScope,
     operation_id: SessionOperationId,
     auth_refresh: Option<Arc<AuthRefreshCallback>>,
+    upload_progress: Option<Arc<UploadProgressCallback>>,
 }
 
 #[cfg(feature = "blockcachevfs")]
@@ -214,6 +216,10 @@ impl fmt::Debug for BlockCacheSessionOptions {
             .field("scope", &self.scope)
             .field("operation_id", &self.operation_id)
             .field("auth_callback_configured", &self.auth_refresh.is_some())
+            .field(
+                "upload_progress_callback_configured",
+                &self.upload_progress.is_some(),
+            )
             .finish()
     }
 }
@@ -247,6 +253,7 @@ impl BlockCacheSessionOptions {
             scope,
             operation_id,
             auth_refresh: None,
+            upload_progress: None,
         })
     }
 
@@ -277,6 +284,7 @@ impl BlockCacheSessionOptions {
             scope,
             operation_id,
             auth_refresh: None,
+            upload_progress: None,
         })
     }
 
@@ -325,6 +333,53 @@ impl BlockCacheSessionOptions {
         self
     }
 
+    /// Report cumulative, complete-block upload progress for this URI-owned VFS.
+    ///
+    /// The callback runs synchronously on the native upload thread after a
+    /// complete block PUT succeeds or an existing immutable block passes an
+    /// exact-byte check. This can be the remote request thread or a thread
+    /// checkpointing the database. Do not re-enter this VFS or connection from
+    /// the callback. Snapshots belong to this VFS attachment and include blocks
+    /// flushed during checkpointing; the graph's final block count is unknown
+    /// while DoltLite is still producing blocks, so no percentage or total is
+    /// reported. Panics are contained and never alter upload or publication
+    /// results. Keep the callback quick. This option is supported only for
+    /// URI-backed session options.
+    ///
+    /// ```
+    /// use rusqlite::blockcachevfs::UploadProgress;
+    /// use rusqlite::{BlockCacheSessionOptions, SessionOperationId, SessionScope};
+    ///
+    /// # fn main() -> rusqlite::Result<()> {
+    /// let scope = SessionScope::new("alice", "default.db", "push,read")?;
+    /// let operation = SessionOperationId::from_request("POST", "/default.db/commit", b"")?;
+    /// let session = BlockCacheSessionOptions::for_uri(
+    ///     "9c539f0e-3913-4875-9f93-23627c3c015d",
+    ///     scope,
+    ///     operation,
+    /// )?
+    /// .upload_progress_callback(|progress: UploadProgress| {
+    ///     eprintln!(
+    ///         "Uploaded {} blocks ({} bytes); reused {} blocks ({} bytes)",
+    ///         progress.uploaded_blocks,
+    ///         progress.uploaded_bytes,
+    ///         progress.reused_blocks,
+    ///         progress.reused_bytes,
+    ///     );
+    /// });
+    /// let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn upload_progress_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(crate::blockcachevfs::UploadProgress) + Send + Sync + 'static,
+    {
+        self.upload_progress = Some(Arc::new(callback));
+        self
+    }
+
     /// Return the caller-authorized context carried by this payload.
     #[must_use]
     pub fn scope(&self) -> &SessionScope {
@@ -353,6 +408,12 @@ impl BlockCacheSessionOptions {
             return Err(remote_server_error(
                 ffi::SQLITE_MISUSE,
                 "credential refresh callbacks require a session-owned GCS URI",
+            ));
+        }
+        if self.upload_progress.is_some() {
+            return Err(remote_server_error(
+                ffi::SQLITE_MISUSE,
+                "upload progress callbacks require a URI-backed session",
             ));
         }
         match &self.target {
@@ -388,6 +449,7 @@ impl BlockCacheSessionOptions {
             operations: self.scope.operations().to_owned(),
             operation_id: self.operation_id,
             auth_refresh: self.auth_refresh.as_ref().map(Arc::clone),
+            upload_progress: self.upload_progress.as_ref().map(Arc::clone),
         }
     }
 }
@@ -1552,6 +1614,16 @@ mod tests {
             test_operation_id(12),
         )
         .expect("valid static-VFS session payload");
+        let static_progress_session = static_session.clone().upload_progress_callback(|_| {});
+        let error = static_progress_session
+            .attach()
+            .expect_err("static-VFS sessions do not support URI upload progress");
+        assert!(matches!(
+            error,
+            crate::Error::SqliteFailure(code, Some(message))
+                if code.extended_code == crate::ffi::SQLITE_MISUSE
+                    && message.contains("URI-backed session")
+        ));
         let uri = "gcs://bucket/prefix?vfs=blockcachevfs&project=test&access_token=private-token&endpoint=http%3A%2F%2F127.0.0.1%3A1&database=session.sqlite";
 
         let error = RemoteServer::start_with_options(
