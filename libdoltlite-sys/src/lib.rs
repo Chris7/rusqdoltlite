@@ -8,6 +8,15 @@ use core::sync::atomic::{AtomicI32, Ordering};
 
 mod error;
 
+// Keep Cargo's native curl/OpenSSL/zlib link metadata reachable through this
+// sys crate without exposing those low-level crates as part of its API.
+#[cfg(feature = "blockcachevfs")]
+extern crate curl_sys as _;
+#[cfg(feature = "blockcachevfs")]
+extern crate libz_sys as _;
+#[cfg(feature = "blockcachevfs")]
+extern crate openssl_sys as _;
+
 #[must_use]
 pub fn SQLITE_STATIC() -> sqlite3_destructor_type {
     None

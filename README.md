@@ -18,9 +18,13 @@ The vendored checkout is from Fossil check-in
 `50e099ad7bf1d12d747f59b0af973d12809887480463fc9893846b0d6ee22e94`; the
 corresponding upstream source archive has SHA-256
 `b322811e8ec4224753f2d9309ed0f011d81c9f2540ce81bd7b5a6a9550d7d03a`.
-The target still needs libcurl and OpenSSL development headers and libraries.
-When pkg-config cannot locate them, set
-`BLOCKCACHEVFS_CURL_INCLUDE_DIR` and `BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR`.
+The feature builds libcurl, OpenSSL, and zlib from Cargo-managed source, so
+builders do not need their system development headers, libraries, or
+`pkg-config`. A native C toolchain plus Perl and `make` are required to build
+vendored OpenSSL. Runtime images still need a system CA bundle (for example,
+`ca-certificates`) for HTTPS. The bundled curl honors `SSL_CERT_FILE` and
+`SSL_CERT_DIR`; when neither is set, it searches readable conventional CA
+bundle locations. The existing `CLOUDSQLITE_CAINFO` setting takes precedence.
 
 Google storage keeps its default endpoint exactly
 `https://storage.googleapis.com`. For a Google-compatible test service, pass
@@ -124,8 +128,9 @@ BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT=http://127.0.0.1:14091 \
 ```
 
 The runner requires Tcl, libcurl, and OpenSSL development headers to build
-CBS's Tcl test binary. It exits with status 77 when an endpoint is not
-configured.
+CBS's Tcl test binary. The Rust TLS trust test also uses the `openssl` and
+Python 3 command-line tools to run its local certificate fixtures. The runner
+exits with status 77 when an endpoint is not configured.
 
 For a multi-tenant endpoint, pass the remote container as `bucket/prefix` and
 choose a slash-free local alias. Attach, read, write, and upload paths then

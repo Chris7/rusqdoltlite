@@ -19,7 +19,7 @@ bundled = ["cc", "bundled_bindings"]
 bundled-windows = ["cc", "bundled_bindings"]
 # Build the vendored Cloud Backed SQLite block-cache VFS into the bundled
 # DoltLite archive.
-blockcachevfs = ["bundled", "pkg-config"]
+blockcachevfs = ["bundled", "pkg-config", "dep:curl-sys", "dep:openssl-sys", "dep:libz-sys"]
 # Enable the HTTP remote client and in-process remote server APIs.
 remote = []
 buildtime_bindgen = ["bindgen", "pkg-config", "vcpkg"]
@@ -41,6 +41,13 @@ session = ["preupdate_hook", "buildtime_bindgen"]
 in_gecko = []
 with-asan = []
 wasm32-wasi-vfs = []
+
+[dependencies]
+# Bundle the native HTTP and TLS libraries used by CBS so blockcachevfs builds
+# do not require libcurl, OpenSSL, or zlib development packages on the target.
+curl-sys = { version = "0.4.83", optional = true, default-features = false, features = ["ssl", "static-curl", "static-ssl"] }
+openssl-sys = { version = "0.9", optional = true, default-features = false, features = ["vendored"] }
+libz-sys = { version = "1.1", optional = true, default-features = false, features = ["static"] }
 
 [build-dependencies]
 bindgen = { version = "0.72", optional = true, default-features = false, features = [

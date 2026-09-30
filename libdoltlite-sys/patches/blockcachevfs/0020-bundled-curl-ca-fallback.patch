@@ -1,0 +1,76 @@
+--- a/bcvutil.c
++++ b/bcvutil.c
+@@ -2372,6 +2372,62 @@
+   return p->errCode;
+ }
+ 
++/* Static curl builds used by the Rust integration do not have an upstream
++** compiled CA bundle. Preserve CBS's explicit CLOUDSQLITE_CAINFO first, then
++** honor the OpenSSL-compatible environment settings. Only when neither is
++** configured, use readable conventional platform bundle locations. */
++#if defined(DOLTLITE_BCV_BUNDLED_CURL) && !defined(_WIN32) && !defined(__WIN32__)
++static int bcvCurlReadableCaPath(const char *zPath, int bDirectory){
++  struct stat st;
++  if( zPath==0 || access(zPath, R_OK)!=0 || stat(zPath, &st)!=0 ) return 0;
++  return bDirectory ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode);
++}
++
++static void bcvCurlSetDefaultCaLocations(CURL *pCurl){
++  static const char * const azFile[] = {
++    "/etc/ssl/certs/ca-certificates.crt",
++    "/etc/pki/tls/certs/ca-bundle.crt",
++    "/etc/ssl/cert.pem",
++    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
++    "/etc/ssl/ca-bundle.pem",
++    "/usr/local/share/certs/ca-root-nss.crt",
++    0
++  };
++  static const char * const azDir[] = {
++    "/etc/ssl/certs",
++    "/etc/pki/tls/certs",
++    "/usr/local/share/certs",
++    "/system/etc/security/cacerts",
++    0
++  };
++  const char *zFile = getenv("SSL_CERT_FILE");
++  const char *zDir = getenv("SSL_CERT_DIR");
++  int i;
++
++  /* Presence is intentional configuration, even if a configured path is
++  ** empty or unreadable: let libcurl report the resulting TLS error instead
++  ** of silently trusting a broader system store. */
++  if( zFile || zDir ){
++    if( zFile ) curl_easy_setopt(pCurl, CURLOPT_CAINFO, zFile);
++    if( zDir ) curl_easy_setopt(pCurl, CURLOPT_CAPATH, zDir);
++    return;
++  }
++
++  for(i=0; azFile[i]; i++){
++    if( bcvCurlReadableCaPath(azFile[i], 0) ){
++      curl_easy_setopt(pCurl, CURLOPT_CAINFO, azFile[i]);
++      break;
++    }
++  }
++  for(i=0; azDir[i]; i++){
++    if( bcvCurlReadableCaPath(azDir[i], 1) ){
++      curl_easy_setopt(pCurl, CURLOPT_CAPATH, azDir[i]);
++      break;
++    }
++  }
++}
++#endif
++
+ sqlite3_bcv_request *sqlite3_bcv_job_request(
+   sqlite3_bcv_job *pJob,          /* Call contex */
+   void *pApp,                     /* 3rd argument for xCallback */
+@@ -2396,6 +2452,10 @@
+     }
+     if( pCont->zCainfo ){
+       curl_easy_setopt(pNew->pCurl, CURLOPT_CAINFO, pCont->zCainfo);
++    }else{
++#if defined(DOLTLITE_BCV_BUNDLED_CURL) && !defined(_WIN32) && !defined(__WIN32__)
++      bcvCurlSetDefaultCaLocations(pNew->pCurl);
++#endif
+     }
+   }
+   return pNew;

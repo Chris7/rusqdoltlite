@@ -103,9 +103,30 @@ jobs:
           rust-version: stable
       - uses: Swatinem/rust-cache@v2
         with: { shared-key: blockcachevfs }
-      - name: Install blockcachevfs test dependencies
+      - name: Install TLS test helper
         run: |
           sudo apt-get update
+          sudo apt-get install --yes openssl
+      - name: Verify bundled native dependencies without pkg-config
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/blockcachevfs-bundled-target
+          PKG_CONFIG: ${{ runner.temp }}/pkg-config-not-installed
+          PKG_CONFIG_PATH: ${{ runner.temp }}/pkg-config-not-installed
+        run: |
+          cargo test --features 'blockcachevfs remote' --test blockcachevfs_security --verbose
+          binary="$(find "$CARGO_TARGET_DIR/debug/deps" -maxdepth 1 -type f -name 'blockcachevfs_security-*' -executable -print -quit)"
+          if [ -z "$binary" ]; then
+            echo "blockcachevfs security integration test binary was not built" >&2
+            exit 1
+          fi
+          linked_libraries="$(ldd "$binary")"
+          printf '%s\n' "$linked_libraries"
+          if printf '%s\n' "$linked_libraries" | grep -E 'lib(curl|ssl|crypto|z)\.so'; then
+            echo "blockcachevfs test binary unexpectedly uses a dynamic curl/TLS/zlib library" >&2
+            exit 1
+          fi
+      - name: Install blockcachevfs test dependencies
+        run: |
           sudo apt-get install --yes build-essential libcurl4-openssl-dev libssl-dev pkg-config tcl-dev
       - name: Locate Tcl headers
         shell: bash

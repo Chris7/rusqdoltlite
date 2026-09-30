@@ -122,3 +122,9 @@ downloads before CBS consumes the body. Block reads also require the configured
 full block size before writing into cache. Conditional 304 responses retain
 the existing not-modified behavior. The same JSON media transport covers block
 objects, session metadata, and the manifest.
+
+`0020-bundled-curl-ca-fallback.patch` applies only to Rust's Cargo-bundled
+static curl build. It preserves `CLOUDSQLITE_CAINFO`, honors `SSL_CERT_FILE`
+and `SSL_CERT_DIR`, and otherwise selects readable conventional CA file and
+directory locations without weakening peer or hostname verification. The
+standalone CBS build keeps its upstream curl configuration.
