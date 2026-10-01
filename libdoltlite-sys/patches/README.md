@@ -76,6 +76,11 @@ requests using smaller hash ranges when the peer returns HTTP 413 or the native
 HTTP reader reaches its fixed 128 MiB response limit. It keeps each response
 within the public server limit and preserves result ordering; a single chunk
 that still exceeds the limit remains an error.
+`0016-http-chunked-response.patch` adds strict HTTP/1.1 chunked response
+decoding for remotes that stream large reads without a Content-Length. It
+validates bounded chunk extensions and trailers, caps encoded and decoded bodies
+at 128 MiB, and recognizes the final chunk on a keepalive connection without
+waiting for EOF.
 `0012-http-transport-error-context.patch` preserves the HTTP transport phase
 when a socket write/read or response parse fails. It reports the configured
 idle timeout as context without claiming every socket error was a timeout. It
