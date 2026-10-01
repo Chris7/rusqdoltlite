@@ -312,7 +312,15 @@ pub mod bcvutil {
 
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 mod remote {
-    use core::ffi::{c_char, c_int, c_long};
+    use core::ffi::{c_char, c_int, c_long, c_void};
+
+    use super::{sqlite3, sqlite3_int64};
+
+    pub const DOLTLITE_PUSH_PROGRESS_PLAN: c_int = 1;
+    pub const DOLTLITE_PUSH_PROGRESS_UPLOADED: c_int = 2;
+
+    pub type sqlite3_doltlite_push_progress_callback =
+        unsafe extern "C" fn(*mut c_void, c_int, sqlite3_int64, sqlite3_int64);
 
     #[repr(C)]
     pub struct DoltliteServer {
@@ -334,6 +342,22 @@ mod remote {
     }
 
     unsafe extern "C" {
+        /// Install a connection-scoped callback for opt-in native `dolt_push` progress.
+        ///
+        /// On success, `context` must remain valid until the matching clear call.
+        /// On failure, ownership remains with the caller.
+        pub fn sqlite3_doltlite_set_push_progress_callback(
+            db: *mut sqlite3,
+            context: *mut c_void,
+            callback: Option<sqlite3_doltlite_push_progress_callback>,
+        ) -> c_int;
+
+        /// Clear the callback only if `context` still owns the registration.
+        pub fn sqlite3_doltlite_clear_push_progress_callback(
+            db: *mut sqlite3,
+            context: *mut c_void,
+        ) -> c_int;
+
         pub fn doltliteServe(
             directory: *const c_char,
             port: c_int,

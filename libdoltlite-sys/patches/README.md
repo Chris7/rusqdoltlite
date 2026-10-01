@@ -62,7 +62,14 @@ URI-backed session loopback servers, so their Dolt requests can wait while the
 same-process server performs cloud writes. Ordinary remotes and TLS session
 URLs retain their configured inactivity limits. TCP connect and TLS handshake
 remain bounded at 30 seconds. The staged server TLS struct change keeps socket
-descriptors aligned with the patched amalgamation.
+descriptors aligned with the patched amalgamation. `0014-dolt-push-transfer-progress.patch`
+adds an opt-in, per-connection Rust callback for logical Dolt chunk transfer
+progress without changing `dolt_push` SQL or HTTP behavior. It plans the fixed
+set of reachable destination-missing chunks before upload and retains only
+hash/length metadata. Synchronous remote writes count after success; HTTP writes
+count only after the complete chunk batch receives a successful response. These
+logical chunk totals are separate from CBS block progress, and the callback
+registration is scoped by a Rust guard.
 `0012-http-transport-error-context.patch` preserves the HTTP transport phase
 when a socket write/read or response parse fails. It reports the configured
 idle timeout as context without claiming every socket error was a timeout. It
