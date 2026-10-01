@@ -2572,6 +2572,13 @@ struct BlockPutObservation {
 }
 
 #[cfg(feature = "remote")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GuardGetObservation {
+    path: String,
+    status: u16,
+}
+
+#[cfg(feature = "remote")]
 struct StorageFaultProxy {
     port: u16,
     stop: Arc<AtomicBool>,
@@ -2583,6 +2590,7 @@ struct StorageFaultProxy {
     kill_pid: Arc<AtomicUsize>,
     upload_checksums_valid: Arc<Mutex<Vec<bool>>>,
     block_put_observations: Arc<Mutex<Vec<BlockPutObservation>>>,
+    guard_get_observations: Arc<Mutex<Vec<GuardGetObservation>>>,
     thread: Option<thread::JoinHandle<()>>,
     url: String,
 }
@@ -2614,6 +2622,8 @@ impl StorageFaultProxy {
         let upload_checksums_valid_thread = Arc::clone(&upload_checksums_valid);
         let block_put_observations = Arc::new(Mutex::new(Vec::new()));
         let block_put_observations_thread = Arc::clone(&block_put_observations);
+        let guard_get_observations = Arc::new(Mutex::new(Vec::new()));
+        let guard_get_observations_thread = Arc::clone(&guard_get_observations);
         let thread_stop = Arc::clone(&stop);
         let thread_armed = Arc::clone(&armed);
         let thread_target = Arc::clone(&target);
@@ -2643,6 +2653,7 @@ impl StorageFaultProxy {
                         kill_pid: &thread_kill_pid,
                         upload_checksums_valid: &upload_checksums_valid_thread,
                         block_put_observations: &block_put_observations_thread,
+                        guard_get_observations: &guard_get_observations_thread,
                     },
                 );
                 if let Err(error) = result {
@@ -2667,6 +2678,7 @@ impl StorageFaultProxy {
             kill_pid,
             upload_checksums_valid,
             block_put_observations,
+            guard_get_observations,
             thread: Some(thread),
             url,
         }
@@ -2718,6 +2730,13 @@ impl StorageFaultProxy {
             .clone()
     }
 
+    fn guard_get_observations(&self) -> Vec<GuardGetObservation> {
+        self.guard_get_observations
+            .lock()
+            .expect("should lock recorded session guard GETs")
+            .clone()
+    }
+
     fn clear_block_put_observations(&self) {
         self.block_put_observations
             .lock()
@@ -2747,6 +2766,7 @@ struct StorageFaultControls<'a> {
     kill_pid: &'a AtomicUsize,
     upload_checksums_valid: &'a Mutex<Vec<bool>>,
     block_put_observations: &'a Mutex<Vec<BlockPutObservation>>,
+    guard_get_observations: &'a Mutex<Vec<GuardGetObservation>>,
 }
 
 #[cfg(feature = "remote")]
@@ -2758,6 +2778,9 @@ fn handle_storage_fault_connection(
     stream.set_read_timeout(Some(HTTP_TEST_TIMEOUT))?;
     stream.set_write_timeout(Some(HTTP_TEST_TIMEOUT))?;
     let (method, request_target, headers, body) = read_storage_proxy_request(stream)?;
+    let request_path = storage_request_path(&request_target);
+    let session_guard_get =
+        method.eq_ignore_ascii_case("GET") && request_path.ends_with("/bcv-session/v1/guard.bcv");
     let media_upload = method.eq_ignore_ascii_case("POST")
         && request_target.contains("/upload/storage/v1/")
         && request_target.contains("uploadType=media");
@@ -2971,6 +2994,16 @@ fn handle_storage_fault_connection(
     }
     let mut response =
         forward_storage_proxy_request(authority, &method, &request_target, &headers, &body)?;
+    if session_guard_get {
+        controls
+            .guard_get_observations
+            .lock()
+            .expect("should lock recorded session guard GETs")
+            .push(GuardGetObservation {
+                path: request_path,
+                status: http_status(&response),
+            });
+    }
     if fault_now && request_fault == Some(StorageFaultTarget::BlockGet) {
         response = mutate_gcs_download_response(&response, action)?;
     }
@@ -8485,6 +8518,15 @@ fn google_uri_session_reports_complete_block_upload_progress() {
     assert!(
         server.first_storage_error().is_none(),
         "a verified create-only reuse and missing first-use guard are not terminal storage failures"
+    );
+    let guard_gets = proxy.guard_get_observations();
+    assert!(
+        !guard_gets.is_empty(),
+        "session block staging should read the cleanup guard around its attempt marker: {guard_gets:?}"
+    );
+    assert!(
+        guard_gets.iter().all(|observation| observation.status == 404),
+        "a missing or CAB-inaccessible global guard should return 404 and be treated as idle: {guard_gets:?}"
     );
 
     let observations = proxy.block_put_observations();
