@@ -8,7 +8,7 @@ use std::{
     ptr,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
     },
     thread,
     time::Duration,
@@ -22,8 +22,6 @@ use rusqlite::{
 use rusqlite::blockcachevfs::SessionOperationId;
 #[cfg(feature = "blockcachevfs")]
 use rusqlite::{BlockCacheSessionOptions, OpenFlags, SessionOperationStatus, SessionScope};
-#[cfg(feature = "blockcachevfs")]
-use std::sync::Mutex;
 #[cfg(feature = "blockcachevfs")]
 use std::time::Instant;
 
@@ -565,6 +563,230 @@ fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
 }
 
 #[test]
+fn fresh_clone_splits_aggregate_get_chunks_413_and_recovers_partial_failure() -> Result<()> {
+    const ROWS: i64 = 1_024;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("server directory");
+    let server = RemoteServer::start(&server_root)?;
+    let source = Connection::open(temp.path().join("source.db"))?;
+    source.execute_batch(
+        "CREATE TABLE batch_values(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+         BEGIN;",
+    )?;
+    {
+        let mut insert = source.prepare("INSERT INTO batch_values VALUES(?1, ?2)")?;
+        for id in 1..=ROWS {
+            insert.execute(params![id, chunk_batch_test_value(id)])?;
+        }
+    }
+    source.execute_batch("COMMIT")?;
+    let _: String = source.query_row(
+        "SELECT dolt_commit('-A', '-m', 'aggregate chunk fixture')",
+        [],
+        |row| row.get(0),
+    )?;
+    let source_hash: String =
+        source.query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))?;
+    let _: i64 = source.query_row(
+        "SELECT dolt_remote('add', 'origin', ?1)",
+        params![server.database_url("origin.db")],
+        |row| row.get(0),
+    )?;
+    let _: i64 = source.query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))?;
+
+    let probe = GetChunksProxy::start(server.port(), None, GetChunksProxyFailure::None);
+    let probe_clone = Connection::open(temp.path().join("probe-clone.db"))?;
+    let _: i64 = probe_clone.query_row(
+        "SELECT dolt_clone(?1)",
+        params![probe.database_url("origin.db")],
+        |row| row.get(0),
+    )?;
+    let probe_stats = probe.stats();
+    assert!(
+        probe_stats.proxy_errors.is_empty(),
+        "proxy errors: {probe_stats:?}"
+    );
+    assert!(
+        probe_stats.max_hashes_per_request > 1,
+        "no multi-hash reply: {probe_stats:?}"
+    );
+    assert!(
+        probe_stats.max_multi_response_bytes > probe_stats.max_single_record_bytes,
+        "fixture must produce a batch larger than its largest individual chunk: {probe_stats:?}"
+    );
+    assert!(probe_stats.max_single_record_bytes > 4);
+    drop(probe_clone);
+    drop(probe);
+
+    let threshold_only = GetChunksProxy::start(
+        server.port(),
+        Some(probe_stats.max_single_record_bytes),
+        GetChunksProxyFailure::None,
+    );
+    let first_attempt_clone = Connection::open(temp.path().join("first-attempt-clone.db"))?;
+    let _: i64 = first_attempt_clone.query_row(
+        "SELECT dolt_clone(?1)",
+        params![threshold_only.database_url("origin.db")],
+        |row| row.get(0),
+    )?;
+    assert_batch_clone_contents(&first_attempt_clone, &source_hash, ROWS)?;
+    let threshold_stats = threshold_only.stats();
+    assert!(
+        threshold_stats.aggregate_413_responses > 0,
+        "the threshold-only proxy should reject aggregate replies: {threshold_stats:?}"
+    );
+    assert!(
+        threshold_stats.successful_split_singleton_responses > 0,
+        "the client should split aggregate responses into successful smaller requests: {threshold_stats:?}"
+    );
+    drop(first_attempt_clone);
+    drop(threshold_only);
+
+    let limited = GetChunksProxy::start(
+        server.port(),
+        Some(probe_stats.max_single_record_bytes),
+        GetChunksProxyFailure::FailAfterFirstSplitSingletonOnce,
+    );
+    let clone = Connection::open(temp.path().join("adaptive-clone.db"))?;
+    let remote_url = limited.database_url("origin.db");
+    let first_attempt =
+        clone.query_row::<i64, _, _>("SELECT dolt_clone(?1)", params![remote_url], |row| {
+            row.get(0)
+        });
+    let partial_stats = limited.stats();
+    let first_error = match first_attempt {
+        Ok(value) => panic!(
+            "should fail the first clone attempt after a split chunk was received: {partial_stats:?}; result={value}"
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(first_error, Error::SqliteFailure(code, _) if code.extended_code == ffi::SQLITE_TOOBIG),
+        "should preserve a terminal chunk 413 as SQLITE_TOOBIG: {first_error:?}"
+    );
+    assert!(
+        partial_stats.proxy_errors.is_empty(),
+        "proxy errors: {partial_stats:?}"
+    );
+    assert!(
+        partial_stats.aggregate_413_responses > 0,
+        "the proxy must reject an aggregate get-chunks response: {partial_stats:?}"
+    );
+    assert_eq!(partial_stats.injected_partial_413_responses, 1);
+    assert!(
+        partial_stats.successful_split_singleton_responses > 0,
+        "at least one split singleton must complete before the injected failure: {partial_stats:?}"
+    );
+    assert_eq!(partial_stats.singleton_413_responses, 1);
+    let usable: i64 = clone.query_row("SELECT 1", [], |row| row.get(0))?;
+    assert_eq!(
+        usable, 1,
+        "failed clone must leave its SQLite handle usable"
+    );
+
+    clone.query_row::<i64, _, _>("SELECT dolt_clone(?1)", params![remote_url], |row| {
+        row.get(0)
+    })?;
+    assert_batch_clone_contents(&clone, &source_hash, ROWS)?;
+    let completed_stats = limited.stats();
+    assert!(
+        completed_stats.proxy_errors.is_empty(),
+        "proxy errors: {completed_stats:?}"
+    );
+    assert!(completed_stats.aggregate_413_responses > partial_stats.aggregate_413_responses);
+    assert!(
+        completed_stats.successful_singleton_responses
+            > partial_stats.successful_singleton_responses
+    );
+    drop(limited);
+
+    let declared = GetChunksProxy::start(
+        server.port(),
+        None,
+        GetChunksProxyFailure::OversizedContentLengthOnce,
+    );
+    let declared_clone = Connection::open(temp.path().join("declared-length-clone.db"))?;
+    let _: i64 = declared_clone.query_row(
+        "SELECT dolt_clone(?1)",
+        params![declared.database_url("origin.db")],
+        |row| row.get(0),
+    )?;
+    assert_batch_clone_contents(&declared_clone, &source_hash, ROWS)?;
+    let declared_stats = declared.stats();
+    assert!(
+        declared_stats.proxy_errors.is_empty(),
+        "proxy errors: {declared_stats:?}"
+    );
+    assert_eq!(declared_stats.declared_oversized_responses, 1);
+    assert!(
+        declared_stats.smaller_responses_after_declared_oversize > 0,
+        "the client should retry the oversized response with smaller hash ranges: {declared_stats:?}"
+    );
+    drop(declared);
+
+    let terminal = GetChunksProxy::start(
+        server.port(),
+        Some(0),
+        GetChunksProxyFailure::FailOversizedSingletonOnce,
+    );
+    let terminal_clone = Connection::open(temp.path().join("terminal-clone.db"))?;
+    let terminal_error = terminal_clone
+        .query_row::<i64, _, _>(
+            "SELECT dolt_clone(?1)",
+            params![terminal.database_url("origin.db")],
+            |row| row.get(0),
+        )
+        .expect_err("should reject a single oversized chunk without retrying it");
+    assert!(
+        matches!(terminal_error, Error::SqliteFailure(code, _) if code.extended_code == ffi::SQLITE_TOOBIG),
+        "should map a single chunk 413 to SQLITE_TOOBIG: {terminal_error:?}"
+    );
+    let terminal_stats = terminal.stats();
+    assert!(
+        terminal_stats.proxy_errors.is_empty(),
+        "proxy errors: {terminal_stats:?}"
+    );
+    assert_eq!(terminal_stats.singleton_413_responses, 1);
+    assert_eq!(terminal_stats.retried_terminal_singleton_responses, 0);
+    assert!(
+        terminal_stats.requests < 32,
+        "terminal 413 should not retry a singleton indefinitely: {terminal_stats:?}"
+    );
+
+    Ok(())
+}
+
+fn assert_batch_clone_contents(
+    connection: &Connection,
+    expected_hash: &str,
+    expected_rows: i64,
+) -> Result<()> {
+    let clone_hash: String =
+        connection.query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))?;
+    assert_eq!(clone_hash, expected_hash);
+
+    let mut statement = connection.prepare("SELECT id, value FROM batch_values ORDER BY id")?;
+    let mut rows = statement.query([])?;
+    for expected_id in 1..=expected_rows {
+        let row = rows.next()?.expect("should contain each fixture row");
+        let actual_id: i64 = row.get(0)?;
+        let actual_value: String = row.get(1)?;
+        assert_eq!(actual_id, expected_id);
+        assert_eq!(
+            actual_value,
+            chunk_batch_test_value(expected_id),
+            "row {expected_id} changed during adaptive retry"
+        );
+    }
+    assert!(
+        rows.next()?.is_none(),
+        "should not contain extra fixture rows"
+    );
+    Ok(())
+}
+
+#[test]
 fn remote_server_keeps_the_public_chunk_limit() -> Result<()> {
     const LARGE_CHUNK_BYTES: u32 = 64 * 1024 * 1024 + 1;
     const EMPTY_PROLLY_HASH: [u8; 20] = [
@@ -1019,6 +1241,346 @@ fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
         }
     }
     request
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GetChunksProxyFailure {
+    None,
+    FailAfterFirstSplitSingletonOnce,
+    FailOversizedSingletonOnce,
+    OversizedContentLengthOnce,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GetChunksProxyStats {
+    requests: usize,
+    max_hashes_per_request: usize,
+    max_single_record_bytes: usize,
+    max_multi_response_bytes: usize,
+    aggregate_413_responses: usize,
+    singleton_413_responses: usize,
+    injected_partial_413_responses: usize,
+    declared_oversized_responses: usize,
+    successful_singleton_responses: usize,
+    successful_split_singleton_responses: usize,
+    smaller_responses_after_declared_oversize: usize,
+    retried_terminal_singleton_responses: usize,
+    proxy_errors: Vec<String>,
+}
+
+struct GetChunksProxyBehavior {
+    threshold_bytes: Option<usize>,
+    failure: GetChunksProxyFailure,
+    failure_injected: bool,
+    saw_aggregate_rejection: bool,
+    oversized_batch_hash_count: Option<usize>,
+}
+
+struct GetChunksProxy {
+    address: String,
+    port: u16,
+    stopped: Arc<AtomicUsize>,
+    stats: Arc<Mutex<GetChunksProxyStats>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl GetChunksProxy {
+    fn start(
+        backend_port: u16,
+        threshold_bytes: Option<usize>,
+        failure: GetChunksProxyFailure,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind get-chunks proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("make get-chunks proxy stoppable");
+        let address = listener.local_addr().expect("get-chunks proxy address");
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(GetChunksProxyStats::default()));
+        let thread_stopped = Arc::clone(&stopped);
+        let thread_stats = Arc::clone(&stats);
+        let thread = thread::spawn(move || {
+            let mut behavior = GetChunksProxyBehavior {
+                threshold_bytes,
+                failure,
+                failure_injected: false,
+                saw_aggregate_rejection: false,
+                oversized_batch_hash_count: None,
+            };
+            while thread_stopped.load(Ordering::Acquire) == 0 {
+                let (mut client, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("accept get-chunks proxy request: {error}"),
+                };
+                if thread_stopped.load(Ordering::Acquire) != 0 {
+                    break;
+                }
+                if let Err(error) = handle_get_chunks_proxy_request(
+                    &mut client,
+                    backend_port,
+                    &mut behavior,
+                    &thread_stats,
+                ) {
+                    thread_stats
+                        .lock()
+                        .expect("lock get-chunks proxy error stats")
+                        .proxy_errors
+                        .push(error.to_string());
+                    break;
+                }
+            }
+        });
+        Self {
+            address: format!("http://{address}"),
+            port: address.port(),
+            stopped,
+            stats,
+            thread: Some(thread),
+        }
+    }
+
+    fn database_url(&self, database: &str) -> String {
+        format!("{}/{database}", self.address)
+    }
+
+    fn stats(&self) -> GetChunksProxyStats {
+        self.stats
+            .lock()
+            .expect("lock get-chunks proxy stats")
+            .clone()
+    }
+}
+
+impl Drop for GetChunksProxy {
+    fn drop(&mut self) {
+        self.stopped.store(1, Ordering::Release);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("join get-chunks proxy");
+        }
+    }
+}
+
+fn handle_get_chunks_proxy_request(
+    client: &mut TcpStream,
+    backend_port: u16,
+    behavior: &mut GetChunksProxyBehavior,
+    stats: &Mutex<GetChunksProxyStats>,
+) -> std::io::Result<()> {
+    let request = read_http_request(client);
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "proxy request has no headers",
+            )
+        })?
+        + 4;
+    let headers = std::str::from_utf8(&request[..header_end])
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    let request_line = headers.lines().next().unwrap_or_default();
+    let mut request_fields = request_line.split_whitespace();
+    let method = request_fields.next().unwrap_or_default();
+    let target = request_fields.next().unwrap_or_default();
+    let path = target.split('?').next().unwrap_or_default();
+    let get_chunks = method.eq_ignore_ascii_case("POST") && path.ends_with("/get-chunks");
+    let request_body = &request[header_end..];
+    let hashes = if get_chunks {
+        let (hashes, remainder) = request_body.as_chunks::<20>();
+        if !remainder.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "get-chunks request is not a sequence of 20-byte hashes",
+            ));
+        }
+        hashes.to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let mut upstream = TcpStream::connect(("127.0.0.1", backend_port))?;
+    upstream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    upstream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    upstream.write_all(&request)?;
+    let mut response = Vec::new();
+    upstream.read_to_end(&mut response)?;
+    if !get_chunks {
+        return client.write_all(&response);
+    }
+
+    let (status, response_body) = http_response_status_and_body(&response)?;
+    if status != 200 || hashes.is_empty() {
+        return client.write_all(&response);
+    }
+    let largest_record = largest_chunk_record_bytes(response_body, hashes.len())?;
+    let too_large = behavior
+        .threshold_bytes
+        .is_some_and(|threshold| response_body.len() > threshold);
+    let mut reject = false;
+    let mut declared_oversize = false;
+    {
+        let mut stats = stats.lock().expect("lock get-chunks proxy stats");
+        stats.requests += 1;
+        stats.max_hashes_per_request = stats.max_hashes_per_request.max(hashes.len());
+        stats.max_single_record_bytes = stats.max_single_record_bytes.max(largest_record);
+        if hashes.len() > 1 {
+            stats.max_multi_response_bytes =
+                stats.max_multi_response_bytes.max(response_body.len());
+        }
+
+        if behavior.failure == GetChunksProxyFailure::OversizedContentLengthOnce
+            && !behavior.failure_injected
+            && hashes.len() > 1
+        {
+            behavior.failure_injected = true;
+            behavior.oversized_batch_hash_count = Some(hashes.len());
+            stats.declared_oversized_responses += 1;
+            declared_oversize = true;
+        } else if too_large && hashes.len() > 1 {
+            reject = true;
+            behavior.saw_aggregate_rejection = true;
+            stats.aggregate_413_responses += 1;
+        }
+
+        if !reject
+            && !declared_oversize
+            && behavior.failure == GetChunksProxyFailure::FailAfterFirstSplitSingletonOnce
+            && behavior.saw_aggregate_rejection
+            && !behavior.failure_injected
+            && hashes.len() == 1
+            && stats.successful_split_singleton_responses > 0
+        {
+            reject = true;
+            behavior.failure_injected = true;
+            stats.singleton_413_responses += 1;
+            stats.injected_partial_413_responses += 1;
+        } else if too_large && hashes.len() == 1 {
+            if behavior.failure == GetChunksProxyFailure::FailOversizedSingletonOnce
+                && !behavior.failure_injected
+            {
+                reject = true;
+                behavior.failure_injected = true;
+                stats.singleton_413_responses += 1;
+            } else if behavior.failure == GetChunksProxyFailure::FailOversizedSingletonOnce {
+                stats.retried_terminal_singleton_responses += 1;
+            } else {
+                reject = true;
+                stats.singleton_413_responses += 1;
+            }
+        }
+
+        if !reject && !declared_oversize {
+            if hashes.len() == 1 {
+                stats.successful_singleton_responses += 1;
+            }
+            if behavior.saw_aggregate_rejection && hashes.len() == 1 {
+                stats.successful_split_singleton_responses += 1;
+            }
+            if behavior
+                .oversized_batch_hash_count
+                .is_some_and(|count| hashes.len() < count)
+            {
+                stats.smaller_responses_after_declared_oversize += 1;
+            }
+        }
+    }
+
+    if declared_oversize {
+        return client.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 134217729\r\nConnection: close\r\n\r\n",
+        );
+    }
+    if reject {
+        client.write_all(
+            b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+    } else {
+        client.write_all(&response)
+    }
+}
+
+fn http_response_status_and_body(response: &[u8]) -> std::io::Result<(u16, &[u8])> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "response has no headers")
+        })?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "response has invalid status",
+            )
+        })?;
+    Ok((status, &response[header_end + 4..]))
+}
+
+fn largest_chunk_record_bytes(body: &[u8], hashes: usize) -> std::io::Result<usize> {
+    let mut offset = 0;
+    let mut largest = 0;
+    for _ in 0..hashes {
+        let length_bytes = body.get(offset..offset + 4).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated chunk length")
+        })?;
+        let length = u32::from_be_bytes(
+            length_bytes
+                .try_into()
+                .expect("four-byte chunk length was selected"),
+        );
+        offset += 4;
+        let chunk_bytes = if length == u32::MAX {
+            0
+        } else {
+            usize::try_from(length).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?
+        };
+        let end = offset.checked_add(chunk_bytes).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk length overflow")
+        })?;
+        if end > body.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk response is truncated",
+            ));
+        }
+        largest = largest.max(4 + chunk_bytes);
+        offset = end;
+    }
+    if offset != body.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "chunk response contains trailing bytes",
+        ));
+    }
+    Ok(largest)
+}
+
+fn chunk_batch_test_value(id: i64) -> String {
+    let mut state = (id as u32)
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add(0xA5A5_1F3D);
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    for _ in 0..8 * 1024 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        bytes.push(b'a' + (state % 26) as u8);
+    }
+    String::from_utf8(bytes).expect("generated payload uses ASCII")
 }
 
 fn spawn_chunk_stalling_http_proxy(backend_port: u16) -> (String, thread::JoinHandle<String>) {
