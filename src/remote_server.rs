@@ -190,6 +190,7 @@ pub struct BlockCacheSessionOptions {
     operation_id: SessionOperationId,
     auth_refresh: Option<Arc<AuthRefreshCallback>>,
     upload_progress: Option<Arc<UploadProgressCallback>>,
+    request_count: Option<u32>,
 }
 
 #[cfg(feature = "blockcachevfs")]
@@ -215,6 +216,7 @@ impl fmt::Debug for BlockCacheSessionOptions {
             .field("session_id", &self.session_id)
             .field("scope", &self.scope)
             .field("operation_id", &self.operation_id)
+            .field("request_count", &self.request_count)
             .field("auth_callback_configured", &self.auth_refresh.is_some())
             .field(
                 "upload_progress_callback_configured",
@@ -254,6 +256,7 @@ impl BlockCacheSessionOptions {
             operation_id,
             auth_refresh: None,
             upload_progress: None,
+            request_count: None,
         })
     }
 
@@ -285,7 +288,22 @@ impl BlockCacheSessionOptions {
             operation_id,
             auth_refresh: None,
             upload_progress: None,
+            request_count: None,
         })
+    }
+
+    /// Set the upper bound on simultaneous block uploads for this URI-owned
+    /// session. When both this option and the URI's `request_count` query
+    /// parameter are set, this explicit option takes precedence. The native
+    /// VFS may use fewer requests to stay within its cache and staging-buffer
+    /// limits. Values outside `1..=i32::MAX` are rejected before opening the
+    /// cloud database. This option is supported only for URI-backed sessions;
+    /// static VFS sessions configure the shared VFS with
+    /// [`crate::blockcachevfs::Config::RequestCount`] when it is built.
+    #[must_use]
+    pub fn request_count(mut self, request_count: u32) -> Self {
+        self.request_count = Some(request_count);
+        self
     }
 
     /// Supply credentials for a session-owned Google Cloud Storage URI.
@@ -453,6 +471,7 @@ impl BlockCacheSessionOptions {
             target_database: self.scope.target_database().to_owned(),
             operations: self.scope.operations().to_owned(),
             operation_id: self.operation_id,
+            request_count: self.request_count,
             auth_refresh: self.auth_refresh.as_ref().map(Arc::clone),
             upload_progress: self.upload_progress.as_ref().map(Arc::clone),
             storage_failure,
@@ -798,6 +817,18 @@ impl RemoteServer {
     ) -> Result<Self> {
         let directory_path = directory.as_ref();
         let cloud_uri = cloud_database_uri(directory_path);
+        #[cfg(feature = "blockcachevfs")]
+        if let Some(session) = options.blockcache_session.as_ref() {
+            if let Some(request_count) = session.request_count {
+                crate::blockcachevfs::validate_request_count(request_count)?;
+                if !session.is_uri() {
+                    return Err(remote_server_error(
+                        ffi::SQLITE_MISUSE,
+                        "request_count session options require a GCS or S3 database URI",
+                    ));
+                }
+            }
+        }
         #[cfg(feature = "blockcachevfs")]
         let session_loopback_transfer = cloud_uri.is_some()
             && options
@@ -1621,6 +1652,23 @@ mod tests {
         assert!(session.scope().matches_database("session.sqlite"));
         assert!(!session.scope().matches_database("other.sqlite"));
         assert_eq!(session.operation_id().as_bytes()[0], 7);
+        let uri_session = BlockCacheSessionOptions::for_uri(
+            "550e8400-e29b-41d4-a716-446655440006",
+            test_scope(),
+            test_operation_id(11),
+        )
+        .expect("valid URI session payload")
+        .request_count(8);
+        assert_eq!(uri_session.request_count, Some(8));
+        assert_eq!(
+            uri_session
+                .uri_context(Arc::new(Mutex::new(None)))
+                .request_count,
+            Some(8)
+        );
+        let debug = format!("{uri_session:?}");
+        assert!(debug.contains("request_count: Some(8)"));
+        assert!(!debug.contains("private-token"));
         let canonicalized = BlockCacheSessionOptions::new(
             vfs,
             AttachSpec::google_json_with_endpoint(
@@ -1664,6 +1712,17 @@ mod tests {
             test_operation_id(12),
         )
         .expect("valid static-VFS session payload");
+        let error = RemoteServer::start_with_options(
+            "/session-alias",
+            &RemoteServerOptions::new().blockcache_session(static_session.clone().request_count(4)),
+        )
+        .expect_err("request_count cannot mutate an existing static VFS");
+        assert!(matches!(
+            error,
+            crate::Error::SqliteFailure(code, Some(message))
+                if code.extended_code == crate::ffi::SQLITE_MISUSE
+                    && message.contains("request_count")
+        ));
         let static_progress_session = static_session.clone().upload_progress_callback(|_| {});
         let error = static_progress_session
             .attach()
@@ -1694,6 +1753,19 @@ mod tests {
             test_operation_id(13),
         )
         .expect("valid URI-backed session payload");
+        let invalid_request_count = uri_session.clone().request_count(0);
+        let error = RemoteServer::start_with_options(
+            uri,
+            &RemoteServerOptions::new().blockcache_session(invalid_request_count),
+        )
+        .expect_err("zero request_count must fail before opening cloud storage");
+        assert!(matches!(
+            &error,
+            crate::Error::SqliteFailure(code, Some(message))
+                if code.extended_code == crate::ffi::SQLITE_MISUSE
+                    && message.contains("request_count")
+        ));
+        assert!(!format!("{error:?}").contains("private-token"));
         let mismatched_database = uri.replace("database=session.sqlite", "database=other.sqlite");
         let error = RemoteServer::start_with_options(
             &mismatched_database,

@@ -1038,7 +1038,11 @@ pub(crate) fn session_alias(spec: &AttachSpec, session_id: &SessionId) -> Result
 pub enum Config {
     /// Maximum local cache size in bytes.
     CacheSize(i64),
-    /// Maximum number of simultaneous upload requests.
+    /// Upper bound on simultaneous cloud block-upload requests.
+    ///
+    /// Native staging may use fewer requests to fit the local cache and its
+    /// bounded staging buffer. Values from 1 through `i32::MAX` are accepted;
+    /// the default is supplied by the native VFS.
     RequestCount(i64),
     /// HTTP timeout in seconds.
     HttpTimeout(i64),
@@ -1050,10 +1054,11 @@ pub enum Config {
     HttpLogTimeout(i64),
     /// Maximum HTTP-log entries; negative means unlimited.
     HttpLogEntries(i64),
-    /// Cache occupancy percentage at which dirty blocks are proactively
-    /// staged. The native VFS accepts values from 1 through 100, inclusive;
-    /// its default is 90. Values outside that range make VFS initialization
-    /// fail with `SQLITE_MISUSE`.
+    /// Dirty-block payload occupancy percentage at which blocks are
+    /// proactively staged. The percentage is relative to the configured cache
+    /// capacity and excludes clean cached blocks. The native VFS accepts
+    /// values from 1 through 100, inclusive; its default is 90. Values outside
+    /// that range make VFS initialization fail with `SQLITE_MISUSE`.
     StageWatermark(i64),
 }
 
@@ -1820,6 +1825,7 @@ struct CloudConnectionUri {
     database: String,
     storage: CloudStorageUri,
     endpoint: Option<String>,
+    request_count: Option<u32>,
 }
 
 enum CloudStorageUri {
@@ -1841,6 +1847,7 @@ pub(crate) struct UriSessionContext {
     pub(crate) target_database: String,
     pub(crate) operations: String,
     pub(crate) operation_id: SessionOperationId,
+    pub(crate) request_count: Option<u32>,
     #[cfg(feature = "remote")]
     pub(crate) auth_refresh: Option<Arc<AuthRefreshCallback>>,
     #[cfg(feature = "remote")]
@@ -1939,6 +1946,10 @@ fn open_connection_uri_inner(
     session: Option<UriSessionContext>,
 ) -> Result<Connection> {
     let uri = CloudConnectionUri::parse(uri)?;
+    let request_count = effective_request_count(
+        uri.request_count,
+        session.as_ref().and_then(|session| session.request_count),
+    )?;
     if let Some(session) = session.as_ref() {
         if session.target_database != uri.database {
             return Err(cbs_uri_error(
@@ -2005,6 +2016,9 @@ fn open_connection_uri_inner(
             }
             Ok(auth_secret.clone())
         });
+    if let Some(request_count) = request_count {
+        builder = builder.config(Config::RequestCount(request_count));
+    }
     #[cfg(feature = "remote")]
     if let Some(callback) = auth_refresh {
         builder = builder.auth_refresh_callback(move |storage, account, container, reason| {
@@ -2288,6 +2302,7 @@ impl CloudConnectionUri {
                 "CBS endpoint must be an HTTP(S) base URL without credentials, query, or fragment",
             ));
         }
+        let request_count = parse_request_count(options.remove("request_count"))?;
         if !options.is_empty() {
             return Err(cbs_uri_error("unsupported CBS URI option"));
         }
@@ -2297,6 +2312,7 @@ impl CloudConnectionUri {
             database,
             storage,
             endpoint,
+            request_count,
         })
     }
 
@@ -2322,6 +2338,41 @@ impl CloudConnectionUri {
             ) => Storage::s3(access_id, container, region),
         }
     }
+}
+
+fn parse_request_count(value: Option<String>) -> Result<Option<u32>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(cbs_uri_error(
+            "request_count must be a decimal integer between 1 and i32::MAX",
+        ));
+    }
+    let request_count = value.parse::<u32>().map_err(|_| {
+        cbs_uri_error("request_count must be a decimal integer between 1 and i32::MAX")
+    })?;
+    validate_request_count(request_count)?;
+    Ok(Some(request_count))
+}
+
+pub(crate) fn validate_request_count(request_count: u32) -> Result<i64> {
+    if request_count == 0 || request_count > i32::MAX as u32 {
+        return Err(cbs_uri_error(
+            "request_count must be between 1 and i32::MAX",
+        ));
+    }
+    Ok(i64::from(request_count))
+}
+
+fn effective_request_count(
+    uri_request_count: Option<u32>,
+    session_request_count: Option<u32>,
+) -> Result<Option<i64>> {
+    session_request_count
+        .or(uri_request_count)
+        .map(validate_request_count)
+        .transpose()
 }
 
 fn valid_s3_region(region: &str) -> bool {
@@ -3059,6 +3110,7 @@ mod tests {
         )
         .expect("valid GCS URI without endpoint");
         assert!(gcs.endpoint.is_none());
+        assert_eq!(gcs.request_count, None);
         let gcs_storage = gcs.storage_for_container("bucket/repository");
         assert_eq!(gcs_storage.provider, "google?api=json");
         assert_eq!(gcs_storage.account, "project");
@@ -3068,6 +3120,7 @@ mod tests {
         )
         .expect("valid S3 URI without endpoint");
         assert!(s3.endpoint.is_none());
+        assert_eq!(s3.request_count, None);
         let s3_storage = s3.storage_for_container("bucket/repository");
         assert_eq!(s3_storage.provider, "s3?region=us-west-2");
         assert_eq!(s3_storage.account, "access");
@@ -3093,6 +3146,50 @@ mod tests {
                 .provider,
             "s3?region=us-west-2&endpoint=http://127.0.0.1:4566"
         );
+    }
+
+    #[test]
+    fn request_count_uri_option_accepts_native_integer_range_for_both_providers() {
+        let gcs = CloudConnectionUri::parse(
+            "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&request_count=1",
+        )
+        .expect("valid GCS request_count");
+        assert_eq!(gcs.request_count, Some(1));
+
+        let s3 = CloudConnectionUri::parse(
+            "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret&request_count=2147483647",
+        )
+        .expect("valid S3 request_count");
+        assert_eq!(s3.request_count, Some(i32::MAX as u32));
+    }
+
+    #[test]
+    fn request_count_uri_option_rejects_malformed_duplicate_and_out_of_range_values() {
+        for value in ["", "0", "-1", "+1", " 1", "1 ", "2147483648", "4294967296"] {
+            let uri = format!(
+                "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&request_count={value}"
+            );
+            assert!(CloudConnectionUri::parse(&uri).is_err(), "accepted {uri}");
+        }
+
+        for query in [
+            "request_count=2&request_count=3",
+            "request_count=2&%72equest_count=3",
+        ] {
+            let uri = format!(
+                "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret&{query}"
+            );
+            assert!(CloudConnectionUri::parse(&uri).is_err(), "accepted {uri}");
+        }
+    }
+
+    #[test]
+    fn explicit_session_request_count_overrides_uri_and_omission_keeps_native_default() {
+        assert_eq!(effective_request_count(None, None).unwrap(), None);
+        assert_eq!(effective_request_count(Some(2), None).unwrap(), Some(2));
+        assert_eq!(effective_request_count(Some(2), Some(8)).unwrap(), Some(8));
+        assert!(effective_request_count(Some(2), Some(0)).is_err());
+        assert!(effective_request_count(Some(2), Some(u32::MAX)).is_err());
     }
 
     #[test]
@@ -3177,6 +3274,10 @@ mod tests {
     fn config_maps_to_cbs_constants() {
         assert_eq!(Config::CacheSize(42).raw(), (raw::SQLITE_BCV_CACHESIZE, 42));
         assert_eq!(
+            Config::RequestCount(i64::from(i32::MAX)).raw(),
+            (raw::SQLITE_BCV_NREQUEST, i64::from(i32::MAX))
+        );
+        assert_eq!(
             Config::CurlVerbose(true).raw(),
             (raw::SQLITE_BCV_CURLVERBOSE, 1)
         );
@@ -3184,6 +3285,41 @@ mod tests {
             Config::StageWatermark(75).raw(),
             (raw::SQLITE_BCV_STAGEWATERMARK, 75)
         );
+    }
+
+    #[test]
+    fn request_count_builder_config_enforces_native_integer_range() -> Result<()> {
+        let directory = tempfile::tempdir().expect("temporary CBS directory");
+
+        for value in [1, 10, i64::from(i32::MAX)] {
+            let vfs = BlockCacheVfs::builder(directory.path())?
+                .name(&format!(
+                    "request-count-valid-{}-{value}",
+                    std::process::id()
+                ))?
+                .config(Config::RequestCount(value))
+                .init_owned()?;
+            drop(vfs);
+        }
+
+        for value in [0, -1, i64::from(i32::MAX) + 1] {
+            let result = BlockCacheVfs::builder(directory.path())?
+                .name(&format!(
+                    "request-count-invalid-{}-{value}",
+                    std::process::id()
+                ))?
+                .config(Config::RequestCount(value))
+                .init_owned();
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::SqliteFailure(code, _))
+                        if code.extended_code == crate::ffi::SQLITE_MISUSE
+                ),
+                "native VFS should reject request count {value}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

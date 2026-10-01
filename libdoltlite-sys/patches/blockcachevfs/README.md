@@ -174,3 +174,21 @@ plan's block and byte totals include both newly uploaded and verified-reused
 blocks; bytes are full block payload sizes, not predicted network traffic, and
 do not include WAL or publication metadata. No plan is reported while the
 producer is active or when dirty entries are blocked.
+
+`0025-parallel-session-staging.patch` batches dirty blocks from one container
+for both streaming watermark staging and the final session drain. It queues up to
+the configured `SQLITE_BCV_NREQUEST` payload PUTs on the existing libcurl multi
+dispatcher; session guard and attempt markers remain fenced serially before any
+payload request is queued. The effective batch is also capped at 64 blocks, the
+cache capacity, and a 64 MiB copied-payload budget (a single larger block still
+stages alone). Exact-byte checks remain required for create-only conflicts.
+Progress counters advance from each completed PUT or byte-verified reuse
+callback, so completed siblings remain visible while another request is still
+running. Every queued request drains before buffers, pins, or the dispatcher are
+released, and each successful PUT or verified reuse is durably recorded and
+cleaned independently even when another block in the batch fails.
+`RequestCount` accepts values from 1 through `INT_MAX`; it is an upper bound,
+with 1 retaining serial staging. The proactive stage watermark now measures
+dirty payload blocks against cache capacity, so later writes continue to form
+batches after the cache first reaches its watermark; hard cache-capacity
+staging remains in place.
