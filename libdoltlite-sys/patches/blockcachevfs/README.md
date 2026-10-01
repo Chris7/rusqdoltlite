@@ -102,3 +102,93 @@ report `(-1, -1)` when a successful checkpoint finds no WAL present; the upload
 path accepts that result and uploads any already-dirty main-file blocks without
 requiring a `-wal` file. This does not imply that attached rollback-journal
 writes are supported.
+
+`0017-session-block-prefix.patch` places every new block read and write under
+`blocks/<block-id>.bcv`. Session writes use create-only PUTs; when an immutable
+object already exists, CBS verifies its exact bytes before accepting it. The
+layout has no flat-key fallback.
+
+`0018-stage-guard-fence.patch` keeps the mutable cleanup guard server-owned.
+Before a session block PUT, the client reads the guard ETag, writes its own
+session-scoped attempt marker, then reads the guard again. It proceeds only
+when both snapshots show the same idle generation (or both show that no guard
+exists). It retries guard transitions for up to 12 seconds. Cleanup changes the
+idle epoch when releasing its sweep, so a sweep that starts and ends between
+the two reads is still detected on stores whose ETags are content-derived.
+
+`0019-gcs-crc32c-integrity.patch` sends CRC32C for every Google JSON media
+upload and requires the matching `X-Goog-Hash` checksum on full-object
+downloads before CBS consumes the body. Block reads also require the configured
+full block size before writing into cache. Conditional 304 responses retain
+the existing not-modified behavior. The same JSON media transport covers block
+objects, session metadata, and the manifest.
+
+`0020-bundled-curl-ca-fallback.patch` applies only to Rust's Cargo-bundled
+static curl build. It preserves `CLOUDSQLITE_CAINFO`, honors `SSL_CERT_FILE`
+and `SSL_CERT_DIR`, and otherwise selects readable conventional CA file and
+directory locations without weakening peer or hostname verification. The
+standalone CBS build keeps its upstream curl configuration.
+
+`0021-cloud-auth-refresh-callback.patch` adds request-boundary Bearer-token
+refresh for session-owned Google JSON connections. CBS asks for a current
+token immediately before dispatching each HTTP request, then after a 401 or
+403 asks for a forced replacement and replays that same request once. The
+replay preserves its body and generation preconditions; a second denial is
+terminal. Callback errors become a generic SQLite authorization I/O error,
+and token-bearing headers are not included in CBS verbose HTTP output. The
+static authentication callback and Google XML/S3 paths keep their existing
+behavior.
+
+This keeps a live `upload()` retry safe when it resumes from local dirty
+manifest state: immutable block objects already accepted by the server remain
+valid, and an exact same-byte create-only replay is accepted. A fresh process
+can rehydrate only an accepted durable session checkpoint/head. Unaccepted
+local overlay-to-block mappings are disposable and rebuilt by Gen from its
+durable local graph; session attempt markers do not reconstruct that mapping,
+so the VFS does not promise bandwidth-free resume for every block staged
+before acceptance.
+
+`0022-upload-progress-callback.patch` adds an optional callback for completed
+block uploads. It reports cumulative created-block and exact-byte-verified
+reuse counts and bytes for one URI-owned VFS. Events cover streaming staging,
+checkpoint flushes, and ordinary block uploads. The callback runs synchronously
+on the thread doing native upload work; panics are ignored and cannot change
+storage or publication results. Callers should keep it quick and must not
+re-enter the same VFS or connection. Its expected total remains unknown while
+the graph is producing blocks; the following plan patch fills it after the
+explicit final checkpoint counts remaining dirty blocks.
+
+`0023-storage-failure-diagnostics.patch` lets a session-owned URI VFS retain a
+credential-free first terminal storage failure with an explicit operation
+phase and HTTP-status or SQLite-code cause. It covers block transfers, local
+cache I/O, session protection, checkpoint and accepted-head records, and
+publication writes. Transient retries, a missing cleanup guard, expected head
+CAS conflicts, and verified immutable-object reuse are not recorded as
+failures. No URL, credential, or provider response text enters the snapshot.
+
+`0024-upload-plan-progress.patch` extends the 0022 progress callback with a
+fixed block-work plan. After the explicit final checkpoint has quiesced the
+WAL, CBS counts the target container's remaining unpinned dirty blocks and
+reports that remainder alongside already completed upload/reuse counts. The
+plan's block and byte totals include both newly uploaded and verified-reused
+blocks; bytes are full block payload sizes, not predicted network traffic, and
+do not include WAL or publication metadata. No plan is reported while the
+producer is active or when dirty entries are blocked.
+
+`0025-parallel-session-staging.patch` batches dirty blocks from one container
+for both streaming watermark staging and the final session drain. It queues up to
+the configured `SQLITE_BCV_NREQUEST` payload PUTs on the existing libcurl multi
+dispatcher; session guard and attempt markers remain fenced serially before any
+payload request is queued. The effective batch is also capped at 64 blocks, the
+cache capacity, and a 64 MiB copied-payload budget (a single larger block still
+stages alone). Exact-byte checks remain required for create-only conflicts.
+Progress counters advance from each completed PUT or byte-verified reuse
+callback, so completed siblings remain visible while another request is still
+running. Every queued request drains before buffers, pins, or the dispatcher are
+released, and each successful PUT or verified reuse is durably recorded and
+cleaned independently even when another block in the batch fails.
+`RequestCount` accepts values from 1 through `INT_MAX`; it is an upper bound,
+with 1 retaining serial staging. The proactive stage watermark now measures
+dirty payload blocks against cache capacity, so later writes continue to form
+batches after the cache first reaches its watermark; hard cache-capacity
+staging remains in place.

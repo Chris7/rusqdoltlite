@@ -1,0 +1,791 @@
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -60,6 +60,7 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <stdlib.h>
++#include <limits.h>
+ 
+ #ifdef __WIN32__
+ # include <windows.h>
+@@ -1750,21 +1751,62 @@
+   }
+ }
+ 
++static void bcvfsReportUploadProgress(
++    sqlite3_bcvfs*, int, sqlite3_int64, sqlite3_int64
++);
++
++typedef struct BcvfsStageBatchCtx BcvfsStageBatchCtx;
++struct BcvfsStageBatchCtx {
++  int rcFirst;
++  int eFailurePhase;
++  int eFailureKind;
++};
++
+ typedef struct BcvfsStageCtx BcvfsStageCtx;
+ struct BcvfsStageCtx {
+   int rc;
+   int eCauseKind;
++  int eFailurePhase;
++  int bAllowExisting;
++  int bCallbackDone;
+   char *zErr;
+   const u8 *aExpected;
++  sqlite3_bcvfs *pFs;
++  sqlite3_int64 nBlockBytes;
+   int nExpected;
++  BcvfsStageBatchCtx *pBatch;
+ };
+ 
++static void bcvfsStageRecordFailure(
++  BcvfsStageBatchCtx *pBatch,
++  int rc,
++  int eFailurePhase,
++  int eFailureKind
++){
++  if( rc!=SQLITE_OK && pBatch->rcFirst==SQLITE_OK ){
++    pBatch->rcFirst = rc;
++    pBatch->eFailurePhase = eFailurePhase;
++    pBatch->eFailureKind = eFailureKind;
++  }
++}
++
+ static void bcvfsStageDone(void *pArg, int rc, int eCause, char *zETag){
+   BcvfsStageCtx *pCtx = (BcvfsStageCtx*)pArg;
+-  if( rc==SQLITE_OK ) BCVFS_TEST_EVENT(1);
++  if( rc==SQLITE_OK ){
++    BCVFS_TEST_EVENT(1);
++    bcvfsReportUploadProgress(
++        pCtx->pFs,BCV_UPLOAD_PROGRESS_UPLOADED_BLOCK,1,pCtx->nBlockBytes
++    );
++  }
+   if( zETag ) pCtx->zErr = sqlite3_mprintf("%s", zETag);
+   pCtx->rc = rc;
+   pCtx->eCauseKind = eCause;
++  pCtx->bCallbackDone = 1;
++  if( rc!=HTTP_BUSY_SNAPSHOT || !pCtx->bAllowExisting ){
++    bcvfsStageRecordFailure(
++        pCtx->pBatch,rc,pCtx->eFailurePhase,eCause
++    );
++  }
+ }
+ 
+ static void bcvfsStageExistingDone(
+@@ -1790,17 +1832,23 @@
+         "existing immutable block does not match its content ID"
+     );
+   }
++  if( rc==SQLITE_OK ){
++    bcvfsReportUploadProgress(
++        pCtx->pFs,BCV_UPLOAD_PROGRESS_REUSED_BLOCK,1,pCtx->nBlockBytes
++    );
++  }
+   pCtx->rc = rc;
+   pCtx->eCauseKind = rc==SQLITE_CORRUPT
+       ? SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE : eCause;
++  pCtx->bCallbackDone = 1;
++  bcvfsStageRecordFailure(
++      pCtx->pBatch,rc,pCtx->eFailurePhase,pCtx->eCauseKind
++  );
+ }
+ 
+ /* These are defined with the other container-state helpers below. */
+ static void bcvfsEnterState(sqlite3_bcvfs*, Container*, int);
+ static void bcvfsLeaveState(sqlite3_bcvfs*, Container*);
+-static void bcvfsReportUploadProgress(
+-    sqlite3_bcvfs*, int, sqlite3_int64, sqlite3_int64
+-);
+ static void bcvfsReportStorageFailure(sqlite3_bcvfs*, int, int, int);
+ static int bcvSessionAllZero(const unsigned char*, int);
+ static int bcvSessionUuidDecode(const char*, unsigned char[16]);
+@@ -1960,48 +2008,96 @@
+   return rc;
+ }
+ 
+-/*
+-** Upload one unpinned dirty block without publishing the manifest. The
+-** local generation is selected before the PUT and the metadata transaction
+-** that records the staged object is completed before the cache entry becomes
+-** clean and eligible for reuse.
+-*/
++/* Upper bounds for a staged batch and its copied block payload buffers. */
++#define BCVFS_STAGE_BATCH_MAX 64
++#define BCVFS_STAGE_BUFFER_LIMIT (64 * 1024 * 1024)
++
++typedef struct BcvfsStageItem BcvfsStageItem;
++struct BcvfsStageItem {
++  CacheEntry *pEntry;
++  int iPos;
++  int iDbPos;
++  i64 iDbId;
++  int nName;
++  u8 aOld[BCV_MAX_NAMEBYTES];
++  u8 aNew[BCV_MAX_NAMEBYTES];
++  u8 *aBuf;
++  char zFile[BCV_MAX_FSNAMEBYTES];
++  BcvfsStageCtx ctx;
++  int bPrepared;
++  int bPutQueued;
++  int bVerifyQueued;
++  int bSucceeded;
++  int bReused;
++};
++
++/* Bound both the number of live request contexts and their copied block
++** buffers. A single block may exceed the buffer limit, but then it stages
++** alone. Cache capacity is also an upper bound on useful concurrent blocks. */
++static int bcvfsStageBatchLimit(sqlite3_bcvfs *pFs){
++  BcvCommon *pCommon = &pFs->c;
++  i64 nLimit;
++  i64 nCacheBlocks = 1;
++  i64 nBufferBlocks = 1;
++  ENTER_VFS_MUTEX; {
++    nLimit = pFs->nRequest;
++    if( nLimit<1 ) nLimit = 1;
++    if( nLimit>BCVFS_STAGE_BATCH_MAX ) nLimit = BCVFS_STAGE_BATCH_MAX;
++    if( pCommon->szBlk>0 ){
++      nCacheBlocks = pCommon->nMaxCache / pCommon->szBlk;
++      if( nCacheBlocks<1 ) nCacheBlocks = 1;
++      nBufferBlocks = BCVFS_STAGE_BUFFER_LIMIT / pCommon->szBlk;
++      if( nBufferBlocks<1 ) nBufferBlocks = 1;
++    }
++    if( nLimit>nCacheBlocks ) nLimit = nCacheBlocks;
++    if( nLimit>nBufferBlocks ) nLimit = nBufferBlocks;
++  } LEAVE_VFS_MUTEX;
++  return (int)nLimit;
++}
++
++/* Upload a bounded batch of unpinned dirty blocks without publishing the
++** manifest. Session markers are fenced serially before payload PUTs are
++** queued; each request then owns a stable buffer and pinned cache entry until
++** the entire dispatcher batch (and any immutable-object verification) drains. */
+ static int bcvfsStageOneForFileInternal(
+   BcvfsFile *pFile,
+   Container *pOnlyCont
+ ){
+   sqlite3_bcvfs *pFs = pFile->pFs;
+   BcvCommon *pCommon = &pFs->c;
+-  CacheEntry *pEntry = 0;
++  BcvfsStageItem *aItem = 0;
++  BcvfsStageBatchCtx batch;
+   BcvDispatch *pDisp = 0;
+   BcvContainer *pBcv = 0;
+-  int nName = 0;
+-  int iPos = 0;
+-  int iDbPos = 0;
+-  i64 iDbId = 0;
+-  int rc = SQLITE_OK;
+-  u8 *aBuf = 0;
+-  u8 aOld[BCV_MAX_NAMEBYTES];
+-  u8 aNew[BCV_MAX_NAMEBYTES];
+-  char zFile[BCV_MAX_FSNAMEBYTES];
+-  BcvfsStageCtx ctx;
+   Container *pCont = 0;
++  int nLimit = bcvfsStageBatchLimit(pFs);
++  int nItem = 0;
++  int nPutQueued = 0;
++  int nVerifyQueued = 0;
++  int iItem;
++  int rc = SQLITE_OK;
+   int bState = 0;
+   int bFoundEntry = 0;
+-  int bReused = 0;
+-  int eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE;
+-  int eFailureKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++  aItem = (BcvfsStageItem*)sqlite3_malloc(
++      (sqlite3_uint64)nLimit * sizeof(BcvfsStageItem)
++  );
++  if( aItem==0 ) return SQLITE_NOMEM;
++  memset(aItem,0,(size_t)nLimit*sizeof(BcvfsStageItem));
++  memset(&batch,0,sizeof(batch));
++  batch.rcFirst = SQLITE_OK;
+ 
+-  memset(&ctx, 0, sizeof(ctx));
+   ENTER_VFS_MUTEX; {
+     int ii;
+-    for(ii=0; ii<pCommon->nHash && pEntry==0; ii++){
++    for(ii=0; ii<pCommon->nHash && nItem<nLimit; ii++){
+       CacheEntry *pTry;
+-      for(pTry=pCommon->aHash[ii]; pTry; pTry=pTry->pHashNext){
++      for(pTry=pCommon->aHash[ii]; pTry && nItem<nLimit;
++          pTry=pTry->pHashNext
++      ){
+         ManifestDb *pTryDb = 0;
+         if( pTry->bValid && pTry->bDirty
+          && pTry->nRef==0 && pTry->bStaging==0 && pTry->pCont
+          && (pOnlyCont==0 || pTry->pCont==pOnlyCont)
++         && (!pCont || pTry->pCont==pCont)
+          && (pTry->pCont->eState==CONTAINER_STATE_NONE
+           || (pTry->pCont==pFile->pCont
+            && pTry->pCont->eState==CONTAINER_STATE_UPLOAD))
+@@ -2017,197 +2113,339 @@
+           ){
+             continue;
+           }
+-          pEntry = pTry;
+-          bFoundEntry = 1;
+-          pCont = pTry->pCont;
+-          iPos = pTry->iPos;
+-          iDbId = pTry->iDbId;
+-          iDbPos = pTry->iDbPos;
+-          pEntry->bStaging = 1;
+-          pEntry->nRef++;
+-          bcvfsLruRemoveIf(pCommon, pEntry);
+-          nName = pEntry->nName;
+-          memcpy(aOld, pEntry->aName, nName);
+-          if( pCont->eState==CONTAINER_STATE_NONE ){
+-            bcvfsEnterState(pFs, pCont, CONTAINER_STATE_STAGE);
+-            bState = 1;
+-          }else{
+-            /* The caller is the checkpointer running inside UPLOAD. That
+-            ** state already excludes competing manifest operations, so do
+-            ** not try to enter STAGE recursively. */
+-            assert( pCont->eState==CONTAINER_STATE_UPLOAD );
+-          }
+-          break;
++          if( pCont==0 ) pCont = pTry->pCont;
++          aItem[nItem].pEntry = pTry;
++          aItem[nItem].iPos = pTry->iPos;
++          aItem[nItem].iDbId = pTry->iDbId;
++          aItem[nItem].iDbPos = pTry->iDbPos;
++          aItem[nItem].nName = pTry->nName;
++          memcpy(aItem[nItem].aOld,pTry->aName,pTry->nName);
++          aItem[nItem].ctx.pBatch = &batch;
++          aItem[nItem].ctx.pFs = pFs;
++          aItem[nItem].ctx.nBlockBytes = pCommon->szBlk;
++          aItem[nItem].ctx.rc = SQLITE_OK;
++          aItem[nItem].ctx.eCauseKind =
++              SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++          pTry->bStaging = 1;
++          pTry->nRef++;
++          bcvfsLruRemoveIf(pCommon,pTry);
++          nItem++;
+         }
+       }
+     }
+-    if( pEntry ){
+-      rc = bcvfsContainerGetBcv(pFs, pCont, &pDisp, &pBcv, 0);
++    if( nItem==0 ){
++      rc = SQLITE_FULL;
++    }else{
++      bFoundEntry = 1;
++      if( pCont->eState==CONTAINER_STATE_NONE ){
++        bcvfsEnterState(pFs,pCont,CONTAINER_STATE_STAGE);
++        bState = 1;
++      }else{
++        /* The caller is the checkpointer running inside UPLOAD. That state
++        ** excludes competing manifest operations and already owns the
++        ** container while this bounded batch drains. */
++        assert( pCont->eState==CONTAINER_STATE_UPLOAD );
++      }
++      rc = bcvfsContainerGetBcv(pFs,pCont,&pDisp,&pBcv,0);
+       if( rc==SQLITE_OK ){
+-        bcvDispatchClientId(pDisp, pFile->zClientId);
++        bcvDispatchClientId(pDisp,pFile->zClientId);
+       }else{
+-        pEntry->bStaging = 0;
+-        bcvfsEntryUnref(pCommon, pEntry);
++        for(iItem=0; iItem<nItem; iItem++){
++          CacheEntry *pEntry = aItem[iItem].pEntry;
++          pEntry->bStaging = 0;
++          bcvfsEntryUnref(pCommon,pEntry);
++        }
++        bcvfsMutexCondSignal(&pFs->mutex);
+         if( bState ){
+-          bcvfsLeaveState(pFs, pCont);
++          bcvfsLeaveState(pFs,pCont);
+           bState = 0;
+         }
+-        pEntry = 0;
++        nItem = 0;
+       }
+-    }else{
+-      rc = SQLITE_FULL;
+     }
+   } LEAVE_VFS_MUTEX;
+ 
+-  if( rc==SQLITE_OK ){
+-    aBuf = (u8*)sqlite3_malloc(pCommon->szBlk);
+-    if( aBuf==0 ){
+-      rc = SQLITE_NOMEM;
+-    }else{
+-      rc = bcvReadfile(
+-          pFile->pCacheFile, aBuf, pCommon->szBlk,
+-          (i64)iPos*pCommon->szBlk
++  if( rc!=SQLITE_OK || nItem==0 ){
++    sqlite3_free(aItem);
++    return rc;
++  }
++
++  /* Read and prepare each block independently. Guard/attempt writes may run
++  ** the dispatcher, so none of the payload PUTs are queued until every
++  ** candidate marker has been fenced. A bad block does not prevent already
++  ** prepared siblings from being safely uploaded. */
++  for(iItem=0; iItem<nItem; iItem++){
++    BcvfsStageItem *pItem = &aItem[iItem];
++    BcvfsStageCtx *pCtx = &pItem->ctx;
++    pCtx->eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE;
++    pItem->aBuf = (u8*)sqlite3_malloc(pCommon->szBlk);
++    if( pItem->aBuf==0 ){
++      pCtx->rc = SQLITE_NOMEM;
++      pCtx->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++      bcvfsStageRecordFailure(
++          &batch,pCtx->rc,pCtx->eFailurePhase,pCtx->eCauseKind
+       );
++      continue;
+     }
++    rc = bcvReadfile(
++        pFile->pCacheFile,pItem->aBuf,pCommon->szBlk,
++        (i64)pItem->iPos*pCommon->szBlk
++    );
+     if( rc!=SQLITE_OK ){
+-      eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE;
+-      eFailureKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
+-    }
+-  }
+-  if( rc==SQLITE_OK ){
+-    memcpy(aNew, aOld, nName);
+-    if( nName>=BCV_MIN_MD5_NAMEBYTES ){
+-      MD5(aBuf, pCommon->szBlk, aNew);
++      pCtx->rc = rc;
++      pCtx->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++      bcvfsStageRecordFailure(
++          &batch,rc,pCtx->eFailurePhase,pCtx->eCauseKind
++      );
++      continue;
+     }
+-    bcvfsBlockidToName(aNew, nName, zFile);
+-
+-    /* Publish the new local generation before doing the network PUT. This
+-    ** makes a failed PUT an ordinary dirty block, while a successful PUT
+-    ** can record exactly the generation that the final manifest will use. */
++    memcpy(pItem->aNew,pItem->aOld,pItem->nName);
++    if( pItem->nName>=BCV_MIN_MD5_NAMEBYTES ){
++      MD5(pItem->aBuf,pCommon->szBlk,pItem->aNew);
++    }
++    bcvfsBlockidToName(pItem->aNew,pItem->nName,pItem->zFile);
++
++    /* Publish the new local generation before its network PUT. A failed
++    ** request remains an ordinary dirty block and a completed request can
++    ** record exactly the generation used by the final manifest. */
+     ENTER_VFS_MUTEX; {
+-      ManifestDb *pManDb = bcvfsFindDatabaseById(pCont->pMan, iDbId);
++      ManifestDb *pManDb = bcvfsFindDatabaseById(pCont->pMan,pItem->iDbId);
+       if( pManDb==0 ){
+         rc = SQLITE_CORRUPT;
+       }else{
+-        rc = bcvfsManifestWrite(pManDb, iDbPos, aNew, nName);
++        rc = bcvfsManifestWrite(pManDb,pItem->iDbPos,pItem->aNew,pItem->nName);
+         if( rc==SQLITE_OK ){
+-          bcvfsHashRemove(pCommon, pEntry);
+-          memcpy(pEntry->aName, aNew, nName);
+-          bcvfsHashAdd(pCommon, pEntry);
++          bcvfsHashRemove(pCommon,pItem->pEntry);
++          memcpy(pItem->pEntry->aName,pItem->aNew,pItem->nName);
++          bcvfsHashAdd(pCommon,pItem->pEntry);
+         }
+       }
+     } LEAVE_VFS_MUTEX;
++    if( rc!=SQLITE_OK ){
++      pCtx->rc = rc;
++      pCtx->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++      bcvfsStageRecordFailure(
++          &batch,rc,pCtx->eFailurePhase,pCtx->eCauseKind
++      );
++      continue;
++    }
++
++    if( pCont->zSessionId ){
++      pCtx->eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_PROTECT_SESSION;
++      if( !pCont->bSessionContext ){
++        rc = SQLITE_AUTH;
++      }else{
++        u8 aScopeHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
++        char *zScopeErr = 0;
++        rc = sqlite3_bcvfs_session_scope_hash(
++            pCont->zStorage,pCont->zAccount,pCont->zContainer,
++            pCont->zSessionPrincipal,pCont->zSessionDatabase,
++            pCont->zSessionOperations,aScopeHash,&zScopeErr
++        );
++        sqlite3_free(zScopeErr);
++        if( rc==SQLITE_OK ){
++          rc = bcvfsSessionProtectBlockFenced(
++              pDisp,pBcv,pCont->zSessionId,pCont->aSessionOperationId,
++              aScopeHash,pItem->aNew,pItem->nName,&pCtx->eCauseKind
++          );
++        }
++      }
++      if( rc!=SQLITE_OK ){
++        pCtx->rc = rc;
++        bcvfsStageRecordFailure(
++            &batch,rc,pCtx->eFailurePhase,pCtx->eCauseKind
++        );
++        continue;
++      }
++    }
++    pItem->bPrepared = 1;
+   }
+-  if( rc==SQLITE_OK && pCont->zSessionId ){
+-    eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_PROTECT_SESSION;
+-    eFailureKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
+-    if( !pCont->bSessionContext ){
+-      /* A legacy session attachment has no authenticated scope or
+-      ** operation fence. Do not PUT a block that GC cannot protect. */
+-      rc = SQLITE_AUTH;
+-    }else{
+-      u8 aScopeHash[SQLITE_BCVFS_SESSION_HASH_BYTES];
+-      char *zScopeErr = 0;
+-      rc = sqlite3_bcvfs_session_scope_hash(
+-          pCont->zStorage,pCont->zAccount,pCont->zContainer,
+-          pCont->zSessionPrincipal,pCont->zSessionDatabase,
+-          pCont->zSessionOperations,aScopeHash,&zScopeErr
++
++  /* Queue every protected payload before running the dispatcher. */
++  for(iItem=0; iItem<nItem; iItem++){
++    BcvfsStageItem *pItem = &aItem[iItem];
++    BcvfsStageCtx *pCtx = &pItem->ctx;
++    if( pItem->bPrepared ){
++      pCtx->eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_STAGE_PUT;
++      pCtx->bAllowExisting = pCont->zSessionId!=0;
++      pCtx->aExpected = pItem->aBuf;
++      pCtx->nExpected = pCommon->szBlk;
++      pCtx->rc = SQLITE_OK;
++      pCtx->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++      pCtx->bCallbackDone = 0;
++      rc = bcvDispatchPutWithCause(
++          pDisp,pBcv,pItem->zFile,pCont->zSessionId ? "*" : 0,
++          pItem->aBuf,pCommon->szBlk,(void*)pCtx,bcvfsStageDone
+       );
+-      sqlite3_free(zScopeErr);
+       if( rc==SQLITE_OK ){
+-        /* Both guard reads must see the same idle generation around the
+-        ** durable marker PUT before the block PUT can proceed. */
+-        rc = bcvfsSessionProtectBlockFenced(
+-            pDisp,pBcv,pCont->zSessionId,pCont->aSessionOperationId,
+-            aScopeHash,aNew,nName,&eFailureKind
++        pItem->bPutQueued = 1;
++        nPutQueued++;
++      }else{
++        pCtx->rc = rc;
++        pCtx->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++        bcvfsStageRecordFailure(
++            &batch,rc,pCtx->eFailurePhase,pCtx->eCauseKind
+         );
++        break;
+       }
+     }
+   }
+-  if( rc==SQLITE_OK ){
+-    eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_STAGE_PUT;
+-    ctx.aExpected = aBuf;
+-    ctx.nExpected = pCommon->szBlk;
+-    rc = bcvDispatchPutWithCause(
+-        pDisp, pBcv, zFile, pCont->zSessionId ? "*" : 0,
+-        aBuf, pCommon->szBlk, (void*)&ctx, bcvfsStageDone
+-    );
+-    if( rc!=SQLITE_OK ) eFailureKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++  if( nPutQueued>0 ){
++    int rcRun = bcvDispatchRunAll(pDisp);
++    if( rcRun!=SQLITE_OK ){
++      bcvfsStageRecordFailure(
++          &batch,rcRun,SQLITE_BCVFS_STORAGE_FAILURE_STAGE_PUT,
++          SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE
++      );
++    }
++    for(iItem=0; iItem<nItem; iItem++){
++      BcvfsStageItem *pItem = &aItem[iItem];
++      if( pItem->bPutQueued && !pItem->ctx.bCallbackDone ){
++        pItem->ctx.rc = rcRun!=SQLITE_OK ? rcRun : SQLITE_IOERR;
++        pItem->ctx.eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++        bcvfsStageRecordFailure(
++            &batch,pItem->ctx.rc,
++            SQLITE_BCVFS_STORAGE_FAILURE_STAGE_PUT,
++            pItem->ctx.eCauseKind
++        );
++      }
++    }
+   }
+-  if( rc==SQLITE_OK ) rc = bcvDispatchRunAll(pDisp);
+-  if( rc==SQLITE_OK ) rc = ctx.rc;
+-  if( rc==HTTP_BUSY_SNAPSHOT && pCont->zSessionId ){
+-    /* A content-addressed block may already exist from another transfer.
+-    ** Keep client CAB writes create-only and accept that immutable object only
+-    ** after verifying its exact bytes. */
+-    sqlite3_free(ctx.zErr);
+-    ctx.zErr = 0;
+-    ctx.rc = SQLITE_OK;
+-    eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_VERIFY_EXISTING;
+-    rc = bcvDispatchFetchWithCause(
+-        pDisp,pBcv,zFile,0,0,(void*)&ctx,bcvfsStageExistingDone
+-    );
+-    if( rc==SQLITE_OK ) rc = bcvDispatchRunAll(pDisp);
+-    if( rc==SQLITE_OK ) rc = ctx.rc;
+-    if( rc==SQLITE_OK ) bReused = 1;
+-    eFailureKind = ctx.eCauseKind;
++
++  /* A create-only conflict is accepted only after an exact-byte GET. Queue
++  ** all such verification reads together as a second bounded dispatcher wave. */
++  for(iItem=0; iItem<nItem; iItem++){
++    BcvfsStageItem *pItem = &aItem[iItem];
++    BcvfsStageCtx *pCtx = &pItem->ctx;
++    if( pItem->bPutQueued && pCtx->rc==HTTP_BUSY_SNAPSHOT
++     && pCont->zSessionId
++    ){
++      sqlite3_free(pCtx->zErr);
++      pCtx->zErr = 0;
++      pCtx->rc = SQLITE_OK;
++      pCtx->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++      pCtx->eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_VERIFY_EXISTING;
++      pCtx->bAllowExisting = 0;
++      pCtx->bCallbackDone = 0;
++      rc = bcvDispatchFetchWithCause(
++          pDisp,pBcv,pItem->zFile,0,0,(void*)pCtx,bcvfsStageExistingDone
++      );
++      if( rc==SQLITE_OK ){
++        pItem->bVerifyQueued = 1;
++        nVerifyQueued++;
++      }else{
++        pCtx->rc = rc;
++        pCtx->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++        bcvfsStageRecordFailure(
++            &batch,rc,pCtx->eFailurePhase,pCtx->eCauseKind
++        );
++      }
++    }
+   }
+-  if( rc==SQLITE_OK ){
+-    bcvfsReportUploadProgress(
+-        pFs,
+-        bReused ? BCV_UPLOAD_PROGRESS_REUSED_BLOCK
+-                : BCV_UPLOAD_PROGRESS_UPLOADED_BLOCK,
+-        1,pCommon->szBlk
+-    );
++  if( nVerifyQueued>0 ){
++    int rcRun = bcvDispatchRunAll(pDisp);
++    if( rcRun!=SQLITE_OK ){
++      bcvfsStageRecordFailure(
++          &batch,rcRun,SQLITE_BCVFS_STORAGE_FAILURE_VERIFY_EXISTING,
++          SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE
++      );
++    }
++    for(iItem=0; iItem<nItem; iItem++){
++      BcvfsStageItem *pItem = &aItem[iItem];
++      if( pItem->bVerifyQueued && !pItem->ctx.bCallbackDone ){
++        pItem->ctx.rc = rcRun!=SQLITE_OK ? rcRun : SQLITE_IOERR;
++        pItem->ctx.eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++        bcvfsStageRecordFailure(
++            &batch,pItem->ctx.rc,
++            SQLITE_BCVFS_STORAGE_FAILURE_VERIFY_EXISTING,
++            pItem->ctx.eCauseKind
++        );
++      }
++    }
++  }
++
++  for(iItem=0; iItem<nItem; iItem++){
++    BcvfsStageItem *pItem = &aItem[iItem];
++    BcvfsStageCtx *pCtx = &pItem->ctx;
++    if( pItem->bPutQueued ){
++      if( pItem->bVerifyQueued ){
++        if( pCtx->bCallbackDone && pCtx->rc==SQLITE_OK ){
++          pItem->bReused = 1;
++        }
++      }else if( pCtx->bCallbackDone && pCtx->rc==SQLITE_OK ){
++        pItem->bReused = 0;
++      }
++      if( pCtx->bCallbackDone && pCtx->rc==SQLITE_OK ){
++        pItem->bSucceeded = 1;
++      }else{
++        bcvfsStageRecordFailure(
++            &batch,pCtx->rc,pCtx->eFailurePhase,pCtx->eCauseKind
++        );
++      }
++    }
+   }
+ 
++  /* Persist every successful member separately. One failed sibling must not
++  ** discard acknowledgements already received and durably stageable. */
+   ENTER_VFS_MUTEX; {
+-  if( pEntry ){
+-      if( rc==SQLITE_OK ){
++    for(iItem=0; iItem<nItem; iItem++){
++      BcvfsStageItem *pItem = &aItem[iItem];
++      CacheEntry *pEntry = pItem->pEntry;
++      if( pItem->bSucceeded ){
+         rc = bcvfsStagedPut(
+-            pCommon, pCont->zName, iDbId, iDbPos,
+-            aNew, nName, aNew, nName
++            pCommon,pCont->zName,pItem->iDbId,pItem->iDbPos,
++            pItem->aNew,pItem->nName,pItem->aNew,pItem->nName
+         );
+         if( rc==SQLITE_OK ){
+           BCVFS_TEST_EVENT(2);
+-          int rcBlock = bcvfsWriteBlockClean(pCommon, pEntry);
+-          if( rcBlock==SQLITE_OK ){
++          rc = bcvfsWriteBlockClean(pCommon,pEntry);
++          if( rc==SQLITE_OK ){
+             pEntry->bStaged = 1;
+             pEntry->bDirty = 0;
+           }else{
+-            /* The staged row is durable, but keep the slot dirty when its
+-            ** cache-row update failed. The next upload can retry the PUT;
+-            ** restart reconciliation will also recover from staged. */
++            /* The staged row is durable, but keep this slot dirty when its
++            ** cache-row update fails; restart reconciliation can recover. */
+             pEntry->bStaged = 0;
+             pEntry->bDirty = 1;
+-            rc = rcBlock;
+-            eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE;
+-            eFailureKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++            pItem->ctx.eFailurePhase =
++                SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE;
++            pItem->ctx.eCauseKind =
++                SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++            bcvfsStageRecordFailure(
++                &batch,rc,pItem->ctx.eFailurePhase,pItem->ctx.eCauseKind
++            );
+           }
+-        }
+-        if( rc!=SQLITE_OK ){
+-          eFailurePhase = SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE;
+-          eFailureKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++        }else{
++          pItem->ctx.eFailurePhase =
++              SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE;
++          pItem->ctx.eCauseKind =
++              SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++          bcvfsStageRecordFailure(
++              &batch,rc,pItem->ctx.eFailurePhase,pItem->ctx.eCauseKind
++          );
+         }
+       }
+       pEntry->bStaging = 0;
+-      bcvfsEntryUnref(pCommon, pEntry);
+-      bcvfsMutexCondSignal(&pFs->mutex);
+-      bcvfsContainerReleaseBcv(pFs, pCont, pDisp, pBcv, rc!=SQLITE_OK);
+-      if( bState ) bcvfsLeaveState(pFs, pCont);
++      bcvfsEntryUnref(pCommon,pEntry);
+     }
++    bcvfsMutexCondSignal(&pFs->mutex);
++    bcvfsContainerReleaseBcv(
++        pFs,pCont,pDisp,pBcv,batch.rcFirst!=SQLITE_OK
++    );
++    if( bState ) bcvfsLeaveState(pFs,pCont);
+   } LEAVE_VFS_MUTEX;
+ 
+-  if( rc!=SQLITE_OK && bFoundEntry ){
+-    if( eFailurePhase==SQLITE_BCVFS_STORAGE_FAILURE_STAGE_PUT ){
+-      eFailureKind = ctx.eCauseKind;
+-    }
+-    bcvfsReportStorageFailure(pFs,eFailurePhase,eFailureKind,rc);
++  if( batch.rcFirst!=SQLITE_OK && bFoundEntry ){
++    bcvfsReportStorageFailure(
++        pFs,batch.eFailurePhase,batch.eFailureKind,batch.rcFirst
++    );
+   }
+-
+-  sqlite3_free(ctx.zErr);
+-  sqlite3_free(aBuf);
+-  return rc;
++  for(iItem=0; iItem<nItem; iItem++){
++    sqlite3_free(aItem[iItem].ctx.zErr);
++    sqlite3_free(aItem[iItem].aBuf);
++  }
++  sqlite3_free(aItem);
++  return batch.rcFirst;
+ }
+ 
+ static int bcvfsStageOneForFile(BcvfsFile *pFile){
+@@ -2443,7 +2681,7 @@
+   return rc;
+ }
+ 
+-static int bcvfsAtStageWatermark(BcvCommon *p);
++static int bcvfsAtStageWatermark(sqlite3_bcvfs *pFs);
+ 
+ static int bcvfsReadWriteDatabase(
+   int bWrite,                     /* True for write, false for read */
+@@ -2641,7 +2879,7 @@
+   ** watermark is relative to the configured block-payload capacity; the
+   ** final slot remains available for a block that cannot yet be staged.
+   */
+-  if( rc==SQLITE_OK && bWrite && bcvfsAtStageWatermark(pCommon) ){
++  if( rc==SQLITE_OK && bWrite && bcvfsAtStageWatermark(pFs) ){
+     int rcStage = bcvfsStageOneForFile(pFile);
+     if( rcStage!=SQLITE_OK && rcStage!=SQLITE_FULL ){
+       rc = rcStage;
+@@ -2665,22 +2903,36 @@
+   return rc;
+ }
+ 
+-/* Compare occupancy with the configured watermark without multiplying large
+-** byte counts. CacheSize is an i64 API, so direct nBlk*szBlk and
++/* Compare dirty payload occupancy with the configured watermark without
++** multiplying large byte counts. CacheSize is an i64 API, so direct
+ ** nMaxCache*percent expressions could overflow before the comparison. */
+-static int bcvfsAtStageWatermark(BcvCommon *p){
++static int bcvfsAtStageWatermark(sqlite3_bcvfs *pFs){
++  BcvCommon *p = &pFs->c;
+   i64 nTargetBytes;
+-  i64 nCap;
+   i64 nTargetSlots;
+-  if( p->szBlk<=0 || p->nMaxCache<=0 || p->nStageWatermark<=0 ){
+-    return 0;
+-  }
+-  nCap = p->nMaxCache;
+-  nTargetBytes = (nCap/100)*p->nStageWatermark
+-               + ((nCap%100)*p->nStageWatermark)/100;
+-  nTargetSlots = nTargetBytes/p->szBlk
+-               + (nTargetBytes%p->szBlk!=0);
+-  return (i64)p->nBlk>=nTargetSlots;
++  i64 nDirty = 0;
++  int bAtWatermark = 0;
++  int ii;
++  ENTER_VFS_MUTEX; {
++    if( p->szBlk>0 && p->nMaxCache>0 && p->nStageWatermark>0 ){
++      nTargetBytes = (p->nMaxCache/100)*p->nStageWatermark
++                   + ((p->nMaxCache%100)*p->nStageWatermark)/100;
++      nTargetSlots = nTargetBytes/p->szBlk
++                   + (nTargetBytes%p->szBlk!=0);
++      /* There cannot be enough dirty blocks before the allocated cache reaches
++      ** the target. Avoid a full hash scan on the producer's early writes. */
++      if( p->nBlk>=nTargetSlots ){
++        for(ii=0; ii<p->nHash; ii++){
++          CacheEntry *pEntry;
++          for(pEntry=p->aHash[ii]; pEntry; pEntry=pEntry->pHashNext){
++            if( pEntry->bValid && pEntry->bDirty ) nDirty++;
++          }
++        }
++        bAtWatermark = nDirty>=nTargetSlots;
++      }
++    }
++  } LEAVE_VFS_MUTEX;
++  return bAtWatermark;
+ }
+ 
+ static int bcvfsReadWriteDatabaseWithRetry(
+@@ -6026,7 +6278,11 @@
+           }
+           break;
+         case SQLITE_BCV_NREQUEST:
+-          pFs->nRequest = iVal;
++          if( iVal<1 || iVal>INT_MAX ){
++            rc = SQLITE_MISUSE;
++          }else{
++            pFs->nRequest = (int)iVal;
++          }
+           break;
+         case SQLITE_BCV_HTTPTIMEOUT:
+           pFs->nHttpTimeout = iVal;
+@@ -7561,7 +7817,9 @@
+       /* Upload all new blocks. */
+       ctx.rc = rc;
+       ctx.iBlk = -1;
+-      for(ii=0; ii<pFs->nRequest; ii++){
++      for(ii=0; ii<pFs->nRequest && ctx.rc==SQLITE_OK
++          && ctx.iDb<ctx.nDb; ii++
++      ){
+         bcvfsUploadOneBlock(&ctx);
+       }
+       rc = bcvDispatchRunAll(ctx.pDisp);

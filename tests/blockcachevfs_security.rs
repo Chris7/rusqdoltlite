@@ -1,16 +1,18 @@
 #![cfg(feature = "blockcachevfs")]
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::ptr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::blockcachevfs::{s3_secret_with_session_token, AttachSpec, BlockCacheVfs, Config};
 use rusqlite::ffi::bcvutil as raw_util;
@@ -27,6 +29,260 @@ const ROUTE_BUCKET_ENV: &str = "RUSQ_DOLTLITE_S3_ROUTE_BUCKET";
 const ACCESS_KEY: &str = "access-key-canary-verbose";
 const SECRET_KEY: &str = "secret-key-canary-verbose";
 const SESSION_TOKEN: &str = "session-token-canary-verbose";
+
+const TLS_CHILD_ENV: &str = "RUSQ_DOLTLITE_TLS_TRUST_CHILD";
+const TLS_ENDPOINT_ENV: &str = "RUSQ_DOLTLITE_TLS_TRUST_ENDPOINT";
+
+const TLS_SERVER_SCRIPT: &str = r#"
+import pathlib
+import socket
+import ssl
+import sys
+
+cert, key, ready, seen = sys.argv[1:]
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+listener.settimeout(12)
+pathlib.Path(ready).write_text(str(listener.getsockname()[1]))
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(certfile=cert, keyfile=key)
+try:
+    raw, _ = listener.accept()
+    try:
+        with context.wrap_socket(raw, server_side=True) as stream:
+            request = stream.recv(4096)
+            if request:
+                pathlib.Path(seen).write_bytes(request)
+                stream.sendall(
+                    b"HTTP/1.1 404 Not Found\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+    except (ssl.SSLError, OSError):
+        pass
+finally:
+    listener.close()
+"#;
+
+fn tls_trust_child() {
+    let endpoint = std::env::var(TLS_ENDPOINT_ENV).expect("should have a TLS test endpoint");
+    let cache = tempfile::tempdir().expect("should create a temporary CBS cache directory");
+    let vfs = BlockCacheVfs::builder(cache.path())
+        .expect("should create a VFS builder")
+        .auth_callback(|_, _, _| Ok("tls-test-secret".to_owned()))
+        .init()
+        .expect("should initialize the block-cache VFS");
+    let result = vfs.attach(
+        &AttachSpec::s3_with_endpoint("tls-test-access", "bucket", "us-east-1", endpoint)
+            .alias("tls"),
+    );
+    let error = result.expect_err("should reject the fixture's missing manifest");
+    eprintln!("TLS attachment error: {error:?}");
+}
+
+fn create_tls_test_certificates(directory: &Path) -> PathBuf {
+    let root_key = directory.join("ca.key");
+    let root_cert = directory.join("ca.pem");
+    let server_key = directory.join("server.key");
+    let server_csr = directory.join("server.csr");
+    let server_cert = directory.join("server.pem");
+    let extensions = directory.join("server.ext");
+
+    let root = Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+        .arg(&root_key)
+        .args(["-out"])
+        .arg(&root_cert)
+        .args([
+            "-days",
+            "3650",
+            "-subj",
+            "/CN=RusqDoltLite blockcache test CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ])
+        .output()
+        .expect("openssl must be installed for the local TLS verification test");
+    assert!(
+        root.status.success(),
+        "create test CA: {}",
+        String::from_utf8_lossy(&root.stderr)
+    );
+
+    let request = Command::new("openssl")
+        .args(["req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+        .arg(&server_key)
+        .args(["-out"])
+        .arg(&server_csr)
+        .args(["-subj", "/CN=localhost"])
+        .output()
+        .expect("openssl must be installed for the local TLS verification test");
+    assert!(
+        request.status.success(),
+        "create test server key: {}",
+        String::from_utf8_lossy(&request.stderr)
+    );
+
+    fs::write(
+        &extensions,
+        "subjectAltName=DNS:localhost\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n",
+    )
+    .expect("should write server certificate extensions");
+    let signed = Command::new("openssl")
+        .args(["x509", "-req", "-in"])
+        .arg(&server_csr)
+        .args(["-CA"])
+        .arg(&root_cert)
+        .args(["-CAkey"])
+        .arg(&root_key)
+        .args(["-CAcreateserial", "-out"])
+        .arg(&server_cert)
+        .args(["-days", "3650", "-sha256", "-extfile"])
+        .arg(&extensions)
+        .output()
+        .expect("openssl must be installed for the local TLS verification test");
+    assert!(
+        signed.status.success(),
+        "sign test server certificate: {}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+
+    root_cert
+}
+
+fn wait_for_process(mut child: Child, description: &str, timeout: Duration) -> Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("wait for {description}: {error}"))
+        {
+            let output = child
+                .wait_with_output()
+                .unwrap_or_else(|error| panic!("collect {description} output: {error}"));
+            assert_eq!(output.status, status);
+            return output;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .unwrap_or_else(|error| panic!("stop timed out {description}: {error}"));
+            panic!(
+                "{description} exceeded {timeout:?}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_tls_server(child: &mut Child, ready: &Path) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if ready.is_file() {
+            return fs::read_to_string(ready)
+                .expect("read TLS test server port")
+                .parse()
+                .expect("should parse the TLS test server port");
+        }
+        if let Some(status) = child
+            .try_wait()
+            .expect("should check TLS test server startup")
+        {
+            panic!("TLS test server exited during startup with {status}");
+        }
+        assert!(Instant::now() < deadline, "TLS test server did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn verify_tls_case(
+    directory: &Path,
+    name: &str,
+    host: &str,
+    ca_file: Option<&Path>,
+    expect_request: bool,
+) {
+    let ready = directory.join(format!("{name}.port"));
+    let seen = directory.join(format!("{name}.request"));
+    let mut server = Command::new("python3")
+        .args(["-c", TLS_SERVER_SCRIPT])
+        .arg(directory.join("server.pem"))
+        .arg(directory.join("server.key"))
+        .arg(&ready)
+        .arg(&seen)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("should have Python 3 installed for the local TLS test server");
+    let port = wait_for_tls_server(&mut server, &ready);
+    let endpoint = format!("https://{host}:{port}");
+    let executable = std::env::current_exe().expect("should locate the TLS child test executable");
+    let mut client_command = Command::new(executable);
+    client_command
+        .args([
+            "--exact",
+            "bundled_curl_preserves_tls_verification_and_custom_ca",
+            "--nocapture",
+        ])
+        .env(TLS_CHILD_ENV, "1")
+        .env(TLS_ENDPOINT_ENV, endpoint)
+        .env("NO_PROXY", "localhost,127.0.0.1")
+        .env("no_proxy", "localhost,127.0.0.1")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("CLOUDSQLITE_CAINFO")
+        .env_remove("SSL_CERT_FILE")
+        .env_remove("SSL_CERT_DIR");
+    if let Some(ca_file) = ca_file {
+        client_command.env("SSL_CERT_FILE", ca_file);
+    }
+    let client = client_command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("should spawn the isolated TLS trust child");
+    let client_output = wait_for_process(
+        client,
+        &format!("{name} TLS child"),
+        Duration::from_secs(20),
+    );
+    let server_output = wait_for_process(
+        server,
+        &format!("{name} TLS server"),
+        Duration::from_secs(15),
+    );
+    assert!(
+        client_output.status.success(),
+        "{name} TLS child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&client_output.stdout),
+        String::from_utf8_lossy(&client_output.stderr)
+    );
+    assert!(
+        server_output.status.success(),
+        "{name} TLS server failed: {}",
+        String::from_utf8_lossy(&server_output.stderr)
+    );
+    let request = if seen.is_file() {
+        fs::read_to_string(&seen).expect("should read the TLS server request")
+    } else {
+        String::new()
+    };
+    assert_eq!(
+        seen.is_file(),
+        expect_request,
+        "{name} TLS case reached the HTTP request phase: {request}"
+    );
+}
 
 unsafe extern "C" fn route_log(ctx: *mut c_void, message: *const c_char) {
     let _ = ctx;
@@ -197,6 +453,24 @@ fn curl_verbose_does_not_log_s3_credentials() {
             !stderr.contains(canary),
             "verbose diagnostics leaked credential canary {canary:?}:\n{stderr}"
         );
+    }
+}
+
+#[test]
+fn bundled_curl_preserves_tls_verification_and_custom_ca() {
+    if std::env::var_os(TLS_CHILD_ENV).is_some() {
+        tls_trust_child();
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("should create the TLS test directory");
+    let ca_file = create_tls_test_certificates(directory.path());
+    for (name, host, trust_file, expect_request) in [
+        ("trusted", "localhost", Some(ca_file.as_path()), true),
+        ("untrusted", "localhost", None, false),
+        ("wrong-host", "127.0.0.1", Some(ca_file.as_path()), false),
+    ] {
+        verify_tls_case(directory.path(), name, host, trust_file, expect_request);
     }
 }
 

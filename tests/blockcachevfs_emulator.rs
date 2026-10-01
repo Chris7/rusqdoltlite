@@ -32,6 +32,10 @@ use rusqlite::blockcachevfs::{
     AttachSpec, BlockCacheVfs, Config, SessionAttachment, SessionOperationId, Storage,
     SESSION_OPERATION_ID_BYTES,
 };
+#[cfg(feature = "remote")]
+use rusqlite::blockcachevfs::{
+    AuthError, AuthRefreshReason, StorageFailureCause, StorageFailurePhase, UploadProgress,
+};
 use rusqlite::ffi::{self, blockcachevfs as raw_bcv};
 #[cfg(feature = "remote")]
 use rusqlite::SessionOperationStatus;
@@ -602,6 +606,23 @@ fn first_google_object_name(listing: &str, prefix: &str) -> Option<String> {
     let start = listing.find(&marker)? + r#""name":""#.len();
     let tail = &listing[start..];
     Some(tail[..tail.find('"')?].to_owned())
+}
+
+#[cfg(feature = "remote")]
+fn google_object_names(listing: &str) -> Vec<String> {
+    let marker = r#""name":""#;
+    let mut names = Vec::new();
+    let mut remaining = listing;
+    while let Some(marker_start) = remaining.find(marker) {
+        let name_start = marker_start + marker.len();
+        let name_and_rest = &remaining[name_start..];
+        let Some(name_end) = name_and_rest.find('"') else {
+            break;
+        };
+        names.push(name_and_rest[..name_end].to_owned());
+        remaining = &name_and_rest[name_end + 1..];
+    }
+    names
 }
 
 #[cfg(feature = "remote")]
@@ -2441,9 +2462,38 @@ impl Drop for SessionHttpProxy {
 /// matches object names after URL decoding, so the test exercises both the
 /// Google JSON and S3 providers rather than a mocked storage implementation.
 #[cfg(feature = "remote")]
+fn test_crc32c_base64(data: &[u8]) -> String {
+    const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut crc = 0xFFFF_FFFF_u32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0_u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
+        }
+    }
+    let bytes = (!crc).to_be_bytes();
+    let indexes = [
+        bytes[0] >> 2,
+        ((bytes[0] & 0x03) << 4) | (bytes[1] >> 4),
+        ((bytes[1] & 0x0F) << 2) | (bytes[2] >> 6),
+        bytes[2] & 0x3F,
+        bytes[3] >> 2,
+        (bytes[3] & 0x03) << 4,
+    ];
+    let mut encoded = String::with_capacity(8);
+    for index in indexes {
+        encoded.push(char::from(BASE64[usize::from(index)]));
+    }
+    encoded.push_str("==");
+    encoded
+}
+
+#[cfg(feature = "remote")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StorageFaultTarget {
     BlockPut,
+    BlockGet,
     XSyncCheckpoint,
     ResponseGateCheckpoint,
     SessionHeadCas,
@@ -2457,6 +2507,7 @@ impl StorageFaultTarget {
     fn code(self) -> u8 {
         match self {
             Self::BlockPut => 1,
+            Self::BlockGet => 8,
             Self::XSyncCheckpoint => 2,
             Self::ResponseGateCheckpoint => 3,
             Self::SessionHeadCas => 4,
@@ -2473,6 +2524,17 @@ enum StorageFaultAction {
     Reject,
     DropResponse,
     KillProcess,
+    BadUploadChecksum,
+    CorruptDownloadBody,
+    MissingDownloadChecksum,
+    MalformedDownloadChecksum,
+    ShortDownloadWithValidChecksum,
+    Unauthorized,
+    Forbidden,
+    AlwaysUnauthorized,
+    AlwaysForbidden,
+    CreateThenReject,
+    CreateCorruptedThenReject,
 }
 
 #[cfg(feature = "remote")]
@@ -2482,8 +2544,38 @@ impl StorageFaultAction {
             Self::Reject => 1,
             Self::DropResponse => 2,
             Self::KillProcess => 3,
+            Self::BadUploadChecksum => 4,
+            Self::CorruptDownloadBody => 5,
+            Self::MissingDownloadChecksum => 6,
+            Self::MalformedDownloadChecksum => 7,
+            Self::ShortDownloadWithValidChecksum => 8,
+            Self::Unauthorized => 9,
+            Self::Forbidden => 10,
+            Self::AlwaysUnauthorized => 11,
+            Self::AlwaysForbidden => 12,
+            Self::CreateThenReject => 13,
+            Self::CreateCorruptedThenReject => 14,
         }
     }
+}
+
+#[cfg(feature = "remote")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BlockPutObservation {
+    object: String,
+    if_generation_match: Option<String>,
+    payload_bytes: usize,
+    payload_crc32c: String,
+    google_crc32c: Option<String>,
+    authorization: Option<String>,
+    injected_status: Option<u16>,
+}
+
+#[cfg(feature = "remote")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GuardGetObservation {
+    path: String,
+    status: u16,
 }
 
 #[cfg(feature = "remote")]
@@ -2496,6 +2588,9 @@ struct StorageFaultProxy {
     matched: Arc<AtomicUsize>,
     faulted: Arc<AtomicUsize>,
     kill_pid: Arc<AtomicUsize>,
+    upload_checksums_valid: Arc<Mutex<Vec<bool>>>,
+    block_put_observations: Arc<Mutex<Vec<BlockPutObservation>>>,
+    guard_get_observations: Arc<Mutex<Vec<GuardGetObservation>>>,
     thread: Option<thread::JoinHandle<()>>,
     url: String,
 }
@@ -2523,6 +2618,12 @@ impl StorageFaultProxy {
         let matched = Arc::new(AtomicUsize::new(0));
         let faulted = Arc::new(AtomicUsize::new(0));
         let kill_pid = Arc::new(AtomicUsize::new(0));
+        let upload_checksums_valid = Arc::new(Mutex::new(Vec::new()));
+        let upload_checksums_valid_thread = Arc::clone(&upload_checksums_valid);
+        let block_put_observations = Arc::new(Mutex::new(Vec::new()));
+        let block_put_observations_thread = Arc::clone(&block_put_observations);
+        let guard_get_observations = Arc::new(Mutex::new(Vec::new()));
+        let guard_get_observations_thread = Arc::clone(&guard_get_observations);
         let thread_stop = Arc::clone(&stop);
         let thread_armed = Arc::clone(&armed);
         let thread_target = Arc::clone(&target);
@@ -2550,6 +2651,9 @@ impl StorageFaultProxy {
                         matched: &thread_matched,
                         faulted: &thread_faulted,
                         kill_pid: &thread_kill_pid,
+                        upload_checksums_valid: &upload_checksums_valid_thread,
+                        block_put_observations: &block_put_observations_thread,
+                        guard_get_observations: &guard_get_observations_thread,
                     },
                 );
                 if let Err(error) = result {
@@ -2572,6 +2676,9 @@ impl StorageFaultProxy {
             matched,
             faulted,
             kill_pid,
+            upload_checksums_valid,
+            block_put_observations,
+            guard_get_observations,
             thread: Some(thread),
             url,
         }
@@ -2608,6 +2715,34 @@ impl StorageFaultProxy {
     fn faulted(&self) -> usize {
         self.faulted.load(Ordering::Acquire)
     }
+
+    fn upload_checksums_valid(&self) -> Vec<bool> {
+        self.upload_checksums_valid
+            .lock()
+            .expect("lock recorded GCS checksums")
+            .clone()
+    }
+
+    fn block_put_observations(&self) -> Vec<BlockPutObservation> {
+        self.block_put_observations
+            .lock()
+            .expect("lock recorded GCS block PUTs")
+            .clone()
+    }
+
+    fn guard_get_observations(&self) -> Vec<GuardGetObservation> {
+        self.guard_get_observations
+            .lock()
+            .expect("should lock recorded session guard GETs")
+            .clone()
+    }
+
+    fn clear_block_put_observations(&self) {
+        self.block_put_observations
+            .lock()
+            .expect("lock recorded GCS block PUTs")
+            .clear();
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -2622,6 +2757,270 @@ impl Drop for StorageFaultProxy {
 }
 
 #[cfg(feature = "remote")]
+#[derive(Default)]
+struct BlockPutConcurrencyState {
+    active: AtomicUsize,
+    high_water: AtomicUsize,
+    requests: AtomicUsize,
+    successful: AtomicUsize,
+    precondition_failed: AtomicUsize,
+    rejected: AtomicUsize,
+    timed_out: AtomicUsize,
+    release: AtomicBool,
+    release_first: AtomicBool,
+    fail_next: AtomicBool,
+    observations: Mutex<Vec<BlockPutObservation>>,
+}
+
+#[cfg(feature = "remote")]
+impl BlockPutConcurrencyState {
+    fn enter_block_put(&self) -> usize {
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        let request_number = self.requests.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut high_water = self.high_water.load(Ordering::Acquire);
+        while active > high_water {
+            match self.high_water.compare_exchange_weak(
+                high_water,
+                active,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => high_water = observed,
+            }
+        }
+        request_number
+    }
+
+    fn wait_until_released(&self, request_number: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !self.release.load(Ordering::Acquire)
+            && !(request_number == 1 && self.release_first.load(Ordering::Acquire))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+        if !self.release.load(Ordering::Acquire)
+            && !(request_number == 1 && self.release_first.load(Ordering::Acquire))
+        {
+            self.timed_out.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn wait_for_active(&self, count: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.active.load(Ordering::Acquire) >= count {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        self.active.load(Ordering::Acquire) >= count
+    }
+
+    fn release(&self) {
+        self.release.store(true, Ordering::Release);
+    }
+
+    fn release_first(&self) {
+        self.release_first.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "remote")]
+struct ActiveBlockPutGuard<'a>(&'a AtomicUsize);
+
+#[cfg(feature = "remote")]
+impl Drop for ActiveBlockPutGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(feature = "remote")]
+struct ConcurrentBlockPutProxy {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    state: Arc<BlockPutConcurrencyState>,
+    handlers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    thread: Option<thread::JoinHandle<()>>,
+    url: String,
+}
+
+#[cfg(feature = "remote")]
+impl ConcurrentBlockPutProxy {
+    fn start(endpoint: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind block-put proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("configure block-put proxy");
+        let address = listener.local_addr().expect("block-put proxy address");
+        let authority = endpoint
+            .trim_end_matches('/')
+            .strip_prefix("http://")
+            .or_else(|| endpoint.trim_end_matches('/').strip_prefix("https://"))
+            .and_then(|value| value.split('/').next())
+            .expect("storage endpoint must have an HTTP authority")
+            .to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(BlockPutConcurrencyState::default());
+        state.release.store(true, Ordering::Release);
+        let handlers = Arc::new(Mutex::new(Vec::new()));
+        let thread_stop = Arc::clone(&stop);
+        let thread_state = Arc::clone(&state);
+        let thread_handlers = Arc::clone(&handlers);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let handler_authority = authority.clone();
+                let handler_state = Arc::clone(&thread_state);
+                let handler = thread::spawn(move || {
+                    let _ = handle_concurrent_block_put_connection(
+                        &mut stream,
+                        &handler_authority,
+                        &handler_state,
+                    );
+                });
+                thread_handlers
+                    .lock()
+                    .expect("lock block-put proxy handlers")
+                    .push(handler);
+            }
+        });
+        Self {
+            port: address.port(),
+            stop,
+            state,
+            handlers,
+            thread: Some(thread),
+            url: format!("http://{address}"),
+        }
+    }
+
+    fn state(&self) -> Arc<BlockPutConcurrencyState> {
+        Arc::clone(&self.state)
+    }
+
+    fn arm_held_block_puts(&self) {
+        assert_eq!(
+            self.state.active.load(Ordering::Acquire),
+            0,
+            "all producer-stage PUTs must finish before arming the checkpoint probe"
+        );
+        self.state.release.store(false, Ordering::Release);
+        self.state.release_first.store(false, Ordering::Release);
+        self.state.requests.store(0, Ordering::Release);
+        self.state.high_water.store(0, Ordering::Release);
+        self.state.successful.store(0, Ordering::Release);
+        self.state.precondition_failed.store(0, Ordering::Release);
+        self.state.rejected.store(0, Ordering::Release);
+        self.state.timed_out.store(0, Ordering::Release);
+        self.state.fail_next.store(false, Ordering::Release);
+        self.state
+            .observations
+            .lock()
+            .expect("lock block PUT observations before arming")
+            .clear();
+    }
+
+    fn fail_next_block_put(&self) {
+        self.state.fail_next.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Drop for ConcurrentBlockPutProxy {
+    fn drop(&mut self) {
+        self.state.release();
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        for handler in std::mem::take(
+            &mut *self
+                .handlers
+                .lock()
+                .expect("lock block-put proxy handlers for join"),
+        ) {
+            let _ = handler.join();
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+fn handle_concurrent_block_put_connection(
+    stream: &mut TcpStream,
+    authority: &str,
+    state: &BlockPutConcurrencyState,
+) -> io::Result<()> {
+    stream.set_read_timeout(Some(HTTP_TEST_TIMEOUT))?;
+    stream.set_write_timeout(Some(HTTP_TEST_TIMEOUT))?;
+    let (method, request_target, headers, body) = read_storage_proxy_request(stream)?;
+    let block_put =
+        storage_fault_target(&method, &request_target, &body) == Some(StorageFaultTarget::BlockPut);
+    if block_put {
+        let request_number = state.enter_block_put();
+        let _active_guard = ActiveBlockPutGuard(&state.active);
+        let fail_this_put = state.fail_next.swap(false, Ordering::AcqRel);
+        let injected_status = fail_this_put.then_some(403);
+        state
+            .observations
+            .lock()
+            .expect("lock concurrent block PUT observations")
+            .push(BlockPutObservation {
+                object: google_upload_object(&request_target)
+                    .unwrap_or_else(|| storage_request_path(&request_target)),
+                if_generation_match: google_upload_generation_match(&request_target),
+                payload_bytes: body.len(),
+                payload_crc32c: test_crc32c_base64(&body),
+                google_crc32c: headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("x-goog-hash"))
+                    .map(|(_, value)| value.clone()),
+                authorization: headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.clone()),
+                injected_status,
+            });
+        state.wait_until_released(request_number, Duration::from_secs(8));
+        let result = if fail_this_put {
+            state.rejected.fetch_add(1, Ordering::AcqRel);
+            stream.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+        } else {
+            let response = forward_storage_proxy_request(
+                authority,
+                &method,
+                &request_target,
+                &headers,
+                &body,
+            )?;
+            let status = http_status(&response);
+            if (200..300).contains(&status) {
+                state.successful.fetch_add(1, Ordering::AcqRel);
+            } else if status == 412 {
+                state.precondition_failed.fetch_add(1, Ordering::AcqRel);
+            }
+            stream.write_all(&response)
+        };
+        return result;
+    }
+    let response =
+        forward_storage_proxy_request(authority, &method, &request_target, &headers, &body)?;
+    stream.write_all(&response)
+}
+
+#[cfg(feature = "remote")]
 struct StorageFaultControls<'a> {
     armed: &'a AtomicBool,
     target: &'a AtomicU8,
@@ -2629,6 +3028,9 @@ struct StorageFaultControls<'a> {
     matched: &'a AtomicUsize,
     faulted: &'a AtomicUsize,
     kill_pid: &'a AtomicUsize,
+    upload_checksums_valid: &'a Mutex<Vec<bool>>,
+    block_put_observations: &'a Mutex<Vec<BlockPutObservation>>,
+    guard_get_observations: &'a Mutex<Vec<GuardGetObservation>>,
 }
 
 #[cfg(feature = "remote")]
@@ -2640,6 +3042,24 @@ fn handle_storage_fault_connection(
     stream.set_read_timeout(Some(HTTP_TEST_TIMEOUT))?;
     stream.set_write_timeout(Some(HTTP_TEST_TIMEOUT))?;
     let (method, request_target, headers, body) = read_storage_proxy_request(stream)?;
+    let request_path = storage_request_path(&request_target);
+    let session_guard_get =
+        method.eq_ignore_ascii_case("GET") && request_path.ends_with("/bcv-session/v1/guard.bcv");
+    let media_upload = method.eq_ignore_ascii_case("POST")
+        && request_target.contains("/upload/storage/v1/")
+        && request_target.contains("uploadType=media");
+    if media_upload {
+        let expected = format!("crc32c={}", test_crc32c_base64(&body));
+        let valid = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-goog-hash"))
+            .is_some_and(|(_, value)| value == &expected);
+        controls
+            .upload_checksums_valid
+            .lock()
+            .expect("lock recorded GCS checksums")
+            .push(valid);
+    }
     let request_fault = storage_fault_target(&method, &request_target, &body);
     let configured_target = controls.target.load(Ordering::Acquire);
     let should_fault = request_fault.is_some_and(|fault| {
@@ -2651,11 +3071,82 @@ fn handle_storage_fault_connection(
     if should_fault {
         controls.matched.fetch_add(1, Ordering::AcqRel);
     }
+    let action = controls.action.load(Ordering::Acquire);
+    let always_reject = matches!(
+        action,
+        value if value == StorageFaultAction::AlwaysUnauthorized.code()
+            || value == StorageFaultAction::AlwaysForbidden.code()
+    );
     let fault_now = should_fault
-        && controls
-            .faulted
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        && (always_reject
+            || controls
+                .faulted
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok());
+    if fault_now && always_reject {
+        controls.faulted.fetch_add(1, Ordering::AcqRel);
+    }
+    let injected_status = if fault_now {
+        match action {
+            value
+                if value == StorageFaultAction::Unauthorized.code()
+                    || value == StorageFaultAction::AlwaysUnauthorized.code() =>
+            {
+                Some(401)
+            }
+            value
+                if value == StorageFaultAction::Forbidden.code()
+                    || value == StorageFaultAction::AlwaysForbidden.code() =>
+            {
+                Some(403)
+            }
+            value
+                if value == StorageFaultAction::Reject.code()
+                    || value == StorageFaultAction::CreateThenReject.code()
+                    || value == StorageFaultAction::CreateCorruptedThenReject.code() =>
+            {
+                Some(412)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if request_fault == Some(StorageFaultTarget::BlockPut) {
+        controls
+            .block_put_observations
+            .lock()
+            .expect("lock recorded GCS block PUTs")
+            .push(BlockPutObservation {
+                object: google_upload_object(&request_target)
+                    .unwrap_or_else(|| storage_request_path(&request_target)),
+                if_generation_match: google_upload_generation_match(&request_target),
+                payload_bytes: body.len(),
+                payload_crc32c: test_crc32c_base64(&body),
+                google_crc32c: headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("x-goog-hash"))
+                    .map(|(_, value)| value.clone()),
+                authorization: headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.clone()),
+                injected_status,
+            });
+    }
+    if fault_now && matches!(injected_status, Some(401 | 403)) {
+        let status = injected_status.expect("matched injected authentication status");
+        write!(
+            stream,
+            "HTTP/1.1 {status} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            if status == 401 {
+                "Unauthorized"
+            } else {
+                "Forbidden"
+            }
+        )?;
+        return Ok(());
+    }
     if fault_now
         && controls.action.load(Ordering::Acquire) == StorageFaultAction::KillProcess.code()
     {
@@ -2668,6 +3159,55 @@ fn handle_storage_fault_connection(
         let _ = stream.shutdown(Shutdown::Both);
         return Ok(());
     }
+    if fault_now
+        && controls.action.load(Ordering::Acquire) == StorageFaultAction::CreateThenReject.code()
+    {
+        let created =
+            forward_storage_proxy_request(authority, &method, &request_target, &headers, &body)?;
+        let created_status = http_status(&created);
+        if !(200..300).contains(&created_status) {
+            return Err(io::Error::other(
+                "test proxy could not pre-create the immutable block",
+            ));
+        }
+        stream.write_all(
+            b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(());
+    }
+    if fault_now
+        && controls.action.load(Ordering::Acquire)
+            == StorageFaultAction::CreateCorruptedThenReject.code()
+    {
+        let Some(first) = body.first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "test proxy cannot corrupt an empty immutable block",
+            ));
+        };
+        let mut corrupted_body = body.clone();
+        corrupted_body[0] = *first ^ 0x01;
+        let checksum = format!("crc32c={}", test_crc32c_base64(&corrupted_body));
+        let mut corrupted_headers = headers.clone();
+        set_test_header(&mut corrupted_headers, "x-goog-hash", &checksum);
+        let created = forward_storage_proxy_request(
+            authority,
+            &method,
+            &request_target,
+            &corrupted_headers,
+            &corrupted_body,
+        )?;
+        let created_status = http_status(&created);
+        if !(200..300).contains(&created_status) {
+            return Err(io::Error::other(
+                "test proxy could not pre-create the corrupted immutable block",
+            ));
+        }
+        stream.write_all(
+            b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(());
+    }
     if fault_now && controls.action.load(Ordering::Acquire) == StorageFaultAction::Reject.code() {
         stream.write_all(
             b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -2675,11 +3215,63 @@ fn handle_storage_fault_connection(
         return Ok(());
     }
 
-    let response =
+    if fault_now && action == StorageFaultAction::BadUploadChecksum.code() {
+        let expected = format!("crc32c={}", test_crc32c_base64(&body));
+        let original_checksum = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-goog-hash"))
+            .map(|(_, value)| value.as_str());
+        if original_checksum != Some(expected.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "test proxy received a bad client CRC32C before fault injection",
+            ));
+        }
+        let mut wrong = expected.as_bytes().to_vec();
+        let checksum_index = wrong.len() - 3;
+        wrong[checksum_index] = if wrong[checksum_index] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let wrong = String::from_utf8(wrong).expect("CRC32C checksum is ASCII");
+        let mut rejected_headers = headers.clone();
+        set_test_header(&mut rejected_headers, "x-goog-hash", &wrong);
+        let rejected_checksum = rejected_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-goog-hash"))
+            .map(|(_, value)| value.as_str());
+        if wrong == expected || rejected_checksum != Some(wrong.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "test proxy failed to create a mismatched CRC32C",
+            ));
+        }
+        let body = r#"{"error":{"code":400,"message":"CRC32C mismatch"}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        stream.write_all(body.as_bytes())?;
+        return Ok(());
+    }
+    let mut response =
         forward_storage_proxy_request(authority, &method, &request_target, &headers, &body)?;
-    if !(fault_now
-        && controls.action.load(Ordering::Acquire) == StorageFaultAction::DropResponse.code())
-    {
+    if session_guard_get {
+        controls
+            .guard_get_observations
+            .lock()
+            .expect("should lock recorded session guard GETs")
+            .push(GuardGetObservation {
+                path: request_path,
+                status: http_status(&response),
+            });
+    }
+    if fault_now && request_fault == Some(StorageFaultTarget::BlockGet) {
+        response = mutate_gcs_download_response(&response, action)?;
+    }
+    if !(fault_now && action == StorageFaultAction::DropResponse.code()) {
         stream.write_all(&response)?;
     }
     if fault_now {
@@ -2849,6 +3441,16 @@ fn google_upload_object(target: &str) -> Option<String> {
 }
 
 #[cfg(feature = "remote")]
+fn google_upload_generation_match(target: &str) -> Option<String> {
+    let query = target.split_once('?')?.1;
+    query.split('&').find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.eq_ignore_ascii_case("ifGenerationMatch")
+            .then(|| percent_decode_path(value))
+    })
+}
+
+#[cfg(feature = "remote")]
 fn percent_decode_path(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut decoded = String::with_capacity(path.len());
@@ -2870,8 +3472,111 @@ fn percent_decode_path(path: &str) -> String {
 }
 
 #[cfg(feature = "remote")]
+fn set_test_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+    if let Some((_, old_value)) = headers
+        .iter_mut()
+        .find(|(old_name, _)| old_name.eq_ignore_ascii_case(name))
+    {
+        *old_value = value.to_owned();
+    } else {
+        headers.push((name.to_owned(), value.to_owned()));
+    }
+}
+
+#[cfg(feature = "remote")]
+fn mutate_gcs_download_response(response: &[u8], action: u8) -> io::Result<Vec<u8>> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing GCS headers"))?;
+    let head = String::from_utf8_lossy(&response[..header_end - 4]);
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing GCS status"))?;
+    if !status.contains(" 2") {
+        return Ok(response.to_vec());
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.to_owned(), value.trim().to_owned()));
+        }
+    }
+    if headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected chunked GCS response in checksum test",
+        ));
+    }
+    let mut body = response[header_end..].to_vec();
+    match action {
+        value if value == StorageFaultAction::CorruptDownloadBody.code() => {
+            let Some(first) = body.first_mut() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "empty GCS block",
+                ));
+            };
+            *first ^= 0x80;
+        }
+        value if value == StorageFaultAction::MissingDownloadChecksum.code() => {
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("x-goog-hash"));
+        }
+        value if value == StorageFaultAction::MalformedDownloadChecksum.code() => {
+            set_test_header(&mut headers, "x-goog-hash", "crc32c=not-base64");
+        }
+        value if value == StorageFaultAction::ShortDownloadWithValidChecksum.code() => {
+            if body.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "empty GCS block",
+                ));
+            }
+            body.pop();
+            let checksum = format!("crc32c={}", test_crc32c_base64(&body));
+            set_test_header(&mut headers, "x-goog-hash", &checksum);
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown GCS download checksum fault",
+            ));
+        }
+    }
+    let mut output = Vec::new();
+    write!(output, "{status}\r\n")?;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("connection")
+        {
+            continue;
+        }
+        write!(output, "{name}: {value}\r\n")?;
+    }
+    write!(
+        output,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    output.extend_from_slice(&body);
+    Ok(output)
+}
+
+#[cfg(feature = "remote")]
 fn storage_fault_target(method: &str, path: &str, body: &[u8]) -> Option<StorageFaultTarget> {
     let request_path = storage_request_path(path);
+    if method.eq_ignore_ascii_case("GET")
+        && request_path.contains("/download/storage/v1/")
+        && request_path.contains("/blocks/")
+    {
+        return Some(StorageFaultTarget::BlockGet);
+    }
     let object_path =
         if method.eq_ignore_ascii_case("POST") && request_path.contains("/upload/storage/v1/") {
             google_upload_object(path)?
@@ -6316,6 +7021,194 @@ fn s3_uri_connection_uploads_existing_prefixed_database() {
     }
 }
 
+#[cfg(feature = "remote")]
+fn assert_gcs_database_value(storage: &Storage, database_name: &str, expected_value: &str) {
+    let cache = tempfile::tempdir().expect("fresh GCS verification cache");
+    let vfs = BlockCacheVfs::builder(cache.path())
+        .expect("GCS verification VFS builder")
+        .config(Config::CacheSize(8 * 1024 * 1024))
+        .auth_callback(|provider, _account, _container| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init_owned()
+        .expect("initialize GCS verification VFS");
+    let alias = format!("verify_{}", std::process::id());
+    vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias))
+        .expect("attach GCS verification container");
+    let path = format!("/{alias}/{database_name}");
+    let database = vfs.open(&path).expect("open uploaded GCS database");
+    let value: String = database
+        .query_row("SELECT value FROM payload", [], |row| row.get(0))
+        .expect("read the uploaded value from GCS");
+    assert_eq!(value, expected_value);
+    database.close().expect("close GCS verification database");
+    vfs.detach(&alias)
+        .expect("detach GCS verification container");
+}
+
+#[cfg(feature = "remote")]
+fn assert_gcs_download_fault_does_not_poison_cache(
+    proxy: &StorageFaultProxy,
+    storage: &Storage,
+    database_name: &str,
+    fault: StorageFaultAction,
+) {
+    let cache = tempfile::tempdir().expect("fresh GCS integrity reader cache");
+    let vfs = BlockCacheVfs::builder(cache.path())
+        .expect("GCS integrity reader VFS builder")
+        .config(Config::CacheSize(8 * 1024 * 1024))
+        .auth_callback(|provider, _account, _container| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init_owned()
+        .expect("initialize GCS integrity reader VFS");
+    let alias = format!("integrity_{}", std::process::id());
+    vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias))
+        .expect("attach GCS integrity test container");
+
+    proxy.configure(StorageFaultTarget::BlockGet, fault);
+    proxy.arm();
+    let path = format!("/{alias}/{database_name}");
+    let database = vfs
+        .open(&path)
+        .expect("open succeeds after rejecting the faulted response and retrying");
+    let value: String = database
+        .query_row("SELECT value FROM payload", [], |row| row.get(0))
+        .expect("read the original value after the integrity retry");
+    proxy.disarm();
+    assert_eq!(
+        proxy.faulted(),
+        1,
+        "the proxy must inject one corrupted, missing, malformed, or short block response"
+    );
+    assert!(
+        proxy.matched() >= 2,
+        "the integrity failure should trigger a fresh block download"
+    );
+    assert_eq!(value, "crc32c-seed");
+    database
+        .close()
+        .expect("close GCS integrity reader database");
+
+    let cached = vfs
+        .open(&path)
+        .expect("re-open GCS database after the integrity retry");
+    let cached_value: String = cached
+        .query_row("SELECT value FROM payload", [], |row| row.get(0))
+        .expect("read the verified block from the cache");
+    assert_eq!(cached_value, "crc32c-seed");
+    cached.close().expect("close cached GCS reader database");
+    vfs.detach(&alias)
+        .expect("detach GCS integrity reader container");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_json_emulator_crc32c_guards_media_integrity() {
+    assert_eq!(test_crc32c_base64(b"123456789"), "4waSgw==");
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let proxy = StorageFaultProxy::start(&endpoint);
+    let prefix = format!("{}/integrity/good", unique_suffix());
+    let storage = Storage::google_json_with_endpoint(
+        "test-project",
+        format!("{bucket}/{prefix}"),
+        &proxy.url,
+    );
+    let cache = tempfile::tempdir().expect("GCS integrity writer cache");
+    let vfs = BlockCacheVfs::builder(cache.path())
+        .expect("GCS integrity writer VFS builder")
+        .config(Config::CacheSize(8 * 1024 * 1024))
+        .auth_callback(|provider, _account, _container| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init_owned()
+        .expect("initialize GCS integrity writer VFS");
+    vfs.initialize_container(&storage)
+        .expect("initialize GCS integrity test container");
+
+    let seed_directory = tempfile::tempdir().expect("GCS integrity seed directory");
+    let seed_path = seed_directory.path().join("seed.sqlite");
+    let seed = Connection::open(&seed_path).expect("create GCS integrity seed database");
+    seed.execute_batch(
+        "CREATE TABLE payload(value TEXT NOT NULL);
+         INSERT INTO payload VALUES ('crc32c-seed');",
+    )
+    .expect("write GCS integrity seed database");
+    seed.close().expect("close GCS integrity seed database");
+    vfs.create_database(&storage, &seed_path, "integrity.sqlite")
+        .expect("upload GCS integrity seed database");
+    let valid_uploads = proxy.upload_checksums_valid();
+    assert!(
+        valid_uploads.len() >= 2,
+        "manifest and block media uploads were observed"
+    );
+    assert!(
+        valid_uploads.iter().all(|valid| *valid),
+        "every GCS media upload must carry CRC32C for its exact request body"
+    );
+
+    let bad_prefix = format!("{}/integrity/bad-upload", unique_suffix());
+    let bad_storage = Storage::google_json_with_endpoint(
+        "test-project",
+        format!("{bucket}/{bad_prefix}"),
+        &proxy.url,
+    );
+    vfs.initialize_container(&bad_storage)
+        .expect("initialize the bad-checksum upload container");
+    proxy.configure(
+        StorageFaultTarget::BlockPut,
+        StorageFaultAction::BadUploadChecksum,
+    );
+    proxy.arm();
+    vfs.create_database(&bad_storage, &seed_path, "integrity.sqlite")
+        .expect("retry the block after a checksum-mismatch response");
+    assert_eq!(
+        proxy.faulted(),
+        1,
+        "the proxy must return one checksum-mismatch rejection"
+    );
+    assert!(
+        proxy.matched() >= 2,
+        "the rejected block should be retried through the GCS transport"
+    );
+    assert!(
+        proxy.upload_checksums_valid().last() == Some(&true),
+        "the client must send a correct checksum on the upload request"
+    );
+    proxy.disarm();
+    assert_gcs_database_value(&bad_storage, "integrity.sqlite", "crc32c-seed");
+
+    for fault in [
+        StorageFaultAction::CorruptDownloadBody,
+        StorageFaultAction::MissingDownloadChecksum,
+        StorageFaultAction::MalformedDownloadChecksum,
+        StorageFaultAction::ShortDownloadWithValidChecksum,
+    ] {
+        assert_gcs_download_fault_does_not_poison_cache(
+            &proxy,
+            &storage,
+            "integrity.sqlite",
+            fault,
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires the pinned local emulator containers"]
 fn google_json_emulator_bootstrap() {
@@ -6494,6 +7387,49 @@ fn remote_request(port: u16, method: &str, path: &str, body: &[u8]) -> Vec<u8> {
     stream
         .read_to_end(&mut response)
         .expect("read remote server response");
+    response
+}
+
+#[cfg(feature = "remote")]
+fn remote_request_large_chunk(port: u16, chunk_bytes: usize) -> Vec<u8> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to remote server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .expect("set large-request read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(120)))
+        .expect("set large-request write timeout");
+    let request_body_bytes = chunk_bytes + 24;
+    write!(
+        stream,
+        "POST /default.db/chunks HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {request_body_bytes}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write large chunk request headers");
+    stream
+        .write_all(&[0_u8; 20])
+        .expect("write invalid Prolly hash");
+    stream
+        .write_all(
+            &u32::try_from(chunk_bytes)
+                .expect("test chunk fits u32")
+                .to_le_bytes(),
+        )
+        .expect("write chunk length");
+
+    let block = [0_u8; 64 * 1024];
+    let mut remaining = chunk_bytes;
+    while remaining > 0 {
+        let count = remaining.min(block.len());
+        if stream.write_all(&block[..count]).is_err() {
+            break;
+        }
+        remaining -= count;
+    }
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read large chunk response");
     response
 }
 
@@ -6731,6 +7667,139 @@ fn start_uri_session_server(
             .database_open_flags(flags)
             .blockcache_session(session),
     )
+}
+
+#[cfg(feature = "remote")]
+fn start_uri_session_server_with_request_count_and_progress<F>(
+    uri: &str,
+    session_id: &str,
+    operation_id: SessionOperationId,
+    request_count: u32,
+    callback: F,
+) -> rusqlite::Result<RemoteServer>
+where
+    F: Fn(UploadProgress) + Send + Sync + 'static,
+{
+    let scope = SessionScope::new("emulator-transfer", "remote.db", "push,read")?;
+    let session = BlockCacheSessionOptions::for_uri(session_id, scope, operation_id)?
+        .request_count(request_count)
+        .upload_progress_callback(callback);
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    RemoteServer::start_with_options(
+        uri,
+        &RemoteServerOptions::new()
+            .database_open_flags(flags)
+            .blockcache_session(session),
+    )
+}
+
+#[cfg(feature = "remote")]
+fn start_graph_uri_session_server(
+    uri: &str,
+    session_id: &str,
+    operation_id: SessionOperationId,
+) -> rusqlite::Result<RemoteServer> {
+    let scope = SessionScope::new("graph-transfer", "default.db", "push,read")?;
+    let session = BlockCacheSessionOptions::for_uri(session_id, scope, operation_id)?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    RemoteServer::start_with_options(
+        uri,
+        &RemoteServerOptions::new()
+            .database_open_flags(flags)
+            .blockcache_session(session),
+    )
+}
+
+#[cfg(feature = "remote")]
+fn start_uri_session_server_with_progress<F>(
+    uri: &str,
+    session_id: &str,
+    operation_id: SessionOperationId,
+    callback: F,
+) -> rusqlite::Result<RemoteServer>
+where
+    F: Fn(UploadProgress) + Send + Sync + 'static,
+{
+    let scope = SessionScope::new("emulator-transfer", "remote.db", "push,read")?;
+    let session = BlockCacheSessionOptions::for_uri(session_id, scope, operation_id)?
+        .upload_progress_callback(callback);
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    RemoteServer::start_with_options(
+        uri,
+        &RemoteServerOptions::new()
+            .database_open_flags(flags)
+            .blockcache_session(session),
+    )
+}
+
+#[cfg(feature = "remote")]
+fn start_uri_session_server_with_auth<F>(
+    uri: &str,
+    session_id: &str,
+    operation_id: SessionOperationId,
+    callback: F,
+) -> rusqlite::Result<RemoteServer>
+where
+    F: Fn(&str, &str, &str, AuthRefreshReason) -> Result<String, AuthError> + Send + Sync + 'static,
+{
+    let scope = SessionScope::new("emulator-transfer", "remote.db", "push,read")?;
+    let session =
+        BlockCacheSessionOptions::for_uri(session_id, scope, operation_id)?.auth_callback(callback);
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    RemoteServer::start_with_options(
+        uri,
+        &RemoteServerOptions::new()
+            .database_open_flags(flags)
+            .blockcache_session(session),
+    )
+}
+
+#[cfg(feature = "remote")]
+fn seed_uri_session_fault_data(database: &Connection) -> rusqlite::Result<()> {
+    database.execute_batch(
+        "CREATE TABLE fault_data(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO fault_data VALUES (1, 'seed');",
+    )
+}
+
+#[cfg(feature = "remote")]
+fn configure_uri_session_test_cache(database: &Connection) {
+    configure_uri_session_test_cache_with(database, 8 * 1024 * 1024, 50);
+}
+
+#[cfg(feature = "remote")]
+fn configure_uri_session_test_cache_with(
+    database: &Connection,
+    cache_bytes: i32,
+    stage_watermark: i32,
+) {
+    let vfs_name = CString::new(
+        database
+            .blockcachevfs_name()
+            .expect("URI session exposes its CBS VFS name"),
+    )
+    .expect("CBS VFS name is NUL-free");
+    let native_vfs = unsafe { ffi::sqlite3_vfs_find(vfs_name.as_ptr()) };
+    assert!(!native_vfs.is_null(), "URI session VFS must be registered");
+    for (option, value) in [
+        (raw_bcv::SQLITE_BCV_CACHESIZE, cache_bytes),
+        (raw_bcv::SQLITE_BCV_STAGEWATERMARK, stage_watermark),
+    ] {
+        let rc = unsafe { raw_bcv::sqlite3_bcvfs_config(native_vfs.cast(), option, value.into()) };
+        assert_eq!(rc, ffi::SQLITE_OK, "configure the URI test VFS cache");
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -7248,6 +8317,281 @@ fn google_uri_session_handoff_keeps_accepted_graph_private_until_upload() {
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 #[test]
 #[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_staged_graph_is_private_until_server_publication() {
+    let suffix = unique_suffix();
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let prefix = format!("{suffix}/uri/direct-session-publish/");
+    let uri = format!(
+        "gcs://{bucket}/{prefix}?vfs=blockcachevfs&project=test-project&access_token=remote-server-token&endpoint={endpoint}&database=default.db"
+    );
+    let read_only_flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let session_id = Uuid::new_v4().to_string();
+    let operation_id = || {
+        SessionOperationId::from_request("POST", "/default.db/commit", b"")
+            .expect("derive stable graph publication operation ID")
+    };
+    let temp = tempfile::tempdir().expect("staged graph tempdir");
+    let source =
+        Connection::open(temp.path().join("source.db")).expect("create direct GCS push source");
+    source
+        .execute_batch(
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO widgets VALUES(1, 'staged');",
+        )
+        .expect("write source graph row");
+    let _: String = source
+        .query_row(
+            "SELECT dolt_commit('-A', '-m', 'staged graph')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("commit source graph");
+
+    let mut client_server = start_graph_uri_session_server(&uri, &session_id, operation_id())
+        .expect("start client-owned session server");
+    let manifest_name = format!("{prefix}manifest.bcv");
+    let initial_manifest = fetch_google_object(&endpoint, bucket, &manifest_name);
+    let remote_url = client_server.database_url("default.db");
+    let _: i64 = source
+        .query_row(
+            "SELECT dolt_remote('add', 'origin', ?1)",
+            params![remote_url],
+            |row| row.get(0),
+        )
+        .expect("add direct GCS session server as source remote");
+    let _: i64 = source
+        .query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))
+        .expect("push committed graph to the client-owned session server");
+    let pushed_hash: String = source
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("read source branch hash");
+    let client_database = client_server
+        .database_connection()
+        .expect("running URI server exposes its database for inspection");
+    let staged_hash: String = client_database
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("read accepted branch before staging");
+    assert_eq!(staged_hash, pushed_hash);
+
+    client_server
+        .stage_request()
+        .expect("checkpoint and accept the graph without publication");
+    assert!(
+        client_server.database_connection().is_none(),
+        "the SQL accessor must be unavailable after the server is quiesced"
+    );
+    assert_eq!(
+        client_server
+            .operation_status()
+            .expect("read accepted operation status"),
+        SessionOperationStatus::Accepted
+    );
+    client_server
+        .close()
+        .expect("close staged client server without publication");
+
+    assert_eq!(
+        fetch_google_object(&endpoint, bucket, &manifest_name),
+        initial_manifest,
+        "staging must leave the published manifest byte-for-byte unchanged"
+    );
+    let listing = list_google_objects(&endpoint, bucket, &prefix);
+    let blocks_prefix = format!("{prefix}blocks/");
+    let attempt_prefix = format!("{prefix}bcv-session/v1/attempt/{session_id}/");
+    let checkpoint_prefix = format!("{prefix}bcv-session/v1/checkpoint/{session_id}/");
+    let head_object = format!("{prefix}bcv-session/v1/head/{session_id}.bcv");
+    let guard_object = format!("{prefix}bcv-session/v1/guard.bcv");
+    assert!(
+        !session_object_exists("google", &endpoint, bucket, &guard_object),
+        "client staging must not create or mutate the global cleanup guard"
+    );
+    assert!(
+        session_listing_contains_object_prefix("google", &listing, &blocks_prefix),
+        "staged graph blocks must use the CAB-separable blocks/ prefix: {listing}"
+    );
+    assert!(
+        session_listing_contains_object_prefix("google", &listing, &attempt_prefix),
+        "stage must persist an attempt marker below this session ID: {listing}"
+    );
+    assert!(
+        session_listing_contains_object_prefix("google", &listing, &checkpoint_prefix),
+        "stage must persist an accepted checkpoint below this session ID: {listing}"
+    );
+    assert!(
+        session_object_exists("google", &endpoint, bucket, &head_object),
+        "stage must persist this session's accepted head"
+    );
+    assert!(
+        !session_listing_contains_object_prefix(
+            "google",
+            &listing,
+            &format!("{prefix}bcv-session/v1/candidate/")
+        ),
+        "client staging must not create server publication candidates: {listing}"
+    );
+    assert!(
+        !session_listing_contains_object_prefix(
+            "google",
+            &listing,
+            &format!("{prefix}bcv-session/v1/publication/")
+        ),
+        "client staging must not create server publication records: {listing}"
+    );
+
+    let unpublished = Connection::open_with_flags(&uri, read_only_flags)
+        .expect("read published graph before final server upload");
+    let unpublished_branches: i64 = unpublished
+        .query_row("SELECT count(*) FROM dolt_branches", [], |row| row.get(0))
+        .expect("read published refs before final upload");
+    assert_eq!(unpublished_branches, 0);
+    unpublished
+        .close()
+        .expect("close reader before final server upload");
+
+    let mut server = start_graph_uri_session_server(&uri, &session_id, operation_id())
+        .expect("reattach the accepted operation as the server owner");
+    assert_eq!(
+        server
+            .operation_status()
+            .expect("read reattached accepted operation status"),
+        SessionOperationStatus::Accepted
+    );
+    let server_database = server
+        .database_connection()
+        .expect("reattached server can inspect the accepted graph before publication");
+    let accepted_hash: String = server_database
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("inspect accepted graph before final upload");
+    assert_eq!(accepted_hash, pushed_hash);
+    let accepted_rows: i64 = server_database
+        .query_row("SELECT count(*) FROM widgets", [], |row| row.get(0))
+        .expect("inspect accepted graph rows before final upload");
+    assert_eq!(accepted_rows, 1);
+
+    server
+        .upload()
+        .expect("server publishes the accepted manifest");
+    assert!(
+        server.database_connection().is_none(),
+        "the SQL accessor must be unavailable after upload closes the URI handle"
+    );
+    server.close().expect("close final server publisher");
+
+    let published = Connection::open_with_flags(&uri, read_only_flags)
+        .expect("open published graph after final server upload");
+    let published_hash: String = published
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("read published branch hash");
+    let published_rows: i64 = published
+        .query_row("SELECT count(*) FROM widgets", [], |row| row.get(0))
+        .expect("read published graph row");
+    assert_eq!(published_hash, pushed_hash);
+    assert_eq!(published_rows, 1);
+    published.close().expect("close published graph reader");
+    source.close().expect("close direct GCS push source");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_cleanup_deletes_prefixed_blocks() {
+    let suffix = unique_suffix();
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let prefix = format!("{suffix}/uri/block-cleanup");
+    let container = format!("{bucket}/{prefix}");
+    let storage = Storage::google_json_with_endpoint("test-project", container, &endpoint);
+    let vfs = BlockCacheVfs::builder(shared_cache())
+        .expect("VFS builder")
+        .auth_callback(|provider, _account, _container| {
+            if provider.starts_with("google?") {
+                Ok("test-token".into())
+            } else {
+                Ok("test".into())
+            }
+        })
+        .init()
+        .expect("initialize block-cache VFS");
+    vfs.initialize_container(&storage)
+        .expect("initialize empty container manifest");
+    let temp = tempfile::tempdir().expect("cleanup seed tempdir");
+    let seed_path = temp.path().join("seed.sqlite");
+    let seed = Connection::open(&seed_path).expect("create cleanup seed database");
+    seed.execute_batch("CREATE TABLE keep(value TEXT); INSERT INTO keep VALUES ('live');")
+        .expect("write cleanup seed database");
+    seed.close().expect("close cleanup seed database");
+    vfs.create_database(&storage, &seed_path, "seed.sqlite")
+        .expect("publish a valid database before orphan cleanup");
+
+    let alias = format!("cleanup_{}", std::process::id());
+    vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias))
+        .expect("attach database before scheduling block cleanup");
+    let control = vfs
+        .open(&format!("/{alias}"))
+        .expect("open attached container control connection");
+    let block_id: Vec<u8> = control
+        .query_row(
+            "SELECT blockid FROM bcv_block \
+             WHERE container = ?1 AND database = 'seed.sqlite' \
+               AND blockid IS NOT NULL LIMIT 1",
+            [&alias],
+            |row| row.get(0),
+        )
+        .expect("read an existing block ID from the manifest");
+    drop(control);
+    assert_eq!(block_id.len(), 16, "test fixture uses a 16-byte block ID");
+    let block_id = block_id
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+    let flat_object = format!("{prefix}/{block_id}.bcv");
+    let blocks_object = format!("{prefix}/blocks/{block_id}.bcv");
+    assert!(
+        session_object_exists("google", &endpoint, bucket, &blocks_object),
+        "new database blocks should live beneath the blocks/ namespace"
+    );
+    assert!(!session_object_exists(
+        "google",
+        &endpoint,
+        bucket,
+        &flat_object
+    ));
+
+    vfs.delete_database(&alias, "seed.sqlite")
+        .expect("schedule deletion of manifest-referenced blocks");
+    vfs.upload(&alias)
+        .expect("publish database deletion and its garbage-collection list");
+    vfs.detach(&alias)
+        .expect("detach after publishing database deletion");
+    vfs.cleanup(&storage, Duration::ZERO)
+        .expect("remove zero-age deleted blocks from the blocks/ namespace");
+    let remaining = list_google_objects(&endpoint, bucket, &prefix);
+    assert!(
+        !session_object_exists("google", &endpoint, bucket, &blocks_object),
+        "cleanup must delete blocks/ prefixed block keys: {remaining}"
+    );
+
+    let guard_object = format!("{prefix}/bcv-session/v1/guard.bcv");
+    let first_idle_epoch = fetch_google_object(&endpoint, bucket, &guard_object);
+    vfs.cleanup(&storage, Duration::ZERO)
+        .expect("run another sweep with no remaining blocks");
+    let second_idle_epoch = fetch_google_object(&endpoint, bucket, &guard_object);
+    assert_ne!(
+        first_idle_epoch, second_idle_epoch,
+        "each sweep must rotate the idle guard epoch, including when the ETag is content-derived"
+    );
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
 fn google_uri_remote_server_publishes_repeated_pushes() {
     run_uri_remote_server_push_workflow("google");
 }
@@ -7355,4 +8699,1322 @@ fn google_uri_connection_creates_empty_database_and_resolves_races() {
 #[ignore = "requires the pinned local S3 emulator container"]
 fn s3_uri_connection_creates_empty_database_and_resolves_races() {
     run_uri_auto_create("s3");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_remote_server_accepts_chunk_over_public_request_limit() {
+    const CHUNK_BYTES: usize = 128 * 1024 * 1024 + 1;
+
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    let prefix = format!("{}/uri/session-large-chunk/", unique_suffix());
+    ensure_google_bucket(&endpoint, bucket);
+    let uri = format!(
+        "gcs://{bucket}/{prefix}?vfs=blockcachevfs&project=test-project&access_token=test-token&endpoint={endpoint}&database=default.db"
+    );
+    let session_id = Uuid::new_v4().to_string();
+    let server = start_graph_uri_session_server(&uri, &session_id, session_operation_id(253))
+        .expect("start URI-session remote server");
+
+    let response = remote_request_large_chunk(server.port(), CHUNK_BYTES);
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+        "the session loopback server should parse a 128MiB+ chunk and reject only its invalid hash, not its size: {}",
+        String::from_utf8_lossy(&response[..response.len().min(200)])
+    );
+    server.close().expect("close URI-session remote server");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_reports_complete_block_upload_progress() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let proxy = StorageFaultProxy::start(&endpoint);
+
+    let prefix = format!("{}/uri/upload-progress/", unique_suffix());
+    let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+    let progress_events = Arc::new(Mutex::new(Vec::<UploadProgress>::new()));
+    let callback_events = Arc::clone(&progress_events);
+    let panic_once = Arc::new(AtomicBool::new(true));
+    let callback_panic_once = Arc::clone(&panic_once);
+    let session_id = Uuid::new_v4().to_string();
+    let operation_id =
+        SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+            .expect("derive upload-progress operation ID");
+    let mut server =
+        start_uri_session_server_with_progress(&uri, &session_id, operation_id, move |progress| {
+            callback_events
+                .lock()
+                .expect("lock upload progress events")
+                .push(progress);
+            if callback_panic_once.swap(false, Ordering::AcqRel) {
+                panic!("test that upload progress panics are contained");
+            }
+        })
+        .expect("start upload-progress URI session");
+    let database = server
+        .database_connection()
+        .expect("URI session exposes its SQLite anchor");
+    configure_uri_session_test_cache(database);
+    seed_uri_session_fault_data(database).expect("seed upload-progress database");
+    let baseline = progress_events
+        .lock()
+        .expect("lock initial upload progress")
+        .last()
+        .copied()
+        .unwrap_or_default();
+    progress_events
+        .lock()
+        .expect("lock upload progress events")
+        .clear();
+    proxy.configure(
+        StorageFaultTarget::BlockPut,
+        StorageFaultAction::CreateThenReject,
+    );
+    proxy.clear_block_put_observations();
+    proxy.arm();
+    let stage_result = stage_session_update(database);
+    proxy.disarm();
+    assert!(
+        stage_result.is_ok(),
+        "write enough data to produce multiple blocks: {stage_result:?}; matched={}; observations={:?}; progress={:?}",
+        proxy.matched(),
+        proxy.block_put_observations(),
+        progress_events
+            .lock()
+            .expect("lock upload progress after staging error")
+            .as_slice()
+    );
+    let producer_events = progress_events
+        .lock()
+        .expect("lock producer upload progress events")
+        .clone();
+    assert!(
+        producer_events
+            .iter()
+            .all(|progress| progress.expected.is_none()),
+        "the block-work total must stay unknown while DoltLite is producing data: {producer_events:?}"
+    );
+    server
+        .complete_request()
+        .expect("checkpoint blocks and accept a verified immutable reuse");
+    assert!(
+        server.first_storage_error().is_none(),
+        "a verified create-only reuse and missing first-use guard are not terminal storage failures"
+    );
+    let guard_gets = proxy.guard_get_observations();
+    assert!(
+        !guard_gets.is_empty(),
+        "session block staging should read the cleanup guard around its attempt marker: {guard_gets:?}"
+    );
+    assert!(
+        guard_gets.iter().all(|observation| observation.status == 404),
+        "a missing or CAB-inaccessible global guard should return 404 and be treated as idle: {guard_gets:?}"
+    );
+
+    let observations = proxy.block_put_observations();
+    let reused = observations
+        .iter()
+        .find(|observation| observation.injected_status == Some(412))
+        .expect("proxy should create one block then return a precondition failure");
+    let created_puts = observations
+        .iter()
+        .filter(|observation| observation.injected_status.is_none())
+        .collect::<Vec<_>>();
+    assert!(
+        created_puts.len() >= 2,
+        "expected multi-block PUTs: {observations:?}"
+    );
+    let events = progress_events
+        .lock()
+        .expect("lock upload progress events")
+        .clone();
+    assert!(
+        !events.is_empty(),
+        "successful blocks should report progress"
+    );
+    assert!(
+        events.windows(2).all(|pair| {
+            pair[0].uploaded_blocks <= pair[1].uploaded_blocks
+                && pair[0].uploaded_bytes <= pair[1].uploaded_bytes
+                && pair[0].reused_blocks <= pair[1].reused_blocks
+                && pair[0].reused_bytes <= pair[1].reused_bytes
+        }),
+        "progress snapshots should be cumulative: {events:?}"
+    );
+    let plan_index = events
+        .iter()
+        .position(|progress| progress.expected.is_some())
+        .expect("the explicit final checkpoint should report a fixed block-work plan");
+    assert!(
+        events[..plan_index]
+            .iter()
+            .all(|progress| progress.expected.is_none()),
+        "no denominator should appear during producer and proactive staging: {events:?}"
+    );
+    let plan = events[plan_index]
+        .expected
+        .expect("the final checkpoint plan should be present");
+    assert!(
+        events[plan_index..]
+            .iter()
+            .all(|progress| progress.expected == Some(plan)),
+        "the final checkpoint denominator should remain fixed while remaining blocks are handled: {events:?}"
+    );
+    assert!(
+        events[plan_index..].iter().all(|progress| {
+            progress.uploaded_blocks + progress.reused_blocks <= plan.blocks
+                && progress.uploaded_bytes + progress.reused_bytes <= plan.bytes
+        }),
+        "block and payload progress must not exceed the fixed plan: {events:?}"
+    );
+    let final_progress = *events.last().expect("at least one progress event");
+    assert_eq!(
+        final_progress.uploaded_blocks - baseline.uploaded_blocks,
+        created_puts.len() as u64,
+        "only complete successful block PUTs should count as uploaded"
+    );
+    assert_eq!(
+        final_progress.uploaded_bytes - baseline.uploaded_bytes,
+        created_puts
+            .iter()
+            .map(|put| put.payload_bytes as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(final_progress.reused_blocks - baseline.reused_blocks, 1);
+    assert_eq!(
+        final_progress.reused_bytes - baseline.reused_bytes,
+        reused.payload_bytes as u64,
+        "a 412 should count as reuse only after reading and matching the complete object"
+    );
+    assert_eq!(
+        plan.blocks,
+        final_progress.uploaded_blocks + final_progress.reused_blocks,
+        "the final plan should equal all completed uploads and verified reuses"
+    );
+    assert_eq!(
+        plan.bytes,
+        final_progress.uploaded_bytes + final_progress.reused_bytes,
+        "the plan byte count includes complete block payloads, including reuse"
+    );
+    server.close().expect("close upload-progress URI session");
+
+    let rejected_prefix = format!("{}/uri/upload-progress-rejected/", unique_suffix());
+    let rejected_uri = remote_server_database_uri("google", &proxy.url, bucket, &rejected_prefix);
+    let rejected_events = Arc::new(Mutex::new(Vec::<UploadProgress>::new()));
+    let callback_rejected_events = Arc::clone(&rejected_events);
+    let rejected_session_id = Uuid::new_v4().to_string();
+    let rejected_operation = SessionOperationId::from_request(
+        "POST",
+        "/remote.db/commit",
+        rejected_session_id.as_bytes(),
+    )
+    .expect("derive rejected-progress operation ID");
+    let rejected_server = start_uri_session_server_with_progress(
+        &rejected_uri,
+        &rejected_session_id,
+        rejected_operation,
+        move |progress| {
+            callback_rejected_events
+                .lock()
+                .expect("lock rejected upload progress events")
+                .push(progress);
+        },
+    )
+    .expect("start rejected-upload URI session");
+    let database = rejected_server
+        .database_connection()
+        .expect("rejected URI session exposes its SQLite anchor");
+    seed_uri_session_fault_data(database).expect("seed rejected-upload database");
+    configure_uri_session_test_cache(database);
+    rejected_events
+        .lock()
+        .expect("lock pre-rejection upload progress events")
+        .clear();
+    proxy.configure(StorageFaultTarget::BlockPut, StorageFaultAction::Reject);
+    proxy.clear_block_put_observations();
+    proxy.arm();
+    let rejected_result =
+        stage_session_small_update(database, "FULL").and_then(|_| database.execute_batch("COMMIT"));
+    proxy.disarm();
+    assert!(
+        rejected_result.is_err(),
+        "a rejected block with no matching object must fail; matched={}; observations={:?}",
+        proxy.matched(),
+        proxy.block_put_observations()
+    );
+    assert!(
+        proxy
+            .block_put_observations()
+            .iter()
+            .any(|observation| observation.injected_status == Some(412)),
+        "proxy should reject the block PUT"
+    );
+    assert!(
+        rejected_events
+            .lock()
+            .expect("lock rejected upload progress events")
+            .is_empty(),
+        "failed PUTs and missing-object verification must not advance progress"
+    );
+    assert!(
+        rejected_events
+            .lock()
+            .expect("lock rejected upload progress events")
+            .iter()
+            .all(|progress| progress.expected.is_none()),
+        "a failed producer stage must not report a final denominator"
+    );
+    assert!(
+        matches!(
+            rejected_server.first_storage_error(),
+            Some(failure)
+                if failure.phase == StorageFailurePhase::VerifyExistingBlock
+                    && failure.cause == StorageFailureCause::HttpStatus(404)
+        ),
+        "a 412 followed by a missing immutable object should report terminal verification failure: {:?}",
+        rejected_server.first_storage_error()
+    );
+    drop(rejected_server);
+
+    let corrupt_prefix = format!("{}/uri/upload-progress-corrupt/", unique_suffix());
+    let corrupt_uri = remote_server_database_uri("google", &proxy.url, bucket, &corrupt_prefix);
+    let corrupt_events = Arc::new(Mutex::new(Vec::<UploadProgress>::new()));
+    let callback_corrupt_events = Arc::clone(&corrupt_events);
+    let corrupt_session_id = Uuid::new_v4().to_string();
+    let corrupt_operation = SessionOperationId::from_request(
+        "POST",
+        "/remote.db/commit",
+        corrupt_session_id.as_bytes(),
+    )
+    .expect("derive corrupt-progress operation ID");
+    let corrupt_server = start_uri_session_server_with_progress(
+        &corrupt_uri,
+        &corrupt_session_id,
+        corrupt_operation,
+        move |progress| {
+            callback_corrupt_events
+                .lock()
+                .expect("lock corrupt upload progress events")
+                .push(progress);
+        },
+    )
+    .expect("start corrupt-upload URI session");
+    let database = corrupt_server
+        .database_connection()
+        .expect("corrupt URI session exposes its SQLite anchor");
+    configure_uri_session_test_cache(database);
+    seed_uri_session_fault_data(database).expect("seed corrupt-upload database");
+    let baseline = corrupt_events
+        .lock()
+        .expect("lock initial corrupt upload progress")
+        .last()
+        .copied()
+        .unwrap_or_default();
+    corrupt_events
+        .lock()
+        .expect("lock corrupt upload progress events")
+        .clear();
+    proxy.configure(
+        StorageFaultTarget::BlockPut,
+        StorageFaultAction::CreateCorruptedThenReject,
+    );
+    proxy.clear_block_put_observations();
+    proxy.arm();
+    let corrupt_result =
+        stage_session_small_update(database, "FULL").and_then(|_| database.execute_batch("COMMIT"));
+    proxy.disarm();
+    let corrupt_error = corrupt_result.expect_err("mismatched existing bytes must fail staging");
+    assert_eq!(
+        corrupt_error.sqlite_error_code(),
+        Some(ffi::ErrorCode::DatabaseCorrupt),
+        "a valid CRC32C cannot make bytes with the wrong content ID reusable"
+    );
+    assert!(
+        matches!(
+            corrupt_server.first_storage_error(),
+            Some(failure)
+                if failure.phase == StorageFailurePhase::VerifyExistingBlock
+                    && failure.cause
+                        == StorageFailureCause::SqliteCode(ffi::SQLITE_CORRUPT)
+        ),
+        "a corrupt existing immutable object should report its terminal verification failure: {:?}",
+        corrupt_server.first_storage_error()
+    );
+    assert!(
+        proxy
+            .block_put_observations()
+            .iter()
+            .any(|observation| observation.injected_status == Some(412)),
+        "proxy should create a mismatching object then return a precondition failure"
+    );
+    let corrupt_progress = corrupt_events
+        .lock()
+        .expect("lock corrupt upload progress events");
+    assert!(
+        corrupt_progress.iter().all(|progress| {
+            progress.reused_blocks == baseline.reused_blocks
+                && progress.reused_bytes == baseline.reused_bytes
+        }),
+        "wrong existing bytes must not count as reuse: {corrupt_progress:?}"
+    );
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_plan_stays_incomplete_after_final_checkpoint_403() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let proxy = StorageFaultProxy::start(&endpoint);
+    let prefix = format!("{}/uri/upload-plan-denied/", unique_suffix());
+    let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+    let events = Arc::new(Mutex::new(Vec::<UploadProgress>::new()));
+    let callback_events = Arc::clone(&events);
+    let session_id = Uuid::new_v4().to_string();
+    let operation_id =
+        SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+            .expect("derive denied-plan operation ID");
+    let mut server =
+        start_uri_session_server_with_progress(&uri, &session_id, operation_id, move |progress| {
+            callback_events
+                .lock()
+                .expect("lock denied-plan upload progress events")
+                .push(progress);
+        })
+        .expect("start denied-plan URI session");
+    let database = server
+        .database_connection()
+        .expect("denied-plan session exposes its SQLite anchor");
+    configure_uri_session_test_cache_with(database, 64 * 1024 * 1024, 90);
+    database
+        .execute_batch("PRAGMA synchronous=OFF;")
+        .expect("disable automatic sync for the one-block fault fixture");
+    seed_uri_session_fault_data(database).expect("seed denied-plan database");
+    events.lock().expect("clear seed progress events").clear();
+    stage_session_small_update(database, "OFF").expect("stage one small dirty block");
+    database
+        .execute_batch("COMMIT")
+        .expect("finish the update without a producer sync");
+    let producer_events = events
+        .lock()
+        .expect("lock producer upload progress events")
+        .clone();
+    assert!(
+        producer_events
+            .iter()
+            .all(|progress| progress.expected.is_none()),
+        "the total must stay unknown before the final checkpoint: {producer_events:?}"
+    );
+    events
+        .lock()
+        .expect("clear producer progress events")
+        .clear();
+
+    proxy.configure(StorageFaultTarget::BlockPut, StorageFaultAction::Forbidden);
+    proxy.clear_block_put_observations();
+    proxy.arm();
+    let result = server.complete_request();
+    proxy.disarm();
+    let observations = proxy.block_put_observations();
+    let progress = events
+        .lock()
+        .expect("lock final-checkpoint upload progress events")
+        .clone();
+    assert!(
+        result.is_err(),
+        "a denied final-checkpoint block PUT must fail; matched={}; observations={observations:?}; progress={progress:?}",
+        proxy.matched()
+    );
+    assert!(
+        observations
+            .iter()
+            .any(|observation| observation.injected_status == Some(403)),
+        "the final checkpoint should attempt a block PUT after publishing its plan: {observations:?}"
+    );
+    let final_progress = *progress
+        .last()
+        .expect("the explicit checkpoint should report a plan before staging");
+    let plan = final_progress
+        .expected
+        .expect("the explicit checkpoint should provide a fixed total");
+    assert!(
+        plan.blocks > 0,
+        "the one-block fixture needs a nonempty plan"
+    );
+    assert!(
+        final_progress.uploaded_blocks + final_progress.reused_blocks < plan.blocks,
+        "a failed block transfer must remain below the fixed total: {final_progress:?}"
+    );
+    assert!(
+        matches!(
+            server.first_storage_error(),
+            Some(failure)
+                if failure.phase == StorageFailurePhase::StageBlockPut
+                    && failure.cause == StorageFailureCause::HttpStatus(403)
+        ),
+        "the terminal block denial should preserve its phase and status: {:?}",
+        server.first_storage_error()
+    );
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_records_terminal_checkpoint_and_accept_failures() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let proxy = StorageFaultProxy::start(&endpoint);
+
+    for (label, target, expected_phase) in [
+        (
+            "checkpoint",
+            StorageFaultTarget::XSyncCheckpoint,
+            StorageFailurePhase::SessionCheckpoint,
+        ),
+        (
+            "accept",
+            StorageFaultTarget::SessionHeadCas,
+            StorageFailurePhase::SessionAccept,
+        ),
+    ] {
+        let prefix = format!("{}/uri/storage-diagnostics-{label}/", unique_suffix());
+        let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+        let session_id = Uuid::new_v4().to_string();
+        let operation_id =
+            SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+                .expect("derive storage-diagnostics operation ID");
+        let mut server = start_uri_session_server(&uri, &session_id, operation_id)
+            .unwrap_or_else(|error| panic!("start {label} diagnostic session: {error:?}"));
+        let database = server
+            .database_connection()
+            .unwrap_or_else(|| panic!("{label} diagnostic session has no SQLite anchor"));
+        configure_uri_session_test_cache_with(database, 64 * 1024 * 1024, 90);
+        database
+            .execute_batch("PRAGMA synchronous=OFF;")
+            .unwrap_or_else(|error| panic!("disable automatic {label} checkpoint: {error:?}"));
+        seed_uri_session_fault_data(database)
+            .unwrap_or_else(|error| panic!("seed {label} diagnostic database: {error:?}"));
+        stage_session_small_update(database, "OFF")
+            .unwrap_or_else(|error| panic!("stage {label} diagnostic data: {error:?}"));
+        database
+            .execute_batch("COMMIT")
+            .unwrap_or_else(|error| panic!("commit {label} diagnostic update: {error:?}"));
+
+        proxy.configure(target, StorageFaultAction::Forbidden);
+        proxy.arm();
+        let result = server.complete_request();
+        proxy.disarm();
+        assert!(
+            result.is_err(),
+            "the injected {label} storage failure should fail completion"
+        );
+        assert_eq!(
+            proxy.faulted(),
+            1,
+            "the proxy should inject one {label} failure"
+        );
+        assert!(
+            matches!(
+                server.first_storage_error(),
+                Some(failure)
+                    if failure.phase == expected_phase
+                        && failure.cause == StorageFailureCause::HttpStatus(403)
+            ),
+            "the {label} failure should retain its typed storage phase and HTTP status: {:?}",
+            server.first_storage_error()
+        );
+        let _ = server.close();
+    }
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_rotates_credentials_during_one_checkpoint_batch() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let proxy = StorageFaultProxy::start(&endpoint);
+    let prefix = format!("{}/uri/credential-rotation/", unique_suffix());
+    let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+    let request_tokens = Arc::new(AtomicUsize::new(0));
+    let callback_tokens = Arc::clone(&request_tokens);
+    let session_id = Uuid::new_v4().to_string();
+    let operation_id =
+        SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+            .expect("derive credential-rotation operation ID");
+    let mut server = start_uri_session_server_with_auth(
+        &uri,
+        &session_id,
+        operation_id,
+        move |_, _, _, reason| match reason {
+            AuthRefreshReason::Request => Ok(format!(
+                "rotating-token-{}",
+                callback_tokens.fetch_add(1, Ordering::AcqRel)
+            )),
+            AuthRefreshReason::Unauthorized => Err(AuthError(
+                "unexpected emulator rejection during proactive token rotation".into(),
+            )),
+        },
+    )
+    .expect("start credential-rotation URI session");
+    let database = server
+        .database_connection()
+        .expect("URI session exposes its SQLite anchor");
+    seed_uri_session_fault_data(database).expect("seed credential-rotation database");
+    stage_session_update(database).expect("stage several block uploads in one checkpoint");
+
+    proxy.clear_block_put_observations();
+    server
+        .complete_request()
+        .expect("checkpoint data while request tokens rotate");
+    let observations = proxy.block_put_observations();
+    assert!(
+        observations.len() >= 2,
+        "large checkpoint should dispatch multiple block uploads: {observations:?}"
+    );
+    let tokens = observations
+        .iter()
+        .filter_map(|observation| observation.authorization.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        tokens.len() >= 2,
+        "multiple block PUTs in one open VFS should use refreshed bearer values: {observations:?}"
+    );
+    assert!(
+        observations.iter().all(|observation| {
+            observation.google_crc32c.as_deref()
+                == Some(format!("crc32c={}", observation.payload_crc32c).as_str())
+        }),
+        "each retried storage request should carry a checksum for its full block body"
+    );
+    let blocks_prefix = format!("{prefix}blocks/");
+    let accepted_blocks =
+        google_object_names(&list_google_objects(&endpoint, bucket, &blocks_prefix));
+    assert!(
+        accepted_blocks.len() >= 2,
+        "the checkpoint should map several complete block objects: {accepted_blocks:?}"
+    );
+
+    server
+        .close()
+        .expect("close after the accepted checkpoint without publishing it");
+    proxy.disarm();
+    let resumed_callback_tokens = Arc::clone(&request_tokens);
+    let resumed = start_uri_session_server_with_auth(
+        &uri,
+        &session_id,
+        operation_id,
+        move |_, _, _, reason| match reason {
+            AuthRefreshReason::Request => Ok(format!(
+                "resumed-token-{}",
+                resumed_callback_tokens.fetch_add(1, Ordering::AcqRel)
+            )),
+            AuthRefreshReason::Unauthorized => Err(AuthError(
+                "unexpected emulator rejection while resuming accepted checkpoint".into(),
+            )),
+        },
+    )
+    .expect("reattach the accepted checkpoint with a renewed provider");
+    assert_eq!(
+        resumed
+            .operation_status()
+            .expect("read resumed operation status"),
+        SessionOperationStatus::Accepted
+    );
+    let resumed_database = resumed
+        .database_connection()
+        .expect("resumed server exposes accepted database");
+    let accepted_rows: i64 = resumed_database
+        .query_row("SELECT count(*) FROM fault_data", [], |row| row.get(0))
+        .expect("read accepted checkpoint before final publication");
+    assert_eq!(accepted_rows, 5_500);
+    assert_eq!(
+        accepted_blocks,
+        google_object_names(&list_google_objects(&endpoint, bucket, &blocks_prefix)),
+        "reattaching an accepted session must reuse its complete immutable blocks"
+    );
+    let mut resumed = resumed;
+    resumed
+        .upload()
+        .expect("publish the resumed accepted checkpoint");
+    resumed
+        .close()
+        .expect("close the resumed published URI session");
+    let readonly_flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let published = Connection::open_with_flags(&uri, readonly_flags)
+        .expect("reopen the database after the live credential changes");
+    let row_count: i64 = published
+        .query_row("SELECT count(*) FROM fault_data", [], |row| row.get(0))
+        .expect("read all checkpointed rows after publication");
+    assert_eq!(row_count, 5_500);
+    published
+        .close()
+        .expect("close the published credential-rotation reader");
+}
+
+#[cfg(feature = "remote")]
+struct SessionPublicationSnapshot {
+    endpoint: String,
+    bucket: String,
+    manifest_name: String,
+    head_name: String,
+    manifest: Vec<u8>,
+    head: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "remote")]
+fn spawn_staging_visibility_probe(
+    state: Arc<BlockPutConcurrencyState>,
+    snapshot: SessionPublicationSnapshot,
+    progress_events: Option<Arc<Mutex<Vec<UploadProgress>>>>,
+    expected_active_puts: usize,
+) -> thread::JoinHandle<Result<(), String>> {
+    thread::spawn(move || {
+        if !state.wait_for_active(expected_active_puts, Duration::from_secs(6)) {
+            let active = state.active.load(Ordering::Acquire);
+            let high_water = state.high_water.load(Ordering::Acquire);
+            state.release();
+            return Err(format!(
+                "only {active} block PUTs became active; expected {expected_active_puts}, high-water={high_water}"
+            ));
+        }
+        if let Some(events) = progress_events {
+            if expected_active_puts > 1 {
+                state.release_first();
+                let deadline = Instant::now() + Duration::from_secs(6);
+                let mut observed_progress_with_sibling = false;
+                while Instant::now() < deadline {
+                    let acknowledged = events
+                        .lock()
+                        .expect("lock in-flight upload progress events")
+                        .iter()
+                        .any(|progress| progress.uploaded_blocks + progress.reused_blocks > 0);
+                    let active = state.active.load(Ordering::Acquire);
+                    if acknowledged && active >= expected_active_puts - 1 {
+                        observed_progress_with_sibling = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                if !observed_progress_with_sibling {
+                    let active = state.active.load(Ordering::Acquire);
+                    state.release();
+                    return Err(format!(
+                        "no completed-block progress arrived while a sibling PUT remained in flight; active={active}, events={:?}",
+                        events.lock().expect("lock final in-flight upload progress").as_slice()
+                    ));
+                }
+            }
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let manifest = fetch_google_object(
+                &snapshot.endpoint,
+                &snapshot.bucket,
+                &snapshot.manifest_name,
+            );
+            if manifest != snapshot.manifest {
+                return Err("published manifest changed before block PUTs finished".to_owned());
+            }
+            let head = session_object_exists(
+                "google",
+                &snapshot.endpoint,
+                &snapshot.bucket,
+                &snapshot.head_name,
+            )
+            .then(|| {
+                fetch_google_object(&snapshot.endpoint, &snapshot.bucket, &snapshot.head_name)
+            });
+            if head != snapshot.head {
+                return Err("accepted session head changed before block PUTs finished".to_owned());
+            }
+            Ok(())
+        }));
+        state.release();
+        match result {
+            Ok(result) => result,
+            Err(_) => Err("object-store visibility probe panicked".to_owned()),
+        }
+    })
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_ordinary_upload_accepts_maximum_request_count() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let prefix = format!("{}/uri/maximum-request-count/", unique_suffix());
+    let uri = format!(
+        "gcs://{bucket}/{prefix}?vfs=blockcachevfs&project=test-project&access_token=test-token&endpoint={endpoint}&database=default.db&request_count=2147483647"
+    );
+    let database = Connection::open(&uri).expect("open ordinary GCS VFS at maximum request_count");
+    database
+        .execute_batch(
+            "CREATE TABLE upload_probe(value TEXT NOT NULL);
+             INSERT INTO upload_probe VALUES('published');",
+        )
+        .expect("write a small database through the ordinary VFS upload path");
+    database
+        .upload()
+        .expect("publish ordinary VFS upload with maximum request_count");
+    database
+        .close()
+        .unwrap_or_else(|(_, error)| panic!("close maximum-request-count database: {error}"));
+
+    let published = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("reopen the ordinary GCS VFS database");
+    let value: String = published
+        .query_row("SELECT value FROM upload_probe", [], |row| row.get(0))
+        .expect("read the published value through a fresh VFS connection");
+    assert_eq!(value, "published");
+    published
+        .close()
+        .unwrap_or_else(|(_, error)| panic!("close maximum-request-count reader: {error}"));
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_bounds_parallel_block_staging_and_recovers_failed_batch() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+
+    for request_count in [1_u32, 3] {
+        let proxy = ConcurrentBlockPutProxy::start(&endpoint);
+        let prefix = format!(
+            "{}/uri/parallel-checkpoint-{request_count}/",
+            unique_suffix()
+        );
+        let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+        let session_id = Uuid::new_v4().to_string();
+        let operation_id =
+            SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+                .expect("derive parallel-checkpoint operation ID");
+        let progress_events = Arc::new(Mutex::new(Vec::<UploadProgress>::new()));
+        let callback_events = Arc::clone(&progress_events);
+        let mut server = start_uri_session_server_with_request_count_and_progress(
+            &uri,
+            &session_id,
+            operation_id,
+            request_count,
+            move |progress| {
+                callback_events
+                    .lock()
+                    .expect("lock parallel-checkpoint progress")
+                    .push(progress);
+            },
+        )
+        .expect("start bounded-concurrency URI session");
+        let database = server
+            .database_connection()
+            .expect("session exposes its SQLite anchor");
+        configure_uri_session_test_cache_with(database, 64 * 1024 * 1024, 90);
+        seed_uri_session_fault_data(database).expect("seed bounded-concurrency database");
+        stage_session_update(database).expect("stage several blocks before checkpoint");
+        progress_events
+            .lock()
+            .expect("lock pre-checkpoint progress")
+            .clear();
+        proxy.arm_held_block_puts();
+
+        let manifest_name = format!("{prefix}manifest.bcv");
+        let checkpoint_prefix = format!("{prefix}bcv-session/v1/checkpoint/{session_id}/");
+        let head_name = format!("{prefix}bcv-session/v1/head/{session_id}.bcv");
+        let original_manifest = fetch_google_object(&endpoint, bucket, &manifest_name);
+        let original_head = session_object_exists("google", &endpoint, bucket, &head_name)
+            .then(|| fetch_google_object(&endpoint, bucket, &head_name));
+        let snapshot = SessionPublicationSnapshot {
+            endpoint: endpoint.clone(),
+            bucket: bucket.to_owned(),
+            manifest_name: manifest_name.clone(),
+            head_name: head_name.clone(),
+            manifest: original_manifest.clone(),
+            head: original_head.clone(),
+        };
+        let probe = spawn_staging_visibility_probe(
+            proxy.state(),
+            snapshot,
+            Some(Arc::clone(&progress_events)),
+            request_count as usize,
+        );
+        server
+            .complete_request()
+            .unwrap_or_else(|error| panic!("checkpoint request_count={request_count}: {error:?}"));
+        probe
+            .join()
+            .expect("visibility probe thread must not panic")
+            .unwrap_or_else(|message| panic!("request_count={request_count}: {message}"));
+
+        assert_eq!(proxy.state.active.load(Ordering::Acquire), 0);
+        assert_eq!(proxy.state.timed_out.load(Ordering::Acquire), 0);
+        let high_water = proxy.state.high_water.load(Ordering::Acquire);
+        assert_eq!(
+            high_water, request_count as usize,
+            "request_count={request_count} should determine simultaneous block PUTs"
+        );
+        assert!(
+            high_water <= request_count as usize,
+            "block PUT concurrency exceeded request_count={request_count}: {high_water}"
+        );
+        let observations = proxy
+            .state
+            .observations
+            .lock()
+            .expect("lock concurrent block PUT observations")
+            .clone();
+        assert!(
+            observations.len() >= request_count as usize,
+            "checkpoint should stage at least request_count blocks: {observations:?}"
+        );
+        assert!(
+            observations.iter().all(|observation| {
+                observation.if_generation_match.as_deref() == Some("0")
+                    && observation.google_crc32c.as_deref()
+                        == Some(format!("crc32c={}", observation.payload_crc32c).as_str())
+            }),
+            "parallel writes must remain create-only and carry full-payload checksums: {observations:?}"
+        );
+        assert_eq!(
+            fetch_google_object(&endpoint, bucket, &manifest_name),
+            original_manifest,
+            "accepted staging must not publish the manifest"
+        );
+        assert_ne!(
+            Some(fetch_google_object(&endpoint, bucket, &head_name)),
+            original_head,
+            "completed staging should advance the accepted session head"
+        );
+        assert!(
+            !google_object_names(&list_google_objects(&endpoint, bucket, &checkpoint_prefix))
+                .is_empty(),
+            "checkpoint should become visible after all block PUTs succeed"
+        );
+        assert_eq!(
+            server
+                .operation_status()
+                .expect("read staged operation status"),
+            SessionOperationStatus::Accepted
+        );
+        let final_progress = *progress_events
+            .lock()
+            .expect("lock final bounded-concurrency progress")
+            .last()
+            .expect("block acknowledgements should report progress");
+        let plan = final_progress
+            .expected
+            .expect("the explicit session checkpoint should publish a fixed plan");
+        assert_eq!(
+            plan.blocks,
+            final_progress.uploaded_blocks + final_progress.reused_blocks
+        );
+        assert_eq!(
+            plan.bytes,
+            final_progress.uploaded_bytes + final_progress.reused_bytes
+        );
+        server.upload().expect("publish bounded staged session");
+        server.close().expect("close published concurrency session");
+
+        let published = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("open published bounded-concurrency database");
+        let row_count: i64 = published
+            .query_row("SELECT count(*) FROM fault_data", [], |row| row.get(0))
+            .expect("read rows after bounded-concurrency publication");
+        let last_value: String = published
+            .query_row("SELECT value FROM fault_data WHERE id = 5_500", [], |row| {
+                row.get(0)
+            })
+            .expect("read final row after bounded-concurrency publication");
+        assert_eq!(row_count, 5_500);
+        assert_eq!(last_value, deterministic_payload(5_500, 2_048));
+        published
+            .close()
+            .expect("close published concurrency reader");
+    }
+
+    let proxy = ConcurrentBlockPutProxy::start(&endpoint);
+    let prefix = format!("{}/uri/parallel-checkpoint-failure/", unique_suffix());
+    let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+    let session_id = Uuid::new_v4().to_string();
+    let operation_id =
+        SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+            .expect("derive failed-batch operation ID");
+    let mut server = start_uri_session_server_with_request_count_and_progress(
+        &uri,
+        &session_id,
+        operation_id,
+        3,
+        |_| {},
+    )
+    .expect("start failure-injection URI session");
+    let database = server
+        .database_connection()
+        .expect("failure session exposes its SQLite anchor");
+    configure_uri_session_test_cache_with(database, 64 * 1024 * 1024, 90);
+    seed_uri_session_fault_data(database).expect("seed failure-injection database");
+    stage_session_update(database).expect("stage failure-injection database update");
+    proxy.arm_held_block_puts();
+
+    let manifest_name = format!("{prefix}manifest.bcv");
+    let head_name = format!("{prefix}bcv-session/v1/head/{session_id}.bcv");
+    let original_manifest = fetch_google_object(&endpoint, bucket, &manifest_name);
+    let original_head = session_object_exists("google", &endpoint, bucket, &head_name)
+        .then(|| fetch_google_object(&endpoint, bucket, &head_name));
+    let snapshot = SessionPublicationSnapshot {
+        endpoint: endpoint.clone(),
+        bucket: bucket.to_owned(),
+        manifest_name: manifest_name.clone(),
+        head_name: head_name.clone(),
+        manifest: original_manifest.clone(),
+        head: original_head.clone(),
+    };
+    proxy.fail_next_block_put();
+    let probe = spawn_staging_visibility_probe(proxy.state(), snapshot, None, 3);
+    let checkpoint_error = server
+        .complete_request()
+        .expect_err("one failed block PUT must fail the checkpoint");
+    probe
+        .join()
+        .expect("failure visibility probe thread must not panic")
+        .expect("manifest and checkpoint must stay private while block PUTs are held");
+    assert!(
+        matches!(
+            server.first_storage_error(),
+            Some(failure)
+                if failure.phase == StorageFailurePhase::StageBlockPut
+                    && failure.cause == StorageFailureCause::HttpStatus(403)
+        ),
+        "failed batch should retain typed block PUT status: {:?}; checkpoint error={checkpoint_error:?}",
+        server.first_storage_error()
+    );
+    assert_eq!(
+        proxy.state.active.load(Ordering::Acquire),
+        0,
+        "checkpoint error must wait for every in-flight PUT to drain"
+    );
+    assert_eq!(proxy.state.rejected.load(Ordering::Acquire), 1);
+    assert!(
+        proxy.state.successful.load(Ordering::Acquire) >= 2,
+        "other in-flight PUTs should succeed before the error returns"
+    );
+    assert_eq!(proxy.state.high_water.load(Ordering::Acquire), 3);
+    assert_eq!(
+        fetch_google_object(&endpoint, bucket, &manifest_name),
+        original_manifest,
+        "a partial batch failure must not publish the manifest"
+    );
+    assert_eq!(
+        session_object_exists("google", &endpoint, bucket, &head_name)
+            .then(|| fetch_google_object(&endpoint, bucket, &head_name)),
+        original_head,
+        "a partial batch failure must not advance the accepted session head"
+    );
+
+    let first_batch = proxy
+        .state
+        .observations
+        .lock()
+        .expect("lock first failed-batch observations")
+        .clone();
+    let failed_object = first_batch
+        .iter()
+        .find(|observation| observation.injected_status == Some(403))
+        .expect("the failed batch should identify its rejected immutable block")
+        .object
+        .clone();
+    let successful_objects = first_batch
+        .iter()
+        .filter(|observation| observation.injected_status.is_none())
+        .map(|observation| observation.object.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let before_retry_count = first_batch.len();
+    server
+        .complete_request()
+        .expect("retry should reuse immutable successes and stage the failed block");
+    let all_observations = proxy
+        .state
+        .observations
+        .lock()
+        .expect("lock observations after retry")
+        .clone();
+    let retry_observations = &all_observations[before_retry_count..];
+    assert!(
+        retry_observations
+            .iter()
+            .all(|observation| !successful_objects.contains(&observation.object)),
+        "durably acknowledged blocks must not be uploaded again on retry: {retry_observations:?}"
+    );
+    assert!(
+        retry_observations
+            .iter()
+            .any(|observation| observation.object == failed_object),
+        "retry should resume the block whose PUT failed: {retry_observations:?}"
+    );
+    assert_ne!(
+        Some(fetch_google_object(&endpoint, bucket, &head_name)),
+        original_head,
+        "retry should accept the checkpoint after all blocks are available"
+    );
+    assert_eq!(
+        fetch_google_object(&endpoint, bucket, &manifest_name),
+        original_manifest,
+        "a successful retry checkpoint must remain unpublished"
+    );
+    server.upload().expect("publish retried session");
+    server.close().expect("close retried published session");
+    let published = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open database after retry publication");
+    let row_count: i64 = published
+        .query_row("SELECT count(*) FROM fault_data", [], |row| row.get(0))
+        .expect("read rows after retry publication");
+    assert_eq!(row_count, 5_500);
+    published
+        .close()
+        .expect("close database after retry publication");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_retries_the_same_block_after_401_and_403() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let proxy = StorageFaultProxy::start(&endpoint);
+
+    for (status, action) in [
+        (401, StorageFaultAction::Unauthorized),
+        (403, StorageFaultAction::Forbidden),
+    ] {
+        let prefix = format!("{}/uri/credential-renewal-{status}/", unique_suffix());
+        let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+        let was_refreshed = Arc::new(AtomicBool::new(false));
+        let callback_was_refreshed = Arc::clone(&was_refreshed);
+        let unauthorized_calls = Arc::new(AtomicUsize::new(0));
+        let callback_unauthorized_calls = Arc::clone(&unauthorized_calls);
+        let session_id = Uuid::new_v4().to_string();
+        let mut server = start_uri_session_server_with_auth(
+            &uri,
+            &session_id,
+            SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+                .expect("derive credential-renewal operation ID"),
+            move |_, _, _, reason| match reason {
+                AuthRefreshReason::Request => {
+                    Ok(if callback_was_refreshed.load(Ordering::Acquire) {
+                        format!("fresh-token-{status}")
+                    } else {
+                        format!("expired-token-{status}")
+                    })
+                }
+                AuthRefreshReason::Unauthorized => {
+                    callback_unauthorized_calls.fetch_add(1, Ordering::AcqRel);
+                    callback_was_refreshed.store(true, Ordering::Release);
+                    Ok(format!("fresh-token-{status}"))
+                }
+            },
+        )
+        .unwrap_or_else(|error| panic!("start URI session for HTTP {status}: {error:?}"));
+        let database = server
+            .database_connection()
+            .expect("URI session exposes its SQLite anchor");
+        seed_uri_session_fault_data(database)
+            .unwrap_or_else(|error| panic!("seed HTTP {status} retry database: {error:?}"));
+        stage_session_small_update(database, "FULL")
+            .unwrap_or_else(|error| panic!("stage HTTP {status} retry data: {error:?}"));
+        database
+            .execute_batch("COMMIT")
+            .unwrap_or_else(|error| panic!("commit HTTP {status} retry data: {error:?}"));
+
+        proxy.configure(StorageFaultTarget::BlockPut, action);
+        proxy.clear_block_put_observations();
+        proxy.arm();
+        server
+            .complete_request()
+            .unwrap_or_else(|error| panic!("renew after HTTP {status} and checkpoint: {error:?}"));
+        proxy.disarm();
+        let observations = proxy.block_put_observations();
+        let rejected = observations
+            .iter()
+            .find(|observation| observation.injected_status == Some(status))
+            .unwrap_or_else(|| panic!("proxy did not inject HTTP {status}: {observations:?}"));
+        let retry = observations
+            .iter()
+            .find(|observation| {
+                observation.injected_status.is_none()
+                    && observation.object == rejected.object
+                    && observation.if_generation_match == rejected.if_generation_match
+                    && observation.payload_bytes == rejected.payload_bytes
+                    && observation.payload_crc32c == rejected.payload_crc32c
+                    && observation.google_crc32c == rejected.google_crc32c
+            })
+            .unwrap_or_else(|| {
+                panic!("HTTP {status} retry did not resend the same full block: {observations:?}")
+            });
+        assert_ne!(
+            rejected.authorization, retry.authorization,
+            "the repeated object PUT must carry the renewed bearer token"
+        );
+        assert_eq!(
+            rejected.if_generation_match.as_deref(),
+            Some("0"),
+            "the retried block must retain its create-only generation precondition"
+        );
+        assert_eq!(
+            unauthorized_calls.load(Ordering::Acquire),
+            1,
+            "one injected HTTP {status} should request one forced renewal"
+        );
+
+        server
+            .upload()
+            .unwrap_or_else(|error| panic!("publish HTTP {status} accepted checkpoint: {error:?}"));
+        server
+            .close()
+            .unwrap_or_else(|error| panic!("close HTTP {status} URI session: {error:?}"));
+        let readonly_flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let published = Connection::open_with_flags(&uri, readonly_flags)
+            .unwrap_or_else(|error| panic!("reopen HTTP {status} database: {error:?}"));
+        let row_count: i64 = published
+            .query_row("SELECT count(*) FROM fault_data", [], |row| row.get(0))
+            .unwrap_or_else(|error| panic!("read HTTP {status} published rows: {error:?}"));
+        assert_eq!(row_count, 2);
+        published
+            .close()
+            .unwrap_or_else(|error| panic!("close HTTP {status} database reader: {error:?}"));
+    }
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_bounds_retries_when_credentials_are_permanently_denied() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let proxy = StorageFaultProxy::start(&endpoint);
+    let prefix = format!("{}/uri/credential-denied/", unique_suffix());
+    let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+    let request_calls = Arc::new(AtomicUsize::new(0));
+    let callback_request_calls = Arc::clone(&request_calls);
+    let unauthorized_calls = Arc::new(AtomicUsize::new(0));
+    let callback_unauthorized_calls = Arc::clone(&unauthorized_calls);
+    let session_id = Uuid::new_v4().to_string();
+    let mut server = start_uri_session_server_with_auth(
+        &uri,
+        &session_id,
+        SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+            .expect("derive denied-credentials operation ID"),
+        move |_, _, _, reason| match reason {
+            AuthRefreshReason::Request => Ok(format!(
+                "still-denied-request-token-{}",
+                callback_request_calls.fetch_add(1, Ordering::AcqRel)
+            )),
+            AuthRefreshReason::Unauthorized => {
+                let refresh = callback_unauthorized_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(format!("still-denied-refresh-token-{refresh}"))
+            }
+        },
+    )
+    .expect("start permanently denied URI session");
+    let database = server
+        .database_connection()
+        .expect("URI session exposes its SQLite anchor");
+    seed_uri_session_fault_data(database).expect("seed permanently denied database");
+    stage_session_small_update(database, "FULL").expect("stage permanently denied update");
+    database
+        .execute_batch("COMMIT")
+        .expect("commit permanently denied update");
+
+    proxy.configure(
+        StorageFaultTarget::BlockPut,
+        StorageFaultAction::AlwaysForbidden,
+    );
+    proxy.clear_block_put_observations();
+    proxy.arm();
+    let error = server
+        .complete_request()
+        .expect_err("a permanently denied GCS block upload must fail");
+    let observations = proxy.block_put_observations();
+    assert!(!observations.is_empty(), "no block PUT reached the proxy");
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.injected_status == Some(403)),
+        "the proxy should deny every matching block PUT: {observations:?}"
+    );
+    let refresh_count = unauthorized_calls.load(Ordering::Acquire);
+    let request_attempts = observations
+        .iter()
+        .filter(|observation| {
+            observation
+                .authorization
+                .as_deref()
+                .is_some_and(|token| token.starts_with("Bearer still-denied-request-token-"))
+        })
+        .count();
+    let renewed_attempts = observations
+        .iter()
+        .filter(|observation| {
+            observation
+                .authorization
+                .as_deref()
+                .is_some_and(|token| token.starts_with("Bearer still-denied-refresh-token-"))
+        })
+        .count();
+    assert!(
+        request_attempts == refresh_count && renewed_attempts == refresh_count,
+        "each denied request should get one forced refresh and one replay only: refreshes={refresh_count} observations={observations:?}"
+    );
+    assert!(
+        observations.len() == refresh_count * 2,
+        "persistent denial should stop after one replay per cloud request: refreshes={refresh_count} observations={observations:?}"
+    );
+    assert!(!error.to_string().contains("still-denied-request-token"));
+    assert!(!format!("{error:?}").contains("still-denied-request-token"));
+    assert!(!error.to_string().contains("still-denied-refresh-token"));
+    assert!(!format!("{error:?}").contains("still-denied-refresh-token"));
 }

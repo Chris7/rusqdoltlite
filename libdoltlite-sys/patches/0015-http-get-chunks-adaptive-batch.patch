@@ -1,0 +1,117 @@
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -565861,21 +565861,34 @@
+ 
+ /* POST hashes to /get-chunks; reply is per-hash [u32be len][bytes],
+ ** 0xFFFFFFFF if absent. */
+-static int httpGetChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
+-                         int nHash, u8 **apData, int *anData){
+-  HttpRemote *p = (HttpRemote*)pRemote;
++static int httpGetChunksRequest(
++  HttpRemote *p,
++  const ProllyHash *aHash,
++  int nHash,
++  u8 **apData,
++  int *anData,
++  int *pbTooBig
++){
+   char *zPath;
+   u8 *pReq = 0;
+   u8 *pResp = 0;
+   int nResp = 0;
+   int status = 0;
++  int nReq;
+   int rc;
+   int i;
+ 
++  *pbTooBig = 0;
+   for(i=0; i<nHash; i++){ apData[i] = 0; anData[i] = 0; }
+   if( nHash <= 0 ) return SQLITE_OK;
+ 
+-  pReq = sqlite3_malloc(nHash * PROLLY_HASH_SIZE);
++  /* Keep one request body within the public server's fixed request limit. */
++  if( (i64)nHash > HTTP_RESP_MAX_BYTES / PROLLY_HASH_SIZE ){
++    *pbTooBig = 1;
++    return SQLITE_TOOBIG;
++  }
++  nReq = nHash * PROLLY_HASH_SIZE;
++  pReq = sqlite3_malloc(nReq);
+   if( !pReq ) return SQLITE_NOMEM;
+   for(i=0; i<nHash; i++){
+     memcpy(pReq + (i * PROLLY_HASH_SIZE), aHash[i].data, PROLLY_HASH_SIZE);
+@@ -565884,19 +565897,72 @@
+   zPath = buildPath(p, "/get-chunks");
+   if( !zPath ){ sqlite3_free(pReq); return SQLITE_NOMEM; }
+ 
+-  rc = httpRequest(p, "POST", zPath, pReq, nHash * PROLLY_HASH_SIZE,
++  rc = httpRequest(p, "POST", zPath, pReq, nReq,
+                    &status, &pResp, &nResp);
+   sqlite3_free(zPath);
+   sqlite3_free(pReq);
+-  if( rc != SQLITE_OK ){ sqlite3_free(pResp); return rc; }
++  if( rc != SQLITE_OK ){
++    if( rc==SQLITE_TOOBIG ) *pbTooBig = 1;
++    sqlite3_free(pResp);
++    return rc;
++  }
+   if( status != 200 ){
++    *pbTooBig = status==413;
+     rc = httpMapError(p, status, pResp, nResp);
+     sqlite3_free(pResp);
+     return rc;
+   }
+   rc = httpParseChunkBatch(pResp, nResp, nHash, apData, anData);
+   sqlite3_free(pResp);
+-  return rc;   /* caller frees apData[i] set before an error */
++  return rc;
++}
++
++/* Oversized aggregate replies are retried as smaller hash ranges. Every
++** request remains bounded, and data is written into the caller's original
++** result slots so the reply order remains unchanged. */
++static int httpGetChunksRange(
++  HttpRemote *p,
++  const ProllyHash *aHash,
++  int nHash,
++  u8 **apData,
++  int *anData
++){
++  int bTooBig = 0;
++  int rc;
++
++  rc = httpGetChunksRequest(p, aHash, nHash, apData, anData, &bTooBig);
++  if( rc!=SQLITE_TOOBIG || !bTooBig || nHash<=1 ) return rc;
++
++  {
++    int nFirst = nHash / 2;
++    rc = httpGetChunksRange(p, aHash, nFirst, apData, anData);
++    if( rc==SQLITE_OK ){
++      rc = httpGetChunksRange(p, aHash+nFirst, nHash-nFirst,
++                              apData+nFirst, anData+nFirst);
++    }
++  }
++  return rc;
++}
++
++static int httpGetChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
++                         int nHash, u8 **apData, int *anData){
++  HttpRemote *p = (HttpRemote*)pRemote;
++  int rc;
++  int i;
++
++  for(i=0; i<nHash; i++){ apData[i] = 0; anData[i] = 0; }
++  if( nHash <= 0 ) return SQLITE_OK;
++
++  rc = httpGetChunksRange(p, aHash, nHash, apData, anData);
++  if( rc!=SQLITE_OK ){
++    /* Free successful sub-batch outputs before returning an error. */
++    for(i=0; i<nHash; i++){
++      sqlite3_free(apData[i]);
++      apData[i] = 0;
++      anData[i] = 0;
++    }
++  }
++  return rc;
+ }
+ 
+ static int httpGetRefs(DoltliteRemote *pRemote, u8 **ppData, int *pnData){

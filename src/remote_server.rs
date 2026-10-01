@@ -2,8 +2,9 @@
 
 #[cfg(feature = "blockcachevfs")]
 use crate::blockcachevfs::{
-    session_alias, AttachSpec, BlockCacheVfs, SessionAttachment, SessionOperationId,
-    SessionOperationStatus, UriSessionContext,
+    session_alias, AttachSpec, AuthError, AuthRefreshCallback, AuthRefreshReason, BlockCacheVfs,
+    SessionAttachment, SessionOperationId, SessionOperationStatus, StorageFailure,
+    StorageFailureSlot, UploadProgressCallback, UriSessionContext,
 };
 use crate::error::error_from_sqlite_code;
 use crate::{ffi, path_to_cstring, Result};
@@ -15,10 +16,14 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
+#[cfg(feature = "blockcachevfs")]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "blockcachevfs")]
 const SQLITE_OPEN_DOLTLITE_NO_SEED: i32 = 0x0080_0000;
+
+const SESSION_LOOPBACK_HTTP_IDLE_TIMEOUT_MS: u32 = 5 * 60 * 1000;
 
 fn cloud_database_uri(path: &Path) -> Option<&str> {
     path.to_str()
@@ -183,6 +188,9 @@ pub struct BlockCacheSessionOptions {
     session_id: crate::blockcachevfs::SessionId,
     scope: SessionScope,
     operation_id: SessionOperationId,
+    auth_refresh: Option<Arc<AuthRefreshCallback>>,
+    upload_progress: Option<Arc<UploadProgressCallback>>,
+    request_count: Option<u32>,
 }
 
 #[cfg(feature = "blockcachevfs")]
@@ -208,6 +216,12 @@ impl fmt::Debug for BlockCacheSessionOptions {
             .field("session_id", &self.session_id)
             .field("scope", &self.scope)
             .field("operation_id", &self.operation_id)
+            .field("request_count", &self.request_count)
+            .field("auth_callback_configured", &self.auth_refresh.is_some())
+            .field(
+                "upload_progress_callback_configured",
+                &self.upload_progress.is_some(),
+            )
             .finish()
     }
 }
@@ -240,6 +254,9 @@ impl BlockCacheSessionOptions {
             session_id,
             scope,
             operation_id,
+            auth_refresh: None,
+            upload_progress: None,
+            request_count: None,
         })
     }
 
@@ -269,7 +286,121 @@ impl BlockCacheSessionOptions {
             session_id: crate::blockcachevfs::SessionId::new(session_id)?,
             scope,
             operation_id,
+            auth_refresh: None,
+            upload_progress: None,
+            request_count: None,
         })
+    }
+
+    /// Set the upper bound on simultaneous block uploads for this URI-owned
+    /// session. When both this option and the URI's `request_count` query
+    /// parameter are set, this explicit option takes precedence. The native
+    /// VFS may use fewer requests to stay within its cache and staging-buffer
+    /// limits. Values outside `1..=i32::MAX` are rejected before opening the
+    /// cloud database. This option is supported only for URI-backed sessions;
+    /// static VFS sessions configure the shared VFS with
+    /// [`crate::blockcachevfs::Config::RequestCount`] when it is built.
+    #[must_use]
+    pub fn request_count(mut self, request_count: u32) -> Self {
+        self.request_count = Some(request_count);
+        self
+    }
+
+    /// Supply credentials for a session-owned Google Cloud Storage URI.
+    ///
+    /// The callback runs once while the URI-owned VFS attaches its storage
+    /// container, before each cloud request, and again after an authorization
+    /// failure. It should return the current token for the requested storage
+    /// identity. This keeps credentials out of the server loop and lets an
+    /// open database continue after a short-lived token expires. The callback
+    /// is supported only by [`Self::for_uri`] with a GCS URI; using it with a
+    /// static VFS session or S3 URI causes server startup to fail.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rusqlite::blockcachevfs::AuthRefreshReason;
+    /// use rusqlite::{BlockCacheSessionOptions, SessionOperationId, SessionScope};
+    ///
+    /// # fn main() -> rusqlite::Result<()> {
+    /// let scope = SessionScope::new("alice", "default.db", "read,write")?;
+    /// let operation = SessionOperationId::from_request("POST", "/default.db/commit", b"")?;
+    /// let session = BlockCacheSessionOptions::for_uri(
+    ///     "9c539f0e-3913-4875-9f93-23627c3c015d",
+    ///     scope,
+    ///     operation,
+    /// )?
+    /// .auth_callback(|_storage, _project, _container, reason| match reason {
+    ///     AuthRefreshReason::Request | AuthRefreshReason::Unauthorized => {
+    ///         Ok("current-access-token".to_owned())
+    ///     }
+    /// });
+    /// let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn auth_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, &str, &str, AuthRefreshReason) -> std::result::Result<String, AuthError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.auth_refresh = Some(Arc::new(callback));
+        self
+    }
+
+    /// Report cumulative, complete-block upload progress for this URI-owned VFS.
+    ///
+    /// The callback runs synchronously on the native upload thread after a
+    /// complete block PUT succeeds or an existing immutable block passes an
+    /// exact-byte check. It also reports a fixed `expected` plan after the
+    /// explicit final checkpoint has quiesced the WAL and counted remaining
+    /// dirty blocks. The plan includes already uploaded and verified-reused
+    /// blocks; its byte count is full block payload bytes, not predicted network
+    /// traffic, and excludes WAL, checkpoint, manifest, and other metadata
+    /// requests. `expected` stays `None` while DoltLite is producing data. A
+    /// complete block-work plan can reach 100% before the session manifest is
+    /// accepted or published. This can be the remote request thread or a thread
+    /// checkpointing the database. Do not re-enter this VFS or connection from
+    /// the callback. Panics are contained and never alter upload or publication
+    /// results. Keep the callback quick. This option is supported only for
+    /// URI-backed session options.
+    ///
+    /// ```
+    /// use rusqlite::blockcachevfs::UploadProgress;
+    /// use rusqlite::{BlockCacheSessionOptions, SessionOperationId, SessionScope};
+    ///
+    /// # fn main() -> rusqlite::Result<()> {
+    /// let scope = SessionScope::new("alice", "default.db", "push,read")?;
+    /// let operation = SessionOperationId::from_request("POST", "/default.db/commit", b"")?;
+    /// let session = BlockCacheSessionOptions::for_uri(
+    ///     "9c539f0e-3913-4875-9f93-23627c3c015d",
+    ///     scope,
+    ///     operation,
+    /// )?
+    /// .upload_progress_callback(|progress: UploadProgress| {
+    ///     eprintln!(
+    ///         "Uploaded {} blocks ({} bytes); reused {} blocks ({} bytes); plan {:?}",
+    ///         progress.uploaded_blocks,
+    ///         progress.uploaded_bytes,
+    ///         progress.reused_blocks,
+    ///         progress.reused_bytes,
+    ///         progress.expected,
+    ///     );
+    /// });
+    /// let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn upload_progress_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(crate::blockcachevfs::UploadProgress) + Send + Sync + 'static,
+    {
+        self.upload_progress = Some(Arc::new(callback));
+        self
     }
 
     /// Return the caller-authorized context carried by this payload.
@@ -296,6 +427,18 @@ impl BlockCacheSessionOptions {
     }
 
     fn attach(&self) -> Result<SessionAttachment> {
+        if self.auth_refresh.is_some() {
+            return Err(remote_server_error(
+                ffi::SQLITE_MISUSE,
+                "credential refresh callbacks require a session-owned GCS URI",
+            ));
+        }
+        if self.upload_progress.is_some() {
+            return Err(remote_server_error(
+                ffi::SQLITE_MISUSE,
+                "upload progress callbacks require a URI-backed session",
+            ));
+        }
         match &self.target {
             BlockCacheSessionTarget::Vfs {
                 vfs, attachment, ..
@@ -321,13 +464,17 @@ impl BlockCacheSessionOptions {
         }
     }
 
-    fn uri_context(&self) -> UriSessionContext {
+    fn uri_context(&self, storage_failure: StorageFailureSlot) -> UriSessionContext {
         UriSessionContext {
             session_id: self.session_id.clone(),
             principal: self.scope.principal().to_owned(),
             target_database: self.scope.target_database().to_owned(),
             operations: self.scope.operations().to_owned(),
             operation_id: self.operation_id,
+            request_count: self.request_count,
+            auth_refresh: self.auth_refresh.as_ref().map(Arc::clone),
+            upload_progress: self.upload_progress.as_ref().map(Arc::clone),
+            storage_failure,
         }
     }
 }
@@ -538,6 +685,19 @@ fn remote_server_error(code: c_int, message: &str) -> crate::Error {
     error_from_sqlite_code(code, Some(message.to_owned()))
 }
 
+fn remote_server_error_with_context(error: crate::Error, context: &str) -> crate::Error {
+    match error {
+        crate::Error::SqliteFailure(code, message) => crate::Error::SqliteFailure(
+            code,
+            Some(match message {
+                Some(message) => format!("{context}: {message}"),
+                None => context.to_owned(),
+            }),
+        ),
+        error => error,
+    }
+}
+
 #[cfg(feature = "blockcachevfs")]
 fn validate_session_directory(directory: &Path, session: &BlockCacheSessionOptions) -> Result<()> {
     let actual = directory.to_str().ok_or_else(|| {
@@ -590,10 +750,13 @@ pub struct RemoteServer {
     session: Option<SessionAttachment>,
     #[cfg(feature = "blockcachevfs")]
     database: Option<Connection>,
+    #[cfg(feature = "blockcachevfs")]
+    storage_failure: Option<StorageFailureSlot>,
     raw: Option<NonNull<ffi::DoltliteServer>>,
     scheme: &'static str,
     bind_address: String,
     port: u16,
+    session_loopback_transfer: bool,
 }
 
 impl RemoteServer {
@@ -655,7 +818,27 @@ impl RemoteServer {
         let directory_path = directory.as_ref();
         let cloud_uri = cloud_database_uri(directory_path);
         #[cfg(feature = "blockcachevfs")]
-        let (database, uri_directory, uri_vfs_name) = match cloud_uri {
+        if let Some(session) = options.blockcache_session.as_ref() {
+            if let Some(request_count) = session.request_count {
+                crate::blockcachevfs::validate_request_count(request_count)?;
+                if !session.is_uri() {
+                    return Err(remote_server_error(
+                        ffi::SQLITE_MISUSE,
+                        "request_count session options require a GCS or S3 database URI",
+                    ));
+                }
+            }
+        }
+        #[cfg(feature = "blockcachevfs")]
+        let session_loopback_transfer = cloud_uri.is_some()
+            && options
+                .blockcache_session
+                .as_ref()
+                .is_some_and(BlockCacheSessionOptions::is_uri);
+        #[cfg(not(feature = "blockcachevfs"))]
+        let session_loopback_transfer = false;
+        #[cfg(feature = "blockcachevfs")]
+        let (database, uri_directory, uri_vfs_name, storage_failure) = match cloud_uri {
             Some(uri) => {
                 if options.vfs_name.is_some() {
                     return Err(remote_server_error(
@@ -664,6 +847,7 @@ impl RemoteServer {
                     ));
                 }
                 let session = options.blockcache_session.as_ref();
+                let storage_failure = session.map(|_| Arc::new(Mutex::new(None)));
                 if let Some(session) = session {
                     if !session.is_uri() {
                         return Err(remote_server_error(
@@ -685,7 +869,11 @@ impl RemoteServer {
                     crate::blockcachevfs::open_connection_uri_with_session(
                         uri,
                         flags,
-                        session.uri_context(),
+                        session.uri_context(Arc::clone(
+                            storage_failure
+                                .as_ref()
+                                .expect("should have a storage-failure slot for a URI session"),
+                        )),
                     )?
                 } else {
                     Connection::open_with_flags(uri, flags)?
@@ -708,7 +896,12 @@ impl RemoteServer {
                         )
                     })?
                     .to_owned();
-                (Some(database), Some(directory), Some(vfs_name))
+                (
+                    Some(database),
+                    Some(directory),
+                    Some(vfs_name),
+                    storage_failure,
+                )
             }
             None => {
                 if options
@@ -721,7 +914,7 @@ impl RemoteServer {
                         "URI session options require a GCS or S3 database URI",
                     ));
                 }
-                (None, None, None)
+                (None, None, None, None)
             }
         };
         #[cfg(not(feature = "blockcachevfs"))]
@@ -844,6 +1037,7 @@ impl RemoteServer {
             zVfsName: vfs_name
                 .as_ref()
                 .map_or(ptr::null(), |value| value.as_ptr()),
+            bSessionLoopbackTransfer: c_int::from(session_loopback_transfer),
         };
         #[cfg(feature = "blockcachevfs")]
         let session = options
@@ -893,6 +1087,8 @@ impl RemoteServer {
             session,
             #[cfg(feature = "blockcachevfs")]
             database,
+            #[cfg(feature = "blockcachevfs")]
+            storage_failure,
             raw: Some(raw),
             scheme: if certificate_file.is_some() {
                 "https"
@@ -901,6 +1097,7 @@ impl RemoteServer {
             },
             bind_address: options.bind_address.clone(),
             port: actual_port,
+            session_loopback_transfer,
         })
     }
 
@@ -908,6 +1105,37 @@ impl RemoteServer {
     #[must_use]
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Returns the connection owned by a cloud-URI server.
+    ///
+    /// A caller can use this connection to inspect the URI database before
+    /// publication. It is available only while the URI connection's SQLite
+    /// handle remains open; [`Self::quiesce`], [`Self::stage_request`], and
+    /// [`Self::upload`] close that handle. Local-directory and static-VFS
+    /// servers return `None`.
+    #[cfg(feature = "blockcachevfs")]
+    #[must_use]
+    pub fn database_connection(&self) -> Option<&Connection> {
+        self.raw.as_ref()?;
+        self.database.as_ref()
+    }
+
+    /// Return the first terminal storage failure recorded by this server's
+    /// session-owned cloud VFS, if one was observed.
+    ///
+    /// The snapshot contains only an operation phase and a typed HTTP or
+    /// SQLite code. It never includes provider URLs, credentials, or response
+    /// bodies. This accessor applies only to session-owned cloud-URI servers;
+    /// other server forms return `None`. Read it before closing the server.
+    #[cfg(feature = "blockcachevfs")]
+    #[must_use]
+    pub fn first_storage_error(&self) -> Option<StorageFailure> {
+        self.storage_failure.as_ref().and_then(|slot| {
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
     }
 
     /// Stop accepting requests and wait for all native workers to finish.
@@ -980,8 +1208,12 @@ impl RemoteServer {
                 }
                 SessionOperationStatus::New => {}
             }
-            session.checkpoint()?;
-            session.accept()?;
+            session.checkpoint().map_err(|error| {
+                remote_server_error_with_context(error, "session checkpoint failed")
+            })?;
+            session.accept().map_err(|error| {
+                remote_server_error_with_context(error, "session acceptance failed")
+            })?;
             Ok(())
         }
         #[cfg(not(feature = "blockcachevfs"))]
@@ -989,6 +1221,44 @@ impl RemoteServer {
             Err(remote_server_error(
                 ffi::SQLITE_MISUSE,
                 "request completion requires the blockcachevfs feature",
+            ))
+        }
+    }
+
+    /// Quiesce and durably accept a URI-backed session operation without
+    /// publishing its manifest. A separate server can attach the same URI,
+    /// session UUID, scope, and operation ID, inspect the accepted database,
+    /// and publish it with [`Self::upload`].
+    ///
+    /// This method is restricted to session-owned cloud-URI servers. Use
+    /// [`Self::complete_request`] for the ordinary per-request boundary on a
+    /// local or static-VFS server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the server owns a session-scoped cloud URI, or
+    /// if quiescing, checkpointing, or acceptance fails. No manifest is
+    /// published by this method.
+    pub fn stage_request(&mut self) -> Result<()> {
+        #[cfg(feature = "blockcachevfs")]
+        {
+            let is_uri_session = self
+                .database
+                .as_ref()
+                .is_some_and(|database| database.blockcache_session().is_some());
+            if !is_uri_session {
+                return Err(remote_server_error(
+                    ffi::SQLITE_MISUSE,
+                    "staging requires a session-owned cloud URI server",
+                ));
+            }
+            self.complete_request()
+        }
+        #[cfg(not(feature = "blockcachevfs"))]
+        {
+            Err(remote_server_error(
+                ffi::SQLITE_MISUSE,
+                "request staging requires the blockcachevfs feature",
             ))
         }
     }
@@ -1017,12 +1287,28 @@ impl RemoteServer {
     }
 
     /// Returns an HTTP remote URL for a database file in the served directory.
+    /// Cleartext URI-backed session loopback URLs disable the HTTP idle
+    /// timeout because the local server may spend an extended period writing
+    /// cloud blocks before returning its response. The TCP connect timeout
+    /// remains bounded. TLS session URLs retain the five-minute idle timeout;
+    /// other remotes use DoltLite's ordinary 30-second default, subject to its
+    /// environment override.
     #[must_use]
     pub fn database_url(&self, database: &str) -> String {
-        format!(
+        let url = format!(
             "{}://{}:{}/{database}",
             self.scheme, self.bind_address, self.port
-        )
+        );
+        if self.session_loopback_transfer {
+            let timeout_ms = if self.scheme == "http" {
+                0
+            } else {
+                SESSION_LOOPBACK_HTTP_IDLE_TIMEOUT_MS
+            };
+            format!("{url}?http_idle_timeout_ms={timeout_ms}")
+        } else {
+            url
+        }
     }
 
     /// Quiesce and publish the current state of this server's session or
@@ -1148,6 +1434,50 @@ mod tests {
         let mut operation_id = [0_u8; SESSION_OPERATION_ID_BYTES];
         operation_id[0] = value;
         SessionOperationId::new(operation_id).expect("valid operation ID")
+    }
+
+    #[test]
+    fn database_url_disables_idle_timeout_only_for_clear_session_loopback() {
+        let make_server = |scheme, session_loopback_transfer| RemoteServer {
+            session: None,
+            database: None,
+            storage_failure: None,
+            raw: None,
+            scheme,
+            bind_address: "127.0.0.1".to_owned(),
+            port: 1234,
+            session_loopback_transfer,
+        };
+
+        assert_eq!(
+            make_server("http", false).database_url("default.db"),
+            "http://127.0.0.1:1234/default.db"
+        );
+        assert_eq!(
+            make_server("http", true).database_url("default.db"),
+            "http://127.0.0.1:1234/default.db?http_idle_timeout_ms=0"
+        );
+        assert_eq!(
+            make_server("https", true).database_url("default.db"),
+            "https://127.0.0.1:1234/default.db?http_idle_timeout_ms=300000"
+        );
+    }
+
+    #[test]
+    fn session_phase_context_preserves_sqlite_error_code_and_native_message() {
+        let error = crate::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_IOERR_READ),
+            Some("injected native detail".to_owned()),
+        );
+
+        let error = remote_server_error_with_context(error, "session checkpoint failed");
+
+        assert!(matches!(
+            error,
+            crate::Error::SqliteFailure(code, Some(message))
+                if code.extended_code == ffi::SQLITE_IOERR_READ
+                    && message == "session checkpoint failed: injected native detail"
+        ));
     }
 
     #[test]
@@ -1322,6 +1652,23 @@ mod tests {
         assert!(session.scope().matches_database("session.sqlite"));
         assert!(!session.scope().matches_database("other.sqlite"));
         assert_eq!(session.operation_id().as_bytes()[0], 7);
+        let uri_session = BlockCacheSessionOptions::for_uri(
+            "550e8400-e29b-41d4-a716-446655440006",
+            test_scope(),
+            test_operation_id(11),
+        )
+        .expect("valid URI session payload")
+        .request_count(8);
+        assert_eq!(uri_session.request_count, Some(8));
+        assert_eq!(
+            uri_session
+                .uri_context(Arc::new(Mutex::new(None)))
+                .request_count,
+            Some(8)
+        );
+        let debug = format!("{uri_session:?}");
+        assert!(debug.contains("request_count: Some(8)"));
+        assert!(!debug.contains("private-token"));
         let canonicalized = BlockCacheSessionOptions::new(
             vfs,
             AttachSpec::google_json_with_endpoint(
@@ -1365,6 +1712,27 @@ mod tests {
             test_operation_id(12),
         )
         .expect("valid static-VFS session payload");
+        let error = RemoteServer::start_with_options(
+            "/session-alias",
+            &RemoteServerOptions::new().blockcache_session(static_session.clone().request_count(4)),
+        )
+        .expect_err("request_count cannot mutate an existing static VFS");
+        assert!(matches!(
+            error,
+            crate::Error::SqliteFailure(code, Some(message))
+                if code.extended_code == crate::ffi::SQLITE_MISUSE
+                    && message.contains("request_count")
+        ));
+        let static_progress_session = static_session.clone().upload_progress_callback(|_| {});
+        let error = static_progress_session
+            .attach()
+            .expect_err("static-VFS sessions do not support URI upload progress");
+        assert!(matches!(
+            error,
+            crate::Error::SqliteFailure(code, Some(message))
+                if code.extended_code == crate::ffi::SQLITE_MISUSE
+                    && message.contains("URI-backed session")
+        ));
         let uri = "gcs://bucket/prefix?vfs=blockcachevfs&project=test&access_token=private-token&endpoint=http%3A%2F%2F127.0.0.1%3A1&database=session.sqlite";
 
         let error = RemoteServer::start_with_options(
@@ -1385,6 +1753,19 @@ mod tests {
             test_operation_id(13),
         )
         .expect("valid URI-backed session payload");
+        let invalid_request_count = uri_session.clone().request_count(0);
+        let error = RemoteServer::start_with_options(
+            uri,
+            &RemoteServerOptions::new().blockcache_session(invalid_request_count),
+        )
+        .expect_err("zero request_count must fail before opening cloud storage");
+        assert!(matches!(
+            &error,
+            crate::Error::SqliteFailure(code, Some(message))
+                if code.extended_code == crate::ffi::SQLITE_MISUSE
+                    && message.contains("request_count")
+        ));
+        assert!(!format!("{error:?}").contains("private-token"));
         let mismatched_database = uri.replace("database=session.sqlite", "database=other.sqlite");
         let error = RemoteServer::start_with_options(
             &mismatched_database,
