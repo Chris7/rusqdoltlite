@@ -34,7 +34,8 @@ use rusqlite::blockcachevfs::{
 };
 #[cfg(feature = "remote")]
 use rusqlite::blockcachevfs::{
-    AuthError, AuthRefreshReason, StorageFailureCause, StorageFailurePhase, UploadProgress,
+    AuthError, AuthRefreshReason, SessionId, SessionStorageLayout, StorageFailureCause,
+    StorageFailurePhase, UploadProgress,
 };
 use rusqlite::ffi::{self, blockcachevfs as raw_bcv};
 #[cfg(feature = "remote")]
@@ -8434,6 +8435,11 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let session_id = Uuid::new_v4().to_string();
+    let layout = SessionStorageLayout::new(
+        &prefix,
+        &SessionId::new(&session_id).expect("generated session ID is a valid UUID"),
+    )
+    .expect("graph prefix is safe for the versioned session layout");
     let operation_id = || {
         SessionOperationId::from_request("POST", "/default.db/commit", b"")
             .expect("derive stable graph publication operation ID")
@@ -8457,7 +8463,7 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
 
     let mut client_server = start_graph_uri_session_server(&uri, &session_id, operation_id())
         .expect("start client-owned session server");
-    let manifest_name = format!("{prefix}manifest.bcv");
+    let manifest_name = layout.manifest_object.clone();
     let initial_manifest = fetch_google_object(&endpoint, bucket, &manifest_name);
     let remote_url = client_server.database_url("default.db");
     let _: i64 = source
@@ -8504,7 +8510,7 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
         "staging must leave the published manifest byte-for-byte unchanged"
     );
     let listing = list_google_objects(&endpoint, bucket, &prefix);
-    let blocks_prefix = format!("{prefix}blocks/");
+    let blocks_prefix = layout.blocks_prefix.clone();
     let flat_block_objects = google_object_names(&listing)
         .into_iter()
         .filter(|name| {
@@ -8517,10 +8523,10 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
             })
         })
         .collect::<Vec<_>>();
-    let attempt_prefix = format!("{prefix}bcv-session/v1/attempt/{session_id}/");
-    let checkpoint_prefix = format!("{prefix}bcv-session/v1/checkpoint/{session_id}/");
-    let head_object = format!("{prefix}bcv-session/v1/head/{session_id}.bcv");
-    let guard_object = format!("{prefix}bcv-session/v1/guard.bcv");
+    let attempt_prefix = layout.attempt_prefix.clone();
+    let checkpoint_prefix = layout.checkpoint_prefix.clone();
+    let head_object = layout.head_object.clone();
+    let guard_object = layout.guard_object.clone();
     assert!(
         !session_object_exists("google", &endpoint, bucket, &guard_object),
         "client staging must not create or mutate the global cleanup guard"

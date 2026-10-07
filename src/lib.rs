@@ -101,7 +101,7 @@ pub use crate::cache::CachedStatement;
 pub use crate::column::Column;
 #[cfg(feature = "column_metadata")]
 pub use crate::column::ColumnMetadata;
-pub use crate::error::{to_sqlite_error, Error};
+pub use crate::error::{to_sqlite_error, Error, RemoteFailureKind};
 pub use crate::ffi::ErrorCode;
 #[cfg(feature = "load_extension")]
 pub use crate::load_extension_guard::LoadExtensionGuard;

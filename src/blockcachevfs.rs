@@ -1819,15 +1819,43 @@ impl Drop for ConnectionVfs {
     }
 }
 
-struct CloudConnectionUri {
+/// A validated `gcs://` or `s3://` BlockCacheVFS connection URI.
+///
+/// Use [`CloudConnectionUri::parse`] for an existing URI or
+/// [`CloudConnectionUri::gcs`] to build a GCS URI safely. Debug output omits
+/// all credentials. The value returned by [`CloudConnectionUri::as_str`]
+/// contains the credentials and must be treated as a secret.
+///
+/// # Examples
+///
+/// ```
+/// use rusqlite::blockcachevfs::CloudConnectionUri;
+///
+/// let uri = CloudConnectionUri::gcs(
+///     "bucket",
+///     "repos/alice/project/.gen/graph_db/",
+///     "my-gcp-project",
+///     "short-lived-token",
+///     "default.db",
+///     None,
+/// )?;
+/// assert_eq!(uri.gcs_access_token(), Some("short-lived-token"));
+/// let identity = uri.identity();
+/// assert_eq!(identity, uri.identity());
+/// # Ok::<(), rusqlite::Error>(())
+/// ```
+#[derive(Clone)]
+pub struct CloudConnectionUri {
     bucket: String,
     prefix: String,
     database: String,
     storage: CloudStorageUri,
     endpoint: Option<String>,
     request_count: Option<u32>,
+    uri: String,
 }
 
+#[derive(Clone)]
 enum CloudStorageUri {
     Google {
         project: String,
@@ -1839,6 +1867,128 @@ enum CloudStorageUri {
         auth_secret: String,
         credentials_to_redact: Vec<String>,
     },
+}
+
+impl fmt::Debug for CloudConnectionUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloudConnectionUri")
+            .field("identity", &self.identity())
+            .field("credentials", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Credential-free identity of one cloud database URI.
+///
+/// This value is intentionally opaque. It includes the cloud provider and its
+/// non-secret project/region, bucket, normalized graph prefix, database name,
+/// endpoint, and request-count setting. Access keys and tokens never
+/// participate in equality, so credential refreshes preserve identity.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CloudConnectionIdentity {
+    provider: &'static str,
+    storage_scope: String,
+    bucket: String,
+    prefix: String,
+    database: String,
+    endpoint: Option<String>,
+    request_count: Option<u32>,
+}
+
+impl fmt::Debug for CloudConnectionIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CloudConnectionIdentity")
+    }
+}
+
+/// Version 1 object keys for one BlockCacheVFS session.
+///
+/// The fields include the supplied repository graph prefix and are full
+/// bucket object keys/prefixes. For example, when `prefix` is
+/// `repos/alice/repo/.gen/graph_db/`, `blocks_prefix` is
+/// `repos/alice/repo/.gen/graph_db/blocks/`.
+///
+/// This type only formats paths. It does not authorize them or issue a CAB;
+/// callers must independently validate every returned path against the
+/// authenticated repository, permitted namespace, and session before granting
+/// access.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionStorageLayout {
+    /// Layout version. Current layouts use version 1.
+    pub layout_version: u32,
+    /// Prefix for immutable content-addressed block payloads.
+    pub blocks_prefix: String,
+    /// Prefix for per-session attempt markers.
+    pub attempt_prefix: String,
+    /// Prefix for per-session durable checkpoints.
+    pub checkpoint_prefix: String,
+    /// Prefix for per-session operation history.
+    pub history_prefix: String,
+    /// Object key for the session's accepted request head.
+    pub head_object: String,
+    /// Object key for the database's published manifest.
+    pub manifest_object: String,
+    /// Shared object key used to fence cleanup and writers.
+    pub guard_object: String,
+}
+
+impl SessionStorageLayout {
+    /// Format the version 1 object paths under a repository graph prefix.
+    ///
+    /// `prefix` is the full object prefix of the graph database within its
+    /// bucket, such as `repos/alice/repo/.gen/graph_db/`. The `session_id`
+    /// must be a validated [`SessionId`]. Returned paths include `prefix`;
+    /// they are not relative to the already-prefixed database container.
+    ///
+    /// This method performs path validation and formatting only. In
+    /// particular, it does not establish that the caller may grant access to
+    /// any of these paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `prefix` contains an empty, dot, or parent path
+    /// segment, a leading separator, or URI/path control characters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusqlite::blockcachevfs::{SessionId, SessionStorageLayout};
+    ///
+    /// let session = SessionId::new("550e8400-e29b-41d4-a716-446655440000")?;
+    /// let layout = SessionStorageLayout::new("repos/alice/repo/.gen/graph_db/", &session)?;
+    /// assert_eq!(layout.layout_version, 1);
+    /// assert_eq!(
+    ///     layout.blocks_prefix,
+    ///     "repos/alice/repo/.gen/graph_db/blocks/"
+    /// );
+    /// assert_eq!(
+    ///     layout.head_object,
+    ///     "repos/alice/repo/.gen/graph_db/bcv-session/v1/head/550e8400-e29b-41d4-a716-446655440000.bcv"
+    /// );
+    /// # Ok::<(), rusqlite::Error>(())
+    /// ```
+    pub fn new(prefix: &str, session_id: &SessionId) -> Result<Self> {
+        let prefix = normalize_cloud_prefix(prefix.to_owned())?;
+        let base = prefix.strip_suffix('/').unwrap_or(&prefix);
+        let key = |suffix: &str| {
+            if base.is_empty() {
+                suffix.to_owned()
+            } else {
+                format!("{base}/{suffix}")
+            }
+        };
+        let session_root = key("bcv-session/v1");
+        Ok(Self {
+            layout_version: 1,
+            blocks_prefix: format!("{}/", key("blocks")),
+            attempt_prefix: format!("{session_root}/attempt/{}/", session_id.as_str()),
+            checkpoint_prefix: format!("{session_root}/checkpoint/{}/", session_id.as_str()),
+            history_prefix: format!("{session_root}/history/{}/", session_id.as_str()),
+            head_object: format!("{session_root}/head/{}.bcv", session_id.as_str()),
+            manifest_object: key("manifest.bcv"),
+            guard_object: format!("{session_root}/guard.bcv"),
+        })
+    }
 }
 
 pub(crate) struct UriSessionContext {
@@ -2161,7 +2311,17 @@ fn open_connection_uri_inner(
 }
 
 impl CloudConnectionUri {
-    fn parse(uri: &str) -> Result<Self> {
+    /// Parse an existing GCS or S3 BlockCacheVFS URI using the same validation
+    /// used by [`Connection::open`](crate::Connection::open).
+    ///
+    /// Errors are intentionally generic and never include the input URI,
+    /// which may contain cloud credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed URIs, invalid paths or credentials,
+    /// duplicate query options, or unsupported options.
+    pub fn parse(uri: &str) -> Result<Self> {
         let (scheme, rest) = uri
             .split_once("://")
             .ok_or_else(|| cbs_uri_error("expected a gcs:// or s3:// URI"))?;
@@ -2187,22 +2347,7 @@ impl CloudConnectionUri {
         {
             return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
         }
-        let has_trailing_slash = prefix.ends_with('/');
-        let prefix_without_trailing_slash = prefix.strip_suffix('/').unwrap_or(&prefix);
-        if prefix_without_trailing_slash.ends_with('/')
-            || prefix_without_trailing_slash.contains(['\\', '\0', '?', '#'])
-            || (!prefix_without_trailing_slash.is_empty()
-                && prefix_without_trailing_slash
-                    .split('/')
-                    .any(|component| component.is_empty() || component == "." || component == ".."))
-        {
-            return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
-        }
-        let prefix = if has_trailing_slash && !prefix_without_trailing_slash.is_empty() {
-            format!("{prefix_without_trailing_slash}/")
-        } else {
-            prefix_without_trailing_slash.to_owned()
-        };
+        let prefix = normalize_cloud_prefix(prefix)?;
 
         let mut options = std::collections::BTreeMap::new();
         for parameter in query.split('&') {
@@ -2230,8 +2375,8 @@ impl CloudConnectionUri {
                 .ok_or_else(|| cbs_uri_error("GCS URI requires a non-empty project"))?;
             let access_token = options
                 .remove("access_token")
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| cbs_uri_error("GCS URI requires a non-empty access_token"))?;
+                .filter(|value| valid_credential_component(value))
+                .ok_or_else(|| cbs_uri_error("GCS URI requires a valid access_token"))?;
             CloudStorageUri::Google {
                 project,
                 access_token,
@@ -2313,7 +2458,89 @@ impl CloudConnectionUri {
             storage,
             endpoint,
             request_count,
+            uri: uri.to_owned(),
         })
+    }
+
+    /// Build a validated GCS URI, percent-encoding each URI component.
+    ///
+    /// `prefix` is the database's bucket object prefix. `endpoint` may be
+    /// supplied for an emulator or compatible storage endpoint. The generated
+    /// URI contains `access_token`, so handle [`Self::as_str`] as a secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any supplied value violates the same validation
+    /// applied when parsing a cloud connection URI.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket` - GCS bucket name.
+    /// * `prefix` - Object prefix of the database in that bucket.
+    /// * `project` - GCP project used for GCS requests.
+    /// * `access_token` - OAuth access token for GCS.
+    /// * `database` - Database filename within the object prefix.
+    /// * `endpoint` - Optional HTTP(S) endpoint override, usually for a
+    ///   compatible emulator.
+    pub fn gcs(
+        bucket: &str,
+        prefix: &str,
+        project: &str,
+        access_token: &str,
+        database: &str,
+        endpoint: Option<&str>,
+    ) -> Result<Self> {
+        let mut uri = format!(
+            "gcs://{}/{}?vfs=blockcachevfs&project={}&access_token={}&database={}",
+            percent_encode_uri_component(bucket, false),
+            percent_encode_uri_component(prefix, true),
+            percent_encode_uri_component(project, false),
+            percent_encode_uri_component(access_token, false),
+            percent_encode_uri_component(database, false),
+        );
+        if let Some(endpoint) = endpoint {
+            uri.push_str("&endpoint=");
+            uri.push_str(&percent_encode_uri_component(endpoint, false));
+        }
+        Self::parse(&uri)
+    }
+
+    /// Return the original validated URI, including its credentials.
+    ///
+    /// Do not log or persist this value in a location accessible to
+    /// untrusted users.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.uri
+    }
+
+    /// Return the credential-free identity used to compare refreshed URIs.
+    #[must_use]
+    pub fn identity(&self) -> CloudConnectionIdentity {
+        let (provider, storage_scope) = match &self.storage {
+            CloudStorageUri::Google { project, .. } => ("gcs", project.clone()),
+            CloudStorageUri::S3 { region, .. } => ("s3", region.clone()),
+        };
+        CloudConnectionIdentity {
+            provider,
+            storage_scope,
+            bucket: self.bucket.clone(),
+            prefix: self.prefix.clone(),
+            database: self.database.clone(),
+            endpoint: self.endpoint.clone(),
+            request_count: self.request_count,
+        }
+    }
+
+    /// Return the decoded GCS OAuth token, or `None` for an S3 URI.
+    ///
+    /// Treat the returned value as a secret and avoid including it in logs.
+    #[must_use]
+    pub fn gcs_access_token(&self) -> Option<&str> {
+        match &self.storage {
+            CloudStorageUri::Google { access_token, .. } => Some(access_token),
+            CloudStorageUri::S3 { .. } => None,
+        }
     }
 
     fn storage_for_container(&self, container: &str) -> Storage {
@@ -2439,6 +2666,49 @@ fn decode_uri_component(value: &str) -> Result<String> {
         }
     }
     String::from_utf8(decoded).map_err(|_| cbs_uri_error("CBS URI contains invalid UTF-8"))
+}
+
+fn normalize_cloud_prefix(prefix: String) -> Result<String> {
+    let has_trailing_slash = prefix.ends_with('/');
+    let prefix_without_trailing_slash = prefix.strip_suffix('/').unwrap_or(&prefix);
+    if prefix.starts_with('/')
+        || prefix_without_trailing_slash.ends_with('/')
+        || prefix_without_trailing_slash
+            .bytes()
+            .any(|byte| byte == b'\\' || byte == 0 || byte.is_ascii_control())
+        || prefix_without_trailing_slash.contains(['?', '#'])
+        || (!prefix_without_trailing_slash.is_empty()
+            && prefix_without_trailing_slash
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == ".."))
+    {
+        return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
+    }
+    Ok(
+        if has_trailing_slash && !prefix_without_trailing_slash.is_empty() {
+            format!("{prefix_without_trailing_slash}/")
+        } else {
+            prefix_without_trailing_slash.to_owned()
+        },
+    )
+}
+
+fn percent_encode_uri_component(value: &str, preserve_slashes: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            || (preserve_slashes && byte == b'/')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
 }
 
 fn hex_digit(byte: u8) -> Result<u8> {
@@ -3101,6 +3371,199 @@ mod tests {
         assert_eq!(region, "us-east-1");
         assert_eq!(access_id, "test");
         assert_eq!(auth_secret, "s/ecret+key\nsession/+token=");
+    }
+
+    #[test]
+    fn gcs_uri_constructor_encodes_values_and_tracks_credential_free_identity() {
+        for bucket in ["bucket/other", "bucket?other", "bucket#other"] {
+            assert!(
+                CloudConnectionUri::gcs(bucket, "repo", "project", "token", "default.db", None)
+                    .is_err(),
+                "accepted invalid bucket {bucket:?}"
+            );
+        }
+
+        let first = CloudConnectionUri::gcs(
+            "bucket",
+            "repos/alice/project/.gen/graph_db/",
+            "my-project",
+            "short/lived+token=",
+            "default.db",
+            Some("http://127.0.0.1:4443"),
+        )
+        .expect("build validated GCS URI");
+        assert!(first
+            .as_str()
+            .contains("access_token=short%2Flived%2Btoken%3D"));
+        assert_eq!(first.gcs_access_token(), Some("short/lived+token="));
+        assert_eq!(
+            CloudConnectionUri::parse(first.as_str())
+                .unwrap()
+                .identity(),
+            first.identity()
+        );
+
+        let refreshed = CloudConnectionUri::gcs(
+            "bucket",
+            "repos/alice/project/.gen/graph_db/",
+            "my-project",
+            "refreshed-token",
+            "default.db",
+            Some("http://127.0.0.1:4443"),
+        )
+        .expect("build refreshed GCS URI");
+        assert_eq!(first.identity(), refreshed.identity());
+
+        let changed = [
+            CloudConnectionUri::gcs(
+                "other-bucket",
+                "repos/alice/project/.gen/graph_db/",
+                "my-project",
+                "token",
+                "default.db",
+                Some("http://127.0.0.1:4443"),
+            ),
+            CloudConnectionUri::gcs(
+                "bucket",
+                "repos/alice/other/.gen/graph_db/",
+                "my-project",
+                "token",
+                "default.db",
+                Some("http://127.0.0.1:4443"),
+            ),
+            CloudConnectionUri::gcs(
+                "bucket",
+                "repos/alice/project/.gen/graph_db/",
+                "other-project",
+                "token",
+                "default.db",
+                Some("http://127.0.0.1:4443"),
+            ),
+            CloudConnectionUri::gcs(
+                "bucket",
+                "repos/alice/project/.gen/graph_db/",
+                "my-project",
+                "token",
+                "other.db",
+                Some("http://127.0.0.1:4443"),
+            ),
+            CloudConnectionUri::gcs(
+                "bucket",
+                "repos/alice/project/.gen/graph_db/",
+                "my-project",
+                "token",
+                "default.db",
+                Some("http://127.0.0.1:4444"),
+            ),
+        ];
+        for changed in changed {
+            assert_ne!(
+                first.identity(),
+                changed.expect("build changed GCS URI").identity()
+            );
+        }
+
+        let changed_request_count = CloudConnectionUri::parse(
+            "gcs://bucket/repos/alice/project/.gen/graph_db/?vfs=blockcachevfs&project=my-project&access_token=token&database=default.db&endpoint=http%3A%2F%2F127.0.0.1%3A4443&request_count=2",
+        )
+        .expect("build GCS URI with changed request count");
+        assert_ne!(first.identity(), changed_request_count.identity());
+    }
+
+    #[test]
+    fn cloud_connection_uri_debug_redacts_gcs_and_s3_credentials() {
+        let gcs = CloudConnectionUri::parse(
+            "gcs://bucket/repo?vfs=blockcachevfs&project=project&access_token=gcs-secret-token",
+        )
+        .expect("parse GCS URI");
+        let gcs_debug = format!("{gcs:?}");
+        assert!(!gcs_debug.contains("gcs-secret-token"));
+        assert!(gcs_debug.contains("[redacted]"));
+
+        let s3 = CloudConnectionUri::parse(
+            "s3://bucket/repo?vfs=blockcachevfs&region=us-east-1&access_id=s3-secret-id&secret_access_key=s3-secret-key&session_token=s3-session-token",
+        )
+        .expect("parse S3 URI");
+        let s3_debug = format!("{s3:?}");
+        for credential in ["s3-secret-id", "s3-secret-key", "s3-session-token"] {
+            assert!(!s3_debug.contains(credential), "debug leaked {credential}");
+        }
+        assert!(s3_debug.contains("[redacted]"));
+
+        let rotated_s3 = CloudConnectionUri::parse(
+            "s3://bucket/repo?vfs=blockcachevfs&region=us-east-1&access_id=new-id&secret_access_key=new-key&session_token=new-session",
+        )
+        .expect("parse rotated S3 URI");
+        assert_eq!(s3.identity(), rotated_s3.identity());
+        assert_eq!(s3.gcs_access_token(), None);
+        assert!(!format!("{:?}", s3.identity()).contains("s3-secret"));
+    }
+
+    #[test]
+    fn public_cloud_uri_parse_rejects_duplicates_without_leaking_input() {
+        let error = CloudConnectionUri::parse(
+            "gcs://bucket/repo?vfs=blockcachevfs&project=project&access_token=do-not-leak&access_token=duplicate",
+        )
+        .expect_err("duplicate options should be rejected");
+        assert!(!error.to_string().contains("do-not-leak"));
+        assert!(!format!("{error:?}").contains("do-not-leak"));
+    }
+
+    #[test]
+    fn session_storage_layout_returns_exact_bucket_object_keys() {
+        let session =
+            SessionId::new("550e8400-e29b-41d4-a716-446655440000").expect("valid session id");
+        let layout = SessionStorageLayout::new("repos/alice/repo/.gen/graph_db/", &session)
+            .expect("valid graph prefix");
+        let base = "repos/alice/repo/.gen/graph_db";
+        let session_root = format!("{base}/bcv-session/v1");
+
+        assert_eq!(layout.layout_version, 1);
+        assert_eq!(layout.blocks_prefix, format!("{base}/blocks/"));
+        assert_eq!(
+            layout.attempt_prefix,
+            format!("{session_root}/attempt/{}/", session.as_str())
+        );
+        assert_eq!(
+            layout.checkpoint_prefix,
+            format!("{session_root}/checkpoint/{}/", session.as_str())
+        );
+        assert_eq!(
+            layout.history_prefix,
+            format!("{session_root}/history/{}/", session.as_str())
+        );
+        assert_eq!(
+            layout.head_object,
+            format!("{session_root}/head/{}.bcv", session.as_str())
+        );
+        assert_eq!(layout.manifest_object, format!("{base}/manifest.bcv"));
+        assert_eq!(layout.guard_object, format!("{session_root}/guard.bcv"));
+    }
+
+    #[test]
+    fn session_storage_layout_rejects_ambiguous_or_traversal_prefixes() {
+        let session =
+            SessionId::new("550e8400-e29b-41d4-a716-446655440000").expect("valid session id");
+        for prefix in [
+            "/repos/alice/repo",
+            "repos//alice/repo",
+            "repos/./repo",
+            "repos/../repo",
+            "../repo",
+            "repos\\alice\\repo",
+            "repos/?alice",
+            "repos/#alice",
+            "repos/\0alice",
+        ] {
+            assert!(
+                SessionStorageLayout::new(prefix, &session).is_err(),
+                "accepted unsafe prefix {prefix:?}"
+            );
+        }
+
+        let root = SessionStorageLayout::new("", &session).expect("empty root prefix is valid");
+        assert_eq!(root.blocks_prefix, "blocks/");
+        assert_eq!(root.manifest_object, "manifest.bcv");
     }
 
     #[test]

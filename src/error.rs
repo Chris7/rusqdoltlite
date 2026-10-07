@@ -7,6 +7,22 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str;
 
+/// A stable category for errors produced by remote graph transfer operations.
+///
+/// The category is derived from narrow SQLite code and message pairs emitted
+/// by the remote transfer implementation. It lets callers present useful
+/// guidance without depending on native error text themselves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RemoteFailureKind {
+    /// The published manifest advanced after a session accepted its head.
+    StaleSession,
+    /// The requested branch update is not a fast-forward.
+    NonFastForward,
+    /// The request was rejected for an authorization reason.
+    Authorization,
+}
+
 /// Enum listing possible errors from rusqlite.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -390,6 +406,37 @@ impl error::Error for Error {
 }
 
 impl Error {
+    /// Classify a known remote graph-transfer failure, if this error matches
+    /// one of the native transfer failures with stable caller meaning.
+    ///
+    /// This deliberately recognizes exact native code and message pairs for
+    /// stale sessions and non-fast-forward branch updates. Unrelated SQLite
+    /// constraint or busy errors return `None`.
+    #[must_use]
+    pub fn remote_failure_kind(&self) -> Option<RemoteFailureKind> {
+        let Self::SqliteFailure(error, message) = self else {
+            return None;
+        };
+
+        match (error.code, error.extended_code, message.as_deref()) {
+            (
+                ffi::ErrorCode::DatabaseBusy,
+                ffi::SQLITE_BUSY,
+                Some("published manifest changed since the accepted session head"),
+            ) => Some(RemoteFailureKind::StaleSession),
+            (
+                ffi::ErrorCode::ConstraintViolation,
+                ffi::SQLITE_CONSTRAINT,
+                Some("not a fast-forward of the remote branch (use force to overwrite)"),
+            ) => Some(RemoteFailureKind::NonFastForward),
+            (ffi::ErrorCode::AuthorizationForStatementDenied, ffi::SQLITE_AUTH, _)
+            | (ffi::ErrorCode::SystemIoFailure, ffi::SQLITE_IOERR_AUTH, _) => {
+                Some(RemoteFailureKind::Authorization)
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the underlying SQLite error if this is [`Error::SqliteFailure`].
     #[inline]
     #[must_use]
@@ -537,5 +584,95 @@ pub unsafe fn set_errmsg(
                 msg.map_or(std::ptr::null(), std::ffi::CStr::as_ptr),
             ),
         )
+    }
+}
+#[cfg(test)]
+mod remote_failure_tests {
+    use super::{Error, RemoteFailureKind};
+    use crate::ffi;
+
+    #[test]
+    fn remote_failure_kind_classifies_only_known_native_errors() {
+        let stale = Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_BUSY),
+            Some("published manifest changed since the accepted session head".into()),
+        );
+        assert_eq!(
+            stale.remote_failure_kind(),
+            Some(RemoteFailureKind::StaleSession)
+        );
+
+        let non_fast_forward = Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CONSTRAINT),
+            Some("not a fast-forward of the remote branch (use force to overwrite)".into()),
+        );
+        assert_eq!(
+            non_fast_forward.remote_failure_kind(),
+            Some(RemoteFailureKind::NonFastForward)
+        );
+
+        for code in [ffi::SQLITE_AUTH, ffi::SQLITE_IOERR_AUTH] {
+            let authorization = Error::SqliteFailure(ffi::Error::new(code), None);
+            assert_eq!(
+                authorization.remote_failure_kind(),
+                Some(RemoteFailureKind::Authorization)
+            );
+        }
+    }
+
+    #[test]
+    fn remote_failure_kind_rejects_wrong_or_inconsistent_codes_and_messages() {
+        let missing_message = Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_BUSY), None);
+        assert_eq!(missing_message.remote_failure_kind(), None);
+
+        let wrong_stale_message = Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_BUSY),
+            Some("another operation is busy".into()),
+        );
+        assert_eq!(wrong_stale_message.remote_failure_kind(), None);
+
+        let wrong_stale_code = Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_BUSY_SNAPSHOT),
+            Some("published manifest changed since the accepted session head".into()),
+        );
+        assert_eq!(wrong_stale_code.remote_failure_kind(), None);
+
+        let wrong_constraint_message = Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CONSTRAINT),
+            Some("a different constraint failed".into()),
+        );
+        assert_eq!(wrong_constraint_message.remote_failure_kind(), None);
+
+        let wrong_constraint_code = Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CONSTRAINT_UNIQUE),
+            Some("not a fast-forward of the remote branch (use force to overwrite)".into()),
+        );
+        assert_eq!(wrong_constraint_code.remote_failure_kind(), None);
+
+        let inconsistent_primary_code = Error::SqliteFailure(
+            ffi::Error {
+                code: ffi::ErrorCode::Unknown,
+                extended_code: ffi::SQLITE_BUSY,
+            },
+            Some("published manifest changed since the accepted session head".into()),
+        );
+        assert_eq!(inconsistent_primary_code.remote_failure_kind(), None);
+
+        let inconsistent_authorization_code = Error::SqliteFailure(
+            ffi::Error {
+                code: ffi::ErrorCode::Unknown,
+                extended_code: ffi::SQLITE_AUTH,
+            },
+            None,
+        );
+        assert_eq!(inconsistent_authorization_code.remote_failure_kind(), None);
+
+        let unrelated_error = Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_ERROR),
+            Some("authorization failed".into()),
+        );
+        assert_eq!(unrelated_error.remote_failure_kind(), None);
+
+        assert_eq!(Error::InvalidQuery.remote_failure_kind(), None);
     }
 }
