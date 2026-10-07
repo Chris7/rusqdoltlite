@@ -166,8 +166,8 @@ and provider response text.
 Dirty payload blocks are staged in bounded parallel batches both at the
 watermark and during the final session drain. Attempt markers remain fenced
 serially before payload requests are queued. `SQLITE_BCV_NREQUEST` accepts
-values from 1 through `INT_MAX` and supplies an upper bound on concurrency; 1
-retains serial staging. Effective batch size is
+values from 1 through `INT_MAX` and supplies an upper bound on parallel uploads;
+1 retains serial staging. Effective batch size is
 also capped at 64 blocks, cache capacity, and 64 MiB of copied payload;
 a single larger block stages alone. Exact-byte checks remain mandatory for
 create-only conflicts. All requests drain before buffers, pins, or the dispatcher
@@ -178,9 +178,9 @@ form batches; hard cache-capacity staging remains in place.
 
 Ordinary final uploads continue scanning past each durable staged block so an
 initial request chain can still dispatch later dirty blocks. The regression in
-`blockcachevfs-tests/bcvfs_staging_fault.test` verifies a staged prefix larger
-than the request count followed by a dirty tail, then checks a cold read after
-publication. Keep this test enabled alongside the `remote_server` and
+`blockcachevfs-tests/bcvfs_staging_fault.test` verifies a staged prefix longer
+than the configured upload concurrency followed by a dirty tail, then checks a
+cold read after publication. Keep this test enabled alongside the `remote_server` and
 `remote_progress` Rust suites, `blockcachevfs_security`, focused
 `blockcachevfs_emulator` tests, and the shared CBS Tcl emulator runner when
 refreshing the patch series.

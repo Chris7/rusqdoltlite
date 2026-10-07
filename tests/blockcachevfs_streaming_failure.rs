@@ -480,7 +480,7 @@ fn failure_phase_one() {
         .expect("VFS builder")
         .auth_callback(|_, _, _| Ok("test".into()))
         .config(Config::CacheSize(CACHE_BYTES))
-        .config(Config::RequestCount(1))
+        .config(Config::UploadConcurrency(1))
         .config(Config::HttpTimeout(1))
         .init()
         .expect("initialize block-cache VFS");
@@ -639,7 +639,7 @@ fn failure_phase_two() {
         .expect("VFS builder")
         .auth_callback(|_, _, _| Ok("test".into()))
         .config(Config::CacheSize(CACHE_BYTES))
-        .config(Config::RequestCount(1))
+        .config(Config::UploadConcurrency(1))
         .config(Config::HttpTimeout(1))
         .init()
         .expect("initialize block-cache VFS for restart");

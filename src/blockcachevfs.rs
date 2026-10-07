@@ -1038,12 +1038,12 @@ pub(crate) fn session_alias(spec: &AttachSpec, session_id: &SessionId) -> Result
 pub enum Config {
     /// Maximum local cache size in bytes.
     CacheSize(i64),
-    /// Upper bound on simultaneous cloud block-upload requests.
+    /// Upper bound on parallel cloud block uploads.
     ///
-    /// Native staging may use fewer requests to fit the local cache and its
+    /// Native staging may use fewer uploads to fit the local cache and its
     /// bounded staging buffer. Values from 1 through `i32::MAX` are accepted;
     /// the default is supplied by the native VFS.
-    RequestCount(i64),
+    UploadConcurrency(i64),
     /// HTTP timeout in seconds.
     HttpTimeout(i64),
     /// Enable verbose libcurl logging. Only non-header diagnostic text is
@@ -1066,7 +1066,7 @@ impl Config {
     fn raw(self) -> (c_int, i64) {
         match self {
             Self::CacheSize(v) => (raw::SQLITE_BCV_CACHESIZE, v),
-            Self::RequestCount(v) => (raw::SQLITE_BCV_NREQUEST, v),
+            Self::UploadConcurrency(v) => (raw::SQLITE_BCV_NREQUEST, v),
             Self::HttpTimeout(v) => (raw::SQLITE_BCV_HTTPTIMEOUT, v),
             Self::CurlVerbose(v) => (raw::SQLITE_BCV_CURLVERBOSE, i64::from(v)),
             Self::HttpLogTimeout(v) => (raw::SQLITE_BCV_HTTPLOG_TIMEOUT, v),
@@ -1851,7 +1851,7 @@ pub struct CloudConnectionUri {
     database: String,
     storage: CloudStorageUri,
     endpoint: Option<String>,
-    request_count: Option<u32>,
+    upload_concurrency: Option<u32>,
     uri: String,
 }
 
@@ -1882,7 +1882,7 @@ impl fmt::Debug for CloudConnectionUri {
 ///
 /// This value is intentionally opaque. It includes the cloud provider and its
 /// non-secret project/region, bucket, normalized graph prefix, database name,
-/// endpoint, and request-count setting. Access keys and tokens never
+/// endpoint, and upload-concurrency setting. Access keys and tokens never
 /// participate in equality, so credential refreshes preserve identity.
 #[derive(Clone, Eq, PartialEq)]
 pub struct CloudConnectionIdentity {
@@ -1892,7 +1892,7 @@ pub struct CloudConnectionIdentity {
     prefix: String,
     database: String,
     endpoint: Option<String>,
-    request_count: Option<u32>,
+    upload_concurrency: Option<u32>,
 }
 
 impl fmt::Debug for CloudConnectionIdentity {
@@ -1997,7 +1997,7 @@ pub(crate) struct UriSessionContext {
     pub(crate) target_database: String,
     pub(crate) operations: String,
     pub(crate) operation_id: SessionOperationId,
-    pub(crate) request_count: Option<u32>,
+    pub(crate) upload_concurrency: Option<u32>,
     #[cfg(feature = "remote")]
     pub(crate) auth_refresh: Option<Arc<AuthRefreshCallback>>,
     #[cfg(feature = "remote")]
@@ -2096,9 +2096,11 @@ fn open_connection_uri_inner(
     session: Option<UriSessionContext>,
 ) -> Result<Connection> {
     let uri = CloudConnectionUri::parse(uri)?;
-    let request_count = effective_request_count(
-        uri.request_count,
-        session.as_ref().and_then(|session| session.request_count),
+    let upload_concurrency = effective_upload_concurrency(
+        uri.upload_concurrency,
+        session
+            .as_ref()
+            .and_then(|session| session.upload_concurrency),
     )?;
     if let Some(session) = session.as_ref() {
         if session.target_database != uri.database {
@@ -2166,8 +2168,8 @@ fn open_connection_uri_inner(
             }
             Ok(auth_secret.clone())
         });
-    if let Some(request_count) = request_count {
-        builder = builder.config(Config::RequestCount(request_count));
+    if let Some(upload_concurrency) = upload_concurrency {
+        builder = builder.config(Config::UploadConcurrency(upload_concurrency));
     }
     #[cfg(feature = "remote")]
     if let Some(callback) = auth_refresh {
@@ -2447,7 +2449,7 @@ impl CloudConnectionUri {
                 "CBS endpoint must be an HTTP(S) base URL without credentials, query, or fragment",
             ));
         }
-        let request_count = parse_request_count(options.remove("request_count"))?;
+        let upload_concurrency = parse_upload_concurrency(options.remove("upload_concurrency"))?;
         if !options.is_empty() {
             return Err(cbs_uri_error("unsupported CBS URI option"));
         }
@@ -2457,7 +2459,7 @@ impl CloudConnectionUri {
             database,
             storage,
             endpoint,
-            request_count,
+            upload_concurrency,
             uri: uri.to_owned(),
         })
     }
@@ -2528,7 +2530,7 @@ impl CloudConnectionUri {
             prefix: self.prefix.clone(),
             database: self.database.clone(),
             endpoint: self.endpoint.clone(),
-            request_count: self.request_count,
+            upload_concurrency: self.upload_concurrency,
         }
     }
 
@@ -2567,38 +2569,38 @@ impl CloudConnectionUri {
     }
 }
 
-fn parse_request_count(value: Option<String>) -> Result<Option<u32>> {
+fn parse_upload_concurrency(value: Option<String>) -> Result<Option<u32>> {
     let Some(value) = value else {
         return Ok(None);
     };
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(cbs_uri_error(
-            "request_count must be a decimal integer between 1 and i32::MAX",
+            "upload_concurrency must be a decimal integer between 1 and i32::MAX",
         ));
     }
-    let request_count = value.parse::<u32>().map_err(|_| {
-        cbs_uri_error("request_count must be a decimal integer between 1 and i32::MAX")
+    let upload_concurrency = value.parse::<u32>().map_err(|_| {
+        cbs_uri_error("upload_concurrency must be a decimal integer between 1 and i32::MAX")
     })?;
-    validate_request_count(request_count)?;
-    Ok(Some(request_count))
+    validate_upload_concurrency(upload_concurrency)?;
+    Ok(Some(upload_concurrency))
 }
 
-pub(crate) fn validate_request_count(request_count: u32) -> Result<i64> {
-    if request_count == 0 || request_count > i32::MAX as u32 {
+pub(crate) fn validate_upload_concurrency(upload_concurrency: u32) -> Result<i64> {
+    if upload_concurrency == 0 || upload_concurrency > i32::MAX as u32 {
         return Err(cbs_uri_error(
-            "request_count must be between 1 and i32::MAX",
+            "upload_concurrency must be between 1 and i32::MAX",
         ));
     }
-    Ok(i64::from(request_count))
+    Ok(i64::from(upload_concurrency))
 }
 
-fn effective_request_count(
-    uri_request_count: Option<u32>,
-    session_request_count: Option<u32>,
+fn effective_upload_concurrency(
+    uri_upload_concurrency: Option<u32>,
+    session_upload_concurrency: Option<u32>,
 ) -> Result<Option<i64>> {
-    session_request_count
-        .or(uri_request_count)
-        .map(validate_request_count)
+    session_upload_concurrency
+        .or(uri_upload_concurrency)
+        .map(validate_upload_concurrency)
         .transpose()
 }
 
@@ -3463,11 +3465,11 @@ mod tests {
             );
         }
 
-        let changed_request_count = CloudConnectionUri::parse(
-            "gcs://bucket/repos/alice/project/.gen/graph_db/?vfs=blockcachevfs&project=my-project&access_token=token&database=default.db&endpoint=http%3A%2F%2F127.0.0.1%3A4443&request_count=2",
+        let changed_upload_concurrency = CloudConnectionUri::parse(
+            "gcs://bucket/repos/alice/project/.gen/graph_db/?vfs=blockcachevfs&project=my-project&access_token=token&database=default.db&endpoint=http%3A%2F%2F127.0.0.1%3A4443&upload_concurrency=2",
         )
-        .expect("build GCS URI with changed request count");
-        assert_ne!(first.identity(), changed_request_count.identity());
+        .expect("build GCS URI with changed upload concurrency");
+        assert_ne!(first.identity(), changed_upload_concurrency.identity());
     }
 
     #[test]
@@ -3573,7 +3575,7 @@ mod tests {
         )
         .expect("valid GCS URI without endpoint");
         assert!(gcs.endpoint.is_none());
-        assert_eq!(gcs.request_count, None);
+        assert_eq!(gcs.upload_concurrency, None);
         let gcs_storage = gcs.storage_for_container("bucket/repository");
         assert_eq!(gcs_storage.provider, "google?api=json");
         assert_eq!(gcs_storage.account, "project");
@@ -3583,7 +3585,7 @@ mod tests {
         )
         .expect("valid S3 URI without endpoint");
         assert!(s3.endpoint.is_none());
-        assert_eq!(s3.request_count, None);
+        assert_eq!(s3.upload_concurrency, None);
         let s3_storage = s3.storage_for_container("bucket/repository");
         assert_eq!(s3_storage.provider, "s3?region=us-west-2");
         assert_eq!(s3_storage.account, "access");
@@ -3612,32 +3614,32 @@ mod tests {
     }
 
     #[test]
-    fn request_count_uri_option_accepts_native_integer_range_for_both_providers() {
+    fn upload_concurrency_uri_option_accepts_native_integer_range_for_both_providers() {
         let gcs = CloudConnectionUri::parse(
-            "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&request_count=1",
+            "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&upload_concurrency=1",
         )
-        .expect("valid GCS request_count");
-        assert_eq!(gcs.request_count, Some(1));
+        .expect("valid GCS upload_concurrency");
+        assert_eq!(gcs.upload_concurrency, Some(1));
 
         let s3 = CloudConnectionUri::parse(
-            "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret&request_count=2147483647",
+            "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret&upload_concurrency=2147483647",
         )
-        .expect("valid S3 request_count");
-        assert_eq!(s3.request_count, Some(i32::MAX as u32));
+        .expect("valid S3 upload_concurrency");
+        assert_eq!(s3.upload_concurrency, Some(i32::MAX as u32));
     }
 
     #[test]
-    fn request_count_uri_option_rejects_malformed_duplicate_and_out_of_range_values() {
+    fn upload_concurrency_uri_option_rejects_malformed_duplicate_and_out_of_range_values() {
         for value in ["", "0", "-1", "+1", " 1", "1 ", "2147483648", "4294967296"] {
             let uri = format!(
-                "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&request_count={value}"
+                "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&upload_concurrency={value}"
             );
             assert!(CloudConnectionUri::parse(&uri).is_err(), "accepted {uri}");
         }
 
         for query in [
-            "request_count=2&request_count=3",
-            "request_count=2&%72equest_count=3",
+            "upload_concurrency=2&upload_concurrency=3",
+            "upload_concurrency=2&%75pload_concurrency=3",
         ] {
             let uri = format!(
                 "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret&{query}"
@@ -3647,12 +3649,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_session_request_count_overrides_uri_and_omission_keeps_native_default() {
-        assert_eq!(effective_request_count(None, None).unwrap(), None);
-        assert_eq!(effective_request_count(Some(2), None).unwrap(), Some(2));
-        assert_eq!(effective_request_count(Some(2), Some(8)).unwrap(), Some(8));
-        assert!(effective_request_count(Some(2), Some(0)).is_err());
-        assert!(effective_request_count(Some(2), Some(u32::MAX)).is_err());
+    fn explicit_session_upload_concurrency_overrides_uri_and_omission_keeps_native_default() {
+        assert_eq!(effective_upload_concurrency(None, None).unwrap(), None);
+        assert_eq!(
+            effective_upload_concurrency(Some(2), None).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            effective_upload_concurrency(Some(2), Some(8)).unwrap(),
+            Some(8)
+        );
+        assert!(effective_upload_concurrency(Some(2), Some(0)).is_err());
+        assert!(effective_upload_concurrency(Some(2), Some(u32::MAX)).is_err());
     }
 
     #[test]
@@ -3737,7 +3745,7 @@ mod tests {
     fn config_maps_to_cbs_constants() {
         assert_eq!(Config::CacheSize(42).raw(), (raw::SQLITE_BCV_CACHESIZE, 42));
         assert_eq!(
-            Config::RequestCount(i64::from(i32::MAX)).raw(),
+            Config::UploadConcurrency(i64::from(i32::MAX)).raw(),
             (raw::SQLITE_BCV_NREQUEST, i64::from(i32::MAX))
         );
         assert_eq!(
@@ -3751,16 +3759,16 @@ mod tests {
     }
 
     #[test]
-    fn request_count_builder_config_enforces_native_integer_range() -> Result<()> {
+    fn upload_concurrency_builder_config_enforces_native_integer_range() -> Result<()> {
         let directory = tempfile::tempdir().expect("temporary CBS directory");
 
         for value in [1, 10, i64::from(i32::MAX)] {
             let vfs = BlockCacheVfs::builder(directory.path())?
                 .name(&format!(
-                    "request-count-valid-{}-{value}",
+                    "upload-concurrency-valid-{}-{value}",
                     std::process::id()
                 ))?
-                .config(Config::RequestCount(value))
+                .config(Config::UploadConcurrency(value))
                 .init_owned()?;
             drop(vfs);
         }
@@ -3768,10 +3776,10 @@ mod tests {
         for value in [0, -1, i64::from(i32::MAX) + 1] {
             let result = BlockCacheVfs::builder(directory.path())?
                 .name(&format!(
-                    "request-count-invalid-{}-{value}",
+                    "upload-concurrency-invalid-{}-{value}",
                     std::process::id()
                 ))?
-                .config(Config::RequestCount(value))
+                .config(Config::UploadConcurrency(value))
                 .init_owned();
             assert!(
                 matches!(
@@ -3779,7 +3787,7 @@ mod tests {
                     Err(Error::SqliteFailure(code, _))
                         if code.extended_code == crate::ffi::SQLITE_MISUSE
                 ),
-                "native VFS should reject request count {value}"
+                "native VFS should reject upload concurrency {value}"
             );
         }
         Ok(())

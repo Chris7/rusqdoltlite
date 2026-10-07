@@ -206,7 +206,7 @@ fn new_vfs(cache: &Path) -> &'static BlockCacheVfs {
         .expect("VFS builder")
         .auth_callback(|_, _, _| Ok("test".into()))
         .config(Config::CacheSize(CACHE_BYTES))
-        .config(Config::RequestCount(4))
+        .config(Config::UploadConcurrency(4))
         .config(Config::HttpTimeout(5))
         .init()
         .expect("initialize block-cache VFS")
@@ -944,7 +944,7 @@ fn run_producer_parallel_staging(vfs: &'static BlockCacheVfs, endpoint: &str, ca
     );
     assert!(
         high_water <= 2,
-        "two cache slots bound concurrent block PUTs even though request_count is four: high-water={high_water}"
+        "two cache slots bound concurrent block PUTs even though upload_concurrency is four: high-water={high_water}"
     );
     assert_cache_bound(cache, "after producer-parallel staging");
 

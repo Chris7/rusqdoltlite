@@ -46,8 +46,9 @@ Retained intent from the former blockcachevfs patches:
   and publication metadata; do not report a plan while production is active or
   dirty blocks are blocked.
 - 0025: Stage dirty blocks in bounded parallel batches for watermark and final
-  drains. SQLITE_BCV_NREQUEST accepts 1 through INT_MAX and is an upper bound,
-  with 1 retaining serial staging. Fence markers serially before queueing
+  drains. The Rust `upload_concurrency` setting maps to the native
+  `SQLITE_BCV_NREQUEST` upper bound. Values from 1 through INT_MAX are accepted;
+  1 retains serial staging. Fence markers serially before queueing
   payload PUTs; cap effective concurrency by SQLITE_BCV_NREQUEST, 64 blocks,
   cache capacity, and 64 MiB of
   copied payload (a larger single block stages alone). Drain every request,
@@ -63,7 +64,8 @@ proof:
   request chain may stop at its first staged block and leave later dirty
   blocks out of the object store even though the manifest includes them. The
   `bcvfs_staging_fault.test` regression checks a staged prefix longer than the
-  request count followed by a dirty tail, then verifies a cold read.
+  configured upload concurrency followed by a dirty tail, then verifies a cold
+  read.
 - Ordinary, unscoped writers retain the shared writer-guard CAS once per batch
   before any block payload PUT. If cleanup owns SWEEP, no payload from that
   batch is queued and dirty local blocks remain retryable. Session-owned CABs

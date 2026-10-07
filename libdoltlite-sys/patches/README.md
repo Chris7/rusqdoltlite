@@ -169,13 +169,14 @@ response text.
 
 The patch also batches dirty blocks for watermark staging and the final session
 drain. Session markers remain fenced serially before payload PUTs are queued;
-effective concurrency is bounded by the configured request count, 64 blocks,
+effective concurrency is bounded by `upload_concurrency`, 64 blocks,
 cache capacity, and 64 MiB of copied payload, with a larger single block staged
 alone. Create-only conflicts still require an exact-byte GET. Every queued
 request drains, successful siblings are persisted independently, and completed
-progress remains visible if another PUT fails. `RequestCount` accepts values from
-1 through `INT_MAX` and is only an upper bound; 1 retains serial staging. The
-watermark measures dirty payload blocks so later writes continue to form batches. DoltLite's 0009 patch
+progress remains visible if another PUT fails. `Config::UploadConcurrency`
+accepts values from 1 through `INT_MAX` and is only an upper bound; 1 retains
+serial staging. The watermark measures dirty payload blocks so later writes
+continue to form batches. DoltLite's 0009 patch
 provides the separate logical chunk plan and callback; these CBS edits apply
 only to build.rs's OUT_DIR copy and remain separate from the pristine vendored
 CBS tree.

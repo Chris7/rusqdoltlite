@@ -179,7 +179,7 @@ fn new_vfs(cache: &Path) -> &'static BlockCacheVfs {
         .expect("VFS builder")
         .auth_callback(|_, _, _| Ok("test".into()))
         .config(Config::CacheSize(CACHE_BYTES))
-        .config(Config::RequestCount(1))
+        .config(Config::UploadConcurrency(1))
         .config(Config::HttpTimeout(2))
         .init()
         .expect("initialize block-cache VFS")

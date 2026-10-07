@@ -4101,7 +4101,7 @@ fn run_session_fault_matrix(backend: &str) {
         .name(&vfs_name)
         .expect("fault VFS name")
         .config(Config::CacheSize(4 * 1024 * 1024))
-        .config(Config::RequestCount(1))
+        .config(Config::UploadConcurrency(1))
         .config(Config::StageWatermark(50))
         .config(Config::HttpTimeout(3))
         .auth_callback(|provider, _account, _container| {
@@ -4271,7 +4271,7 @@ fn run_session_crash_child() {
         .name(&vfs_name)
         .expect("crash child VFS name")
         .config(Config::CacheSize(4 * 1024 * 1024))
-        .config(Config::RequestCount(1))
+        .config(Config::UploadConcurrency(1))
         .config(Config::StageWatermark(50))
         .config(Config::HttpTimeout(5))
         .auth_callback(|provider, _account, _container| {
@@ -4372,7 +4372,7 @@ fn run_session_crash_recovery_child() {
         .name(&vfs_name)
         .expect("recovery VFS name")
         .config(Config::CacheSize(4 * 1024 * 1024))
-        .config(Config::RequestCount(1))
+        .config(Config::UploadConcurrency(1))
         .config(Config::StageWatermark(50))
         .config(Config::HttpTimeout(5))
         .auth_callback(|provider, _account, _container| {
@@ -4433,7 +4433,7 @@ fn run_session_crash_case(backend: &str, endpoint: &str, bucket: &str, window: S
         .name(&parent_vfs_name)
         .expect("crash parent VFS name")
         .config(Config::CacheSize(4 * 1024 * 1024))
-        .config(Config::RequestCount(1))
+        .config(Config::UploadConcurrency(1))
         .config(Config::StageWatermark(50))
         .config(Config::HttpTimeout(5))
         .auth_callback(|provider, _account, _container| {
@@ -7774,11 +7774,11 @@ fn start_uri_session_server(
 }
 
 #[cfg(feature = "remote")]
-fn start_uri_session_server_with_request_count_and_progress<F>(
+fn start_uri_session_server_with_upload_concurrency_and_progress<F>(
     uri: &str,
     session_id: &str,
     operation_id: SessionOperationId,
-    request_count: u32,
+    upload_concurrency: u32,
     callback: F,
 ) -> rusqlite::Result<RemoteServer>
 where
@@ -7786,7 +7786,7 @@ where
 {
     let scope = SessionScope::new("emulator-transfer", "remote.db", "push,read")?;
     let session = BlockCacheSessionOptions::for_uri(session_id, scope, operation_id)?
-        .request_count(request_count)
+        .upload_concurrency(upload_concurrency)
         .upload_progress_callback(callback);
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
@@ -9208,7 +9208,7 @@ fn google_uri_session_refences_after_guard_epoch_changes_between_reads() {
     let operation_id =
         SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
             .expect("derive guard-epoch test operation ID");
-    let mut server = start_uri_session_server_with_request_count_and_progress(
+    let mut server = start_uri_session_server_with_upload_concurrency_and_progress(
         &uri,
         &session_id,
         operation_id,
@@ -9677,16 +9677,17 @@ fn spawn_staging_visibility_probe(
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 #[test]
 #[ignore = "requires the pinned local GCS emulator container"]
-fn google_uri_ordinary_upload_accepts_maximum_request_count() {
+fn google_uri_ordinary_upload_accepts_maximum_upload_concurrency() {
     let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
         .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
     let bucket = "app_storage";
     ensure_google_bucket(&endpoint, bucket);
-    let prefix = format!("{}/uri/maximum-request-count/", unique_suffix());
+    let prefix = format!("{}/uri/maximum-upload-concurrency/", unique_suffix());
     let uri = format!(
-        "gcs://{bucket}/{prefix}?vfs=blockcachevfs&project=test-project&access_token=test-token&endpoint={endpoint}&database=default.db&request_count=2147483647"
+        "gcs://{bucket}/{prefix}?vfs=blockcachevfs&project=test-project&access_token=test-token&endpoint={endpoint}&database=default.db&upload_concurrency=2147483647"
     );
-    let database = Connection::open(&uri).expect("open ordinary GCS VFS at maximum request_count");
+    let database =
+        Connection::open(&uri).expect("open ordinary GCS VFS at maximum upload concurrency");
     database
         .execute_batch(
             "CREATE TABLE upload_probe(value TEXT NOT NULL);
@@ -9695,10 +9696,10 @@ fn google_uri_ordinary_upload_accepts_maximum_request_count() {
         .expect("write a small database through the ordinary VFS upload path");
     database
         .upload()
-        .expect("publish ordinary VFS upload with maximum request_count");
+        .expect("publish ordinary VFS upload with maximum upload concurrency");
     database
         .close()
-        .unwrap_or_else(|(_, error)| panic!("close maximum-request-count database: {error}"));
+        .unwrap_or_else(|(_, error)| panic!("close maximum-upload-concurrency database: {error}"));
 
     let published = Connection::open_with_flags(
         &uri,
@@ -9713,7 +9714,7 @@ fn google_uri_ordinary_upload_accepts_maximum_request_count() {
     assert_eq!(value, "published");
     published
         .close()
-        .unwrap_or_else(|(_, error)| panic!("close maximum-request-count reader: {error}"));
+        .unwrap_or_else(|(_, error)| panic!("close maximum-upload-concurrency reader: {error}"));
 }
 
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
@@ -9725,10 +9726,10 @@ fn google_uri_session_bounds_parallel_block_staging_and_recovers_failed_batch() 
     let bucket = "app_storage";
     ensure_google_bucket(&endpoint, bucket);
 
-    for request_count in [1_u32, 3] {
+    for upload_concurrency in [1_u32, 3] {
         let proxy = ConcurrentBlockPutProxy::start(&endpoint);
         let prefix = format!(
-            "{}/uri/parallel-checkpoint-{request_count}/",
+            "{}/uri/parallel-checkpoint-{upload_concurrency}/",
             unique_suffix()
         );
         let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
@@ -9738,11 +9739,11 @@ fn google_uri_session_bounds_parallel_block_staging_and_recovers_failed_batch() 
                 .expect("derive parallel-checkpoint operation ID");
         let progress_events = Arc::new(Mutex::new(Vec::<UploadProgress>::new()));
         let callback_events = Arc::clone(&progress_events);
-        let mut server = start_uri_session_server_with_request_count_and_progress(
+        let mut server = start_uri_session_server_with_upload_concurrency_and_progress(
             &uri,
             &session_id,
             operation_id,
-            request_count,
+            upload_concurrency,
             move |progress| {
                 callback_events
                     .lock()
@@ -9781,26 +9782,26 @@ fn google_uri_session_bounds_parallel_block_staging_and_recovers_failed_batch() 
             proxy.state(),
             snapshot,
             Some(Arc::clone(&progress_events)),
-            request_count as usize,
+            upload_concurrency as usize,
         );
-        server
-            .complete_request()
-            .unwrap_or_else(|error| panic!("checkpoint request_count={request_count}: {error:?}"));
+        server.complete_request().unwrap_or_else(|error| {
+            panic!("checkpoint upload_concurrency={upload_concurrency}: {error:?}")
+        });
         probe
             .join()
             .expect("visibility probe thread must not panic")
-            .unwrap_or_else(|message| panic!("request_count={request_count}: {message}"));
+            .unwrap_or_else(|message| panic!("upload_concurrency={upload_concurrency}: {message}"));
 
         assert_eq!(proxy.state.active.load(Ordering::Acquire), 0);
         assert_eq!(proxy.state.timed_out.load(Ordering::Acquire), 0);
         let high_water = proxy.state.high_water.load(Ordering::Acquire);
         assert_eq!(
-            high_water, request_count as usize,
-            "request_count={request_count} should determine simultaneous block PUTs"
+            high_water, upload_concurrency as usize,
+            "upload_concurrency={upload_concurrency} should determine simultaneous block PUTs"
         );
         assert!(
-            high_water <= request_count as usize,
-            "block PUT concurrency exceeded request_count={request_count}: {high_water}"
+            high_water <= upload_concurrency as usize,
+            "block PUT concurrency exceeded upload_concurrency={upload_concurrency}: {high_water}"
         );
         let observations = proxy
             .state
@@ -9809,8 +9810,8 @@ fn google_uri_session_bounds_parallel_block_staging_and_recovers_failed_batch() 
             .expect("lock concurrent block PUT observations")
             .clone();
         assert!(
-            observations.len() >= request_count as usize,
-            "checkpoint should stage at least request_count blocks: {observations:?}"
+            observations.len() >= upload_concurrency as usize,
+            "checkpoint should stage at least upload_concurrency blocks: {observations:?}"
         );
         assert!(
             observations.iter().all(|observation| {
@@ -9889,7 +9890,7 @@ fn google_uri_session_bounds_parallel_block_staging_and_recovers_failed_batch() 
     let operation_id =
         SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
             .expect("derive failed-batch operation ID");
-    let mut server = start_uri_session_server_with_request_count_and_progress(
+    let mut server = start_uri_session_server_with_upload_concurrency_and_progress(
         &uri,
         &session_id,
         operation_id,

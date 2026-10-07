@@ -115,8 +115,8 @@ test service.
 
 ### Concurrent cloud block uploads
 
-Cloud database URIs accept an optional `request_count` query parameter for both
-GCS and S3. It is a positive decimal integer from `1` through `i32::MAX`; when
+Cloud database URIs accept an optional `upload_concurrency` query parameter
+for both GCS and S3. It is a positive decimal integer from `1` through `i32::MAX`; when
 omitted, the native VFS default is used (currently 10). This is an upper bound:
 the VFS can use fewer simultaneous block uploads to fit the local cache and its
 staging-buffer budget.
@@ -126,18 +126,18 @@ use rusqlite::Connection;
 
 # fn main() -> rusqlite::Result<()> {
 let db = Connection::open(
-    "gcs://bucket/prefix?vfs=blockcachevfs&project=project&access_token=TOKEN&database=file.db&request_count=8",
+    "gcs://bucket/prefix?vfs=blockcachevfs&project=project&access_token=TOKEN&database=file.db&upload_concurrency=8",
 )?;
 # drop(db);
 # Ok(())
 # }
 ```
 
-For a session-owned URI server, `BlockCacheSessionOptions::request_count(8)`
+For a session-owned URI server, `BlockCacheSessionOptions::upload_concurrency(8)`
 sets the same limit. If both the session option and URI parameter are present,
 the explicit session option takes precedence. A static process-lifetime VFS is
-configured when it is built with `.config(Config::RequestCount(8))`; a session
-option cannot change the configuration of an already shared VFS.
+configured when it is built with `.config(Config::UploadConcurrency(8))`; a
+session option cannot change the configuration of an already shared VFS.
 
 To reuse CBS's own emulator tests, run the shared runner once per backend. It
 uses the same vendored checkout, applies this repository's numbered patches to
