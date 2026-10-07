@@ -103,92 +103,90 @@ path accepts that result and uploads any already-dirty main-file blocks without
 requiring a `-wal` file. This does not imply that attached rollback-journal
 writes are supported.
 
-`0017-session-block-prefix.patch` places every new block read and write under
-`blocks/<block-id>.bcv`. Session writes use create-only PUTs; when an immutable
-object already exists, CBS verifies its exact bytes before accepting it. The
-layout has no flat-key fallback.
+`0017-session-upload-safety-and-parallel-staging.patch` consolidates the
+former 0017-0025 production patches as one regenerated net diff. Its patch
+header is the change-retention checklist for future CBS upgrades; regenerate it
+from the pinned pristine source after applying 0001-0016, and keep
+`../../cloudsqlite` untouched.
 
-`0018-stage-guard-fence.patch` keeps the mutable cleanup guard server-owned.
-Before a session block PUT, the client reads the guard ETag, writes its own
-session-scoped attempt marker, then reads the guard again. It proceeds only
-when both snapshots show the same idle generation (or both show that no guard
-exists). It retries guard transitions for up to 12 seconds. Cleanup changes the
-idle epoch when releasing its sweep, so a sweep that starts and ends between
-the two reads is still detected on stores whose ETags are content-derived.
+The retained behavior includes the `blocks/<block-id>.bcv` immutable payload
+namespace with no flat-key fallback. This path lets a client CAB grant access to
+immutable payloads without granting mutable session-control objects. Session
+writes are create-only, and an already-present object requires exact-byte
+verification. A staged block PUT does not publish the database; only the explicit
+`sqlite3_bcvfs_upload` operation can install the conditional manifest. Session
+block writes
+are protected by an attempt marker fenced between two reads of the server-owned
+cleanup guard. Both observations must show the same idle epoch, or both must
+show no guard; cleanup changes the idle epoch when it releases a sweep, and
+clients retry a transition for up to 12 seconds.
 
-`0019-gcs-crc32c-integrity.patch` sends CRC32C for every Google JSON media
-upload and requires the matching `X-Goog-Hash` checksum on full-object
-downloads before CBS consumes the body. Block reads also require the configured
-full block size before writing into cache. Conditional 304 responses retain
-the existing not-modified behavior. The same JSON media transport covers block
-objects, session metadata, and the manifest.
+Ordinary unscoped writers retain one shared writer-guard CAS before any
+payload PUT in a staging batch. If cleanup owns SWEEP, the batch queues no
+payload and leaves dirty local blocks for retry after the guard returns to
+IDLE. Session-owned CAB VFS connections cannot write the shared guard; they
+continue to use the read-idle, attempt-marker, read-epoch fence above. The
+`bcvfs_session_gc.test` regression keeps the zero-PUT-under-SWEEP and
+idle-transition recovery checks.
 
-`0020-bundled-curl-ca-fallback.patch` applies only to Rust's Cargo-bundled
-static curl build. It preserves `CLOUDSQLITE_CAINFO`, honors `SSL_CERT_FILE`
-and `SSL_CERT_DIR`, and otherwise selects readable conventional CA file and
-directory locations without weakening peer or hostname verification. The
-standalone CBS build keeps its upstream curl configuration.
+Google JSON media uploads include CRC32C. CBS verifies the matching checksum
+before handing full-object downloads to cache consumers, rejects short blocks,
+and preserves conditional 304 behavior. The Cargo-bundled static curl build
+keeps `CLOUDSQLITE_CAINFO`, honors `SSL_CERT_FILE` and `SSL_CERT_DIR`, and uses
+readable conventional CA paths only when neither environment setting is
+present. It does not weaken peer or hostname verification, and standalone CBS
+keeps its upstream curl configuration.
 
-`0021-cloud-auth-refresh-callback.patch` adds request-boundary Bearer-token
-refresh for session-owned Google JSON connections. CBS asks for a current
-token immediately before dispatching each HTTP request, then after a 401 or
-403 asks for a forced replacement and replays that same request once. The
-replay preserves its body and generation preconditions; a second denial is
-terminal. Callback errors become a generic SQLite authorization I/O error,
-and token-bearing headers are not included in CBS verbose HTTP output. The
-static authentication callback and Google XML/S3 paths keep their existing
-behavior.
+Session-owned Google JSON requests obtain a current Bearer token immediately
+before dispatch, then refresh and replay the same request once after a 401/403.
+The replay preserves its body and generation preconditions; a second denial is
+terminal. Static auth and Google XML/S3 retain their existing behavior, and
+token-bearing headers stay out of verbose output. A live upload retry accepts an
+exact same-byte replay of an immutable block. A fresh process rehydrates only an
+accepted durable checkpoint/head; unaccepted overlay-to-block mappings are
+disposable and rebuilt from Gen's durable local graph. Attempt markers do not
+reconstruct those mappings, so CBS does not promise bandwidth-free resume for
+every block staged before acceptance. The optional URI-VFS progress
+callback reports completed block uploads and exact-byte-verified reuse during
+streaming staging, checkpoint flushes, and ordinary uploads. After the explicit
+final checkpoint has quiesced the WAL, it reports the remaining unpinned dirty
+blocks as a fixed plan. Plan bytes count full payloads, not predicted network
+traffic, WAL, or publication metadata; no plan is emitted during production or
+when dirty blocks are blocked. Callback code runs synchronously on the upload
+thread, so callers must keep it quick and must not re-enter the same VFS. Rust
+callback panics are contained and cannot change storage or publication results.
 
-This keeps a live `upload()` retry safe when it resumes from local dirty
-manifest state: immutable block objects already accepted by the server remain
-valid, and an exact same-byte create-only replay is accepted. A fresh process
-can rehydrate only an accepted durable session checkpoint/head. Unaccepted
-local overlay-to-block mappings are disposable and rebuilt by Gen from its
-durable local graph; session attempt markers do not reconstruct that mapping,
-so the VFS does not promise bandwidth-free resume for every block staged
-before acceptance.
+A session-owned URI VFS also retains its first terminal storage failure as a
+safe phase and explicitly typed HTTP-status or SQLite-code cause. It covers
+block transfers, local cache I/O, session protection, checkpoints, accepted
+heads, and publication writes. It excludes transient retries, missing guards,
+expected head CAS conflicts, verified immutable-object reuse, URLs, credentials,
+and provider response text.
 
-`0022-upload-progress-callback.patch` adds an optional callback for completed
-block uploads. It reports cumulative created-block and exact-byte-verified
-reuse counts and bytes for one URI-owned VFS. Events cover streaming staging,
-checkpoint flushes, and ordinary block uploads. The callback runs synchronously
-on the thread doing native upload work; panics are ignored and cannot change
-storage or publication results. Callers should keep it quick and must not
-re-enter the same VFS or connection. Its expected total remains unknown while
-the graph is producing blocks; the following plan patch fills it after the
-explicit final checkpoint counts remaining dirty blocks.
+Dirty payload blocks are staged in bounded parallel batches both at the
+watermark and during the final session drain. Attempt markers remain fenced
+serially before payload requests are queued. `SQLITE_BCV_NREQUEST` accepts
+values from 1 through `INT_MAX` and supplies an upper bound on concurrency; 1
+retains serial staging. Effective batch size is
+also capped at 64 blocks, cache capacity, and 64 MiB of copied payload;
+a single larger block stages alone. Exact-byte checks remain mandatory for
+create-only conflicts. All requests drain before buffers, pins, or the dispatcher
+are released, and each successful PUT or verified reuse is recorded and cleaned
+independently. Completed sibling progress remains visible when another request
+fails. The watermark measures dirty payload blocks so later writes continue to
+form batches; hard cache-capacity staging remains in place.
 
-`0023-storage-failure-diagnostics.patch` lets a session-owned URI VFS retain a
-credential-free first terminal storage failure with an explicit operation
-phase and HTTP-status or SQLite-code cause. It covers block transfers, local
-cache I/O, session protection, checkpoint and accepted-head records, and
-publication writes. Transient retries, a missing cleanup guard, expected head
-CAS conflicts, and verified immutable-object reuse are not recorded as
-failures. No URL, credential, or provider response text enters the snapshot.
+Ordinary final uploads continue scanning past each durable staged block so an
+initial request chain can still dispatch later dirty blocks. The regression in
+`blockcachevfs-tests/bcvfs_staging_fault.test` verifies a staged prefix larger
+than the request count followed by a dirty tail, then checks a cold read after
+publication. Keep this test enabled alongside the `remote_server` and
+`remote_progress` Rust suites, `blockcachevfs_security`, focused
+`blockcachevfs_emulator` tests, and the shared CBS Tcl emulator runner when
+refreshing the patch series.
 
-`0024-upload-plan-progress.patch` extends the 0022 progress callback with a
-fixed block-work plan. After the explicit final checkpoint has quiesced the
-WAL, CBS counts the target container's remaining unpinned dirty blocks and
-reports that remainder alongside already completed upload/reuse counts. The
-plan's block and byte totals include both newly uploaded and verified-reused
-blocks; bytes are full block payload sizes, not predicted network traffic, and
-do not include WAL or publication metadata. No plan is reported while the
-producer is active or when dirty entries are blocked.
-
-`0025-parallel-session-staging.patch` batches dirty blocks from one container
-for both streaming watermark staging and the final session drain. It queues up to
-the configured `SQLITE_BCV_NREQUEST` payload PUTs on the existing libcurl multi
-dispatcher; session guard and attempt markers remain fenced serially before any
-payload request is queued. The effective batch is also capped at 64 blocks, the
-cache capacity, and a 64 MiB copied-payload budget (a single larger block still
-stages alone). Exact-byte checks remain required for create-only conflicts.
-Progress counters advance from each completed PUT or byte-verified reuse
-callback, so completed siblings remain visible while another request is still
-running. Every queued request drains before buffers, pins, or the dispatcher are
-released, and each successful PUT or verified reuse is durably recorded and
-cleaned independently even when another block in the batch fails.
-`RequestCount` accepts values from 1 through `INT_MAX`; it is an upper bound,
-with 1 retaining serial staging. The proactive stage watermark now measures
-dirty payload blocks against cache capacity, so later writes continue to form
-batches after the cache first reaches its watermark; hard cache-capacity
-staging remains in place.
+The CBS block callback and DoltLite logical chunk plan are paired by the Rust
+integration but remain separate native interfaces. Standalone CBS builds do not
+require DoltLite. This patch is applied only to staged CBS source; the separate
+`blockcachevfs-tests/` series carries CBS test changes and the emulator runner
+applies those tests after the production patch.

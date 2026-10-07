@@ -1,5 +1,4 @@
 diff --git a/blockcachevfstest.c b/blockcachevfstest.c
-index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef29f12c3c 100644
 --- a/blockcachevfstest.c
 +++ b/blockcachevfstest.c
 @@ -18,6 +18,30 @@
@@ -33,7 +32,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
  
  
  struct BcvTestGlobal {
-@@ -32,6 +56,12 @@ struct BcvTestGlobal {
+@@ -32,6 +56,12 @@
    int (*xRecv)(BCV_SOCKET_TYPE, void *, int);
    int (*xSend)(BCV_SOCKET_TYPE, void *, int);
  
@@ -46,7 +45,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    /* For curl-config-cb */
    Tcl_Interp *interp;
    Tcl_Obj *pScript;
-@@ -318,8 +348,6 @@ static int test_bcv_detach(
+@@ -318,8 +348,6 @@
    return TCL_OK;
  }
  
@@ -55,7 +54,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
  typedef struct TestBcv TestBcv;
  struct TestBcv {
    sqlite3_bcv *pBcv;
-@@ -400,6 +428,8 @@ static int test_bcv_cmd(
+@@ -400,6 +428,8 @@
      { "errmsg",   0, "" },                  /* 8 */
      { "upload",   2, "LOCAL REMOTE" },      /* 9 */
      { "cleanup",  1, "MS" },                /* 10 */
@@ -64,7 +63,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
      { 0, 0 }
    };
    int iCmd = 0;
-@@ -584,6 +614,20 @@ static int test_bcv_cmd(
+@@ -584,6 +614,20 @@
        Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
        break;
      };
@@ -85,11 +84,10 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
      default:
        assert( 0 );
    }
-@@ -818,6 +862,140 @@ static int test_bcv_ioerr_control(
-   return TCL_OK;
+@@ -819,6 +863,140 @@
  }
  
-+/*
+ /*
 +** bcv_test_crash_event EVENT
 +**
 +** The runtime test patch calls bcv_test_event() at named streaming-write
@@ -223,10 +221,11 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +  return TCL_OK;
 +}
 +
- /*
++/*
  ** vfs_delete VFSNAME FILE
  */
-@@ -863,6 +1041,68 @@ struct TestBcvfs {
+ static int test_vfs_delete(
+@@ -863,6 +1041,68 @@
    Tcl_Interp *interp;
  };
  
@@ -295,7 +294,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
  static void bcvfsDestroy(ClientData clientData){
    TestBcvfs *pTest = (TestBcvfs*)clientData;
    sqlite3_bcvfs_destroy(pTest->pFs);
-@@ -1111,7 +1351,16 @@ static int bcvfsCommand(
+@@ -1111,7 +1351,16 @@
      "delete",           /* 10 */
      "prefetch_new",     /* 11 */
      "revert",           /* 12 */
@@ -313,7 +312,15 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    };
    TestBcvfs *pTest = (TestBcvfs*)clientData;
    int iCmd;
-@@ -1512,54 +1761,4526 @@ static int bcvfsCommand(
+@@ -1133,6 +1382,7 @@
+           const char *zName;
+           int eOp;
+         } aOpt[] = {
++          { "stagewatermark", SQLITE_BCV_STAGEWATERMARK },
+           { "cachesize", SQLITE_BCV_CACHESIZE },
+           { "nrequest", SQLITE_BCV_NREQUEST },
+           { "httptimeout", SQLITE_BCV_HTTPTIMEOUT },
+@@ -1512,13 +1762,4485 @@
        }
        break;
      }
@@ -396,31 +403,20 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +  return 24+nEtag+nManifest;
 +}
 +
- /*
--** sqlite3_bcvfs_create DIR VFSNAME
++/*
 +** sqlite3_bcvfs_session_record_test
 +**
 +** Exercise the local format and access-boundary checks without requiring a
 +** cloud emulator.  Remote conditional PUTs are covered by the backend matrix;
 +** this command keeps malformed, cross-scope and path-construction cases in
 +** the ordinary CBS test binary as well.
- */
--static int test_bcvfs_create(
++*/
 +static int test_bcvfs_session_record(
-   ClientData clientData,
-   Tcl_Interp *interp,
-   int objc,
-   Tcl_Obj *const objv[]
- ){
--  const char *zDir = 0;
--  const char *zVfsname = 0;
--  sqlite3_bcvfs *pNew = 0;
--  TestBcvfs *pTest = 0;
--  int rc = SQLITE_OK;
--  Tcl_Obj *pCmd;
--
--  if( objc!=3 ){
--    Tcl_WrongNumArgs(interp, 1, objv, "DIR VFSNAME");
++  ClientData clientData,
++  Tcl_Interp *interp,
++  int objc,
++  Tcl_Obj *const objv[]
++){
 +  sqlite3_bcvfs_session_record in;
 +  sqlite3_bcvfs_session_record out;
 +  unsigned char aScope[SQLITE_BCVFS_SESSION_HASH_BYTES];
@@ -456,8 +452,8 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +  (void)clientData;
 +  if( objc!=1 ){
 +    Tcl_WrongNumArgs(interp, 1, objv, "");
-     return TCL_ERROR;
-   }
++    return TCL_ERROR;
++  }
 +#define SESSION_TEST_FAIL(zMsg) do { \
 +    Tcl_SetObjResult(interp, Tcl_NewStringObj((zMsg), -1)); \
 +    rcRet = TCL_ERROR; \
@@ -780,9 +776,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +    sqlite3_free(zErr);
 +    zErr = 0;
 +  }
- 
--  zDir = Tcl_GetString(objv[1]);
--  zVfsname = Tcl_GetString(objv[2]);
++
 +  aEncoded[SQLITE_BCVFS_SESSION_RECORD_HEADER_BYTES] ^= 0x01;
 +  rc = sqlite3_bcvfs_session_record_decode(
 +      aEncoded,nEncoded,zUuid,aScope,&out,&zErr
@@ -803,11 +797,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +  SESSION_TEST_REQUIRE(rc==SQLITE_AUTH, "cross-session record was accepted");
 +  sqlite3_free(zErr);
 +  zErr = 0;
- 
--  rc = sqlite3_bcvfs_create(zDir, zVfsname, &pNew, 0);
--  if( rc!=SQLITE_OK ){
--    Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
--    return TCL_ERROR;
++
 +  rc = sqlite3_bcvfs_session_object_name(
 +      SQLITE_BCVFS_SESSION_HEAD,zUuid,0,zName,sizeof(zName),&zErr
 +  );
@@ -859,11 +849,8 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +    sqlite3_free(zErr);
 +    zErr = 0;
 +    sqlite3_free(aInvalid);
-   }
- 
--  pTest = (TestBcvfs*)ckalloc(sizeof(TestBcvfs));
--  memset(pTest, 0, sizeof(TestBcvfs));
--  pTest->pFs = pNew;
++  }
++
 +  {
 +    sqlite3_bcvfs_session_record accepted = in;
 +    unsigned char aHeadBody[128];
@@ -948,10 +935,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +      }
 +    }
 +  }
- 
--  pCmd = Tcl_ObjPrintf("bcvfs_%s", zVfsname);
--  Tcl_CreateObjCommand(interp, 
--      Tcl_GetString(pCmd), bcvfsCommand, (void*)pTest, bcvfsDestroy
++
 +  {
 +    sqlite3_bcvfs_session_record invalid = in;
 +    unsigned char *aInvalid = 0;
@@ -979,9 +963,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +  in.nBody = SQLITE_BCVFS_SESSION_RECORD_MAX_BYTES;
 +  rc = sqlite3_bcvfs_session_record_encode(
 +      &in, &aEncoded, &nEncoded, aHash, &zErr
-   );
--  Tcl_SetObjResult(interp, pCmd);
--  return TCL_OK;
++  );
 +  SESSION_TEST_REQUIRE(rc==SQLITE_TOOBIG, "oversize session record was accepted");
 +
 +  /* The publication manifest carries exact logical EOF metadata in a
@@ -1059,10 +1041,8 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +#undef SESSION_TEST_REQUIRE
 +#undef SESSION_TEST_FAIL
 +  return rcRet;
- }
- 
--typedef struct BcvTfsList BcvTfsList;
--struct BcvTfsList {
++}
++
 +/*
 +** $vfs session_backend_test MODULE ACCOUNT CONTAINER SESSION_ID
 +**
@@ -3935,9 +3915,9 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +  return rcRet;
 +}
 +
-+/*
-+** sqlite3_bcvfs_create DIR VFSNAME
-+*/
+ /*
+ ** sqlite3_bcvfs_create DIR VFSNAME
+ */
 +static int test_bcvfs_session_uuid_decode(
 +  const char *z,
 +  unsigned char aUuid[16]
@@ -4823,51 +4803,10 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
 +  return rcRet;
 +}
 +
-+static int test_bcvfs_create(
-+  ClientData clientData,
-+  Tcl_Interp *interp,
-+  int objc,
-+  Tcl_Obj *const objv[]
-+){
-+  const char *zDir = 0;
-+  const char *zVfsname = 0;
-+  sqlite3_bcvfs *pNew = 0;
-+  TestBcvfs *pTest = 0;
-+  int rc = SQLITE_OK;
-+  Tcl_Obj *pCmd;
-+
-+  if( objc!=3 ){
-+    Tcl_WrongNumArgs(interp, 1, objv, "DIR VFSNAME");
-+    return TCL_ERROR;
-+  }
-+
-+  zDir = Tcl_GetString(objv[1]);
-+  zVfsname = Tcl_GetString(objv[2]);
-+
-+  rc = sqlite3_bcvfs_create(zDir, zVfsname, &pNew, 0);
-+  if( rc!=SQLITE_OK ){
-+    Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
-+    return TCL_ERROR;
-+  }
-+
-+  pTest = (TestBcvfs*)ckalloc(sizeof(TestBcvfs));
-+  memset(pTest, 0, sizeof(TestBcvfs));
-+  pTest->pFs = pNew;
-+
-+  pCmd = Tcl_ObjPrintf("bcvfs_%s", zVfsname);
-+  Tcl_CreateObjCommand(interp, 
-+      Tcl_GetString(pCmd), bcvfsCommand, (void*)pTest, bcvfsDestroy
-+  );
-+  Tcl_SetObjResult(interp, pCmd);
-+  return TCL_OK;
-+}
-+
-+typedef struct BcvTfsList BcvTfsList;
-+struct BcvTfsList {
-   int nRef;                       /* Pointers to this structure */
-   int rc;
-   int nAlloc;
-@@ -2047,15 +6768,156 @@ typedef struct BcvTestFile BcvTestFile;
+ static int test_bcvfs_create(
+   ClientData clientData,
+   Tcl_Interp *interp,
+@@ -2047,15 +6769,156 @@
  struct BcvTestFile {
    sqlite3_file base;
    sqlite3_file *pReal;
@@ -5025,7 +4964,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    return rc;
  }
  static int bcvTestRead(
-@@ -2065,10 +6927,18 @@ static int bcvTestRead(
+@@ -2065,10 +6928,18 @@
    sqlite3_int64 iOfst
  ){
    BcvTestFile *p = (BcvTestFile*)pFile;
@@ -5045,7 +4984,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
  }
  static int bcvTestWrite(
    sqlite3_file *pFile, 
-@@ -2077,18 +6947,43 @@ static int bcvTestWrite(
+@@ -2077,18 +6948,43 @@
    sqlite3_int64 iOfst
  ){
    BcvTestFile *p = (BcvTestFile*)pFile;
@@ -5089,7 +5028,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    return p->pReal->pMethods->xFileSize(p->pReal, pSize);
  }
  static int bcvTestLock(sqlite3_file *pFile, int eLock){
-@@ -2193,8 +7088,15 @@ static int bcvTestOpen(
+@@ -2193,8 +7089,15 @@
    p->pReal = (sqlite3_file*)&p[1];
    rc = pVfs2->xOpen(pVfs2, zName, p->pReal, flags, pFlags);
    if( rc==SQLITE_OK ){
@@ -5105,7 +5044,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
    return rc;
  }
  static int bcvTestDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir){
-@@ -2369,12 +7271,19 @@ const char *bcvtest_init(Tcl_Interp *interp){
+@@ -2369,12 +7272,19 @@
      { "bcv_oom_control", test_bcv_oom_control },
      { "bcv_socket_fault_control", test_bcv_socket_fault_control },
      { "sqlite3_bcvfs_create", test_bcvfs_create },
@@ -5125,7 +5064,7 @@ index cd2a97584cd9547da81f5cd619624d213271cf76..fd8b12e10c3e5e7df584e015e55f72ef
      { "vfs_delete", test_vfs_delete },
  
      { "bcv_curl_config_cb", test_bcv_curl_config_cb },
-@@ -2406,4 +7315,3 @@ const char *bcvtest_init(Tcl_Interp *interp){
+@@ -2406,4 +7316,3 @@
  
    return 0;
  }

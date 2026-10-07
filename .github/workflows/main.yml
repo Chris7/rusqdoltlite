@@ -148,6 +148,8 @@ jobs:
         run: cargo test --workspace --features blockcachevfs --all-targets --verbose
       - name: Rust remote server VFS tests
         run: cargo test --features 'blockcachevfs remote' --test remote_server --verbose
+      - name: Rust remote transfer progress tests
+        run: cargo test --features 'blockcachevfs remote' --test remote_progress --verbose
       - name: Start pinned emulator containers
         run: |
           set -euo pipefail
@@ -202,6 +204,59 @@ jobs:
         env:
           BLOCKCACHEVFS_S3_EMULATOR: http://127.0.0.1:4566
         run: cargo test --test blockcachevfs_emulator --features blockcachevfs -- --ignored --exact s3_emulator_bootstrap
+      - name: Run focused GCS session regressions
+        if: always() && steps.emulator_readiness.outcome == 'success'
+        env:
+          BLOCKCACHEVFS_GCS_EMULATOR: http://127.0.0.1:4443
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_ignored_test() {
+            local target="$1"
+            local name="$2"
+            local output
+            if ! output="$(cargo test --features 'blockcachevfs remote' --test "$target" -- --ignored --exact "$name" 2>&1)"; then
+              printf '%s\n' "$output"
+              return 1
+            fi
+            printf '%s\n' "$output"
+            if ! grep -Eq '^running [1-9][0-9]* tests?$' <<<"$output"; then
+              echo "the requested ignored test did not run: $target::$name" >&2
+              return 1
+            fi
+          }
+
+          run_ignored_test blockcachevfs_emulator google_cleanup_deletes_prefixed_blocks
+          run_ignored_test blockcachevfs_emulator google_uri_staged_graph_is_private_until_server_publication
+          run_ignored_test blockcachevfs_emulator google_uri_session_refences_after_guard_epoch_changes_between_reads
+          run_ignored_test blockcachevfs_emulator google_json_emulator_crc32c_guards_media_integrity
+          run_ignored_test blockcachevfs_emulator google_uri_session_reports_complete_block_upload_progress
+          run_ignored_test blockcachevfs_emulator google_uri_session_plan_stays_incomplete_after_final_checkpoint_403
+          run_ignored_test blockcachevfs_emulator google_uri_session_records_terminal_checkpoint_and_accept_failures
+          run_ignored_test blockcachevfs_emulator google_uri_session_rotates_credentials_during_one_checkpoint_batch
+          run_ignored_test blockcachevfs_emulator google_uri_session_retries_the_same_block_after_401_and_403
+          run_ignored_test blockcachevfs_emulator google_uri_session_bounds_retries_when_credentials_are_permanently_denied
+          run_ignored_test blockcachevfs_emulator google_uri_session_bounds_parallel_block_staging_and_recovers_failed_batch
+          run_ignored_test blockcachevfs_emulator google_uri_session_remote_server_accepts_chunk_over_public_request_limit
+          run_ignored_test remote_server uri_session_push_can_outlive_loopback_response_idle_timeout
+      - name: Run URI remote server smoke test against S3
+        if: always() && steps.emulator_readiness.outcome == 'success'
+        env:
+          BLOCKCACHEVFS_S3_EMULATOR: http://127.0.0.1:4566
+          BLOCKCACHEVFS_S3_ACCESS_KEY: test
+          BLOCKCACHEVFS_S3_SECRET: test
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(cargo test --test blockcachevfs_emulator --features 'blockcachevfs remote' -- --ignored --exact s3_uri_remote_server_publishes_repeated_pushes 2>&1)" || {
+            printf '%s\n' "$output"
+            exit 1
+          }
+          printf '%s\n' "$output"
+          grep -Eq '^running [1-9][0-9]* tests?$' <<<"$output" || {
+            echo "the requested ignored S3 smoke test did not run" >&2
+            exit 1
+          }
       - name: Run shared CBS suite against Google JSON
         if: always() && steps.emulator_readiness.outcome == 'success'
         env:

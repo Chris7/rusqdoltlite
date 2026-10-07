@@ -31,7 +31,7 @@ parts in the DoltLite and CBS series; apply each series directly to its own
 staged source tree and document any dependency between them. The numbered core
 patches apply to `doltlite.c`; remote-server sidecar patches apply to the
 staged `doltlite_remotesrv.c` and `doltlite_remotesrv.h` files before the
-server is appended to the amalgamation. Patch `0010` also applies to the staged
+server is appended to the amalgamation. Patch `0009` also applies to the staged
 `doltlite_tls.c` sidecar so its opaque connection allocation matches the
 amalgamation's `DoltliteConn` layout. Currently, `0001` and `0002` add
 `dolt_remote('set-url', ...)`, `0003` adds the CBS upload lock hooks, and
@@ -46,46 +46,29 @@ adds a NO_SEED-only native helper that commits an empty refs table for a new
 CBS DoltLite store without a SQL write that would create an unborn zero-tip
 branch. `0008-http-upload-batch-16mb.patch` reduces the maximum buffered HTTP
 upload batch from 32 MiB to 16 MiB.
-`0009-remote-server-chunk-limit.patch` keeps the public 64 MiB chunk and
-128 MiB request limits. A session-owned, URI-backed IPv4 loopback RemoteServer
-may receive larger push bodies up to the native signed-`int` request bound
-(2,147,483,647 bytes); the largest single Prolly chunk is 24 bytes less to
-account for its hash and length framing. `0010-http-remote-idle-timeout.patch`
-makes the HTTP client timeout a 30-second inactivity limit, refreshed after
-successful reads and writes. `0011-http-idle-timeout-url.patch` adds the
-request-local `http_idle_timeout_ms` URL option, capped at five minutes.
-Positive URL values take precedence over `DOLTLITE_HTTP_TIMEOUT_MS`, which
-remains the default idle-timeout override. `0013-loopback-unbounded-idle-timeout.patch`
-allows the explicit value `0` only for clear HTTP URLs whose host is a numeric
-IPv4 address in 127/8. `RemoteServer::database_url` uses that value only for
-URI-backed session loopback servers, so their Dolt requests can wait while the
-same-process server performs cloud writes. Ordinary remotes and TLS session
-URLs retain their configured inactivity limits. TCP connect and TLS handshake
-remain bounded at 30 seconds. The staged server TLS struct change keeps socket
-descriptors aligned with the patched amalgamation. `0014-dolt-push-transfer-progress.patch`
-adds an opt-in, per-connection Rust callback for logical Dolt chunk transfer
-progress without changing `dolt_push` SQL or HTTP behavior. It plans the fixed
-set of reachable destination-missing chunks before upload and retains only
-hash/length metadata. Synchronous remote writes count after success; HTTP writes
-count only after the complete chunk batch receives a successful response. These
-logical chunk totals are separate from CBS block progress, and the callback
-registration is scoped by a Rust guard.
+`0009-http-session-transfer-and-progress.patch` is one regenerated net patch
+for the former DoltLite patches 0009-0016. Its retention checklist is also in
+the patch header so an upstream refresh keeps every behavior. It keeps the
+public RemoteServer limits at 64 MiB per chunk and 128 MiB per request, while a
+session-owned numeric IPv4 loopback server may accept a request up to the native
+signed-int bound (with 24 bytes reserved for Prolly hash and length framing).
+HTTP operation timeouts are inactivity limits refreshed on successful reads and
+writes; connect and TLS handshake remain bounded at 30 seconds. The request URL
+option `http_idle_timeout_ms` is capped at five minutes and takes precedence
+over `DOLTLITE_HTTP_TIMEOUT_MS`; zero is accepted only for clear HTTP URLs with
+a numeric address in 127/8, as used by URI-backed session loopback servers.
+Transport diagnostics retain fixed phase and configured timeout context without
+including URLs, headers, credentials, provider bodies, or false timeout claims.
 
-`0015-http-get-chunks-adaptive-batch.patch` retries oversized `/get-chunks`
-requests using smaller hash ranges when the peer returns HTTP 413 or the native
-HTTP reader reaches its fixed 128 MiB response limit. It keeps each response
-within the public server limit and preserves result ordering; a single chunk
-that still exceeds the limit remains an error.
-`0016-http-chunked-response.patch` adds strict HTTP/1.1 chunked response
-decoding for remotes that stream large reads without a Content-Length. It
-validates bounded chunk extensions and trailers, caps encoded and decoded bodies
-at 128 MiB, and recognizes the final chunk on a keepalive connection without
-waiting for EOF.
-`0012-http-transport-error-context.patch` preserves the HTTP transport phase
-when a socket write/read or response parse fails. It reports the configured
-idle timeout as context without claiming every socket error was a timeout. It
-does not include the URL, headers, credentials, or provider response body, and
-preserves existing SQLite return codes, retry decisions, and timeout behavior.
+The same patch provides an opt-in per-connection Rust callback for logical Dolt
+chunk progress without changing public SQL or HTTP behavior. It plans reachable,
+destination-missing chunks while retaining hashes and lengths only, counts
+synchronous writes after success and HTTP writes after a complete successful
+batch, retries oversized `/get-chunks` reads with smaller ranges after HTTP 413
+or the fixed 128 MiB response limit, and decodes strict HTTP/1.1 chunked bodies
+with bounded extensions, trailers, and encoded/decoded sizes. A single chunk
+that exceeds the limit remains an error, and the final chunk is recognized on a
+keepalive connection without waiting for EOF.
 Patches under `blockcachevfs/` apply only to the staged CBS sources; patches in
 this directory apply only to DoltLite sources.
 
@@ -157,23 +140,42 @@ live manifest ETag to equal the fresh session's captured base, and the
 conditional manifest write preserves stale-base rejection. Pending
 `PUBLISHING` records remain fenced.
 
-`blockcachevfs/0019-gcs-crc32c-integrity.patch` sends CRC32C on GCS JSON media
-uploads, checks the server checksum before CBS consumes full-object downloads,
-and rejects short blocks before cache writes.
+The consolidated CBS production patch is
+`blockcachevfs/0017-session-upload-safety-and-parallel-staging.patch`. Its patch
+header lists every former 0017-0025 intent as an upstream-retention checklist.
+It stores payload blocks under `blocks/<block-id>.bcv` with no flat-key fallback,
+requires create-only session writes and exact-byte verification for immutable
+object reuse, and fences each attempt marker with before/after snapshots of the
+server-owned cleanup guard and its idle epoch. Google JSON media writes include
+CRC32C and full-object downloads are checked before CBS consumes them; short
+blocks are rejected before cache writes. The Cargo static-curl build preserves
+explicit CA settings, honors `SSL_CERT_FILE` and `SSL_CERT_DIR`, and selects
+readable conventional CA locations without weakening TLS verification.
 
-`blockcachevfs/0023-storage-failure-diagnostics.patch` records the first
-terminal storage failure observed by a session-owned URI VFS as a safe phase
-and an explicitly typed HTTP status or SQLite result code. It covers block
-transfers, local cache I/O, session protection, checkpoint and accepted-head
-records, and publication writes. It omits URLs, credentials, and provider
-response text; transient retries, a missing cleanup guard, expected head CAS
-conflicts, and verified immutable-object reuse are not reported as failures.
+For session-owned Google JSON connections, CBS refreshes Bearer credentials at
+the request dispatch boundary and after one 401/403, replaying the same body and
+generation conditions once. A live upload retry accepts an exact same-byte replay
+of an immutable block, while a fresh process rehydrates only an accepted durable
+checkpoint/head; unaccepted overlay mappings are rebuilt from Gen's durable graph,
+and attempt markers do not promise bandwidth-free resume for previously staged
+blocks. It reports completed physical block uploads and
+verified reuse separately from DoltLite's logical chunk progress. The URI-VFS
+callback runs synchronously, and Rust callback panics are contained without
+changing storage or publication results. After the explicit final checkpoint,
+it reports remaining unpinned dirty blocks as a fixed plan; totals count full payload blocks rather than network traffic or WAL
+and publication metadata. The first terminal storage error retains a safe phase
+and explicitly typed HTTP or SQLite cause without URLs, credentials, or provider
+response text.
 
-`blockcachevfs/0024-upload-plan-progress.patch` extends the 0022 progress
-callback with a fixed block-work plan. After the explicit final checkpoint has
-quiesced the WAL, CBS counts the target container's remaining unpinned dirty
-blocks and reports that remainder alongside already completed upload/reuse
-counts. The plan includes newly uploaded and verified-reused blocks; bytes are
-full block payload sizes, not predicted network traffic, and exclude WAL or
-publication metadata. No plan is reported while the producer is active or
-when dirty entries are blocked.
+The patch also batches dirty blocks for watermark staging and the final session
+drain. Session markers remain fenced serially before payload PUTs are queued;
+effective concurrency is bounded by the configured request count, 64 blocks,
+cache capacity, and 64 MiB of copied payload, with a larger single block staged
+alone. Create-only conflicts still require an exact-byte GET. Every queued
+request drains, successful siblings are persisted independently, and completed
+progress remains visible if another PUT fails. `RequestCount` accepts values from
+1 through `INT_MAX` and is only an upper bound; 1 retains serial staging. The
+watermark measures dirty payload blocks so later writes continue to form batches. DoltLite's 0009 patch
+provides the separate logical chunk plan and callback; these CBS edits apply
+only to build.rs's OUT_DIR copy and remain separate from the pristine vendored
+CBS tree.

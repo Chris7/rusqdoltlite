@@ -42,6 +42,8 @@ use rusqlite::SessionOperationStatus;
 use rusqlite::{params, Connection, OpenFlags};
 #[cfg(feature = "remote")]
 use rusqlite::{BlockCacheSessionOptions, RemoteServer, RemoteServerOptions, SessionScope};
+#[cfg(feature = "remote")]
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 fn unique_suffix() -> String {
@@ -2490,6 +2492,17 @@ fn test_crc32c_base64(data: &[u8]) -> String {
 }
 
 #[cfg(feature = "remote")]
+fn idle_guard_body(epoch: u8) -> Vec<u8> {
+    let mut body = vec![0_u8; 68];
+    body[..7].copy_from_slice(b"BCVGD01");
+    body[9] = 1;
+    body[20..36].fill(epoch);
+    let checksum = Sha256::digest(&body[..36]);
+    body[36..].copy_from_slice(&checksum);
+    body
+}
+
+#[cfg(feature = "remote")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StorageFaultTarget {
     BlockPut,
@@ -2576,6 +2589,7 @@ struct BlockPutObservation {
 struct GuardGetObservation {
     path: String,
     status: u16,
+    generation: Option<String>,
 }
 
 #[cfg(feature = "remote")]
@@ -2591,6 +2605,9 @@ struct StorageFaultProxy {
     upload_checksums_valid: Arc<Mutex<Vec<bool>>>,
     block_put_observations: Arc<Mutex<Vec<BlockPutObservation>>>,
     guard_get_observations: Arc<Mutex<Vec<GuardGetObservation>>>,
+    guard_epoch_transition: Arc<AtomicBool>,
+    guard_get_sequence: Arc<AtomicUsize>,
+    first_block_put_guard_get_count: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
     url: String,
 }
@@ -2624,6 +2641,12 @@ impl StorageFaultProxy {
         let block_put_observations_thread = Arc::clone(&block_put_observations);
         let guard_get_observations = Arc::new(Mutex::new(Vec::new()));
         let guard_get_observations_thread = Arc::clone(&guard_get_observations);
+        let guard_epoch_transition = Arc::new(AtomicBool::new(false));
+        let guard_epoch_transition_thread = Arc::clone(&guard_epoch_transition);
+        let guard_get_sequence = Arc::new(AtomicUsize::new(0));
+        let guard_get_sequence_thread = Arc::clone(&guard_get_sequence);
+        let first_block_put_guard_get_count = Arc::new(AtomicUsize::new(0));
+        let first_block_put_guard_get_count_thread = Arc::clone(&first_block_put_guard_get_count);
         let thread_stop = Arc::clone(&stop);
         let thread_armed = Arc::clone(&armed);
         let thread_target = Arc::clone(&target);
@@ -2654,6 +2677,9 @@ impl StorageFaultProxy {
                         upload_checksums_valid: &upload_checksums_valid_thread,
                         block_put_observations: &block_put_observations_thread,
                         guard_get_observations: &guard_get_observations_thread,
+                        guard_epoch_transition: &guard_epoch_transition_thread,
+                        guard_get_sequence: &guard_get_sequence_thread,
+                        first_block_put_guard_get_count: &first_block_put_guard_get_count_thread,
                     },
                 );
                 if let Err(error) = result {
@@ -2679,6 +2705,9 @@ impl StorageFaultProxy {
             upload_checksums_valid,
             block_put_observations,
             guard_get_observations,
+            guard_epoch_transition,
+            guard_get_sequence,
+            first_block_put_guard_get_count,
             thread: Some(thread),
             url,
         }
@@ -2742,6 +2771,26 @@ impl StorageFaultProxy {
             .lock()
             .expect("lock recorded GCS block PUTs")
             .clear();
+    }
+
+    fn configure_guard_epoch_transition(&self) {
+        self.guard_epoch_transition.store(true, Ordering::Release);
+        self.guard_get_sequence.store(0, Ordering::Release);
+        self.first_block_put_guard_get_count
+            .store(0, Ordering::Release);
+        self.guard_get_observations
+            .lock()
+            .expect("lock recorded session guard GETs")
+            .clear();
+        self.clear_block_put_observations();
+    }
+
+    fn disable_guard_epoch_transition(&self) {
+        self.guard_epoch_transition.store(false, Ordering::Release);
+    }
+
+    fn first_block_put_guard_get_count(&self) -> usize {
+        self.first_block_put_guard_get_count.load(Ordering::Acquire)
     }
 }
 
@@ -3031,6 +3080,9 @@ struct StorageFaultControls<'a> {
     upload_checksums_valid: &'a Mutex<Vec<bool>>,
     block_put_observations: &'a Mutex<Vec<BlockPutObservation>>,
     guard_get_observations: &'a Mutex<Vec<GuardGetObservation>>,
+    guard_epoch_transition: &'a AtomicBool,
+    guard_get_sequence: &'a AtomicUsize,
+    first_block_put_guard_get_count: &'a AtomicUsize,
 }
 
 #[cfg(feature = "remote")]
@@ -3045,6 +3097,32 @@ fn handle_storage_fault_connection(
     let request_path = storage_request_path(&request_target);
     let session_guard_get =
         method.eq_ignore_ascii_case("GET") && request_path.ends_with("/bcv-session/v1/guard.bcv");
+    if session_guard_get && controls.guard_epoch_transition.load(Ordering::Acquire) {
+        let sequence = controls.guard_get_sequence.fetch_add(1, Ordering::AcqRel);
+        let (epoch, generation) = if sequence == 0 {
+            (0xA1, "1001")
+        } else {
+            (0xB2, "2002")
+        };
+        let body = idle_guard_body(epoch);
+        controls
+            .guard_get_observations
+            .lock()
+            .expect("lock recorded session guard GETs")
+            .push(GuardGetObservation {
+                path: request_path,
+                status: 200,
+                generation: Some(generation.to_owned()),
+            });
+        let checksum = test_crc32c_base64(&body);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nx-goog-generation: {generation}\r\nX-Goog-Hash: crc32c={checksum}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        stream.write_all(&body)?;
+        return Ok(());
+    }
     let media_upload = method.eq_ignore_ascii_case("POST")
         && request_target.contains("/upload/storage/v1/")
         && request_target.contains("uploadType=media");
@@ -3113,6 +3191,15 @@ fn handle_storage_fault_connection(
         None
     };
     if request_fault == Some(StorageFaultTarget::BlockPut) {
+        if controls.guard_epoch_transition.load(Ordering::Acquire) {
+            let guard_gets = controls.guard_get_sequence.load(Ordering::Acquire);
+            let _ = controls.first_block_put_guard_get_count.compare_exchange(
+                0,
+                guard_gets,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
         controls
             .block_put_observations
             .lock()
@@ -3266,6 +3353,7 @@ fn handle_storage_fault_connection(
             .push(GuardGetObservation {
                 path: request_path,
                 status: http_status(&response),
+                generation: None,
             });
     }
     if fault_now && request_fault == Some(StorageFaultTarget::BlockGet) {
@@ -7434,14 +7522,36 @@ fn remote_request_large_chunk(port: u16, chunk_bytes: usize) -> Vec<u8> {
 }
 
 #[cfg(feature = "remote")]
+fn remote_server_credentials(backend: &str) -> Vec<String> {
+    match backend {
+        "google" => vec!["remote-server-token".to_owned()],
+        "s3" => vec![
+            std::env::var("BLOCKCACHEVFS_S3_ACCESS_KEY")
+                .unwrap_or_else(|_| "remote-server-access".to_owned()),
+            std::env::var("BLOCKCACHEVFS_S3_SECRET")
+                .unwrap_or_else(|_| "remote-server-secret".to_owned()),
+        ],
+        _ => unreachable!("unknown remote server backend {backend}"),
+    }
+}
+
+#[cfg(feature = "remote")]
 fn remote_server_database_uri(backend: &str, endpoint: &str, bucket: &str, prefix: &str) -> String {
     match backend {
         "google" => format!(
             "gcs://{bucket}/{prefix}?vfs=blockcachevfs&project=test-project&access_token=remote-server-token&endpoint={endpoint}&database=remote.db"
         ),
-        "s3" => format!(
-            "s3://{bucket}/{prefix}?vfs=blockcachevfs&region=us-east-1&access_id=remote-server-access&secret_access_key=remote-server-secret&endpoint={endpoint}&database=remote.db"
-        ),
+        "s3" => {
+            let credentials = remote_server_credentials(backend);
+            let [access_id, secret_access_key] = credentials.as_slice() else {
+                unreachable!("S3 remote server has access-key and secret credentials")
+            };
+            format!(
+                "s3://{bucket}/{prefix}?vfs=blockcachevfs&region=us-east-1&access_id={}&secret_access_key={}&endpoint={endpoint}&database=remote.db",
+                encode_query_value(access_id),
+                encode_query_value(secret_access_key)
+            )
+        }
         _ => unreachable!("unknown remote server backend {backend}"),
     }
 }
@@ -7466,6 +7576,7 @@ fn run_uri_remote_server_push_workflow(backend: &str) {
     } else {
         ensure_s3_bucket(&endpoint, &bucket);
     }
+    let credentials = remote_server_credentials(backend);
 
     let prefix = format!("{suffix}/uri/remote-server/");
     for (name, flags) in [
@@ -7492,11 +7603,7 @@ fn run_uri_remote_server_push_workflow(backend: &str) {
             Some(ffi::SQLITE_NOTFOUND),
             "a missing remote database should preserve SQLITE_NOTFOUND: {error:?}"
         );
-        for credential in [
-            "remote-server-token",
-            "remote-server-access",
-            "remote-server-secret",
-        ] {
+        for credential in &credentials {
             assert!(!error.to_string().contains(credential));
             assert!(!format!("{error:?}").contains(credential));
         }
@@ -7531,11 +7638,7 @@ fn run_uri_remote_server_push_workflow(backend: &str) {
 
     let first_server = RemoteServer::start_with_options(&uri, &writable_options)
         .expect("start URI-owned remote server");
-    for credential in [
-        "remote-server-token",
-        "remote-server-access",
-        "remote-server-secret",
-    ] {
+    for credential in &credentials {
         assert!(!format!("{first_server:?}").contains(credential));
     }
     let empty_refs = remote_request(first_server.port(), "GET", "/remote.db/refs", &[]);
@@ -8402,6 +8505,18 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
     );
     let listing = list_google_objects(&endpoint, bucket, &prefix);
     let blocks_prefix = format!("{prefix}blocks/");
+    let flat_block_objects = google_object_names(&listing)
+        .into_iter()
+        .filter(|name| {
+            name.strip_prefix(&prefix).is_some_and(|relative| {
+                !relative.contains('/')
+                    && relative.strip_suffix(".bcv").is_some_and(|block_id| {
+                        !block_id.is_empty()
+                            && block_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            })
+        })
+        .collect::<Vec<_>>();
     let attempt_prefix = format!("{prefix}bcv-session/v1/attempt/{session_id}/");
     let checkpoint_prefix = format!("{prefix}bcv-session/v1/checkpoint/{session_id}/");
     let head_object = format!("{prefix}bcv-session/v1/head/{session_id}.bcv");
@@ -8413,6 +8528,10 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
     assert!(
         session_listing_contains_object_prefix("google", &listing, &blocks_prefix),
         "staged graph blocks must use the CAB-separable blocks/ prefix: {listing}"
+    );
+    assert!(
+        flat_block_objects.is_empty(),
+        "session staging must not create legacy flat block keys: {flat_block_objects:?}"
     );
     assert!(
         session_listing_contains_object_prefix("google", &listing, &attempt_prefix),
@@ -9066,6 +9185,98 @@ fn google_uri_session_reports_complete_block_upload_progress() {
         }),
         "wrong existing bytes must not count as reuse: {corrupt_progress:?}"
     );
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_session_refences_after_guard_epoch_changes_between_reads() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let proxy = StorageFaultProxy::start(&endpoint);
+    let prefix = format!("{}/uri/guard-epoch-transition/", unique_suffix());
+    let uri = remote_server_database_uri("google", &proxy.url, bucket, &prefix);
+    let session_id = Uuid::new_v4().to_string();
+    let operation_id =
+        SessionOperationId::from_request("POST", "/remote.db/commit", session_id.as_bytes())
+            .expect("derive guard-epoch test operation ID");
+    let mut server = start_uri_session_server_with_request_count_and_progress(
+        &uri,
+        &session_id,
+        operation_id,
+        1,
+        |_| {},
+    )
+    .expect("start serialized guard-epoch URI session");
+    let database = server
+        .database_connection()
+        .expect("guard-epoch URI session exposes its SQLite anchor");
+    configure_uri_session_test_cache_with(database, 64 * 1024 * 1024, 90);
+    seed_uri_session_fault_data(database).expect("seed guard-epoch database");
+    stage_session_update(database).expect("stage guard-epoch database update");
+
+    proxy.configure_guard_epoch_transition();
+    let checkpoint = server.complete_request();
+    assert!(
+        checkpoint.is_ok(),
+        "retry block fencing after cleanup changes the idle epoch: {checkpoint:?}; guard GETs={:?}; first storage failure={:?}",
+        proxy.guard_get_observations(),
+        server.first_storage_error()
+    );
+
+    let guard_gets = proxy.guard_get_observations();
+    let observed_epochs = guard_gets
+        .iter()
+        .take(4)
+        .map(|observation| observation.generation.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed_epochs,
+        [Some("1001"), Some("2002"), Some("2002"), Some("2002")],
+        "the first marker is fenced across an idle-epoch change, then retried against a stable generation: {guard_gets:?}"
+    );
+    assert_eq!(
+        proxy.first_block_put_guard_get_count(),
+        4,
+        "CBS must complete a matching before/after guard pair before the first immutable block PUT"
+    );
+    let block_puts = proxy.block_put_observations();
+    assert!(
+        !block_puts.is_empty(),
+        "a stable second guard snapshot should allow block staging"
+    );
+    assert!(
+        block_puts
+            .iter()
+            .all(|observation| observation.object.contains("/blocks/")),
+        "session blocks must stay under the blocks/ object prefix: {block_puts:?}"
+    );
+
+    // The synthetic generations above only prove refencing during staging.
+    // Let the emulator provide its real guard state for publication/readback.
+    proxy.disable_guard_epoch_transition();
+    server
+        .upload()
+        .expect("publish the accepted guard-fenced session");
+    server
+        .close()
+        .expect("close guard-fenced session publisher");
+    let published = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open published guard-fenced database");
+    let row_count: i64 = published
+        .query_row("SELECT count(*) FROM fault_data", [], |row| row.get(0))
+        .expect("read guard-fenced published data");
+    assert_eq!(row_count, 5_500);
+    published
+        .close()
+        .expect("close guard-fenced database reader");
 }
 
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]

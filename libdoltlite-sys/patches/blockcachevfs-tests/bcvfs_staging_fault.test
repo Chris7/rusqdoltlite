@@ -145,6 +145,9 @@ foreach event {1 2 3 4} {
     sqlite3_bcvfs_register_vtab objects
     set cloudObjects [objects eval {SELECT name FROM bcv_tfs}]
     foreach candidate $stagedObjects {
+      # Immutable payloads now live in the dedicated namespace; the metadata
+      # table still stores only the content hash.
+      set candidate "blocks/$candidate"
       if {[lsearch -exact $cloudObjects $candidate]>=0} {
         set object $candidate
         break
@@ -162,14 +165,108 @@ foreach event {1 2 3 4} {
   } 1
 
   sqlite3 db /after/staging.db -vfs bcvfs
-  do_execsql_test $event.3 {
+  do_execsql_test $event.3.integrity {
     PRAGMA integrity_check;
+  } ok
+  do_execsql_test $event.3.row_count {
     SELECT count(*) FROM payload;
+  } [expr {$event==4 ? 2001 : 1001}]
+  do_execsql_test $event.3.updated_row {
     SELECT hex(substr(body,1,4)), hex(substr(body,-1)) FROM payload WHERE id=1;
-  } [expr {$event==4 ? {ok 2001 00000000 01} : {ok 1001 00000000 00}}]
+  } [expr {$event==4 ? {00000000 01} : {00000000 00}}]
   db close
   $cmd destroy
 }
+
+# A staged prefix must not hide a later dirty block from a one-request upload.
+# Seed 1001 rows, then update one row and append rows 1001 through 2000. Retain
+# the default watermark so the last dirty slot remains available for the tail.
+set tail_container "bcv-staged-tail-$run_suffix"
+set tail_dir "staging-tail-testdir-$run_suffix"
+bcv_mkdir $tail_dir
+bcv_create_container $tail_container
+staging_upload_new_wal_db $tail_container staging.db {
+  CREATE TABLE payload(id INTEGER PRIMARY KEY, body BLOB NOT NULL);
+  INSERT INTO payload VALUES(0, zeroblob(4096));
+  WITH RECURSIVE c(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<1000
+  ) INSERT INTO payload(id, body) SELECT i, zeroblob(4096) FROM c;
+}
+set tail_request_count 1
+set tail_cmd [bcvfs_create $tail_dir "bcvfs-tail"]
+$tail_cmd config cachesize [expr 2*$::D(blocksize)]
+$tail_cmd config nrequest $tail_request_count
+bcvfs_attach -alias tail $tail_cmd $tail_container
+sqlite3 taildb /tail/staging.db -vfs bcvfs-tail
+taildb eval {
+  BEGIN IMMEDIATE;
+  UPDATE payload SET body=CAST(zeroblob(4095)||X'01' AS BLOB) WHERE id=1;
+  WITH RECURSIVE c(i) AS (
+    SELECT 1001 UNION ALL SELECT i+1 FROM c WHERE i<2000
+  ) INSERT INTO payload(id, body)
+    SELECT i, CAST(zeroblob(4095)||X'01' AS BLOB) FROM c;
+  COMMIT;
+}
+taildb eval {PRAGMA wal_checkpoint(TRUNCATE)}
+taildb close
+$tail_cmd destroy
+
+sqlite3 tailmeta [file join $tail_dir blocksdb.bcv]
+set nTailStaged [tailmeta onecolumn {
+  SELECT count(*) FROM staged WHERE container='tail'
+}]
+set nTailDirty [tailmeta onecolumn {
+  SELECT count(*) FROM block WHERE container='tail'
+}]
+set tailDirtyDb [tailmeta onecolumn {
+  SELECT db FROM block WHERE container='tail' LIMIT 1
+}]
+set tailDirtyPos [tailmeta onecolumn {
+  SELECT min(dbpos) FROM block WHERE container='tail'
+}]
+set nTailStagedBeforeDirty [tailmeta onecolumn {
+  SELECT count(DISTINCT dbpos) FROM staged
+  WHERE container='tail' AND db=$tailDirtyDb AND dbpos<$tailDirtyPos
+}]
+tailmeta close
+do_test 6.1.staged_prefix_precedes_dirty_tail {
+  if {$nTailDirty!=1 || $nTailStagedBeforeDirty<=$tail_request_count} {
+    error "expected > nrequest distinct staged db positions before one dirty tail (staged=$nTailStaged dirty=$nTailDirty prefix=$nTailStagedBeforeDirty dirty_db=$tailDirtyDb dirty_pos=$tailDirtyPos nrequest=$tail_request_count)"
+  }
+  set stagedPrefixVerified 1
+  set stagedPrefixVerified
+} 1
+
+# Recreate the VFS over the same local metadata directory so it resumes the
+# staged-prefix/dirty-tail mappings left by the first writer.
+set tail_publish_cmd [bcvfs_create $tail_dir "bcvfs-tail-publish"]
+$tail_publish_cmd config cachesize [expr 2*$::D(blocksize)]
+$tail_publish_cmd config nrequest $tail_request_count
+bcvfs_attach -ifnot -alias tail $tail_publish_cmd $tail_container
+do_test 6.2.publish_staged_prefix_and_dirty_tail {
+  catch {$tail_publish_cmd upload tail}
+} 0
+$tail_publish_cmd destroy
+
+set tail_verify_dir "staging-tail-verify-$run_suffix"
+bcv_mkdir $tail_verify_dir
+set tail_verify_cmd [bcvfs_create $tail_verify_dir "bcvfs-tail-verify"]
+$tail_verify_cmd config cachesize [expr 2*$::D(blocksize)]
+bcvfs_attach -alias verify $tail_verify_cmd $tail_container
+sqlite3 tailverify /verify/staging.db -vfs bcvfs-tail-verify
+do_test 6.3.cold_integrity {
+  tailverify onecolumn {PRAGMA integrity_check}
+} ok
+do_test 6.3.cold_row_count {
+  tailverify onecolumn {SELECT count(*) FROM payload}
+} 2001
+do_test 6.3.cold_updated_row {
+  tailverify eval {
+    SELECT hex(substr(body,1,4)), hex(substr(body,-1)) FROM payload WHERE id=1
+  }
+} {00000000 01}
+tailverify close
+$tail_verify_cmd destroy
 
 # A full cache can leave every changed block durably staged, with no dirty
 # `block` row left to make an ordinary detach notice unpublished data. The
@@ -187,6 +284,7 @@ staging_upload_new_wal_db $detach_container staging.db {
 }
 set cmd [bcvfs_create $detach_dir "bcvfs"]
 $cmd config cachesize [expr 2*$::D(blocksize)]
+$cmd config stagewatermark 50
 bcvfs_attach -alias staged $cmd $detach_container
 sqlite3 stageddb /staged/staging.db -vfs bcvfs
 stageddb eval {

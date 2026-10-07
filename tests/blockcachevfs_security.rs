@@ -208,6 +208,24 @@ fn verify_tls_case(
     ca_file: Option<&Path>,
     expect_request: bool,
 ) {
+    verify_tls_case_with_ca_environment(
+        directory,
+        name,
+        host,
+        ca_file.map(|path| ("SSL_CERT_FILE", path)),
+        expect_request,
+        "bundled_curl_preserves_tls_verification_and_custom_ca",
+    );
+}
+
+fn verify_tls_case_with_ca_environment(
+    directory: &Path,
+    name: &str,
+    host: &str,
+    ca_environment: Option<(&str, &Path)>,
+    expect_request: bool,
+    child_test_name: &str,
+) {
     let ready = directory.join(format!("{name}.port"));
     let seen = directory.join(format!("{name}.request"));
     let mut server = Command::new("python3")
@@ -225,11 +243,7 @@ fn verify_tls_case(
     let executable = std::env::current_exe().expect("should locate the TLS child test executable");
     let mut client_command = Command::new(executable);
     client_command
-        .args([
-            "--exact",
-            "bundled_curl_preserves_tls_verification_and_custom_ca",
-            "--nocapture",
-        ])
+        .args(["--exact", child_test_name, "--nocapture"])
         .env(TLS_CHILD_ENV, "1")
         .env(TLS_ENDPOINT_ENV, endpoint)
         .env("NO_PROXY", "localhost,127.0.0.1")
@@ -243,8 +257,8 @@ fn verify_tls_case(
         .env_remove("CLOUDSQLITE_CAINFO")
         .env_remove("SSL_CERT_FILE")
         .env_remove("SSL_CERT_DIR");
-    if let Some(ca_file) = ca_file {
-        client_command.env("SSL_CERT_FILE", ca_file);
+    if let Some((environment, path)) = ca_environment {
+        client_command.env(environment, path);
     }
     let client = client_command
         .stdout(Stdio::piped())
@@ -472,6 +486,66 @@ fn bundled_curl_preserves_tls_verification_and_custom_ca() {
     ] {
         verify_tls_case(directory.path(), name, host, trust_file, expect_request);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn bundled_curl_honors_ssl_cert_dir() {
+    if std::env::var_os(TLS_CHILD_ENV).is_some() {
+        tls_trust_child();
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("should create the TLS test directory");
+    let ca_file = create_tls_test_certificates(directory.path());
+    let hash = Command::new("openssl")
+        .args(["x509", "-hash", "-noout", "-in"])
+        .arg(&ca_file)
+        .output()
+        .expect("should have openssl installed for the local TLS verification test");
+    assert!(
+        hash.status.success(),
+        "calculate the test CA subject hash: {}",
+        String::from_utf8_lossy(&hash.stderr)
+    );
+    let ca_directory = directory.path().join("ca-directory");
+    fs::create_dir(&ca_directory).expect("should create the OpenSSL CA directory");
+    fs::copy(
+        &ca_file,
+        ca_directory.join(format!(
+            "{}.0",
+            String::from_utf8_lossy(&hash.stdout).trim()
+        )),
+    )
+    .expect("should copy the test CA under its OpenSSL subject hash");
+
+    let empty_ca_directory = directory.path().join("empty-ca-directory");
+    fs::create_dir(&empty_ca_directory).expect("should create an empty CA directory");
+
+    verify_tls_case_with_ca_environment(
+        directory.path(),
+        "ssl-cert-dir",
+        "localhost",
+        Some(("SSL_CERT_DIR", &ca_directory)),
+        true,
+        "bundled_curl_honors_ssl_cert_dir",
+    );
+    verify_tls_case_with_ca_environment(
+        directory.path(),
+        "ssl-cert-dir-untrusted",
+        "localhost",
+        Some(("SSL_CERT_DIR", &empty_ca_directory)),
+        false,
+        "bundled_curl_honors_ssl_cert_dir",
+    );
+    verify_tls_case_with_ca_environment(
+        directory.path(),
+        "ssl-cert-dir-wrong-host",
+        "127.0.0.1",
+        Some(("SSL_CERT_DIR", &ca_directory)),
+        false,
+        "bundled_curl_honors_ssl_cert_dir",
+    );
 }
 
 #[test]
