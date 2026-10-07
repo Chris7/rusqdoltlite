@@ -1,0 +1,15 @@
+diff --git a/doltlite.c b/doltlite.c
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -566045,8 +566045,11 @@
+   p->nPendingRefs = 0;
+   p->hasExpectedRefsHash = 0;
+   sqlite3_free(p->zPushBranch);
+   p->zPushBranch = 0;
++  if( rc==SQLITE_OK ){
++    rc = pRemote->xCommit(pRemote);
++  }
+   return rc;
+ }
+ 
+ static int httpCommit(DoltliteRemote *pRemote){

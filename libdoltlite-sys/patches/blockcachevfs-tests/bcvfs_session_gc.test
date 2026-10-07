@@ -42,7 +42,7 @@ proc manifest_delete_names {aManifest} {
     set iStart [expr {$iOffset + $ii*($nName+8)}]
     set aBlock [string range $aManifest $iStart [expr {$iStart+$nName-1}]]
     binary scan $aBlock H* zHex
-    lappend aName "[string toupper $zHex].bcv"
+    lappend aName "blocks/[string toupper $zHex].bcv"
   }
   return $aName
 }
@@ -60,7 +60,7 @@ proc manifest_live_names {aManifest} {
         set iStart [expr {$iOff + $jj*$nName}]
         set aBlock [string range $aManifest $iStart [expr {$iStart+$nName-1}]]
         binary scan $aBlock H* zHex
-        lappend aName "[string toupper $zHex].bcv"
+        lappend aName "blocks/[string toupper $zHex].bcv"
       }
     }
   }
@@ -153,7 +153,7 @@ $marker_bcv config find_orphans 1
 set marker_fixture [$cmd session_attempt_marker_test bcvfs $C(module) $C(user) \
     $marker_container $marker_session_id marker.db $fresh_dir active $C(namebytes)]
 lassign $marker_fixture marker_path marker_name block_path block_hex
-set marker_block_name [format "%s.bcv" $block_hex]
+set marker_block_name [format "blocks/%s.bcv" $block_hex]
 do_test 1.2 {
   list [$marker_bcv put $marker_path $marker_name] \
       [$marker_bcv cleanup 0]
@@ -170,7 +170,7 @@ do_test 1.3 {
 set shared_fixture [$cmd session_attempt_marker_test bcvfs $C(module) $C(user) \
     $marker_container $shared_session_id marker.db $fresh_dir expired $C(namebytes)]
 lassign $shared_fixture shared_marker_path shared_marker_name shared_block_path shared_block_hex
-set shared_block_name [format "%s.bcv" $shared_block_hex]
+set shared_block_name [format "blocks/%s.bcv" $shared_block_hex]
 do_test 1.4 {
   list [$marker_bcv put $shared_marker_path $shared_marker_name] \
       [$marker_bcv put $shared_block_path $shared_block_name] \
@@ -186,7 +186,7 @@ $guard_bcv config find_orphans 1
 set guard_fixture [$cmd session_attempt_marker_test bcvfs $C(module) $C(user) \
     $guard_container $shared_session_id guard.db $fresh_dir guard $C(namebytes)]
 lassign $guard_fixture guard_path guard_name guard_block_path guard_block_hex
-set guard_block_name [format "%s.bcv" $guard_block_hex]
+set guard_block_name [format "blocks/%s.bcv" $guard_block_hex]
 do_test 1.5 {
   list [$guard_bcv put $guard_path $guard_name] \
       [$guard_bcv put $guard_block_path $guard_block_name] \
@@ -200,7 +200,7 @@ do_test 1.5.guard-state {
   list $rc $eMode
 } {0 1}
 
-# Even a legacy, unscoped attachment must join the writer fence. Keep one VFS
+# Even an ordinary unscoped attachment must join the writer fence. Keep one VFS
 # and SQLite connection open across the guard transition: writes/checkpoints
 # under SWEEP are followed by more writes after IDLE, so the same local dirty
 # cache must eventually reach StageOne and produce durable staged blocks.
@@ -245,7 +245,7 @@ $guard_bcv close
 do_test 1.6.idle-stage-state {
   sqlite3 guard_stage_metadata [file join $guard_stage_dir blocksdb.bcv]
   set stagedObjects [guard_stage_metadata eval {
-    SELECT hex(blockid) || '.bcv' FROM staged
+    SELECT 'blocks/' || hex(blockid) || '.bcv' FROM staged
   }]
   guard_stage_metadata close
   set stage_bcv [bcv_open $guard_container]
@@ -266,7 +266,7 @@ do_test 1.6.idle-stage-state {
 
 $marker_bcv close
 set orphan_path [file join $fresh_dir orphan-block.bcv]
-set orphan_name [string repeat f $block_hex_chars].bcv
+set orphan_name "blocks/[string repeat f $block_hex_chars].bcv"
 set out [open $orphan_path wb]
 fconfigure $out -translation binary -encoding binary
 puts -nonewline $out [string repeat O 512]
@@ -519,7 +519,7 @@ fconfigure $out -translation binary -encoding binary
 puts -nonewline $out [string repeat Q 512]
 close $out
 set bad_candidate_name [string repeat 1 64].bcv
-set bad_orphan_name [string repeat e $block_hex_chars].bcv
+set bad_orphan_name "blocks/[string repeat e $block_hex_chars].bcv"
 
 do_test 3.1 {
   list [$bcv put $bad_candidate_path \

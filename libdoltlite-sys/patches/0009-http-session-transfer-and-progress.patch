@@ -1,0 +1,1914 @@
+Subject: [PATCH] Bound and observe DoltLite HTTP session transfers
+Base: DoltLite v0.50.12 with local patches 0001-0008 applied
+
+This is a regenerated net patch from the state after DoltLite patches 0001-0008.
+Its source was produced by applying the former 0009-0016 series in order, then
+adding only the C comments below. On an upstream refresh, retain every numbered
+intent below when regenerating this patch; do not edit the pristine vendored
+amalgamation or remote sidecars.
+
+Retained intent from the former DoltLite patches:
+- 0009: Keep public RemoteServer limits at 64 MiB per chunk and 128 MiB per
+  request. A session-owned numeric IPv4 loopback server may accept bodies up to
+  the native signed-int bound; a single Prolly chunk stays 24 bytes below it for
+  hash and length framing. Permit slow body progress for this same-process
+  loopback path while ordinary servers retain their request limits.
+- 0010: Make HTTP timeouts inactivity limits refreshed by successful reads and
+  writes. Keep TCP connect and TLS handshake bounded at 30 seconds and update
+  the staged TLS sidecar to match DoltliteConn's layout.
+- 0011: Add request-local http_idle_timeout_ms, capped at five minutes and
+  taking precedence over DOLTLITE_HTTP_TIMEOUT_MS; keep the environment value
+  as the default override.
+- 0012: Preserve fixed HTTP transport phase and configured idle-timeout context
+  for socket and response failures without leaking URLs, headers, credentials,
+  provider bodies, or mislabeling arbitrary socket errors as timeouts. Preserve
+  SQLite result codes and retry behavior.
+- 0013: Allow timeout value zero only for clear HTTP URLs with a numeric IPv4
+  literal in 127/8. URI-backed session loopback RemoteServers use it while
+  ordinary remotes and TLS session URLs retain their configured idle timeout.
+- 0014: Add an opt-in per-connection Rust callback for logical Dolt push chunk
+  progress, without changing public SQL or HTTP behavior. Plan the reachable,
+  destination-missing chunks before transfer and retain hashes and lengths, not
+  payloads. Count synchronous writes on success and HTTP writes only after the
+  full batch succeeds.
+- 0015: Retry oversized /get-chunks responses as smaller hash ranges after HTTP
+  413 or the fixed 128 MiB response bound, preserve output order, and keep a
+  single overlarge chunk an error.
+- 0016: Decode strict HTTP/1.1 chunked responses without Content-Length. Validate
+  bounded extensions and trailers, cap encoded and decoded bodies at 128 MiB,
+  and stop when the final chunk arrives even on a keepalive connection.
+
+Cross-tree dependencies: the RemoteServer session-loopback option is consumed
+by the rusqdoltlite session-owned server integration. The callback here feeds
+logical chunk progress; CBS patch 0017 separately reports physical block
+progress, authorization refresh, integrity checks, and storage failures. The
+build applies this patch to staged copies of doltlite.c and the remote C
+sidecars; keep those vendored upstream files pristine.
+
+diff --git a/doltlite.c b/doltlite.c
+index b53be0ead7a148a35afb4cd45bb6bdb5c2cc34cf..11b77500c51285c2fb05675d8ca83198ec717978 100644
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -473262,6 +473262,7 @@ struct DoltliteConn {
+   int useTls;
+   int ownsConf;
+   long long deadlineMs;
++  int idleTimeoutMs;
+   mbedtls_net_context net;
+ 
+   mbedtls_ssl_context ssl;
+@@ -473299,23 +473300,37 @@ static int connApplyDeadline(DoltliteConn *c) {
+   return doltliteSocketSetTimeout(c->net.fd, (int)remaining);
+ }
+ 
++static void connRefreshIdleDeadline(DoltliteConn *c) {
++  if (c->idleTimeoutMs > 0) {
++    c->deadlineMs = doltliteMonotonicMs() + c->idleTimeoutMs;
++  }
++}
++
+ static int connSend(void *pCtx, const unsigned char *pBuf, size_t nBuf) {
+-  int fd = ((mbedtls_net_context *)pCtx)->fd;
++  DoltliteConn *c = (DoltliteConn *)pCtx;
++  int fd = c->net.fd;
+   int flags = 0;
++  int n;
++  if (connApplyDeadline(c) != 0) return MBEDTLS_ERR_NET_SEND_FAILED;
+ #ifdef MSG_NOSIGNAL
+   flags = MSG_NOSIGNAL;
+ #endif
+ #ifdef _WIN32
+-  {
+-    int n = send(fd, (const char *)pBuf, (int)nBuf, flags);
+-    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
+-  }
++  n = send(fd, (const char *)pBuf, (int)nBuf, flags);
+ #else
+-  {
+-    int n = (int)send(fd, pBuf, nBuf, flags);
+-    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
+-  }
++  n = (int)send(fd, pBuf, nBuf, flags);
+ #endif
++  if (n > 0) connRefreshIdleDeadline(c);
++  return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
++}
++
++static int connRecv(void *pCtx, unsigned char *pBuf, size_t nBuf) {
++  DoltliteConn *c = (DoltliteConn *)pCtx;
++  int n;
++  if (connApplyDeadline(c) != 0) return MBEDTLS_ERR_NET_RECV_FAILED;
++  n = mbedtls_net_recv(&c->net, pBuf, nBuf);
++  if (n > 0) connRefreshIdleDeadline(c);
++  return n;
+ }
+ 
+ #ifdef _WIN32
+@@ -473416,7 +473431,7 @@ DoltliteConn *doltliteConnOpenTimeout(
+   if (mbedtls_ssl_setup(&c->ssl, &c->conf) != 0) goto fail_tls;
+ 
+   if (mbedtls_ssl_set_hostname(&c->ssl, host) != 0) goto fail_tls;
+-  mbedtls_ssl_set_bio(&c->ssl, &c->net, connSend, mbedtls_net_recv, NULL);
++  mbedtls_ssl_set_bio(&c->ssl, c, connSend, connRecv, NULL);
+ 
+   do {
+     if (connApplyDeadline(c) != 0) goto fail_tls;
+@@ -473448,11 +473463,14 @@ int doltliteConnWriteAll(DoltliteConn *c, const void *buf, int nbuf) {
+     if (c->useTls) {
+       n = mbedtls_ssl_write(&c->ssl, p + off, (size_t)(nbuf - off));
+     } else {
+-      n = connSend(&c->net, p + off, (size_t)(nbuf - off));
++      n = connSend(c, p + off, (size_t)(nbuf - off));
+     }
+     if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+     if (n <= 0) return 1;
+     off += n;
++    if (c->idleTimeoutMs > 0) {
++      c->deadlineMs = doltliteMonotonicMs() + c->idleTimeoutMs;
++    }
+   }
+   return 0;
+ }
+@@ -473470,13 +473488,18 @@ int doltliteConnRead(DoltliteConn *c, void *buf, int nbuf) {
+ 
+     if (c->useTls && n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
+     if (n < 0) return -1;
++    if (n > 0 && c->idleTimeoutMs > 0) {
++      c->deadlineMs = doltliteMonotonicMs() + c->idleTimeoutMs;
++    }
+     return n;
+   }
+ }
+ 
+ int doltliteConnSetTimeout(DoltliteConn *c, int timeoutMs) {
+-  c->deadlineMs = timeoutMs > 0 ? doltliteMonotonicMs() + timeoutMs : 0;
+-  if (timeoutMs <= 0) return doltliteSocketSetTimeout(c->net.fd, 0);
++  c->idleTimeoutMs = timeoutMs > 0 ? timeoutMs : 0;
++  c->deadlineMs = c->idleTimeoutMs > 0
++                ? doltliteMonotonicMs() + c->idleTimeoutMs : 0;
++  if (c->idleTimeoutMs == 0) return doltliteSocketSetTimeout(c->net.fd, 0);
+   return connApplyDeadline(c);
+ }
+ 
+@@ -473562,7 +473585,7 @@ DoltliteConn *doltliteConnServerAccept(DoltliteTlsServer *s, int clientFd) {
+   mbedtls_ssl_init(&c->ssl);
+ 
+   if (mbedtls_ssl_setup(&c->ssl, &s->conf) != 0) goto fail;
+-  mbedtls_ssl_set_bio(&c->ssl, &c->net, connSend, mbedtls_net_recv, NULL);
++  mbedtls_ssl_set_bio(&c->ssl, c, connSend, connRecv, NULL);
+   do {
+     ret = mbedtls_ssl_handshake(&c->ssl);
+   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+@@ -509357,6 +509380,13 @@ int recordFromSortKeyBufferColl(
+ 
+ /* #include "chunk_store.h" */
+ 
++#define DOLTLITE_PUSH_PROGRESS_PLAN 1
++#define DOLTLITE_PUSH_PROGRESS_UPLOADED 2
++#define DOLTLITE_PUSH_PROGRESS_CLIENTDATA "rusqdoltlite.dolt_push_progress.v1"
++typedef void (SQLITE_APICALL *DoltlitePushProgressCallback)(
++    void*, int, sqlite3_int64, sqlite3_int64
++);
++
+ typedef struct DoltliteRemote DoltliteRemote;
+ struct DoltliteRemote {
+   int (*xGetChunk)(DoltliteRemote*, const ProllyHash*, u8**, int*);
+@@ -509385,8 +509415,127 @@ struct DoltliteRemote {
+   ** instead of honouring busy_timeout. */
+   int (*xBusy)(void*);
+   void *pBusyArg;
++  /* Optional source-connection scoped push progress observer. */
++  sqlite3 *pPushProgressDb;
++  void *pPushProgressCtx;
++  DoltlitePushProgressCallback xPushProgress;
++  sqlite3_int64 nPushPlannedChunks;
++  sqlite3_int64 nPushPlannedBytes;
++  sqlite3_int64 nPushAcknowledgedChunks;
++  sqlite3_int64 nPushAcknowledgedBytes;
++  int bPushPutsAckOnFlush;
++};
++
++typedef struct DoltlitePushProgressRegistration DoltlitePushProgressRegistration;
++struct DoltlitePushProgressRegistration {
++  void *pContext;
++  DoltlitePushProgressCallback xCallback;
+ };
+ 
++static void doltlitePushProgressRegistrationFree(void *pArg){
++  sqlite3_free(pArg);
++}
++
++SQLITE_API int SQLITE_APICALL sqlite3_doltlite_set_push_progress_callback(
++  sqlite3 *db,
++  void *pContext,
++  DoltlitePushProgressCallback xCallback
++){
++  DoltlitePushProgressRegistration *pRegistration;
++  int rc;
++  if( !db || !pContext || !xCallback ) return SQLITE_MISUSE;
++  sqlite3_mutex_enter(db->mutex);
++  if( sqlite3_get_clientdata(db, DOLTLITE_PUSH_PROGRESS_CLIENTDATA) ){
++    sqlite3_mutex_leave(db->mutex);
++    return SQLITE_MISUSE;
++  }
++  pRegistration = sqlite3_malloc64(sizeof(*pRegistration));
++  if( !pRegistration ){
++    sqlite3_mutex_leave(db->mutex);
++    return SQLITE_NOMEM;
++  }
++  pRegistration->pContext = pContext;
++  pRegistration->xCallback = xCallback;
++  rc = sqlite3_set_clientdata(
++      db, DOLTLITE_PUSH_PROGRESS_CLIENTDATA, pRegistration,
++      doltlitePushProgressRegistrationFree
++  );
++  sqlite3_mutex_leave(db->mutex);
++  return rc;
++}
++
++SQLITE_API int SQLITE_APICALL sqlite3_doltlite_clear_push_progress_callback(
++  sqlite3 *db,
++  void *pContext
++){
++  DoltlitePushProgressRegistration *pRegistration;
++  if( !db || !pContext ) return SQLITE_MISUSE;
++  sqlite3_mutex_enter(db->mutex);
++  pRegistration = sqlite3_get_clientdata(db, DOLTLITE_PUSH_PROGRESS_CLIENTDATA);
++  if( !pRegistration || pRegistration->pContext!=pContext ){
++    sqlite3_mutex_leave(db->mutex);
++    return SQLITE_MISUSE;
++  }
++  {
++    int rc = sqlite3_set_clientdata(
++        db, DOLTLITE_PUSH_PROGRESS_CLIENTDATA, 0, 0
++    );
++    sqlite3_mutex_leave(db->mutex);
++    return rc;
++  }
++}
++
++static void doltlitePushProgressAttach(sqlite3 *db, DoltliteRemote *pRemote){
++  DoltlitePushProgressRegistration *pRegistration;
++  if( !db || !pRemote ) return;
++  pRegistration = sqlite3_get_clientdata(db, DOLTLITE_PUSH_PROGRESS_CLIENTDATA);
++  if( pRegistration ){
++    pRemote->pPushProgressDb = db;
++    pRemote->pPushProgressCtx = pRegistration->pContext;
++    pRemote->xPushProgress = pRegistration->xCallback;
++  }
++}
++
++static void doltlitePushProgressReportPlan(
++  DoltliteRemote *pRemote,
++  sqlite3_int64 nChunks,
++  sqlite3_int64 nBytes
++){
++  if( !pRemote || !pRemote->xPushProgress ) return;
++  pRemote->nPushPlannedChunks = nChunks;
++  pRemote->nPushPlannedBytes = nBytes;
++  pRemote->nPushAcknowledgedChunks = 0;
++  pRemote->nPushAcknowledgedBytes = 0;
++  pRemote->xPushProgress(
++      pRemote->pPushProgressCtx, DOLTLITE_PUSH_PROGRESS_PLAN, nChunks, nBytes
++  );
++}
++
++static void doltlitePushProgressReportAcknowledged(
++  DoltliteRemote *pRemote,
++  sqlite3_int64 nChunks,
++  sqlite3_int64 nBytes
++){
++  if( !pRemote || !pRemote->xPushProgress || nChunks<0 || nBytes<0 ) return;
++  if( nChunks > pRemote->nPushPlannedChunks-pRemote->nPushAcknowledgedChunks
++   || nBytes > pRemote->nPushPlannedBytes-pRemote->nPushAcknowledgedBytes ){
++    return;
++  }
++  pRemote->nPushAcknowledgedChunks += nChunks;
++  pRemote->nPushAcknowledgedBytes += nBytes;
++  pRemote->xPushProgress(
++      pRemote->pPushProgressCtx,
++      DOLTLITE_PUSH_PROGRESS_UPLOADED,
++      pRemote->nPushAcknowledgedChunks,
++      pRemote->nPushAcknowledgedBytes
++  );
++}
++
++static int doltlitePushProgressInterrupted(DoltliteRemote *pRemote){
++  return pRemote && pRemote->pPushProgressDb
++      && sqlite3_is_interrupted(pRemote->pPushProgressDb);
++}
++
+ static inline int doltliteRemotePersistRefs(ChunkStore *cs){
+   int rc = chunkStoreSerializeRefs(cs);
+   if( rc==SQLITE_OK ) rc = chunkStoreCommit(cs);
+@@ -561570,6 +561719,265 @@ static int syncVerifyFetchedChunk(
+   return SQLITE_OK;
+ }
+ 
++typedef struct SyncPushPlanEntry SyncPushPlanEntry;
++struct SyncPushPlanEntry {
++  ProllyHash hash;
++  int nData;
++};
++
++typedef struct SyncPushPlan SyncPushPlan;
++struct SyncPushPlan {
++  SyncPushPlanEntry *aEntry;
++  int nEntry;
++  int nAlloc;
++  sqlite3_int64 nBytes;
++};
++
++static void syncPushPlanFree(SyncPushPlan *pPlan){
++  sqlite3_free(pPlan->aEntry);
++  memset(pPlan, 0, sizeof(*pPlan));
++}
++
++static int syncPushPlanAppend(
++  SyncPushPlan *pPlan,
++  const ProllyHash *pHash,
++  int nData
++){
++  if( nData<0 || pPlan->nBytes>0x7fffffffffffffffLL-nData ){
++    return SQLITE_TOOBIG;
++  }
++  if( pPlan->nEntry==0x7fffffff ) return SQLITE_TOOBIG;
++  if( pPlan->nEntry==pPlan->nAlloc ){
++    int nNext;
++    SyncPushPlanEntry *aNew;
++    if( pPlan->nAlloc==0 ){
++      nNext = 128;
++    }else if( pPlan->nAlloc>0x7fffffff/2 ){
++      nNext = 0x7fffffff;
++    }else{
++      nNext = pPlan->nAlloc*2;
++    }
++    aNew = sqlite3_realloc64(
++        pPlan->aEntry, (sqlite3_uint64)nNext*sizeof(*aNew)
++    );
++    if( !aNew ) return SQLITE_NOMEM;
++    pPlan->aEntry = aNew;
++    pPlan->nAlloc = nNext;
++  }
++  memcpy(&pPlan->aEntry[pPlan->nEntry].hash, pHash, sizeof(*pHash));
++  pPlan->aEntry[pPlan->nEntry].nData = nData;
++  pPlan->nEntry++;
++  pPlan->nBytes += nData;
++  return SQLITE_OK;
++}
++
++/* Make the same reachability/resume decision as doltliteSyncChunks, but keep
++** only each missing hash and payload length. Never retain chunk payloads. */
++static int syncBuildPushPlan(
++  DoltliteRemote *pSrc,
++  DoltliteRemote *pDst,
++  ProllyHash *aRoots,
++  int nRoots,
++  SyncPushPlan *pPlan
++){
++  SyncQueue queue;
++  ProllyHashSet seen;
++  SyncBatchBuf *pB = 0;
++  int bFirstBatch = 1;
++  int bResumeScan = 0;
++  int bQueueInit = 0;
++  int bSeenInit = 0;
++  int rc;
++  int i;
++
++  memset(&queue, 0, sizeof(queue));
++  memset(&seen, 0, sizeof(seen));
++  pB = sqlite3_malloc64(sizeof(*pB));
++  if( !pB ) return SQLITE_NOMEM;
++  rc = syncQueueInit(&queue);
++  if( rc!=SQLITE_OK ) goto plan_done;
++  bQueueInit = 1;
++  rc = prollyHashSetInit(&seen, 256);
++  if( rc!=SQLITE_OK ) goto plan_done;
++  bSeenInit = 1;
++  for(i=0; i<nRoots && rc==SQLITE_OK; i++){
++    if( !prollyHashIsEmpty(&aRoots[i])
++     && !prollyHashSetContains(&seen, &aRoots[i]) ){
++      rc = prollyHashSetAdd(&seen, &aRoots[i]);
++      if( rc==SQLITE_OK ) rc = syncQueuePush(&queue, &aRoots[i]);
++    }
++  }
++  while( rc==SQLITE_OK && syncQueuePending(&queue)>0 ){
++    int nBatch = 0;
++    if( doltlitePushProgressInterrupted(pDst) ){
++      rc = SQLITE_INTERRUPT;
++      break;
++    }
++    while( nBatch<SYNC_BATCH_SIZE
++        && syncQueuePop(&queue, &pB->aBatch[nBatch]) ){
++      nBatch++;
++    }
++    if( nBatch==0 ) break;
++    rc = pDst->xHasChunks(pDst, pB->aBatch, nBatch, pB->aPresent);
++    if( rc!=SQLITE_OK ) break;
++    if( bFirstBatch && pDst->bResumePartialPuts ){
++      bResumeScan = 1;
++      for(i=0; i<nBatch; i++){
++        if( !pB->aPresent[i] ){
++          bResumeScan = 0;
++          break;
++        }
++      }
++    }
++    bFirstBatch = 0;
++    {
++      int nFetch = 0;
++      for(i=0; i<nBatch; i++){
++        if( !pB->aPresent[i] || bResumeScan ){
++          pB->aFetch[nFetch] = pB->aBatch[i];
++          pB->aPut[nFetch] = !pB->aPresent[i];
++          nFetch++;
++        }
++      }
++      if( nFetch==0 ) continue;
++      if( pSrc->xGetChunks ){
++        memset(pB->apData, 0, sizeof(pB->apData[0])*nFetch);
++        rc = pSrc->xGetChunks(
++            pSrc,pB->aFetch,nFetch,pB->apData,pB->anData
++        );
++        for(i=0; i<nFetch && rc==SQLITE_OK; i++){
++          if( !pB->apData[i] ){
++            rc = SQLITE_NOTFOUND;
++            break;
++          }
++          rc = syncVerifyFetchedChunk(
++              &pB->aFetch[i],pB->apData[i],pB->anData[i]
++          );
++          if( rc==SQLITE_OK && pB->aPut[i] ){
++            rc = syncPushPlanAppend(
++                pPlan,&pB->aFetch[i],pB->anData[i]
++            );
++          }
++          if( rc==SQLITE_OK ){
++            rc = syncEnqueueChildren(
++                pB->apData[i],pB->anData[i],&queue,&seen
++            );
++          }
++        }
++        for(i=0; i<nFetch; i++) sqlite3_free(pB->apData[i]);
++      }else{
++        for(i=0; i<nFetch && rc==SQLITE_OK; i++){
++          u8 *pData = 0;
++          int nData = 0;
++          rc = pSrc->xGetChunk(pSrc,&pB->aFetch[i],&pData,&nData);
++          if( rc==SQLITE_OK ){
++            rc = syncVerifyFetchedChunk(&pB->aFetch[i],pData,nData);
++          }
++          if( rc==SQLITE_OK && pB->aPut[i] ){
++            rc = syncPushPlanAppend(pPlan,&pB->aFetch[i],nData);
++          }
++          if( rc==SQLITE_OK ){
++            rc = syncEnqueueChildren(pData,nData,&queue,&seen);
++          }
++          sqlite3_free(pData);
++        }
++      }
++    }
++  }
++plan_done:
++  if( bSeenInit ) prollyHashSetFree(&seen);
++  if( bQueueInit ) syncQueueFree(&queue);
++  sqlite3_free(pB);
++  return rc;
++}
++
++static int syncUploadPushPlan(
++  DoltliteRemote *pSrc,
++  DoltliteRemote *pDst,
++  const SyncPushPlan *pPlan
++){
++  int offset;
++  int rc = SQLITE_OK;
++  for(offset=0; offset<pPlan->nEntry && rc==SQLITE_OK; ){
++    int nBatch = pPlan->nEntry-offset;
++    int i;
++    if( doltlitePushProgressInterrupted(pDst) ) return SQLITE_INTERRUPT;
++    if( nBatch>SYNC_BATCH_SIZE ) nBatch = SYNC_BATCH_SIZE;
++    if( pSrc->xGetChunks ){
++      u8 *apData[SYNC_BATCH_SIZE];
++      int anData[SYNC_BATCH_SIZE];
++      ProllyHash aHash[SYNC_BATCH_SIZE];
++      memset(apData, 0, sizeof(apData));
++      for(i=0; i<nBatch; i++){
++        memcpy(&aHash[i], &pPlan->aEntry[offset+i].hash, sizeof(ProllyHash));
++      }
++      rc = pSrc->xGetChunks(pSrc,aHash,nBatch,apData,anData);
++      for(i=0; i<nBatch && rc==SQLITE_OK; i++){
++        if( !apData[i] ){
++          rc = SQLITE_NOTFOUND;
++          break;
++        }
++        rc = syncVerifyFetchedChunk(&aHash[i],apData[i],anData[i]);
++        if( rc==SQLITE_OK && anData[i]!=pPlan->aEntry[offset+i].nData ){
++          rc = SQLITE_CORRUPT;
++        }
++        if( rc==SQLITE_OK ){
++          rc = pDst->xPutChunk(pDst,&aHash[i],apData[i],anData[i]);
++        }
++        if( rc==SQLITE_OK && !pDst->bPushPutsAckOnFlush ){
++          doltlitePushProgressReportAcknowledged(pDst,1,anData[i]);
++        }
++      }
++      for(i=0; i<nBatch; i++) sqlite3_free(apData[i]);
++    }else{
++      for(i=0; i<nBatch && rc==SQLITE_OK; i++){
++        const SyncPushPlanEntry *pEntry = &pPlan->aEntry[offset+i];
++        u8 *pData = 0;
++        int nData = 0;
++        rc = pSrc->xGetChunk(pSrc,&pEntry->hash,&pData,&nData);
++        if( rc==SQLITE_OK ){
++          rc = syncVerifyFetchedChunk(&pEntry->hash,pData,nData);
++        }
++        if( rc==SQLITE_OK && nData!=pEntry->nData ) rc = SQLITE_CORRUPT;
++        if( rc==SQLITE_OK ){
++          rc = pDst->xPutChunk(pDst,&pEntry->hash,pData,nData);
++        }
++        if( rc==SQLITE_OK && !pDst->bPushPutsAckOnFlush ){
++          doltlitePushProgressReportAcknowledged(pDst,1,nData);
++        }
++        sqlite3_free(pData);
++      }
++    }
++    offset += nBatch;
++  }
++  return rc;
++}
++
++static int doltliteSyncChunksWithPushProgress(
++  DoltliteRemote *pSrc,
++  DoltliteRemote *pDst,
++  ProllyHash *aRoots,
++  int nRoots
++){
++  SyncPushPlan plan;
++  int rc;
++  memset(&plan, 0, sizeof(plan));
++  if( !pDst->xPushProgress ){
++    return doltliteSyncChunks(pSrc,pDst,aRoots,nRoots);
++  }
++  rc = syncBuildPushPlan(pSrc,pDst,aRoots,nRoots,&plan);
++  if( rc==SQLITE_OK ){
++    doltlitePushProgressReportPlan(pDst,plan.nEntry,plan.nBytes);
++    if( doltlitePushProgressInterrupted(pDst) ) rc = SQLITE_INTERRUPT;
++    if( rc==SQLITE_OK ) rc = syncUploadPushPlan(pSrc,pDst,&plan);
++    if( rc==SQLITE_OK && doltlitePushProgressInterrupted(pDst) ){
++      rc = SQLITE_INTERRUPT;
++    }
++  }
++  syncPushPlanFree(&plan);
++  return rc;
++}
++
+ int doltliteSyncChunks(
+   DoltliteRemote *pSrc,
+   DoltliteRemote *pDst,
+@@ -562771,6 +563179,7 @@ int doltlitePush(
+     if( noOp ){
+       rc = pRemote->xCheckRefsIf(pRemote, &expectedRefsHash, zRef, bForce,
+                                   refsData, nRefsData);
++      if( rc==SQLITE_OK ) doltlitePushProgressReportPlan(pRemote,0,0);
+       goto push_done;
+     }
+     sqlite3_free(refsData);
+@@ -562792,7 +563201,9 @@ int doltlitePush(
+         rc = SQLITE_NOMEM;
+         goto push_done;
+       }
+-      rc = doltliteSyncChunks(pLocalSrc, pRemote, &localCommit, 1);
++      rc = doltliteSyncChunksWithPushProgress(
++          pLocalSrc,pRemote,&localCommit,1
++      );
+       pLocalSrc->xClose(pLocalSrc);
+       if( rc!=SQLITE_OK ) goto push_done;
+       if( refsTableBranchCount(&refs.refs)==0 ){
+@@ -562820,6 +563231,9 @@ int doltlitePush(
+     if( rc==SQLITE_OK ){
+       doltliteTestCrashFinalize("push");
+       rc = pRemote->xCommit(pRemote);
++      if( rc==SQLITE_OK && bDelete ){
++        doltlitePushProgressReportPlan(pRemote,0,0);
++      }
+     }
+ 
+ push_done:
+@@ -562867,6 +563281,7 @@ int doltlitePushTag(
+       for(i=0; i<nRemoteTag; i++){
+         if( strcmp(aRemoteTag[i].zName, zTag)==0
+          && scopedTagsMatch(pLocalTag, 1, &aRemoteTag[i], 1) ){
++          doltlitePushProgressReportPlan(pRemote,0,0);
+           chunkStoreClose(&refsView);
+           sqlite3_free(refsData);
+           return SQLITE_OK;
+@@ -562886,8 +563301,8 @@ int doltlitePushTag(
+     ProllyHash tagCommit;
+     if( !pLocalSrc ) return SQLITE_NOMEM;
+     memcpy(&tagCommit, &pLocalTag->commitHash, sizeof(tagCommit));
+-    rc = doltliteSyncChunks(
+-        pLocalSrc, pRemote, &tagCommit, 1);
++    rc = doltliteSyncChunksWithPushProgress(
++        pLocalSrc,pRemote,&tagCommit,1);
+     pLocalSrc->xClose(pLocalSrc);
+   }
+   if( rc!=SQLITE_OK ) return rc;
+@@ -563807,6 +564222,7 @@ static void doltPushParsedFunc(
+ 
+   rc = remoteSqlOpenNamedRemote(db, cs, zRemoteName, &zUrl, &pRemote);
+   if( remoteSqlReportOpenError(ctx, db, rc, 0) ) return;
++  doltlitePushProgressAttach(db,pRemote);
+ 
+   if( bTags ){
+     const TagRef *aTag = 0;
+@@ -563817,6 +564233,9 @@ static void doltPushParsedFunc(
+     for(i=0; i<nTag && rc==SQLITE_OK; i++){
+       rc = doltlitePushTag(cs, pRemote, aTag[i].zName);
+     }
++    if( rc==SQLITE_OK && nTag==0 ){
++      doltlitePushProgressReportPlan(pRemote,0,0);
++    }
+   }else if( zRef[0]==':'
+          || chunkStoreFindBranch(cs, zRef, 0)==SQLITE_OK ){
+     mutation.zRemote = zRemoteName;
+@@ -564801,6 +565220,8 @@ struct HttpRemote {
+   u8 *pUploadBuf;
+   i64 nUploadBuf;
+   i64 nUploadBufAlloc;
++  sqlite3_int64 nPushBatchChunks;
++  sqlite3_int64 nPushBatchBytes;
+ 
+   u8 *pPendingRefs;
+   int nPendingRefs;
+@@ -564814,7 +565235,10 @@ struct HttpRemote {
+ #define HTTP_RESP_MAX_BYTES ((i64)128 * 1024 * 1024)
+ #define HTTP_HEADER_MAX_BYTES ((i64)64 * 1024)
+ #define HTTP_UPLOAD_BATCH_MAX ((i64)16 * 1024 * 1024)
++/* Idle time allowed without transport progress during an HTTP request. */
+ #define HTTP_TIMEOUT_MS 30000
++#define HTTP_CONNECT_TIMEOUT_MS 30000
++#define HTTP_MAX_IDLE_TIMEOUT_MS (5 * 60 * 1000)
+ #define HTTP_BUSY_RETRY_MAX 20
+ #define HTTP_BUSY_RETRY_MS 50
+ 
+@@ -564836,6 +565260,15 @@ static void httpSetLastError(HttpRemote *p, const char *zMsg){
+   }
+ }
+ 
++/* Report only fixed phase names and configured limits.  Never include a URL,
++** request header, response body, or credential in transport diagnostics. */
++static void httpSetTransportError(HttpRemote *p, const char *zPhase){
++  httpClearLastError(p);
++  p->zLastError = sqlite3_mprintf(
++      "%s failed (socket error; configured idle timeout %d ms)",
++      zPhase, p->timeoutMs);
++}
++
+ static char *httpJsonStringField(const u8 *p, int n, const char *zKey){
+   char zNeedle[64];
+   int nNeedle;
+@@ -565021,14 +565454,11 @@ static int httpHeaderNameEquals(
+ #else
+ struct HttpConn {
+   int fd;
+-  i64 deadlineMs;
++  int timeoutMs;
+ };
+ 
+-static int httpConnApplyDeadline(HttpConn *pConn){
+-  i64 remaining = pConn->deadlineMs - doltliteMonotonicMs();
+-  if( remaining<=0 ) return 1;
+-  if( remaining>0x7fffffff ) remaining = 0x7fffffff;
+-  return doltliteSocketSetTimeout(pConn->fd, (int)remaining);
++static int httpConnApplyTimeout(HttpConn *pConn){
++  return doltliteSocketSetTimeout(pConn->fd, pConn->timeoutMs);
+ }
+ 
+ static HttpConn *httpConnOpen(
+@@ -565038,7 +565468,6 @@ static HttpConn *httpConnOpen(
+   int timeoutMs
+ ){
+   char zPort[16];
+-  i64 deadlineMs = doltliteMonotonicMs() + timeoutMs;
+   int fd;
+   HttpConn *pConn;
+ 
+@@ -565059,8 +565488,8 @@ static HttpConn *httpConnOpen(
+     return 0;
+   }
+   pConn->fd = fd;
+-  pConn->deadlineMs = deadlineMs;
+-  if( httpConnApplyDeadline(pConn)!=0 ){
++  pConn->timeoutMs = timeoutMs;
++  if( httpConnApplyTimeout(pConn)!=0 ){
+     doltliteCloseSocket(fd);
+     sqlite3_free(pConn);
+     return 0;
+@@ -565069,9 +565498,8 @@ static HttpConn *httpConnOpen(
+ }
+ 
+ static int httpConnSetTimeout(HttpConn *pConn, int timeoutMs){
+-  pConn->deadlineMs = timeoutMs>0 ? doltliteMonotonicMs() + timeoutMs : 0;
+-  if( timeoutMs<=0 ) return doltliteSocketSetTimeout(pConn->fd, 0);
+-  return httpConnApplyDeadline(pConn);
++  pConn->timeoutMs = timeoutMs>0 ? timeoutMs : 0;
++  return httpConnApplyTimeout(pConn);
+ }
+ 
+ static int httpConnWriteAll(HttpConn *pConn, const void *pBuf, int nBuf){
+@@ -565083,7 +565511,7 @@ static int httpConnWriteAll(HttpConn *pConn, const void *pBuf, int nBuf){
+ #endif
+   while( nSent<nBuf ){
+     int n;
+-    if( httpConnApplyDeadline(pConn)!=0 ) return 1;
++    if( httpConnApplyTimeout(pConn)!=0 ) return 1;
+     n = send(pConn->fd, z+nSent, nBuf-nSent, flags);
+     if( n<=0 ) return 1;
+     nSent += n;
+@@ -565092,7 +565520,7 @@ static int httpConnWriteAll(HttpConn *pConn, const void *pBuf, int nBuf){
+ }
+ 
+ static int httpConnRead(HttpConn *pConn, void *pBuf, int nBuf){
+-  if( httpConnApplyDeadline(pConn)!=0 ) return -1;
++  if( httpConnApplyTimeout(pConn)!=0 ) return -1;
+   return recv(pConn->fd, (char*)pBuf, nBuf, 0);
+ }
+ 
+@@ -565110,8 +565538,353 @@ struct HttpResponseInfo {
+   int bodyStart;
+   int contentLength;
+   int closeConnection;
++  int bChunked;
+ };
+ 
++enum {
++  HTTP_CHUNK_SIZE = 0,
++  HTTP_CHUNK_SIZE_LF,
++  HTTP_CHUNK_EXT_BEFORE_SEMI,
++  HTTP_CHUNK_EXT_NAME_START,
++  HTTP_CHUNK_EXT_NAME,
++  HTTP_CHUNK_EXT_NAME_OWS,
++  HTTP_CHUNK_EXT_VALUE_START,
++  HTTP_CHUNK_EXT_TOKEN_VALUE,
++  HTTP_CHUNK_EXT_TOKEN_VALUE_OWS,
++  HTTP_CHUNK_EXT_QUOTED_VALUE,
++  HTTP_CHUNK_EXT_QUOTED_ESCAPE,
++  HTTP_CHUNK_EXT_QUOTED_END,
++  HTTP_CHUNK_DATA,
++  HTTP_CHUNK_DATA_CR,
++  HTTP_CHUNK_DATA_LF,
++  HTTP_CHUNK_TRAILER_START,
++  HTTP_CHUNK_TRAILER_LINE,
++  HTTP_CHUNK_TRAILER_LINE_LF,
++  HTTP_CHUNK_TRAILER_END_LF,
++  HTTP_CHUNK_DONE
++};
++
++typedef struct HttpChunkedDecoder HttpChunkedDecoder;
++struct HttpChunkedDecoder {
++  int state;
++  int nSizeDigits;
++  int nSizeLineBytes;
++  int nTrailerLineBytes;
++  int nTrailerNameBytes;
++  int bTrailerColon;
++  i64 nChunkSize;
++  i64 nChunkRemaining;
++  i64 nDecoded;
++  i64 nWire;
++  i64 nTrailerBytes;
++};
++
++static int httpChunkedHexValue(u8 c){
++  if( c>='0' && c<='9' ) return c-'0';
++  if( c>='a' && c<='f' ) return c-'a'+10;
++  if( c>='A' && c<='F' ) return c-'A'+10;
++  return -1;
++}
++
++static int httpTokenChar(u8 c){
++  if( (c>='0' && c<='9') || (c>='A' && c<='Z')
++   || (c>='a' && c<='z') ) return 1;
++  switch( c ){
++    case '!': case '#': case '$': case '%': case '&': case 0x27:
++    case '*': case '+': case '-': case '.': case '^': case '_':
++    case '`': case '|': case '~':
++      return 1;
++  }
++  return 0;
++}
++
++static int httpChunkQuotedTextChar(u8 c){
++  return c=='\t' || c==' ' || c==0x21
++      || (c>=0x23 && c<=0x5b) || (c>=0x5d && c<=0x7e) || c>=0x80;
++}
++
++static int httpChunkQuotedPairChar(u8 c){
++  return c=='\t' || c==' ' || (c>=0x21 && c<=0x7e) || c>=0x80;
++}
++
++static void httpChunkedDecoderInit(HttpChunkedDecoder *p){
++  memset(p, 0, sizeof(*p));
++  p->state = HTTP_CHUNK_SIZE;
++}
++
++/* Feed new wire bytes once. A NULL output validates framing without copying. */
++static int httpChunkedDecoderFeed(
++  HttpChunkedDecoder *p,
++  const u8 *pIn,
++  int nIn,
++  u8 *pOut,
++  int nOutMax,
++  int *pnOut,
++  int *pbDone
++){
++  int i = 0;
++  int nProduced = 0;
++
++  *pnOut = 0;
++  *pbDone = 0;
++  while( i<nIn ){
++    int c = pIn[i];
++
++    if( p->state==HTTP_CHUNK_DONE ) return SQLITE_PROTOCOL;
++    if( p->state==HTTP_CHUNK_DATA ){
++      i64 nTake = nIn - i;
++      if( nTake>p->nChunkRemaining ) nTake = p->nChunkRemaining;
++      if( nTake>HTTP_RESP_MAX_BYTES-p->nWire
++       || nTake>HTTP_RESP_MAX_BYTES-p->nDecoded ){
++        return SQLITE_TOOBIG;
++      }
++      if( pOut && (i64)nProduced+nTake>nOutMax ) return SQLITE_TOOBIG;
++      if( pOut ) memcpy(pOut+nProduced, pIn+i, (size_t)nTake);
++      p->nWire += nTake;
++      p->nDecoded += nTake;
++      p->nChunkRemaining -= nTake;
++      nProduced += (int)nTake;
++      i += (int)nTake;
++      if( p->nChunkRemaining==0 ) p->state = HTTP_CHUNK_DATA_CR;
++      continue;
++    }
++
++    if( p->nWire>=HTTP_RESP_MAX_BYTES ) return SQLITE_TOOBIG;
++    p->nWire++;
++    if( p->state<=HTTP_CHUNK_EXT_QUOTED_END ){
++      if( p->nSizeLineBytes>=HTTP_HEADER_MAX_BYTES ){
++        return SQLITE_TOOBIG;
++      }
++      p->nSizeLineBytes++;
++    }
++    if( p->state>=HTTP_CHUNK_TRAILER_START
++     && p->state<=HTTP_CHUNK_TRAILER_END_LF ){
++      if( p->nTrailerBytes>=HTTP_HEADER_MAX_BYTES ) return SQLITE_TOOBIG;
++      p->nTrailerBytes++;
++    }
++
++    switch( p->state ){
++      case HTTP_CHUNK_SIZE: {
++        int digit = httpChunkedHexValue((u8)c);
++        if( digit>=0 ){
++          if( p->nChunkSize>(HTTP_RESP_MAX_BYTES-digit)/16 ){
++            return SQLITE_TOOBIG;
++          }
++          p->nChunkSize = p->nChunkSize*16 + digit;
++          p->nSizeDigits++;
++        }else if( c=='\r' && p->nSizeDigits>0 ){
++          p->state = HTTP_CHUNK_SIZE_LF;
++        }else if( c==';' && p->nSizeDigits>0 ){
++          p->state = HTTP_CHUNK_EXT_NAME_START;
++        }else if( (c==' ' || c=='\t') && p->nSizeDigits>0 ){
++          p->state = HTTP_CHUNK_EXT_BEFORE_SEMI;
++        }else{
++          return SQLITE_PROTOCOL;
++        }
++        break;
++      }
++      case HTTP_CHUNK_SIZE_LF:
++        if( c!='\n' ) return SQLITE_PROTOCOL;
++        if( p->nChunkSize==0 ){
++          p->state = HTTP_CHUNK_TRAILER_START;
++          p->nTrailerBytes = 0;
++        }else{
++          if( p->nChunkSize>HTTP_RESP_MAX_BYTES-p->nDecoded ){
++            return SQLITE_TOOBIG;
++          }
++          p->nChunkRemaining = p->nChunkSize;
++          p->state = HTTP_CHUNK_DATA;
++        }
++        break;
++      case HTTP_CHUNK_EXT_BEFORE_SEMI:
++        if( c==' ' || c=='\t' ) break;
++        if( c==';' ){
++          p->state = HTTP_CHUNK_EXT_NAME_START;
++          break;
++        }
++        return SQLITE_PROTOCOL;
++      case HTTP_CHUNK_EXT_NAME_START:
++        if( c==' ' || c=='\t' ) break;
++        if( !httpTokenChar((u8)c) ) return SQLITE_PROTOCOL;
++        p->state = HTTP_CHUNK_EXT_NAME;
++        break;
++      case HTTP_CHUNK_EXT_NAME:
++        if( httpTokenChar((u8)c) ) break;
++        if( c=='=' ){
++          p->state = HTTP_CHUNK_EXT_VALUE_START;
++        }else if( c==';' ){
++          p->state = HTTP_CHUNK_EXT_NAME_START;
++        }else if( c==' ' || c=='\t' ){
++          p->state = HTTP_CHUNK_EXT_NAME_OWS;
++        }else if( c=='\r' ){
++          p->state = HTTP_CHUNK_SIZE_LF;
++        }else{
++          return SQLITE_PROTOCOL;
++        }
++        break;
++      case HTTP_CHUNK_EXT_NAME_OWS:
++        if( c==' ' || c=='\t' ) break;
++        if( c=='=' ){
++          p->state = HTTP_CHUNK_EXT_VALUE_START;
++        }else if( c==';' ){
++          p->state = HTTP_CHUNK_EXT_NAME_START;
++        }else if( c=='\r' ){
++          p->state = HTTP_CHUNK_SIZE_LF;
++        }else{
++          return SQLITE_PROTOCOL;
++        }
++        break;
++      case HTTP_CHUNK_EXT_VALUE_START:
++        if( c==' ' || c=='\t' ) break;
++        if( httpTokenChar((u8)c) ){
++          p->state = HTTP_CHUNK_EXT_TOKEN_VALUE;
++        }else if( c=='"' ){
++          p->state = HTTP_CHUNK_EXT_QUOTED_VALUE;
++        }else{
++          return SQLITE_PROTOCOL;
++        }
++        break;
++      case HTTP_CHUNK_EXT_TOKEN_VALUE:
++        if( httpTokenChar((u8)c) ) break;
++        if( c==' ' || c=='\t' ){
++          p->state = HTTP_CHUNK_EXT_TOKEN_VALUE_OWS;
++        }else if( c==';' ){
++          p->state = HTTP_CHUNK_EXT_NAME_START;
++        }else if( c=='\r' ){
++          p->state = HTTP_CHUNK_SIZE_LF;
++        }else{
++          return SQLITE_PROTOCOL;
++        }
++        break;
++      case HTTP_CHUNK_EXT_TOKEN_VALUE_OWS:
++        if( c==' ' || c=='\t' ) break;
++        if( c==';' ){
++          p->state = HTTP_CHUNK_EXT_NAME_START;
++        }else if( c=='\r' ){
++          p->state = HTTP_CHUNK_SIZE_LF;
++        }else{
++          return SQLITE_PROTOCOL;
++        }
++        break;
++      case HTTP_CHUNK_EXT_QUOTED_VALUE:
++        if( c=='"' ){
++          p->state = HTTP_CHUNK_EXT_QUOTED_END;
++        }else if( c==0x5c ){
++          p->state = HTTP_CHUNK_EXT_QUOTED_ESCAPE;
++        }else if( !httpChunkQuotedTextChar((u8)c) ){
++          return SQLITE_PROTOCOL;
++        }
++        break;
++      case HTTP_CHUNK_EXT_QUOTED_ESCAPE:
++        if( !httpChunkQuotedPairChar((u8)c) ) return SQLITE_PROTOCOL;
++        p->state = HTTP_CHUNK_EXT_QUOTED_VALUE;
++        break;
++      case HTTP_CHUNK_EXT_QUOTED_END:
++        if( c==' ' || c=='\t' ) break;
++        if( c==';' ){
++          p->state = HTTP_CHUNK_EXT_NAME_START;
++        }else if( c=='\r' ){
++          p->state = HTTP_CHUNK_SIZE_LF;
++        }else{
++          return SQLITE_PROTOCOL;
++        }
++        break;
++      case HTTP_CHUNK_DATA_CR:
++        if( c!='\r' ) return SQLITE_PROTOCOL;
++        p->state = HTTP_CHUNK_DATA_LF;
++        break;
++      case HTTP_CHUNK_DATA_LF:
++        if( c!='\n' ) return SQLITE_PROTOCOL;
++        p->state = HTTP_CHUNK_SIZE;
++        p->nChunkSize = 0;
++        p->nSizeDigits = 0;
++        p->nSizeLineBytes = 0;
++        break;
++      case HTTP_CHUNK_TRAILER_START:
++        if( c=='\r' ){
++          p->state = HTTP_CHUNK_TRAILER_END_LF;
++        }else if( c=='\n' || !httpTokenChar((u8)c) ){
++          return SQLITE_PROTOCOL;
++        }else{
++          p->state = HTTP_CHUNK_TRAILER_LINE;
++          p->nTrailerLineBytes = 1;
++          p->nTrailerNameBytes = 1;
++          p->bTrailerColon = 0;
++        }
++        break;
++      case HTTP_CHUNK_TRAILER_LINE:
++        if( p->nTrailerLineBytes>=HTTP_HEADER_MAX_BYTES ){
++          return SQLITE_TOOBIG;
++        }
++        p->nTrailerLineBytes++;
++        if( c=='\r' ){
++          if( !p->bTrailerColon || p->nTrailerNameBytes==0 ){
++            return SQLITE_PROTOCOL;
++          }
++          p->state = HTTP_CHUNK_TRAILER_LINE_LF;
++        }else if( c=='\n' ){
++          return SQLITE_PROTOCOL;
++        }else if( !p->bTrailerColon ){
++          if( c==':' ){
++            if( p->nTrailerNameBytes==0 ) return SQLITE_PROTOCOL;
++            p->bTrailerColon = 1;
++          }else{
++            if( !httpTokenChar((u8)c) ) return SQLITE_PROTOCOL;
++            p->nTrailerNameBytes++;
++          }
++        }else if( (c<0x20 && c!='\t') || c==0x7f ){
++          return SQLITE_PROTOCOL;
++        }
++        break;
++      case HTTP_CHUNK_TRAILER_LINE_LF:
++        if( c!='\n' ) return SQLITE_PROTOCOL;
++        p->state = HTTP_CHUNK_TRAILER_START;
++        break;
++      case HTTP_CHUNK_TRAILER_END_LF:
++        if( c!='\n' ) return SQLITE_PROTOCOL;
++        p->state = HTTP_CHUNK_DONE;
++        break;
++      default:
++        return SQLITE_PROTOCOL;
++    }
++    i++;
++  }
++  *pnOut = nProduced;
++  *pbDone = p->state==HTTP_CHUNK_DONE;
++  return SQLITE_OK;
++}
++
++static int httpDecodeChunkedBody(
++  const u8 *pIn,
++  int nIn,
++  u8 **ppOut,
++  int *pnOut
++){
++  HttpChunkedDecoder decoder;
++  u8 *pOut = 0;
++  int nDecoded = 0;
++  int bDone = 0;
++  int rc;
++
++  *ppOut = 0;
++  *pnOut = 0;
++  if( nIn<0 || (i64)nIn>HTTP_RESP_MAX_BYTES ) return SQLITE_TOOBIG;
++  pOut = sqlite3_malloc64((i64)nIn + 1);
++  if( !pOut ) return SQLITE_NOMEM;
++  httpChunkedDecoderInit(&decoder);
++  rc = httpChunkedDecoderFeed(&decoder, pIn, nIn, pOut, nIn,
++                              &nDecoded, &bDone);
++  if( rc==SQLITE_OK && !bDone ) rc = SQLITE_PROTOCOL;
++  if( rc!=SQLITE_OK ){
++    sqlite3_free(pOut);
++    return rc;
++  }
++  pOut[nDecoded] = 0;
++  *ppOut = pOut;
++  *pnOut = nDecoded;
++  return SQLITE_OK;
++}
++
+ static int httpHeaderValueHasToken(
+   const u8 *zValue,
+   int nValue,
+@@ -565221,7 +565994,14 @@ static int httpParseResponseHeaders(
+       pInfo->contentLength = (int)value;
+     }else if( httpHeaderNameEquals(
+                  pRaw+lineStart, colon-lineStart, "Transfer-Encoding") ){
++      if( seenTransferEncoding ) return SQLITE_PROTOCOL;
+       seenTransferEncoding = 1;
++      if( valueEnd-valueStart!=7
++       || sqlite3_strnicmp(
++            (const char*)pRaw+valueStart, "chunked", 7)!=0 ){
++        return SQLITE_PROTOCOL;
++      }
++      pInfo->bChunked = 1;
+     }else if( httpHeaderNameEquals(
+                  pRaw+lineStart, colon-lineStart, "Connection")
+            && httpHeaderValueHasToken(
+@@ -565230,8 +566010,15 @@ static int httpParseResponseHeaders(
+     }
+   }
+ 
+-  if( pInfo->bodyStart<0 || seenTransferEncoding ) return SQLITE_PROTOCOL;
+-  if( pInfo->contentLength<0
++  if( pInfo->bodyStart<0 ) return SQLITE_PROTOCOL;
++  if( pInfo->bodyStart>HTTP_HEADER_MAX_BYTES ) return SQLITE_TOOBIG;
++  if( pInfo->bChunked && seenContentLength ) return SQLITE_PROTOCOL;
++  if( pInfo->bChunked
++   && ((pInfo->status>=100 && pInfo->status<200)
++       || pInfo->status==204 || pInfo->status==304) ){
++    return SQLITE_PROTOCOL;
++  }
++  if( !pInfo->bChunked && pInfo->contentLength<0
+    && ((pInfo->status>=100 && pInfo->status<200)
+        || pInfo->status==204 || pInfo->status==304) ){
+     pInfo->contentLength = 0;
+@@ -565240,6 +566027,7 @@ static int httpParseResponseHeaders(
+ }
+ 
+ static int readHttpResponse(
++  HttpRemote *pRemote,
+   HttpConn *conn,
+   u8 **ppOut,
+   int *pnOut,
+@@ -565249,8 +566037,11 @@ static int readHttpResponse(
+   i64 nAlloc = 4096;
+   i64 nUsed = 0;
+   i64 nTarget = -1;
++  i64 nBodyFed = 0;
+   i64 nMax = HTTP_HEADER_MAX_BYTES + HTTP_RESP_MAX_BYTES;
++  int nHeaderScan = 0;
+   HttpResponseInfo info;
++  HttpChunkedDecoder decoder;
+   int headersParsed = 0;
+   int rc = SQLITE_OK;
+   u8 *pBuf = sqlite3_malloc64(nAlloc);
+@@ -565264,7 +566055,10 @@ static int readHttpResponse(
+   for(;;){
+     int n;
+     int nRead;
+-    if( nTarget>=0 && nUsed==nTarget ) break;
++    if( headersParsed && info.bChunked
++     && decoder.state==HTTP_CHUNK_DONE ) break;
++    if( headersParsed && !info.bChunked
++     && nTarget>=0 && nUsed==nTarget ) break;
+     if( nUsed==nAlloc ){
+       u8 *pNew;
+       i64 nNew = nAlloc * 2;
+@@ -565282,17 +566076,26 @@ static int readHttpResponse(
+       nAlloc = nNew;
+     }
+     nRead = (int)(nAlloc - nUsed);
+-    if( nTarget>=0 && nTarget-nUsed<nRead ) nRead = (int)(nTarget-nUsed);
++    if( headersParsed && !info.bChunked && nTarget>=0
++     && nTarget-nUsed<nRead ){
++      nRead = (int)(nTarget-nUsed);
++    }
+     n = httpConnRead(conn, pBuf+nUsed, nRead);
+     if( n<0 ){
+       *pTransportError = 1;
++      httpSetTransportError(pRemote, "reading remote HTTP response");
+       rc = SQLITE_IOERR;
+       break;
+     }
+     if( n==0 ){
+       *pCloseConnection = 1;
+-      if( !headersParsed || (nTarget>=0 && nUsed!=nTarget) ){
++      if( !headersParsed
++       || (info.bChunked && decoder.state!=HTTP_CHUNK_DONE)
++       || (!info.bChunked && nTarget>=0 && nUsed!=nTarget) ){
+         *pTransportError = 1;
++        httpSetLastError(pRemote, !headersParsed
++            ? "remote closed the connection before sending HTTP response headers"
++            : "remote closed the connection before completing the HTTP response body");
+         rc = SQLITE_PROTOCOL;
+       }
+       break;
+@@ -565300,32 +566103,92 @@ static int readHttpResponse(
+     nUsed += n;
+ 
+     if( !headersParsed ){
+-      int i;
+-      for(i=0; i+3<nUsed; i++){
+-        if( pBuf[i]=='\r' && pBuf[i+1]=='\n'
+-         && pBuf[i+2]=='\r' && pBuf[i+3]=='\n' ){
++      while( (i64)nHeaderScan+3<nUsed ){
++        if( pBuf[nHeaderScan]=='\r' && pBuf[nHeaderScan+1]=='\n'
++         && pBuf[nHeaderScan+2]=='\r' && pBuf[nHeaderScan+3]=='\n' ){
+           rc = httpParseResponseHeaders(pBuf, (int)nUsed, &info);
+-          if( rc!=SQLITE_OK ) break;
++          if( rc!=SQLITE_OK ){
++            if( rc==SQLITE_PROTOCOL ){
++              httpSetLastError(pRemote, "remote returned malformed HTTP response headers");
++            }
++            break;
++          }
+           headersParsed = 1;
+           *pCloseConnection = info.closeConnection;
+-          if( info.contentLength>=0 ){
+-            nTarget = (i64)info.bodyStart + info.contentLength;
+-            if( nTarget>nMax ) rc = SQLITE_TOOBIG;
+-            if( nUsed>nTarget ) rc = SQLITE_PROTOCOL;
++          if( info.bChunked ){
++            httpChunkedDecoderInit(&decoder);
++          }else if( info.contentLength>=0 ){
++            if( (i64)info.bodyStart
++                > nMax-(i64)info.contentLength ){
++              rc = SQLITE_TOOBIG;
++            }else{
++              nTarget = (i64)info.bodyStart + info.contentLength;
++              if( nUsed>nTarget ) rc = SQLITE_PROTOCOL;
++            }
+           }
+           break;
+         }
++        nHeaderScan++;
+       }
+       if( rc!=SQLITE_OK ) break;
+       if( !headersParsed && nUsed>=HTTP_HEADER_MAX_BYTES ){
++        httpSetLastError(pRemote, "remote HTTP response headers exceeded the size limit");
+         rc = SQLITE_TOOBIG;
+         break;
+       }
+     }
++
++    if( headersParsed && info.bChunked ){
++      i64 nBodyAvailable;
++      i64 nNewBody;
++      int nDecodedNow = 0;
++      int bDone = 0;
++      if( nUsed<info.bodyStart ){
++        rc = SQLITE_PROTOCOL;
++        break;
++      }
++      nBodyAvailable = nUsed-info.bodyStart;
++      if( nBodyAvailable<nBodyFed ){
++        rc = SQLITE_PROTOCOL;
++        break;
++      }
++      nNewBody = nBodyAvailable-nBodyFed;
++      if( nNewBody>0 ){
++        if( nNewBody>0x7fffffff ){
++          rc = SQLITE_TOOBIG;
++          break;
++        }
++        rc = httpChunkedDecoderFeed(
++            &decoder, pBuf+info.bodyStart+nBodyFed, (int)nNewBody,
++            0, 0, &nDecodedNow, &bDone);
++        if( rc!=SQLITE_OK ) break;
++        nBodyFed += nNewBody;
++        if( bDone ) break;
++      }
++    }else if( headersParsed && nTarget>=0 && nUsed>nTarget ){
++      rc = SQLITE_PROTOCOL;
++      break;
++    }
+   }
+ 
+-  if( rc==SQLITE_OK && !headersParsed ) rc = SQLITE_PROTOCOL;
+-  if( rc==SQLITE_OK && info.contentLength<0 ) *pCloseConnection = 1;
++  if( rc==SQLITE_OK && !headersParsed ){
++    httpSetLastError(pRemote, "remote returned an incomplete HTTP response");
++    rc = SQLITE_PROTOCOL;
++  }
++  if( rc==SQLITE_OK && info.bChunked
++   && decoder.state!=HTTP_CHUNK_DONE ){
++    httpSetLastError(pRemote, "remote returned an incomplete HTTP response");
++    rc = SQLITE_PROTOCOL;
++  }
++  if( rc==SQLITE_PROTOCOL && !pRemote->zLastError ){
++    httpSetLastError(pRemote, "remote returned a malformed HTTP response");
++  }
++  if( rc==SQLITE_TOOBIG && !pRemote->zLastError ){
++    httpSetLastError(pRemote, "remote HTTP response exceeded the size limit");
++  }
++  if( rc==SQLITE_OK && info.contentLength<0 && !info.bChunked ){
++    *pCloseConnection = 1;
++  }
+   if( rc==SQLITE_OK ){
+     u8 *pNew;
+     if( nUsed==nAlloc ){
+@@ -565362,7 +566225,17 @@ static int httpParseResponse(
+ 
+   rc = httpParseResponseHeaders(pRaw, nRaw, &info);
+   if( rc!=SQLITE_OK ) return rc;
+-  nAvail = nRaw - info.bodyStart;
++  if( info.bodyStart>nRaw ) return SQLITE_PROTOCOL;
++  nAvail = nRaw-info.bodyStart;
++  if( info.bChunked ){
++    if( (i64)nAvail>HTTP_RESP_MAX_BYTES ) return SQLITE_TOOBIG;
++    rc = httpDecodeChunkedBody(
++        pRaw+info.bodyStart, nAvail, ppResp, pnResp);
++    if( rc!=SQLITE_OK ) return rc;
++    *pStatus = info.status;
++    return SQLITE_OK;
++  }
++  if( (i64)nAvail>HTTP_RESP_MAX_BYTES ) return SQLITE_TOOBIG;
+   nCopy = info.contentLength>=0 ? info.contentLength : nAvail;
+   if( info.contentLength>=0 && info.contentLength!=nAvail ){
+     return SQLITE_PROTOCOL;
+@@ -565599,13 +566472,6 @@ static void httpDisconnect(HttpRemote *p){
+   p->pConn = 0;
+ }
+ 
+-static int httpRemainingTimeout(i64 deadlineMs){
+-  i64 remaining = deadlineMs - doltliteMonotonicMs();
+-  if( remaining<=0 ) return 0;
+-  if( remaining>0x7fffffff ) remaining = 0x7fffffff;
+-  return (int)remaining;
+-}
+-
+ static int httpRequestMayRetry(const char *zMethod, const char *zPath){
+   int nPath = (int)strlen(zPath);
+   if( sqlite3_stricmp(zMethod, "GET")==0 ) return 1;
+@@ -565621,7 +566487,6 @@ static int httpRequestOnce(
+   const u8 *pBody, i64 nBody,
+   int *pStatus,
+   u8 **ppResp, int *pnResp,
+-  i64 deadlineMs,
+   int *pWasReused,
+   int *pTransportError
+ ){
+@@ -565639,22 +566504,18 @@ static int httpRequestOnce(
+   *pWasReused = p->pConn!=0;
+   *pTransportError = 0;
+ 
+-  timeoutMs = httpRemainingTimeout(deadlineMs);
+-  if( timeoutMs<=0 ){
+-    *pTransportError = 1;
+-    httpDisconnect(p);
+-    return SQLITE_IOERR;
+-  }
++  timeoutMs = p->timeoutMs;
+   if( !p->pConn ){
+-    p->pConn = httpConnOpen(p->zHost, p->port, p->useTls, timeoutMs);
++    p->pConn = httpConnOpen(p->zHost, p->port, p->useTls,
++                            HTTP_CONNECT_TIMEOUT_MS);
+   }
+   if( !p->pConn ){
+     httpSetLastError(p, "could not connect to remote");
+     return SQLITE_ERROR;
+   }
+-  timeoutMs = httpRemainingTimeout(deadlineMs);
+-  if( timeoutMs<=0 || httpConnSetTimeout(p->pConn, timeoutMs)!=0 ){
++  if( httpConnSetTimeout(p->pConn, timeoutMs)!=0 ){
+     *pTransportError = 1;
++    httpSetTransportError(p, "configuring the remote HTTP socket timeout");
+     httpDisconnect(p);
+     return SQLITE_IOERR;
+   }
+@@ -565698,6 +566559,7 @@ static int httpRequestOnce(
+   sqlite3_free(zHdr);
+   if( rc != SQLITE_OK ){
+     *pTransportError = 1;
++    httpSetTransportError(p, "sending remote HTTP request headers");
+     httpDisconnect(p);
+     return rc;
+   }
+@@ -565708,6 +566570,7 @@ static int httpRequestOnce(
+       int nWrite = nRemain>0x7fffffff ? 0x7fffffff : (int)nRemain;
+       if( httpConnWriteAll(p->pConn, pBody+off, nWrite) ){
+         *pTransportError = 1;
++        httpSetTransportError(p, "sending remote HTTP request body");
+         httpDisconnect(p);
+         return SQLITE_IOERR;
+       }
+@@ -565715,7 +566578,7 @@ static int httpRequestOnce(
+     }
+   }
+ 
+-  rc = readHttpResponse(p->pConn, &pRaw, &nRaw, &closeConnection,
++  rc = readHttpResponse(p, p->pConn, &pRaw, &nRaw, &closeConnection,
+                         pTransportError);
+   if( rc != SQLITE_OK ){
+     httpDisconnect(p);
+@@ -565724,7 +566587,14 @@ static int httpRequestOnce(
+   if( closeConnection ) httpDisconnect(p);
+   rc = httpParseResponse(pRaw, nRaw, pStatus, ppResp, pnResp);
+   sqlite3_free(pRaw);
+-  if( rc!=SQLITE_OK ) httpDisconnect(p);
++  if( rc!=SQLITE_OK ){
++    if( rc==SQLITE_PROTOCOL && !p->zLastError ){
++      httpSetLastError(p, "remote returned a malformed HTTP response");
++    }else if( rc==SQLITE_TOOBIG && !p->zLastError ){
++      httpSetLastError(p, "remote HTTP response exceeded the size limit");
++    }
++    httpDisconnect(p);
++  }
+   return rc;
+ }
+ 
+@@ -565738,20 +566608,17 @@ static int httpRequest(
+ ){
+   int wasReused = 0;
+   int transportError = 0;
+-  i64 deadlineMs = doltliteMonotonicMs() + p->timeoutMs;
+   int rc;
+ 
+   httpClearLastError(p);
+   rc = httpRequestOnce(p, zMethod, zPath, pBody, nBody,
+                        pStatus, ppResp, pnResp,
+-                       deadlineMs,
+                        &wasReused, &transportError);
+   if( rc!=SQLITE_OK && wasReused && transportError
+    && httpRequestMayRetry(zMethod, zPath) ){
+     httpClearLastError(p);
+     rc = httpRequestOnce(p, zMethod, zPath, pBody, nBody,
+                          pStatus, ppResp, pnResp,
+-                         deadlineMs,
+                          &wasReused, &transportError);
+   }
+   return rc;
+@@ -565810,7 +566677,19 @@ static int httpFlushUploadBatch(HttpRemote *p){
+   }
+   sqlite3_free(zPath);
+   sqlite3_free(pResp);
+-  if( rc==SQLITE_OK ) p->nUploadBuf = 0;
++  if( rc==SQLITE_OK ){
++    if( p->base.xPushProgress && p->nPushBatchChunks>0 ){
++      doltlitePushProgressReportAcknowledged(
++          &p->base,p->nPushBatchChunks,p->nPushBatchBytes
++      );
++      if( doltlitePushProgressInterrupted(&p->base) ){
++        rc = SQLITE_INTERRUPT;
++      }
++    }
++    p->nPushBatchChunks = 0;
++    p->nPushBatchBytes = 0;
++    p->nUploadBuf = 0;
++  }
+   return rc;
+ }
+ 
+@@ -565937,7 +566816,16 @@ static int httpPutChunk(DoltliteRemote *pRemote, const ProllyHash *pHash,
+   if( rc != SQLITE_OK ) goto put_error;
+ 
+   rc = uploadBufAppend(p, pData, nData);
+-  if( rc != SQLITE_OK ) goto put_error;
++  if( rc!=SQLITE_OK ) goto put_error;
++  if( p->base.xPushProgress ){
++    if( p->nPushBatchChunks==0x7fffffffffffffffLL
++     || p->nPushBatchBytes>0x7fffffffffffffffLL-nData ){
++      p->nUploadBuf = nSaved;
++      return SQLITE_TOOBIG;
++    }
++    p->nPushBatchChunks++;
++    p->nPushBatchBytes += nData;
++  }
+   return SQLITE_OK;
+ 
+ put_error:
+@@ -565999,21 +566887,34 @@ int doltliteHttpParseResponseForTest(
+ 
+ /* POST hashes to /get-chunks; reply is per-hash [u32be len][bytes],
+ ** 0xFFFFFFFF if absent. */
+-static int httpGetChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
+-                         int nHash, u8 **apData, int *anData){
+-  HttpRemote *p = (HttpRemote*)pRemote;
++static int httpGetChunksRequest(
++  HttpRemote *p,
++  const ProllyHash *aHash,
++  int nHash,
++  u8 **apData,
++  int *anData,
++  int *pbTooBig
++){
+   char *zPath;
+   u8 *pReq = 0;
+   u8 *pResp = 0;
+   int nResp = 0;
+   int status = 0;
++  int nReq;
+   int rc;
+   int i;
+ 
++  *pbTooBig = 0;
+   for(i=0; i<nHash; i++){ apData[i] = 0; anData[i] = 0; }
+   if( nHash <= 0 ) return SQLITE_OK;
+ 
+-  pReq = sqlite3_malloc(nHash * PROLLY_HASH_SIZE);
++  /* Keep one request body within the public server's fixed request limit. */
++  if( (i64)nHash > HTTP_RESP_MAX_BYTES / PROLLY_HASH_SIZE ){
++    *pbTooBig = 1;
++    return SQLITE_TOOBIG;
++  }
++  nReq = nHash * PROLLY_HASH_SIZE;
++  pReq = sqlite3_malloc(nReq);
+   if( !pReq ) return SQLITE_NOMEM;
+   for(i=0; i<nHash; i++){
+     memcpy(pReq + (i * PROLLY_HASH_SIZE), aHash[i].data, PROLLY_HASH_SIZE);
+@@ -566022,19 +566923,72 @@ static int httpGetChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
+   zPath = buildPath(p, "/get-chunks");
+   if( !zPath ){ sqlite3_free(pReq); return SQLITE_NOMEM; }
+ 
+-  rc = httpRequest(p, "POST", zPath, pReq, nHash * PROLLY_HASH_SIZE,
++  rc = httpRequest(p, "POST", zPath, pReq, nReq,
+                    &status, &pResp, &nResp);
+   sqlite3_free(zPath);
+   sqlite3_free(pReq);
+-  if( rc != SQLITE_OK ){ sqlite3_free(pResp); return rc; }
++  if( rc != SQLITE_OK ){
++    if( rc==SQLITE_TOOBIG ) *pbTooBig = 1;
++    sqlite3_free(pResp);
++    return rc;
++  }
+   if( status != 200 ){
++    *pbTooBig = status==413;
+     rc = httpMapError(p, status, pResp, nResp);
+     sqlite3_free(pResp);
+     return rc;
+   }
+   rc = httpParseChunkBatch(pResp, nResp, nHash, apData, anData);
+   sqlite3_free(pResp);
+-  return rc;   /* caller frees apData[i] set before an error */
++  return rc;
++}
++
++/* Oversized aggregate replies are retried as smaller hash ranges. Every
++** request remains bounded, and data is written into the caller's original
++** result slots so the reply order remains unchanged. */
++static int httpGetChunksRange(
++  HttpRemote *p,
++  const ProllyHash *aHash,
++  int nHash,
++  u8 **apData,
++  int *anData
++){
++  int bTooBig = 0;
++  int rc;
++
++  rc = httpGetChunksRequest(p, aHash, nHash, apData, anData, &bTooBig);
++  if( rc!=SQLITE_TOOBIG || !bTooBig || nHash<=1 ) return rc;
++
++  {
++    int nFirst = nHash / 2;
++    rc = httpGetChunksRange(p, aHash, nFirst, apData, anData);
++    if( rc==SQLITE_OK ){
++      rc = httpGetChunksRange(p, aHash+nFirst, nHash-nFirst,
++                              apData+nFirst, anData+nFirst);
++    }
++  }
++  return rc;
++}
++
++static int httpGetChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
++                         int nHash, u8 **apData, int *anData){
++  HttpRemote *p = (HttpRemote*)pRemote;
++  int rc;
++  int i;
++
++  for(i=0; i<nHash; i++){ apData[i] = 0; anData[i] = 0; }
++  if( nHash <= 0 ) return SQLITE_OK;
++
++  rc = httpGetChunksRange(p, aHash, nHash, apData, anData);
++  if( rc!=SQLITE_OK ){
++    /* Free successful sub-batch outputs before returning an error. */
++    for(i=0; i<nHash; i++){
++      sqlite3_free(apData[i]);
++      apData[i] = 0;
++      anData[i] = 0;
++    }
++  }
++  return rc;
+ }
+ 
+ static int httpGetRefs(DoltliteRemote *pRemote, u8 **ppData, int *pnData){
+@@ -566294,6 +567248,35 @@ static void httpResolveCreds(HttpRemote *p){
+ }
+ #endif
+ 
++/* Accept only dotted-decimal IPv4 literals in 127/8 for an unbounded
++** idle timeout.  Do not resolve names here: this is a loopback trust check. */
++static int httpIsNumericLoopbackHost(const char *zHost, int nHost){
++  int i;
++  int nPart = 0;
++  int value = 0;
++  int digits = 0;
++  int c;
++
++  for(i=0; i<=nHost; i++){
++    c = i==nHost ? 0 : (unsigned char)zHost[i];
++    if( c>='0' && c<='9' ){
++      digits++;
++      if( digits>3 ) return 0;
++      value = value*10 + (c-'0');
++      if( value>255 ) return 0;
++    }else if( c=='.' || c==0 ){
++      if( digits==0 || nPart>=4 ) return 0;
++      if( nPart==0 && value!=127 ) return 0;
++      nPart++;
++      value = 0;
++      digits = 0;
++    }else{
++      return 0;
++    }
++  }
++  return nPart==4;
++}
++
+ DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
+   HttpRemote *p;
+   const char *zAfterScheme;
+@@ -566305,11 +567288,22 @@ DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
+   int useTls;
+   int nUserPath;
+   int nBasePath;
++  const char *zQueryStart;
+   const char *zTimeout;
+-  uint64_t timeoutMs;
++  uint64_t timeoutMs = HTTP_TIMEOUT_MS;
+ 
+   if( !zUrl ) return 0;
+ 
++  zTimeout = getenv("DOLTLITE_HTTP_TIMEOUT_MS");
++  if( zTimeout && zTimeout[0] ){
++    if( doltliteParseDecimal(
++          zTimeout, zTimeout+strlen(zTimeout), 0x7fffffff, &timeoutMs)
++          !=DOLTLITE_DECIMAL_OK
++     || timeoutMs==0 ){
++      timeoutMs = HTTP_TIMEOUT_MS;
++    }
++  }
++
+   if( strncmp(zUrl, "https://", 8) == 0 ){
+ #ifndef DOLTLITE_HAVE_AUTH
+     return 0;
+@@ -566331,13 +567325,13 @@ DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
+   zPathStart = 0;
+   {
+     const char *c = zHostStart;
+-    while( *c && *c != ':' && *c != '/' ) c++;
++    while( *c && *c != ':' && *c != '/' && *c != '?' ) c++;
+     nHost = (int)(c - zHostStart);
+     if( *c == ':' ){
+       uint64_t value;
+       zPortStart = c + 1;
+       c = zPortStart;
+-      while( *c && *c != '/' ) c++;
++      while( *c && *c != '/' && *c != '?' ) c++;
+       if( doltliteParseDecimal(zPortStart, c, 65535, &value)
+           !=DOLTLITE_DECIMAL_OK
+        || value==0 ){
+@@ -566353,8 +567347,26 @@ DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
+   if( nHost <= 0 ) return 0;
+ 
+   nUserPath = 0;
++  /* The URL value is an idle timeout; zero is limited to a clear numeric
++  ** 127/8 loopback so only a local session server can wait without a deadline. */
+   if( zPathStart ){
+-    nUserPath = (int)strlen(zPathStart);
++    zQueryStart = strchr(zPathStart, '?');
++    if( zQueryStart ){
++      static const char zIdleTimeoutQuery[] = "?http_idle_timeout_ms=";
++      const char *zValue = zQueryStart + sizeof(zIdleTimeoutQuery) - 1;
++      if( strncmp(zQueryStart, zIdleTimeoutQuery,
++                  sizeof(zIdleTimeoutQuery) - 1)!=0
++       || doltliteParseDecimal(
++            zValue, zUrl + strlen(zUrl), HTTP_MAX_IDLE_TIMEOUT_MS,
++            &timeoutMs)!=DOLTLITE_DECIMAL_OK
++       || (timeoutMs==0
++           && (useTls || !httpIsNumericLoopbackHost(zHostStart, nHost))) ){
++        return 0;
++      }
++    }
++    nUserPath = zQueryStart
++              ? (int)(zQueryStart - zPathStart)
++              : (int)strlen(zPathStart);
+ 
+     while( nUserPath > 0 && zPathStart[nUserPath-1] == '/' ){
+       nUserPath--;
+@@ -566374,16 +567386,6 @@ DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
+   p->zHost[nHost] = 0;
+ 
+   p->port = port;
+-  timeoutMs = HTTP_TIMEOUT_MS;
+-  zTimeout = getenv("DOLTLITE_HTTP_TIMEOUT_MS");
+-  if( zTimeout && zTimeout[0] ){
+-    if( doltliteParseDecimal(
+-          zTimeout, zTimeout+strlen(zTimeout), 0x7fffffff, &timeoutMs)
+-          !=DOLTLITE_DECIMAL_OK
+-     || timeoutMs==0 ){
+-      timeoutMs = HTTP_TIMEOUT_MS;
+-    }
+-  }
+   p->timeoutMs = (int)timeoutMs;
+ 
+   nBasePath = nUserPath;
+@@ -566422,6 +567424,7 @@ DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
+   p->base.xErrMsg = httpErrMsg;
+   p->base.bResumePartialPuts = 1;
+   p->base.bCacheForChunkSource = 1;
++  p->base.bPushPutsAckOnFlush = 1;
+ 
+   return &p->base;
+ }
+diff --git a/doltlite_remotesrv.c b/doltlite_remotesrv.c
+index c989fe3f3af1654e6242f55ff3d5324eb0058efc..b89bafac34c5687a2bb71ecf56b3211a0edbf861 100644
+--- a/doltlite_remotesrv.c
++++ b/doltlite_remotesrv.c
+@@ -69,6 +69,9 @@ struct DoltliteServer {
+   int nQueue;
+   int activeFd[SERVER_WORKERS];
+   int timeoutMs;
++  int maxRequestBytes;
++  int maxChunkBytes;
++  int bSessionLoopbackTransfer;
+   sqlite3_vfs *pVfs;
+ 
+   DoltliteTlsServer *tls;
+@@ -245,6 +248,10 @@ static int remoteSrvCommitPending(ChunkStore *pStore){
+ ** batch get-chunks cannot materialize an unbounded reply. */
+ #define MAX_CHUNK_BYTES    (64 * 1024 * 1024)
+ #define MAX_REQUEST_BYTES  (128 * 1024 * 1024)
++/* Larger request limits apply only to a session-owned loopback server; the
++** public unauthenticated protocol keeps its 64 MiB chunk and 128 MiB request caps. */
++#define MAX_REQUEST_BYTES_MAX 0x7fffffff
++#define MAX_CHUNK_BYTES_MAX (MAX_REQUEST_BYTES_MAX - (PROLLY_HASH_SIZE + 4))
+ #define MAX_RESPONSE_BYTES MAX_REQUEST_BYTES
+ 
+ /* Header must arrive in one timeout; body then sustains BODY_MIN_RATE
+@@ -283,13 +290,13 @@ static int remoteSrvGrowBuf(u8 **pp, i64 *pnAlloc, i64 need){
+ }
+ 
+ static int readExact(DoltliteConn *fd, u8 *pBuf, int nBytes,
+-                     i64 startMs, int graceMs){
++                     i64 startMs, int graceMs, int bAllowSlowProgress){
+   int nRead = 0;
+   while( nRead < nBytes ){
+     int n = doltliteConnRead(fd, pBuf + nRead, nBytes - nRead);
+     if( n <= 0 ) return -1;
+     nRead += n;
+-    if( monotonicMs() - startMs
++    if( !bAllowSlowProgress && monotonicMs() - startMs
+         > graceMs + (i64)nRead * 1000 / SERVER_BODY_MIN_RATE ){
+       return -1;
+     }
+@@ -310,6 +317,7 @@ static int headerNameEquals(
+ static int parseContentLength(
+   const char *zValue,
+   const char *zEnd,
++  int maxRequestBytes,
+   int *pnValue
+ ){
+   const char *p = zValue;
+@@ -318,7 +326,7 @@ static int parseContentLength(
+ 
+   while( p<zEnd && (*p==' ' || *p=='\t') ) p++;
+   while( zEnd>p && (zEnd[-1]==' ' || zEnd[-1]=='\t') ) zEnd--;
+-  rc = doltliteParseDecimal(p, zEnd, MAX_REQUEST_BYTES, &nValue);
++  rc = doltliteParseDecimal(p, zEnd, (uint64_t)maxRequestBytes, &nValue);
+   if( rc==DOLTLITE_DECIMAL_RANGE ) return -2;
+   if( rc!=DOLTLITE_DECIMAL_OK ) return -1;
+   *pnValue = (int)nValue;
+@@ -331,7 +339,9 @@ static int parseRequest(
+   char *zPath, int nPathMax,
+   char *zAuth, int nAuthMax,
+   u8 **ppBody, int *pnBody,
+-  int timeoutMs
++  int timeoutMs,
++  int maxRequestBytes,
++  int bAllowSlowProgress
+ ){
+   char aBuf[MAX_HEADER_SIZE];
+   int nBuf = 0;
+@@ -408,7 +418,8 @@ static int parseRequest(
+       int rc;
+       if( seenContentLength ) return -1;
+       seenContentLength = 1;
+-      rc = parseContentLength(pValue, pValueEnd, &contentLength);
++      rc = parseContentLength(pValue, pValueEnd, maxRequestBytes,
++                              &contentLength);
+       if( rc!=0 ) return rc;
+     }else if( headerNameEquals(p, nName, "Transfer-Encoding") ){
+       /* Chunked request bodies are not implemented. */
+@@ -432,7 +443,8 @@ static int parseRequest(
+   if( contentLength > 0 ){
+     u8 *pBody = (u8*)sqlite3_malloc(contentLength);
+     if( !pBody ) return -1;
+-    if( readExact(fd, pBody, contentLength, monotonicMs(), timeoutMs)!=0 ){
++    if( readExact(fd, pBody, contentLength, monotonicMs(), timeoutMs,
++                  bAllowSlowProgress)!=0 ){
+       sqlite3_free(pBody);
+       return -1;
+     }
+@@ -662,10 +674,11 @@ static void handleGetChunk(ChunkStore *pStore, DoltliteConn *fd, const char *zHe
+   sqlite3_free(pData);
+ }
+ 
+-static int remoteSrvStoreChunkBatch(
++static int remoteSrvStoreChunkBatchWithLimit(
+   ChunkStore *pStore,
+   const u8 *pBody,
+-  int nBody
++  int nBody,
++  int maxChunkBytes
+ ){
+   int offset = 0;
+   int rc;
+@@ -688,8 +701,11 @@ static int remoteSrvStoreChunkBatch(
+         | ((u32)pBody[offset+3] << 24);
+     offset += 4;
+ 
+-    if( len > (u32)MAX_CHUNK_BYTES
+-     || len > (u32)(nBody - offset) ){
++    if( len > (u32)maxChunkBytes ){
++      rc = SQLITE_TOOBIG;
++      goto store_error;
++    }
++    if( len > (u32)(nBody - offset) ){
+       rc = SQLITE_PROTOCOL;
+       goto store_error;
+     }
+@@ -711,9 +727,18 @@ store_error:
+   return rc;
+ }
+ 
+-static void handlePostChunks(ChunkStore *pStore, DoltliteConn *fd,
+-                             const u8 *pBody, int nBody){
+-  int rc = remoteSrvStoreChunkBatch(pStore, pBody, nBody);
++static int remoteSrvStoreChunkBatch(ChunkStore *pStore,
++                                    const u8 *pBody, int nBody){
++  return remoteSrvStoreChunkBatchWithLimit(
++      pStore, pBody, nBody, MAX_CHUNK_BYTES
++  );
++}
++
++static void handlePostChunks(DoltliteServer *pSrv, ChunkStore *pStore,
++                             DoltliteConn *fd, const u8 *pBody, int nBody){
++  int rc = remoteSrvStoreChunkBatchWithLimit(
++      pStore, pBody, nBody, pSrv->maxChunkBytes
++  );
+   if( rc==SQLITE_PROTOCOL ){
+     sendBadRequest(fd);
+     return;
+@@ -1157,7 +1182,8 @@ static void handleRequest(DoltliteServer *pSrv, DoltliteConn *fd){
+   rc = parseRequest(fd, zMethod, sizeof(zMethod),
+                     zPath, sizeof(zPath),
+                     zAuth, sizeof(zAuth), &pBody, &nBody,
+-                    pSrv->timeoutMs);
++                    pSrv->timeoutMs, pSrv->maxRequestBytes,
++                    pSrv->bSessionLoopbackTransfer);
+   if( rc!=0 ){
+     if( rc==-2 ){
+       sendPayloadTooLarge(fd);
+@@ -1237,7 +1263,7 @@ static void handleRequest(DoltliteServer *pSrv, DoltliteConn *fd){
+     }else if( strcmp(zEndpoint, "get-chunks")==0 ){
+       handleGetChunks(pStore, fd, pBody, nBody);
+     }else if( strcmp(zEndpoint, "chunks")==0 ){
+-      handlePostChunks(pStore, fd, pBody, nBody);
++      handlePostChunks(pSrv, pStore, fd, pBody, nBody);
+     }else if( strcmp(zEndpoint, "commit")==0 ){
+       handleCommit(pStore, fd);
+     }else{
+@@ -1375,6 +1401,12 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+ 
+   memset(pSrv, 0, sizeof(*pSrv));
+   pSrv->listenFd = -1;
++  if( o->bSessionLoopbackTransfer!=0 && o->bSessionLoopbackTransfer!=1 ){
++    return SQLITE_MISUSE;
++  }
++  pSrv->bSessionLoopbackTransfer = o->bSessionLoopbackTransfer;
++  pSrv->maxRequestBytes = MAX_REQUEST_BYTES;
++  pSrv->maxChunkBytes = MAX_CHUNK_BYTES;
+   pSrv->pVfs = sqlite3_vfs_find(o->zVfsName);
+   if( !pSrv->pVfs ) return SQLITE_ERROR;
+   pSrv->timeoutMs = o->timeoutMs>0 ? o->timeoutMs
+@@ -1395,6 +1427,14 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+     serverCleanup(pSrv);
+     return SQLITE_ERROR;
+   }
++  if( pSrv->bSessionLoopbackTransfer ){
++    if( (ntohl(bindIn.s_addr) & 0xff000000U)!=0x7f000000U ){
++      serverCleanup(pSrv);
++      return SQLITE_MISUSE;
++    }
++    pSrv->maxRequestBytes = MAX_REQUEST_BYTES_MAX;
++    pSrv->maxChunkBytes = MAX_CHUNK_BYTES_MAX;
++  }
+ 
+   pSrv->zDir = dupStr(o->zDir);
+   if( !pSrv->zDir ){
+diff --git a/doltlite_remotesrv.h b/doltlite_remotesrv.h
+index 120104962b47eeb702dd681d6dd1f566020496f9..388c74288a9f77f942650b4ebb5eccdb8f71fe9b 100644
+--- a/doltlite_remotesrv.h
++++ b/doltlite_remotesrv.h
+@@ -13,6 +13,7 @@ typedef struct DoltliteServeOpts {
+   const char *audience;
+   int timeoutMs;
+   const char *zVfsName;
++  int bSessionLoopbackTransfer;
+ } DoltliteServeOpts;
+ 
+ int doltliteServe(const char *zDir, int port, const char *zBindAddr);
+diff --git a/doltlite_tls.c b/doltlite_tls.c
+index 220c012d6abc8fd618712afbc27a434fce59178a..85a1aa26dc92b273639ad4cca337d70f6d2de61f 100644
+--- a/doltlite_tls.c
++++ b/doltlite_tls.c
+@@ -24,6 +24,7 @@ struct DoltliteConn {
+   int useTls;
+   int ownsConf;
+   long long deadlineMs;
++  int idleTimeoutMs;
+   mbedtls_net_context net;
+ 
+   mbedtls_ssl_context ssl;

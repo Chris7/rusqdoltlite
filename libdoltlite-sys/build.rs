@@ -96,6 +96,7 @@ mod build_bundled {
         println!("cargo:rerun-if-changed={lib_name}/{source_file}");
         println!("cargo:rerun-if-changed={lib_name}/remote/doltlite_remotesrv.c");
         println!("cargo:rerun-if-changed={lib_name}/remote/doltlite_remotesrv.h");
+        println!("cargo:rerun-if-changed={lib_name}/remote/doltlite_tls.c");
         println!("cargo:rerun-if-changed=patches");
         let upstream_source = manifest_dir.join(lib_name).join(source_file);
         let patched_source = apply_local_patches(
@@ -107,6 +108,7 @@ mod build_bundled {
             .parent()
             .expect("patched DoltLite source must have a parent directory");
         let staged_remote_server = staged_remote_dir.join("doltlite_remotesrv.c");
+        let staged_remote_tls = staged_remote_dir.join("doltlite_tls.c");
         // Remote-auth server uses pthreads, unported to Windows/MSVC.
         let remote_supported = cfg!(feature = "remote")
             && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"))
@@ -279,8 +281,6 @@ mod build_bundled {
         println!("cargo:rerun-if-env-changed=LIBSQLITE3_FLAGS");
 
         cfg.compile(lib_name);
-        #[cfg(feature = "blockcachevfs")]
-        link_blockcachevfs();
         if win_target() {
             // The DoltLite amalgamation always includes its remote client and
             // auth implementation, even when the Rust `remote` feature (which
@@ -291,7 +291,7 @@ mod build_bundled {
             println!("cargo:rustc-link-lib=crypt32");
         }
         if remote_supported && auth_is_in_amalgamation {
-            compile_server_tls(&remote_dir);
+            compile_server_tls(&remote_dir, &staged_remote_tls);
         }
 
         println!("cargo:lib_dir={out_dir}");
@@ -353,47 +353,33 @@ mod build_bundled {
         .expect("could not stage bundled DoltLite header for CBS");
         apply_blockcache_patches(&stage, &manifest_dir.join("patches/blockcachevfs"));
 
+        // curl-sys, openssl-sys, and libz-sys own native linking for this
+        // feature. Their metadata keeps the static libraries registered once
+        // and in Cargo's dependency order. CBS itself needs CURL_STATICLIB so
+        // curl headers use static declarations on Windows as well.
         cfg.files(sources.iter().map(|name| stage.join(name)))
             .include(&stage)
             .flag("-DSQLITE_CORE")
             .flag("-DSQLITE_THREADSAFE=1")
             .define("BCV_DOLTLITE_INTEGRATION", None)
+            .define("CURL_STATICLIB", None)
+            .define("DOLTLITE_BCV_BUNDLED_CURL", None)
             .warnings(false);
 
-        // CBS uses libcurl and OpenSSL directly.  Prefer pkg-config when the
-        // target supplies it, but retain the conventional linker names for
-        // systems where the development packages do not ship .pc files.
-        let curl = pkg_config::Config::new()
-            .cargo_metadata(false)
-            .probe("libcurl")
-            .or_else(|_| {
-                pkg_config::Config::new()
-                    .cargo_metadata(false)
-                    .probe("curl")
-            });
-        let openssl = pkg_config::Config::new()
-            .cargo_metadata(false)
-            .probe("openssl");
-        if let Ok(ref lib) = curl {
-            cfg.includes(&lib.include_paths);
-        } else if let Ok(path) = env::var("BLOCKCACHEVFS_CURL_INCLUDE_DIR") {
-            cfg.include(path);
-        } else {
-            panic!(
-                "could not find libcurl with pkg-config; set BLOCKCACHEVFS_CURL_INCLUDE_DIR to its headers"
-            );
+        // These include paths come from the same Cargo native dependencies
+        // that build and link CBS's static curl, OpenSSL, and zlib libraries.
+        for (variable, library) in [
+            ("DEP_CURL_INCLUDE", "bundled libcurl"),
+            ("DEP_OPENSSL_INCLUDE", "vendored OpenSSL"),
+        ] {
+            let include = env::var_os(variable)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| panic!("{variable} metadata is missing for {library}"));
+            if !include.is_dir() {
+                panic!("{variable} does not name an include directory for {library}");
+            }
+            cfg.include(include);
         }
-        if let Ok(ref lib) = openssl {
-            cfg.includes(&lib.include_paths);
-        } else if let Ok(path) = env::var("BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR") {
-            cfg.include(path);
-        } else {
-            panic!(
-                "could not find OpenSSL with pkg-config; set BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR to its headers"
-            );
-        }
-        println!("cargo:rerun-if-env-changed=BLOCKCACHEVFS_CURL_INCLUDE_DIR");
-        println!("cargo:rerun-if-env-changed=BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR");
     }
 
     #[cfg(feature = "blockcachevfs")]
@@ -443,43 +429,6 @@ mod build_bundled {
                 stage.display(),
                 String::from_utf8_lossy(&output.stderr)
             );
-        }
-    }
-
-    #[cfg(feature = "blockcachevfs")]
-    fn link_blockcachevfs() {
-        let curl = pkg_config::Config::new()
-            .cargo_metadata(false)
-            .probe("libcurl")
-            .or_else(|_| {
-                pkg_config::Config::new()
-                    .cargo_metadata(false)
-                    .probe("curl")
-            });
-        let openssl = pkg_config::Config::new()
-            .cargo_metadata(false)
-            .probe("openssl");
-        let curl_found = curl.is_ok();
-        let openssl_found = openssl.is_ok();
-        for lib in [curl, openssl].into_iter().flatten() {
-            for path in lib.link_paths {
-                println!("cargo:rustc-link-search=native={}", path.display());
-            }
-            for name in lib.libs {
-                println!("cargo:rustc-link-lib={name}");
-            }
-            for name in lib.frameworks {
-                println!("cargo:rustc-link-lib=framework={name}");
-            }
-        }
-        // Development environments without pkg-config commonly still expose
-        // the conventional shared-library names.
-        if !curl_found {
-            println!("cargo:rustc-link-lib=curl");
-        }
-        if !openssl_found {
-            println!("cargo:rustc-link-lib=ssl");
-            println!("cargo:rustc-link-lib=crypto");
         }
     }
 
@@ -554,10 +503,10 @@ mod build_bundled {
         auth_is_in_amalgamation
     }
 
-    fn compile_server_tls(remote_dir: &Path) {
+    fn compile_server_tls(remote_dir: &Path, staged_tls_source: &Path) {
         let mbedtls_dir = remote_dir.join("mbedtls");
         let mut cfg = cc::Build::new();
-        cfg.file(remote_dir.join("doltlite_tls.c"))
+        cfg.file(staged_tls_source)
             .define(
                 "doltliteConnOpenTimeout",
                 "doltliteBundledClientConnOpenTimeout",
@@ -594,7 +543,11 @@ mod build_bundled {
                 patched_source.display()
             )
         });
-        for sidecar in ["doltlite_remotesrv.c", "doltlite_remotesrv.h"] {
+        for sidecar in [
+            "doltlite_remotesrv.c",
+            "doltlite_remotesrv.h",
+            "doltlite_tls.c",
+        ] {
             let upstream_sidecar = upstream_source
                 .parent()
                 .expect("DoltLite amalgamation must have a parent directory")
@@ -627,6 +580,9 @@ mod build_bundled {
             .collect::<Vec<_>>();
         patches.sort();
         assert!(!patches.is_empty(), "the local DoltLite patch set is empty");
+        for patch in &patches {
+            println!("cargo:rerun-if-changed={}", patch.display());
+        }
 
         let ceiling = output_dir
             .parent()

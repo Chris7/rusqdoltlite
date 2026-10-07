@@ -8,6 +8,15 @@ use core::sync::atomic::{AtomicI32, Ordering};
 
 mod error;
 
+// Keep Cargo's native curl/OpenSSL/zlib link metadata reachable through this
+// sys crate without exposing those low-level crates as part of its API.
+#[cfg(feature = "blockcachevfs")]
+extern crate curl_sys as _;
+#[cfg(feature = "blockcachevfs")]
+extern crate libz_sys as _;
+#[cfg(feature = "blockcachevfs")]
+extern crate openssl_sys as _;
+
 #[must_use]
 pub fn SQLITE_STATIC() -> sqlite3_destructor_type {
     None
@@ -46,6 +55,24 @@ pub mod blockcachevfs {
         pz_auth_token: *mut *mut c_char,
     ) -> c_int;
 
+    /// Request-boundary credential refresh callback for session-owned cloud VFSes.
+    pub type sqlite3_bcvfs_auth_refresh_callback = unsafe extern "C" fn(
+        p_ctx: *mut c_void,
+        z_storage: *const c_char,
+        z_account: *const c_char,
+        z_container: *const c_char,
+        reason: c_int,
+        pz_auth_token: *mut *mut c_char,
+    ) -> c_int;
+
+    /// Upload progress event with block and full-block-byte counts.
+    pub type sqlite3_bcvfs_upload_progress_callback =
+        unsafe extern "C" fn(*mut c_void, c_int, sqlite3_int64, sqlite3_int64);
+
+    /// A safe, credential-free terminal storage failure observed by the VFS.
+    pub type sqlite3_bcvfs_storage_failure_callback =
+        unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int);
+
     /// Busy callback used by an upload checkpoint.
     pub type sqlite3_bcvfs_busy_callback = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 
@@ -57,6 +84,22 @@ pub mod blockcachevfs {
     pub const SQLITE_BCV_HTTPLOG_NENTRY: c_int = 6;
     /// Proactively stage dirty blocks once this percentage of the cache is occupied.
     pub const SQLITE_BCV_STAGEWATERMARK: c_int = 7;
+    pub const SQLITE_BCV_AUTH_REQUEST: c_int = 0;
+    pub const SQLITE_BCV_AUTH_UNAUTHORIZED: c_int = 1;
+    pub const SQLITE_BCVFS_UPLOAD_PROGRESS_UPLOADED_BLOCK: c_int = 1;
+    pub const SQLITE_BCVFS_UPLOAD_PROGRESS_REUSED_BLOCK: c_int = 2;
+    pub const SQLITE_BCVFS_UPLOAD_PROGRESS_PLAN: c_int = 3;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE: c_int = 0;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_HTTP: c_int = 1;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE: c_int = 1;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_BLOCK_READ: c_int = 2;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_STAGE_PUT: c_int = 3;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_VERIFY_EXISTING: c_int = 4;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_PROTECT_SESSION: c_int = 5;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_FINAL_PUT: c_int = 6;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_SESSION_CHECKPOINT: c_int = 7;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_SESSION_ACCEPT: c_int = 8;
+    pub const SQLITE_BCVFS_STORAGE_FAILURE_SESSION_PUBLISH: c_int = 9;
 
     pub const SQLITE_BCV_ATTACH_SECURE: c_int = 0x0001;
     pub const SQLITE_BCV_ATTACH_IFNOT: c_int = 0x0002;
@@ -86,6 +129,21 @@ pub mod blockcachevfs {
             fs: *mut sqlite3_bcvfs,
             auth_ctx: *mut c_void,
             auth: Option<sqlite3_bcvfs_auth_callback>,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_auth_refresh_callback(
+            fs: *mut sqlite3_bcvfs,
+            auth_ctx: *mut c_void,
+            auth: Option<sqlite3_bcvfs_auth_refresh_callback>,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_upload_progress_callback(
+            fs: *mut sqlite3_bcvfs,
+            progress_ctx: *mut c_void,
+            progress: Option<sqlite3_bcvfs_upload_progress_callback>,
+        ) -> c_int;
+        pub fn sqlite3_bcvfs_storage_failure_callback(
+            fs: *mut sqlite3_bcvfs,
+            failure_ctx: *mut c_void,
+            failure: Option<sqlite3_bcvfs_storage_failure_callback>,
         ) -> c_int;
         pub fn sqlite3_bcvfs_attach(
             fs: *mut sqlite3_bcvfs,
@@ -142,6 +200,19 @@ pub mod blockcachevfs {
             busy: Option<sqlite3_bcvfs_busy_callback>,
             busy_ctx: *mut c_void,
             pz_err: *mut *mut c_char,
+        ) -> c_int;
+        /// Initialize an empty DoltLite store without creating a zero-tip branch.
+        ///
+        /// The connection must have been opened with DoltLite's private no-seed
+        /// flag. This serializes and commits an empty refs table for the named
+        /// SQLite schema.
+        ///
+        /// # Safety
+        /// `db` must be a live SQLite connection and `z_db` must point to a
+        /// NUL-terminated schema name valid for that connection.
+        pub fn sqlite3_doltlite_bcvfs_initialize_empty_store(
+            db: *mut sqlite3,
+            z_db: *const c_char,
         ) -> c_int;
         pub fn sqlite3_bcvfs_session_checkpoint(
             fs: *mut sqlite3_bcvfs,
@@ -241,7 +312,15 @@ pub mod bcvutil {
 
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 mod remote {
-    use core::ffi::{c_char, c_int, c_long};
+    use core::ffi::{c_char, c_int, c_long, c_void};
+
+    use super::{sqlite3, sqlite3_int64};
+
+    pub const DOLTLITE_PUSH_PROGRESS_PLAN: c_int = 1;
+    pub const DOLTLITE_PUSH_PROGRESS_UPLOADED: c_int = 2;
+
+    pub type sqlite3_doltlite_push_progress_callback =
+        unsafe extern "C" fn(*mut c_void, c_int, sqlite3_int64, sqlite3_int64);
 
     #[repr(C)]
     pub struct DoltliteServer {
@@ -259,9 +338,26 @@ mod remote {
         pub audience: *const c_char,
         pub timeoutMs: c_int,
         pub zVfsName: *const c_char,
+        pub bSessionLoopbackTransfer: c_int,
     }
 
     unsafe extern "C" {
+        /// Install a connection-scoped callback for opt-in native `dolt_push` progress.
+        ///
+        /// On success, `context` must remain valid until the matching clear call.
+        /// On failure, ownership remains with the caller.
+        pub fn sqlite3_doltlite_set_push_progress_callback(
+            db: *mut sqlite3,
+            context: *mut c_void,
+            callback: Option<sqlite3_doltlite_push_progress_callback>,
+        ) -> c_int;
+
+        /// Clear the callback only if `context` still owns the registration.
+        pub fn sqlite3_doltlite_clear_push_progress_callback(
+            db: *mut sqlite3,
+            context: *mut c_void,
+        ) -> c_int;
+
         pub fn doltliteServe(
             directory: *const c_char,
             port: c_int,

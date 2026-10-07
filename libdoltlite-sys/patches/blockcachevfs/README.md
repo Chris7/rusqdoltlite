@@ -102,3 +102,91 @@ report `(-1, -1)` when a successful checkpoint finds no WAL present; the upload
 path accepts that result and uploads any already-dirty main-file blocks without
 requiring a `-wal` file. This does not imply that attached rollback-journal
 writes are supported.
+
+`0017-session-upload-safety-and-parallel-staging.patch` consolidates the
+former 0017-0025 production patches as one regenerated net diff. Its patch
+header is the change-retention checklist for future CBS upgrades; regenerate it
+from the pinned pristine source after applying 0001-0016, and keep
+`../../cloudsqlite` untouched.
+
+The retained behavior includes the `blocks/<block-id>.bcv` immutable payload
+namespace with no flat-key fallback. This path lets a client CAB grant access to
+immutable payloads without granting mutable session-control objects. Session
+writes are create-only, and an already-present object requires exact-byte
+verification. A staged block PUT does not publish the database; only the explicit
+`sqlite3_bcvfs_upload` operation can install the conditional manifest. Session
+block writes
+are protected by an attempt marker fenced between two reads of the server-owned
+cleanup guard. Both observations must show the same idle epoch, or both must
+show no guard; cleanup changes the idle epoch when it releases a sweep, and
+clients retry a transition for up to 12 seconds.
+
+Ordinary unscoped writers retain one shared writer-guard CAS before any
+payload PUT in a staging batch. If cleanup owns SWEEP, the batch queues no
+payload and leaves dirty local blocks for retry after the guard returns to
+IDLE. Session-owned CAB VFS connections cannot write the shared guard; they
+continue to use the read-idle, attempt-marker, read-epoch fence above. The
+`bcvfs_session_gc.test` regression keeps the zero-PUT-under-SWEEP and
+idle-transition recovery checks.
+
+Google JSON media uploads include CRC32C. CBS verifies the matching checksum
+before handing full-object downloads to cache consumers, rejects short blocks,
+and preserves conditional 304 behavior. The Cargo-bundled static curl build
+keeps `CLOUDSQLITE_CAINFO`, honors `SSL_CERT_FILE` and `SSL_CERT_DIR`, and uses
+readable conventional CA paths only when neither environment setting is
+present. It does not weaken peer or hostname verification, and standalone CBS
+keeps its upstream curl configuration.
+
+Session-owned Google JSON requests obtain a current Bearer token immediately
+before dispatch, then refresh and replay the same request once after a 401/403.
+The replay preserves its body and generation preconditions; a second denial is
+terminal. Static auth and Google XML/S3 retain their existing behavior, and
+token-bearing headers stay out of verbose output. A live upload retry accepts an
+exact same-byte replay of an immutable block. A fresh process rehydrates only an
+accepted durable checkpoint/head; unaccepted overlay-to-block mappings are
+disposable and rebuilt from Gen's durable local graph. Attempt markers do not
+reconstruct those mappings, so CBS does not promise bandwidth-free resume for
+every block staged before acceptance. The optional URI-VFS progress
+callback reports completed block uploads and exact-byte-verified reuse during
+streaming staging, checkpoint flushes, and ordinary uploads. After the explicit
+final checkpoint has quiesced the WAL, it reports the remaining unpinned dirty
+blocks as a fixed plan. Plan bytes count full payloads, not predicted network
+traffic, WAL, or publication metadata; no plan is emitted during production or
+when dirty blocks are blocked. Callback code runs synchronously on the upload
+thread, so callers must keep it quick and must not re-enter the same VFS. Rust
+callback panics are contained and cannot change storage or publication results.
+
+A session-owned URI VFS also retains its first terminal storage failure as a
+safe phase and explicitly typed HTTP-status or SQLite-code cause. It covers
+block transfers, local cache I/O, session protection, checkpoints, accepted
+heads, and publication writes. It excludes transient retries, missing guards,
+expected head CAS conflicts, verified immutable-object reuse, URLs, credentials,
+and provider response text.
+
+Dirty payload blocks are staged in bounded parallel batches both at the
+watermark and during the final session drain. Attempt markers remain fenced
+serially before payload requests are queued. `SQLITE_BCV_NREQUEST` accepts
+values from 1 through `INT_MAX` and supplies an upper bound on parallel uploads;
+1 retains serial staging. Effective batch size is
+also capped at 64 blocks, cache capacity, and 64 MiB of copied payload;
+a single larger block stages alone. Exact-byte checks remain mandatory for
+create-only conflicts. All requests drain before buffers, pins, or the dispatcher
+are released, and each successful PUT or verified reuse is recorded and cleaned
+independently. Completed sibling progress remains visible when another request
+fails. The watermark measures dirty payload blocks so later writes continue to
+form batches; hard cache-capacity staging remains in place.
+
+Ordinary final uploads continue scanning past each durable staged block so an
+initial request chain can still dispatch later dirty blocks. The regression in
+`blockcachevfs-tests/bcvfs_staging_fault.test` verifies a staged prefix longer
+than the configured upload concurrency followed by a dirty tail, then checks a
+cold read after publication. Keep this test enabled alongside the `remote_server` and
+`remote_progress` Rust suites, `blockcachevfs_security`, focused
+`blockcachevfs_emulator` tests, and the shared CBS Tcl emulator runner when
+refreshing the patch series.
+
+The CBS block callback and DoltLite logical chunk plan are paired by the Rust
+integration but remain separate native interfaces. Standalone CBS builds do not
+require DoltLite. This patch is applied only to staged CBS source; the separate
+`blockcachevfs-tests/` series carries CBS test changes and the emulator runner
+applies those tests after the production patch.

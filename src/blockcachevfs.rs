@@ -7,8 +7,10 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+use sha2::{Digest, Sha256};
 
 use crate::error::{check, Error};
 use crate::{Connection, OpenFlags, Result};
@@ -34,6 +36,215 @@ impl std::error::Error for AuthError {}
 /// A callback that supplies a cloud provider authentication token.
 pub type AuthCallback =
     dyn Fn(&str, &str, &str) -> std::result::Result<String, AuthError> + Send + Sync + 'static;
+
+/// Fixed block-work total once the final staging plan is known.
+///
+/// The plan counts all complete-block work for the VFS attachment, including
+/// blocks already uploaded or verified as reused and blocks still to stage.
+/// `bytes` is the full block payload size for that work; it does not predict
+/// network bytes because some objects may be reused.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UploadPlan {
+    /// Total number of complete blocks in the plan.
+    pub blocks: u64,
+    /// Total full-size block payload bytes in the plan.
+    pub bytes: u64,
+}
+
+/// Cumulative complete-block upload progress for one VFS attachment.
+///
+/// `expected` is unknown while DoltLite is still producing data. It becomes
+/// available after the explicit final checkpoint has quiesced the WAL and
+/// counted the remaining dirty blocks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UploadProgress {
+    /// Number of blocks created successfully in cloud storage.
+    pub uploaded_blocks: u64,
+    /// Bytes in blocks created successfully in cloud storage.
+    pub uploaded_bytes: u64,
+    /// Number of existing immutable blocks accepted after exact-byte verification.
+    pub reused_blocks: u64,
+    /// Bytes in existing immutable blocks accepted after exact-byte verification.
+    pub reused_bytes: u64,
+    /// Fixed total block-work plan, available after final staging is planned.
+    pub expected: Option<UploadPlan>,
+}
+
+/// Storage operation where a session-owned VFS first observed a terminal failure.
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageFailurePhase {
+    /// Reading or updating the VFS's local block cache.
+    LocalBlockCache,
+    /// Fetching a content-addressed block from the object store.
+    BlockRead,
+    /// Creating a content-addressed block before checkpoint publication.
+    StageBlockPut,
+    /// Reading and verifying an immutable object that already existed.
+    VerifyExistingBlock,
+    /// Writing the session's durable block-protection marker.
+    ProtectSessionBlock,
+    /// Creating a content-addressed block during final manifest upload.
+    FinalBlockPut,
+    /// Creating or validating a session checkpoint.
+    SessionCheckpoint,
+    /// Accepting a session checkpoint.
+    SessionAccept,
+    /// Publishing a session checkpoint to the database manifest.
+    SessionPublish,
+}
+
+#[cfg(feature = "remote")]
+impl StorageFailurePhase {
+    fn from_raw(value: c_int) -> Option<Self> {
+        match value {
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_LOCAL_CACHE => Some(Self::LocalBlockCache),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_BLOCK_READ => Some(Self::BlockRead),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_STAGE_PUT => Some(Self::StageBlockPut),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_VERIFY_EXISTING => Some(Self::VerifyExistingBlock),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_PROTECT_SESSION => Some(Self::ProtectSessionBlock),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_FINAL_PUT => Some(Self::FinalBlockPut),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_SESSION_CHECKPOINT => Some(Self::SessionCheckpoint),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_SESSION_ACCEPT => Some(Self::SessionAccept),
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_SESSION_PUBLISH => Some(Self::SessionPublish),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalBlockCache => "local block cache",
+            Self::BlockRead => "block read",
+            Self::StageBlockPut => "staged block upload",
+            Self::VerifyExistingBlock => "existing block verification",
+            Self::ProtectSessionBlock => "session block protection",
+            Self::FinalBlockPut => "final block upload",
+            Self::SessionCheckpoint => "session checkpoint",
+            Self::SessionAccept => "session acceptance",
+            Self::SessionPublish => "session publication",
+        }
+    }
+}
+
+/// Safe error code category captured at a terminal storage boundary.
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageFailureCause {
+    /// The object store returned an HTTP status code.
+    HttpStatus(u16),
+    /// SQLite or the CBS VFS returned an extended SQLite result code.
+    SqliteCode(i32),
+}
+
+/// Credential-free snapshot of the first terminal storage failure in a server attempt.
+///
+/// The snapshot records the first low-level storage failure reported by the
+/// session-owned VFS. It is useful diagnostic context, not proof that no other
+/// failure contributed to a higher-level operation. It contains no provider
+/// URL, credentials, or response body.
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageFailure {
+    /// Operation that first reported a terminal storage failure.
+    pub phase: StorageFailurePhase,
+    /// Safe failure category and numeric code.
+    pub cause: StorageFailureCause,
+}
+
+#[cfg(feature = "remote")]
+impl StorageFailure {
+    fn from_raw(phase: c_int, kind: c_int, code: c_int) -> Option<Self> {
+        let phase = StorageFailurePhase::from_raw(phase)?;
+        let cause = match kind {
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_HTTP => {
+                StorageFailureCause::HttpStatus(u16::try_from(code).ok()?)
+            }
+            raw::SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE => StorageFailureCause::SqliteCode(code),
+            _ => return None,
+        };
+        Some(Self { phase, cause })
+    }
+}
+
+#[cfg(feature = "remote")]
+impl fmt::Display for StorageFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.cause {
+            StorageFailureCause::HttpStatus(status) => {
+                write!(f, "{} failed with HTTP {status}", self.phase.as_str())
+            }
+            StorageFailureCause::SqliteCode(code) => {
+                write!(f, "{} failed with SQLite code {code}", self.phase.as_str())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) type StorageFailureSlot = Arc<Mutex<Option<StorageFailure>>>;
+
+#[cfg(feature = "remote")]
+pub(crate) type UploadProgressCallback = dyn Fn(UploadProgress) + Send + Sync + 'static;
+
+#[cfg(feature = "remote")]
+struct UploadProgressState {
+    callback: Arc<UploadProgressCallback>,
+    current: Mutex<UploadProgress>,
+}
+
+#[cfg(feature = "remote")]
+impl UploadProgressState {
+    fn report(&self, event: c_int, blocks: u64, bytes: u64) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match event {
+            raw::SQLITE_BCVFS_UPLOAD_PROGRESS_UPLOADED_BLOCK => {
+                current.uploaded_blocks = current.uploaded_blocks.saturating_add(blocks);
+                current.uploaded_bytes = current.uploaded_bytes.saturating_add(bytes);
+            }
+            raw::SQLITE_BCVFS_UPLOAD_PROGRESS_REUSED_BLOCK => {
+                current.reused_blocks = current.reused_blocks.saturating_add(blocks);
+                current.reused_bytes = current.reused_bytes.saturating_add(bytes);
+            }
+            raw::SQLITE_BCVFS_UPLOAD_PROGRESS_PLAN => {
+                current.expected = Some(UploadPlan {
+                    blocks: current
+                        .uploaded_blocks
+                        .saturating_add(current.reused_blocks)
+                        .saturating_add(blocks),
+                    bytes: current
+                        .uploaded_bytes
+                        .saturating_add(current.reused_bytes)
+                        .saturating_add(bytes),
+                });
+            }
+            _ => return,
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.callback)(*current);
+        }));
+    }
+}
+
+/// Why a session-owned cloud VFS is requesting an authentication token.
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthRefreshReason {
+    /// A cloud request is about to be handed to the HTTP dispatcher; the
+    /// provider may renew a token before the request starts.
+    Request,
+    /// The cloud provider rejected a request; the provider must fetch fresh
+    /// credentials before the same request is retried.
+    Unauthorized,
+}
+
+#[cfg(feature = "remote")]
+pub(crate) type AuthRefreshCallback = dyn Fn(&str, &str, &str, AuthRefreshReason) -> std::result::Result<String, AuthError>
+    + Send
+    + Sync
+    + 'static;
 
 /// Encode temporary S3 credentials for the CBS authentication callback.
 ///
@@ -489,6 +700,48 @@ pub const SESSION_OPERATION_ID_BYTES: usize = raw::SQLITE_BCVFS_SESSION_HASH_BYT
 pub struct SessionOperationId([u8; SESSION_OPERATION_ID_BYTES]);
 
 impl SessionOperationId {
+    /// Derive an operation identifier from the exact HTTP request fields.
+    ///
+    /// Length-prefixing each field makes the encoding unambiguous. Identical
+    /// method, target, and body bytes produce the same identifier so a caller
+    /// can retry one request without advancing the session twice.
+    ///
+    /// # Arguments
+    ///
+    /// * `method` - Exact HTTP method bytes.
+    /// * `target` - Exact request-target bytes, including the path and query.
+    /// * `body` - Exact HTTP request body bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the resulting digest is the reserved all-zero ID.
+    pub fn from_request(method: &str, target: &str, body: &[u8]) -> Result<Self> {
+        let mut digest = Sha256::new();
+        digest.update(b"rusqdoltlite-session-operation-v1\0");
+        for field in [method.as_bytes(), target.as_bytes(), body] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        Self::new(digest.finalize())
+    }
+
+    /// Create a fresh opaque operation identifier from SQLite's native
+    /// randomness source.
+    #[must_use]
+    pub fn random() -> Self {
+        let mut operation_id = [0_u8; SESSION_OPERATION_ID_BYTES];
+        unsafe {
+            crate::ffi::sqlite3_randomness(
+                operation_id.len() as c_int,
+                operation_id.as_mut_ptr().cast::<c_void>(),
+            );
+        }
+        if operation_id.iter().all(|byte| *byte == 0) {
+            operation_id[SESSION_OPERATION_ID_BYTES - 1] = 1;
+        }
+        Self(operation_id)
+    }
+
     /// Validate and store a fixed-size, non-zero operation identifier.
     pub fn new(operation_id: impl AsRef<[u8]>) -> Result<Self> {
         let operation_id = operation_id.as_ref();
@@ -548,16 +801,29 @@ impl SessionOperationStatus {
     }
 }
 
+enum SessionVfs {
+    Static(&'static BlockCacheVfs),
+    Owned(Arc<BlockCacheVfs>),
+}
+
+impl SessionVfs {
+    fn get(&self) -> &BlockCacheVfs {
+        match self {
+            Self::Static(vfs) => vfs,
+            Self::Owned(vfs) => vfs,
+        }
+    }
+}
+
 /// A block-cache attachment owned by one server/application session.
 ///
 /// The attachment stores its session identity locally and never changes a
-/// process-wide "current session".  Its alias is attached with `IFNOT`
-/// disabled, so an existing alias can never be silently reused by a session
-/// with a different storage context. A second live owner is rejected because
-/// the current CBS container is a mutable request overlay; same-session reuse
-/// is permitted only after the prior owner has released it.
+/// process-wide current session. Its alias is attached with IFNOT disabled,
+/// so an existing alias cannot be silently reused under another storage
+/// context. A second live owner is rejected while the mutable request overlay
+/// is active; same-session reuse is allowed after the prior owner releases it.
 pub struct SessionAttachment {
-    vfs: &'static BlockCacheVfs,
+    vfs: SessionVfs,
     alias: String,
     session_id: SessionId,
     operation_id: Option<SessionOperationId>,
@@ -573,6 +839,10 @@ impl fmt::Debug for SessionAttachment {
 }
 
 impl SessionAttachment {
+    fn vfs(&self) -> &BlockCacheVfs {
+        self.vfs.get()
+    }
+
     /// Return the validated session identifier bound to this attachment.
     #[must_use]
     pub fn session_id(&self) -> &str {
@@ -595,7 +865,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_operation_status(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut status,
@@ -623,7 +893,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_checkpoint(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 checkpoint_hash.as_mut_ptr(),
@@ -649,7 +919,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_accept(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut etag,
@@ -673,7 +943,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_upload(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut err,
@@ -693,7 +963,7 @@ impl SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_session_finalize(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut err,
@@ -718,7 +988,7 @@ impl Drop for SessionAttachment {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             raw::sqlite3_bcvfs_detach_session(
-                self.vfs.fs,
+                self.vfs().fs,
                 alias.as_ptr(),
                 session_id.as_ptr(),
                 &mut err,
@@ -768,8 +1038,12 @@ pub(crate) fn session_alias(spec: &AttachSpec, session_id: &SessionId) -> Result
 pub enum Config {
     /// Maximum local cache size in bytes.
     CacheSize(i64),
-    /// Maximum number of simultaneous upload requests.
-    RequestCount(i64),
+    /// Upper bound on parallel cloud block uploads.
+    ///
+    /// Native staging may use fewer uploads to fit the local cache and its
+    /// bounded staging buffer. Values from 1 through `i32::MAX` are accepted;
+    /// the default is supplied by the native VFS.
+    UploadConcurrency(i64),
     /// HTTP timeout in seconds.
     HttpTimeout(i64),
     /// Enable verbose libcurl logging. Only non-header diagnostic text is
@@ -780,10 +1054,11 @@ pub enum Config {
     HttpLogTimeout(i64),
     /// Maximum HTTP-log entries; negative means unlimited.
     HttpLogEntries(i64),
-    /// Cache occupancy percentage at which dirty blocks are proactively
-    /// staged. The native VFS accepts values from 1 through 100, inclusive;
-    /// its default is 90. Values outside that range make VFS initialization
-    /// fail with `SQLITE_MISUSE`.
+    /// Dirty-block payload occupancy percentage at which blocks are
+    /// proactively staged. The percentage is relative to the configured cache
+    /// capacity and excludes clean cached blocks. The native VFS accepts
+    /// values from 1 through 100, inclusive; its default is 90. Values outside
+    /// that range make VFS initialization fail with `SQLITE_MISUSE`.
     StageWatermark(i64),
 }
 
@@ -791,7 +1066,7 @@ impl Config {
     fn raw(self) -> (c_int, i64) {
         match self {
             Self::CacheSize(v) => (raw::SQLITE_BCV_CACHESIZE, v),
-            Self::RequestCount(v) => (raw::SQLITE_BCV_NREQUEST, v),
+            Self::UploadConcurrency(v) => (raw::SQLITE_BCV_NREQUEST, v),
             Self::HttpTimeout(v) => (raw::SQLITE_BCV_HTTPTIMEOUT, v),
             Self::CurlVerbose(v) => (raw::SQLITE_BCV_CURLVERBOSE, i64::from(v)),
             Self::HttpLogTimeout(v) => (raw::SQLITE_BCV_HTTPLOG_TIMEOUT, v),
@@ -806,11 +1081,23 @@ pub struct Builder {
     directory: std::path::PathBuf,
     name: CString,
     auth: Box<AuthCallback>,
+    #[cfg(feature = "remote")]
+    auth_refresh: Option<Box<AuthRefreshCallback>>,
+    #[cfg(feature = "remote")]
+    upload_progress: Option<Arc<UploadProgressCallback>>,
+    #[cfg(feature = "remote")]
+    storage_failure: Option<StorageFailureSlot>,
     config: Vec<Config>,
 }
 
 struct AuthState {
     callback: Box<AuthCallback>,
+    #[cfg(feature = "remote")]
+    refresh_callback: Option<Box<AuthRefreshCallback>>,
+    #[cfg(feature = "remote")]
+    upload_progress: Option<UploadProgressState>,
+    #[cfg(feature = "remote")]
+    storage_failure: Option<StorageFailureSlot>,
 }
 
 impl Builder {
@@ -820,6 +1107,12 @@ impl Builder {
             directory: directory.as_ref().to_owned(),
             name: CString::new("rusqdoltlite-bcvfs").map_err(Error::NulError)?,
             auth: Box::new(|_, _, _| Err(AuthError("no CBS auth callback configured".into()))),
+            #[cfg(feature = "remote")]
+            auth_refresh: None,
+            #[cfg(feature = "remote")]
+            upload_progress: None,
+            #[cfg(feature = "remote")]
+            storage_failure: None,
             config: Vec::new(),
         })
     }
@@ -843,6 +1136,33 @@ impl Builder {
         F: Fn(&str, &str, &str) -> std::result::Result<String, AuthError> + Send + Sync + 'static,
     {
         self.auth = Box::new(callback);
+        self
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn auth_refresh_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, &str, &str, AuthRefreshReason) -> std::result::Result<String, AuthError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.auth_refresh = Some(Box::new(callback));
+        self
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn upload_progress_callback(
+        mut self,
+        callback: Arc<UploadProgressCallback>,
+    ) -> Self {
+        self.upload_progress = Some(callback);
+        self
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn storage_failure_slot(mut self, slot: StorageFailureSlot) -> Self {
+        self.storage_failure = Some(slot);
         self
     }
 
@@ -910,11 +1230,62 @@ impl Builder {
 
         let mut auth = Box::new(AuthState {
             callback: self.auth,
+            #[cfg(feature = "remote")]
+            refresh_callback: self.auth_refresh,
+            #[cfg(feature = "remote")]
+            upload_progress: self.upload_progress.map(|callback| UploadProgressState {
+                callback,
+                current: Mutex::new(UploadProgress::default()),
+            }),
+            #[cfg(feature = "remote")]
+            storage_failure: self.storage_failure,
         });
         let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
         let rc = unsafe { raw::sqlite3_bcvfs_auth_callback(fs, auth_ptr, Some(auth_trampoline)) };
         if let Err(error) = check(rc) {
             return Err(destroy_failed(fs, auth, error));
+        }
+        #[cfg(feature = "remote")]
+        if auth.refresh_callback.is_some() {
+            let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
+            let rc = unsafe {
+                raw::sqlite3_bcvfs_auth_refresh_callback(
+                    fs,
+                    auth_ptr,
+                    Some(auth_refresh_trampoline),
+                )
+            };
+            if let Err(error) = check(rc) {
+                return Err(destroy_failed(fs, auth, error));
+            }
+        }
+        #[cfg(feature = "remote")]
+        if auth.upload_progress.is_some() {
+            let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
+            let rc = unsafe {
+                raw::sqlite3_bcvfs_upload_progress_callback(
+                    fs,
+                    auth_ptr,
+                    Some(upload_progress_trampoline),
+                )
+            };
+            if let Err(error) = check(rc) {
+                return Err(destroy_failed(fs, auth, error));
+            }
+        }
+        #[cfg(feature = "remote")]
+        if auth.storage_failure.is_some() {
+            let auth_ptr = (&mut *auth) as *mut AuthState as *mut c_void;
+            let rc = unsafe {
+                raw::sqlite3_bcvfs_storage_failure_callback(
+                    fs,
+                    auth_ptr,
+                    Some(storage_failure_trampoline),
+                )
+            };
+            if let Err(error) = check(rc) {
+                return Err(destroy_failed(fs, auth, error));
+            }
         }
         for config in &self.config {
             let (op, value) = config.raw();
@@ -1062,7 +1433,7 @@ impl BlockCacheVfs {
         result_with_err(rc, &mut err)?;
 
         Ok(SessionAttachment {
-            vfs: self,
+            vfs: SessionVfs::Static(self),
             alias: alias_text,
             session_id,
             operation_id: None,
@@ -1084,6 +1455,31 @@ impl BlockCacheVfs {
         operations: &str,
         operation_id: &SessionOperationId,
     ) -> Result<SessionAttachment> {
+        let (session_id, alias) = self.attach_session_scoped_inner(
+            spec,
+            session_id,
+            principal,
+            database,
+            operations,
+            operation_id,
+        )?;
+        Ok(SessionAttachment {
+            vfs: SessionVfs::Static(self),
+            alias,
+            session_id,
+            operation_id: Some(*operation_id),
+        })
+    }
+
+    fn attach_session_scoped_inner(
+        &self,
+        spec: &AttachSpec,
+        session_id: impl AsRef<str>,
+        principal: &str,
+        database: &str,
+        operations: &str,
+        operation_id: &SessionOperationId,
+    ) -> Result<(SessionId, String)> {
         let session_id = SessionId::new(session_id)?;
         if self.is_daemon() {
             return Err(Error::SqliteFailure(
@@ -1126,10 +1522,29 @@ impl BlockCacheVfs {
             )
         };
         result_with_err(rc, &mut err)?;
+        Ok((session_id, alias_text))
+    }
 
+    pub(crate) fn attach_session_scoped_owned(
+        self: &Arc<Self>,
+        spec: &AttachSpec,
+        session_id: impl AsRef<str>,
+        principal: &str,
+        database: &str,
+        operations: &str,
+        operation_id: &SessionOperationId,
+    ) -> Result<SessionAttachment> {
+        let (session_id, alias) = self.attach_session_scoped_inner(
+            spec,
+            session_id,
+            principal,
+            database,
+            operations,
+            operation_id,
+        )?;
         Ok(SessionAttachment {
-            vfs: self,
-            alias: alias_text,
+            vfs: SessionVfs::Owned(Arc::clone(self)),
+            alias,
             session_id,
             operation_id: Some(*operation_id),
         })
@@ -1341,31 +1756,46 @@ impl BlockCacheVfs {
 
 /// CBS resources retained for the lifetime of a URI-opened connection.
 pub(crate) struct ConnectionVfs {
-    vfs: BlockCacheVfs,
+    vfs: Arc<BlockCacheVfs>,
     alias: String,
     path: String,
     directory: String,
     attached: bool,
+    session: Option<SessionAttachment>,
     cache_directory: std::path::PathBuf,
 }
 
 impl ConnectionVfs {
     pub(crate) fn close(&mut self) -> Result<()> {
+        // Session detachment preserves its durable accepted head. It must
+        // happen after SQLite closes the database and before VFS destruction.
+        self.session.take();
         if self.attached {
             self.vfs.detach(&self.alias)?;
             self.attached = false;
         }
-        let rc = unsafe { raw::sqlite3_bcvfs_destroy(self.vfs.fs) };
+        let vfs = Arc::get_mut(&mut self.vfs).ok_or_else(|| {
+            Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_BUSY),
+                Some("CBS VFS still has live session owners".into()),
+            )
+        })?;
+        let rc = unsafe { raw::sqlite3_bcvfs_destroy(vfs.fs) };
         if rc != crate::ffi::SQLITE_OK {
             return Err(Error::SqliteFailure(
                 crate::ffi::Error::new(rc),
                 Some("cannot destroy CBS VFS while it has open clients".into()),
             ));
         }
-        self.vfs.fs = ptr::null_mut();
-        self.vfs._auth.take();
+        vfs.fs = ptr::null_mut();
+        vfs._auth.take();
         let _ = std::fs::remove_dir_all(&self.cache_directory);
         Ok(())
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn session(&self) -> Option<&SessionAttachment> {
+        self.session.as_ref()
     }
 }
 
@@ -1373,26 +1803,59 @@ impl Drop for ConnectionVfs {
     fn drop(&mut self) {
         // Dropping never uploads changes. After SQLite drops its DB field, a
         // dirty connection can destroy its VFS and discard its local cache.
-        // Explicit close reports detach failures so callers can upload first.
-        if self.close().is_err() && !self.vfs.fs.is_null() {
-            let rc = unsafe { raw::sqlite3_bcvfs_destroy(self.vfs.fs) };
-            if rc == crate::ffi::SQLITE_OK {
-                self.vfs.fs = ptr::null_mut();
-                self.vfs._auth.take();
-                let _ = std::fs::remove_dir_all(&self.cache_directory);
+        // Explicit close reports errors returned while destroying resources.
+        if self.close().is_err() {
+            if let Some(vfs) = Arc::get_mut(&mut self.vfs) {
+                if !vfs.fs.is_null() {
+                    let rc = unsafe { raw::sqlite3_bcvfs_destroy(vfs.fs) };
+                    if rc == crate::ffi::SQLITE_OK {
+                        vfs.fs = ptr::null_mut();
+                        vfs._auth.take();
+                        let _ = std::fs::remove_dir_all(&self.cache_directory);
+                    }
+                }
             }
         }
     }
 }
 
-struct CloudConnectionUri {
+/// A validated `gcs://` or `s3://` BlockCacheVFS connection URI.
+///
+/// Use [`CloudConnectionUri::parse`] for an existing URI or
+/// [`CloudConnectionUri::gcs`] to build a GCS URI safely. Debug output omits
+/// all credentials. The value returned by [`CloudConnectionUri::as_str`]
+/// contains the credentials and must be treated as a secret.
+///
+/// # Examples
+///
+/// ```
+/// use rusqlite::blockcachevfs::CloudConnectionUri;
+///
+/// let uri = CloudConnectionUri::gcs(
+///     "bucket",
+///     "repos/alice/project/.gen/graph_db/",
+///     "my-gcp-project",
+///     "short-lived-token",
+///     "default.db",
+///     None,
+/// )?;
+/// assert_eq!(uri.gcs_access_token(), Some("short-lived-token"));
+/// let identity = uri.identity();
+/// assert_eq!(identity, uri.identity());
+/// # Ok::<(), rusqlite::Error>(())
+/// ```
+#[derive(Clone)]
+pub struct CloudConnectionUri {
     bucket: String,
     prefix: String,
     database: String,
     storage: CloudStorageUri,
     endpoint: Option<String>,
+    upload_concurrency: Option<u32>,
+    uri: String,
 }
 
+#[derive(Clone)]
 enum CloudStorageUri {
     Google {
         project: String,
@@ -1406,8 +1869,253 @@ enum CloudStorageUri {
     },
 }
 
+impl fmt::Debug for CloudConnectionUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloudConnectionUri")
+            .field("identity", &self.identity())
+            .field("credentials", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Credential-free identity of one cloud database URI.
+///
+/// This value is intentionally opaque. It includes the cloud provider and its
+/// non-secret project/region, bucket, normalized graph prefix, database name,
+/// endpoint, and upload-concurrency setting. Access keys and tokens never
+/// participate in equality, so credential refreshes preserve identity.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CloudConnectionIdentity {
+    provider: &'static str,
+    storage_scope: String,
+    bucket: String,
+    prefix: String,
+    database: String,
+    endpoint: Option<String>,
+    upload_concurrency: Option<u32>,
+}
+
+impl fmt::Debug for CloudConnectionIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CloudConnectionIdentity")
+    }
+}
+
+/// Version 1 object keys for one BlockCacheVFS session.
+///
+/// The fields include the supplied repository graph prefix and are full
+/// bucket object keys/prefixes. For example, when `prefix` is
+/// `repos/alice/repo/.gen/graph_db/`, `blocks_prefix` is
+/// `repos/alice/repo/.gen/graph_db/blocks/`.
+///
+/// This type only formats paths. It does not authorize them or issue a CAB;
+/// callers must independently validate every returned path against the
+/// authenticated repository, permitted namespace, and session before granting
+/// access.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionStorageLayout {
+    /// Layout version. Current layouts use version 1.
+    pub layout_version: u32,
+    /// Prefix for immutable content-addressed block payloads.
+    pub blocks_prefix: String,
+    /// Prefix for per-session attempt markers.
+    pub attempt_prefix: String,
+    /// Prefix for per-session durable checkpoints.
+    pub checkpoint_prefix: String,
+    /// Prefix for per-session operation history.
+    pub history_prefix: String,
+    /// Object key for the session's accepted request head.
+    pub head_object: String,
+    /// Object key for the database's published manifest.
+    pub manifest_object: String,
+    /// Shared object key used to fence cleanup and writers.
+    pub guard_object: String,
+}
+
+impl SessionStorageLayout {
+    /// Format the version 1 object paths under a repository graph prefix.
+    ///
+    /// `prefix` is the full object prefix of the graph database within its
+    /// bucket, such as `repos/alice/repo/.gen/graph_db/`. The `session_id`
+    /// must be a validated [`SessionId`]. Returned paths include `prefix`;
+    /// they are not relative to the already-prefixed database container.
+    ///
+    /// This method performs path validation and formatting only. In
+    /// particular, it does not establish that the caller may grant access to
+    /// any of these paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `prefix` contains an empty, dot, or parent path
+    /// segment, a leading separator, or URI/path control characters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusqlite::blockcachevfs::{SessionId, SessionStorageLayout};
+    ///
+    /// let session = SessionId::new("550e8400-e29b-41d4-a716-446655440000")?;
+    /// let layout = SessionStorageLayout::new("repos/alice/repo/.gen/graph_db/", &session)?;
+    /// assert_eq!(layout.layout_version, 1);
+    /// assert_eq!(
+    ///     layout.blocks_prefix,
+    ///     "repos/alice/repo/.gen/graph_db/blocks/"
+    /// );
+    /// assert_eq!(
+    ///     layout.head_object,
+    ///     "repos/alice/repo/.gen/graph_db/bcv-session/v1/head/550e8400-e29b-41d4-a716-446655440000.bcv"
+    /// );
+    /// # Ok::<(), rusqlite::Error>(())
+    /// ```
+    pub fn new(prefix: &str, session_id: &SessionId) -> Result<Self> {
+        let prefix = normalize_cloud_prefix(prefix.to_owned())?;
+        let base = prefix.strip_suffix('/').unwrap_or(&prefix);
+        let key = |suffix: &str| {
+            if base.is_empty() {
+                suffix.to_owned()
+            } else {
+                format!("{base}/{suffix}")
+            }
+        };
+        let session_root = key("bcv-session/v1");
+        Ok(Self {
+            layout_version: 1,
+            blocks_prefix: format!("{}/", key("blocks")),
+            attempt_prefix: format!("{session_root}/attempt/{}/", session_id.as_str()),
+            checkpoint_prefix: format!("{session_root}/checkpoint/{}/", session_id.as_str()),
+            history_prefix: format!("{session_root}/history/{}/", session_id.as_str()),
+            head_object: format!("{session_root}/head/{}.bcv", session_id.as_str()),
+            manifest_object: key("manifest.bcv"),
+            guard_object: format!("{session_root}/guard.bcv"),
+        })
+    }
+}
+
+pub(crate) struct UriSessionContext {
+    pub(crate) session_id: SessionId,
+    pub(crate) principal: String,
+    pub(crate) target_database: String,
+    pub(crate) operations: String,
+    pub(crate) operation_id: SessionOperationId,
+    pub(crate) upload_concurrency: Option<u32>,
+    #[cfg(feature = "remote")]
+    pub(crate) auth_refresh: Option<Arc<AuthRefreshCallback>>,
+    #[cfg(feature = "remote")]
+    pub(crate) upload_progress: Option<Arc<UploadProgressCallback>>,
+    #[cfg(feature = "remote")]
+    pub(crate) storage_failure: StorageFailureSlot,
+}
+
 pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connection> {
+    open_connection_uri_inner(uri, flags, None)
+}
+
+#[cfg(feature = "remote")]
+pub(crate) fn open_connection_uri_with_session(
+    uri: &str,
+    flags: OpenFlags,
+    session: UriSessionContext,
+) -> Result<Connection> {
+    open_connection_uri_inner(uri, flags, Some(session))
+}
+
+fn bootstrap_session_database(
+    vfs: &BlockCacheVfs,
+    storage: &Storage,
+    alias: &str,
+    database: &str,
+    flags: OpenFlags,
+    create: bool,
+    credentials_to_redact: &[String],
+) -> Result<()> {
+    let spec = AttachSpec::new(storage.clone());
+    let bootstrap_spec = spec.clone().alias(alias);
+    if let Err(error) = vfs.attach(&bootstrap_spec) {
+        let error = normalize_container_not_found(error);
+        let missing = matches!(
+            &error,
+            Error::SqliteFailure(native, _)
+                if native.extended_code == crate::ffi::SQLITE_NOTFOUND
+        );
+        if !create || !missing {
+            return Err(sanitize_cloud_error(error, credentials_to_redact));
+        }
+        let initialization_error = vfs.initialize_container(storage).err();
+        if let Err(attach_error) = vfs.attach(&bootstrap_spec) {
+            let error =
+                initialization_error.unwrap_or_else(|| normalize_container_not_found(attach_error));
+            return Err(sanitize_cloud_error(error, credentials_to_redact));
+        }
+    }
+
+    let bootstrap = (|| {
+        let root = vfs.open(format!("/{alias}"))?;
+        let exists = root.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bcv_database WHERE container = ?1 AND database = ?2)",
+            crate::params![alias, database],
+            |row| row.get::<_, bool>(0),
+        );
+        if let Err((root, error)) = root.close() {
+            drop(root);
+            return Err(error);
+        }
+        let exists = exists?;
+        if !exists {
+            if !create {
+                return Err(Error::SqliteFailure(
+                    crate::ffi::Error::new(crate::ffi::SQLITE_NOTFOUND),
+                    Some("CBS database not found".into()),
+                ));
+            }
+            let path = format!("/{alias}/{database}");
+            let empty = vfs.open_with_flags(path, flags)?;
+            // Materialize an empty Dolt store without the SQL seed commit.
+            // The native helper only accepts NO_SEED handles with no refs or
+            // chunks, then registers default main with zero branches.
+            // SAFETY: `empty` owns this live SQLite handle; the helper accepts
+            // the named main schema and does not retain the handle.
+            check(unsafe {
+                raw::sqlite3_doltlite_bcvfs_initialize_empty_store(empty.handle(), c"main".as_ptr())
+            })?;
+            empty.close().map_err(|(_, error)| error)?;
+            vfs.upload(alias)?;
+        }
+        Ok(())
+    })();
+    let detach = vfs.detach(alias);
+    match (bootstrap, detach) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(sanitize_cloud_error(error, credentials_to_redact)),
+        (Ok(()), Err(error)) => Err(sanitize_cloud_error(error, credentials_to_redact)),
+    }
+}
+
+fn open_connection_uri_inner(
+    uri: &str,
+    flags: OpenFlags,
+    session: Option<UriSessionContext>,
+) -> Result<Connection> {
     let uri = CloudConnectionUri::parse(uri)?;
+    let upload_concurrency = effective_upload_concurrency(
+        uri.upload_concurrency,
+        session
+            .as_ref()
+            .and_then(|session| session.upload_concurrency),
+    )?;
+    if let Some(session) = session.as_ref() {
+        if session.target_database != uri.database {
+            return Err(cbs_uri_error(
+                "session scope target database does not match the cloud URI",
+            ));
+        }
+        if !flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE)
+            || flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY)
+        {
+            return Err(cbs_uri_error(
+                "session-owned cloud URIs require a writable database open",
+            ));
+        }
+    }
     let id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let mut cache_directory = CacheDirectoryGuard::new(create_cache_directory(id)?);
 
@@ -1422,11 +2130,62 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
         } => (auth_secret.clone(), credentials_to_redact.clone()),
     };
 
+    #[cfg(feature = "remote")]
+    let auth_refresh = session
+        .as_ref()
+        .and_then(|session| session.auth_refresh.as_ref().map(Arc::clone));
+    #[cfg(feature = "remote")]
+    let upload_progress = session
+        .as_ref()
+        .and_then(|session| session.upload_progress.as_ref().map(Arc::clone));
+    #[cfg(feature = "remote")]
+    let storage_failure = session
+        .as_ref()
+        .map(|session| Arc::clone(&session.storage_failure));
+    #[cfg(feature = "remote")]
+    if auth_refresh.is_some() && !matches!(&uri.storage, CloudStorageUri::Google { .. }) {
+        return Err(cbs_uri_error(
+            "credential refresh callbacks require a GCS URI",
+        ));
+    }
+
     let name = format!("rusqdoltlite-bcvfs-{}-{id}", std::process::id());
-    let vfs = BlockCacheVfs::builder(cache_directory.path())?
+    #[cfg(feature = "remote")]
+    let auth_refresh_for_initial = auth_refresh.as_ref().map(Arc::clone);
+    let mut builder = BlockCacheVfs::builder(cache_directory.path())?
         .name(&name)?
-        .auth_callback(move |_storage, _account, _container| Ok(auth_secret.clone()))
-        .build()?;
+        .auth_callback(move |storage, account, container| {
+            #[cfg(feature = "remote")]
+            if let Some(callback) = auth_refresh_for_initial.as_ref() {
+                let token = callback(storage, account, container, AuthRefreshReason::Request)
+                    .map_err(|_| AuthError("session URI credential provider failed".to_owned()))?;
+                if !valid_refresh_token(&token) {
+                    return Err(AuthError(
+                        "session URI credential provider returned an invalid token".to_owned(),
+                    ));
+                }
+                return Ok(token);
+            }
+            Ok(auth_secret.clone())
+        });
+    if let Some(upload_concurrency) = upload_concurrency {
+        builder = builder.config(Config::UploadConcurrency(upload_concurrency));
+    }
+    #[cfg(feature = "remote")]
+    if let Some(callback) = auth_refresh {
+        builder = builder.auth_refresh_callback(move |storage, account, container, reason| {
+            callback(storage, account, container, reason)
+        });
+    }
+    #[cfg(feature = "remote")]
+    if let Some(callback) = upload_progress {
+        builder = builder.upload_progress_callback(callback);
+    }
+    #[cfg(feature = "remote")]
+    if let Some(slot) = storage_failure {
+        builder = builder.storage_failure_slot(slot);
+    }
+    let vfs = Arc::new(builder.build()?);
 
     let container = if uri.prefix.is_empty() {
         uri.bucket.clone()
@@ -1434,33 +2193,66 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
         format!("{}/{}", uri.bucket, uri.prefix)
     };
     let storage = uri.storage_for_container(&container);
-    let alias = format!("cbs_{}_{}", std::process::id(), id);
-    let path = format!("/{alias}/{}", uri.database);
-    let directory = format!("/{alias}");
     let create = flags.contains(OpenFlags::SQLITE_OPEN_CREATE)
         && !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY);
-    if let Err(error) = vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias)) {
-        let error = normalize_container_not_found(error);
-        let missing = matches!(
-            &error,
-            Error::SqliteFailure(native, _)
-                if native.extended_code == crate::ffi::SQLITE_NOTFOUND
-        );
-        if !create || !missing {
-            return Err(sanitize_cloud_error(error, &credentials_to_redact));
-        }
 
-        let initialization_error = vfs.initialize_container(&storage).err();
-        if let Err(attach_error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
-            let error =
-                initialization_error.unwrap_or_else(|| normalize_container_not_found(attach_error));
-            return Err(sanitize_cloud_error(error, &credentials_to_redact));
+    let (alias, session_attachment, attached) = if let Some(session) = session.as_ref() {
+        let mut spec = AttachSpec::new(storage.clone());
+        let alias = session_alias(&spec, &session.session_id)?;
+        spec.alias = Some(alias.clone());
+        bootstrap_session_database(
+            &vfs,
+            &storage,
+            &alias,
+            &uri.database,
+            flags,
+            create,
+            &credentials_to_redact,
+        )?;
+        let attachment = vfs
+            .attach_session_scoped_owned(
+                &spec,
+                session.session_id.as_str(),
+                &session.principal,
+                &session.target_database,
+                &session.operations,
+                &session.operation_id,
+            )
+            .map_err(|error| {
+                sanitize_cloud_error(normalize_container_not_found(error), &credentials_to_redact)
+            })?;
+        (alias, Some(attachment), false)
+    } else {
+        let alias = format!("cbs_{}_{}", std::process::id(), id);
+        if let Err(error) = vfs.attach(&AttachSpec::new(storage.clone()).alias(&alias)) {
+            let error = normalize_container_not_found(error);
+            let missing = matches!(
+                &error,
+                Error::SqliteFailure(native, _)
+                    if native.extended_code == crate::ffi::SQLITE_NOTFOUND
+            );
+            if !create || !missing {
+                return Err(sanitize_cloud_error(error, &credentials_to_redact));
+            }
+
+            let initialization_error = vfs.initialize_container(&storage).err();
+            if let Err(attach_error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
+                let error = initialization_error
+                    .unwrap_or_else(|| normalize_container_not_found(attach_error));
+                return Err(sanitize_cloud_error(error, &credentials_to_redact));
+            }
         }
-    }
+        (alias, None, true)
+    };
+    let path = format!("/{alias}/{}", uri.database);
+    let directory = format!("/{alias}");
     let control = match vfs.open(&directory) {
         Ok(control) => control,
         Err(error) => {
-            let _ = vfs.detach(&alias);
+            drop(session_attachment);
+            if attached {
+                let _ = vfs.detach(&alias);
+            }
             return Err(sanitize_cloud_error(error, &credentials_to_redact));
         }
     };
@@ -1473,17 +2265,26 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
         Ok(value) => value,
         Err(error) => {
             let _ = control.close();
-            let _ = vfs.detach(&alias);
+            drop(session_attachment);
+            if attached {
+                let _ = vfs.detach(&alias);
+            }
             return Err(sanitize_cloud_error(error, &credentials_to_redact));
         }
     };
     if let Err((control, error)) = control.close() {
         drop(control);
-        let _ = vfs.detach(&alias);
+        drop(session_attachment);
+        if attached {
+            let _ = vfs.detach(&alias);
+        }
         return Err(sanitize_cloud_error(error, &credentials_to_redact));
     }
     if !database_exists && !create {
-        let _ = vfs.detach(&alias);
+        drop(session_attachment);
+        if attached {
+            let _ = vfs.detach(&alias);
+        }
         return Err(Error::SqliteFailure(
             crate::ffi::Error::new(crate::ffi::SQLITE_NOTFOUND),
             Some("CBS database not found".into()),
@@ -1492,7 +2293,10 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
     let mut connection = match vfs.open_with_flags(&path, flags) {
         Ok(connection) => connection,
         Err(error) => {
-            let _ = vfs.detach(&alias);
+            drop(session_attachment);
+            if attached {
+                let _ = vfs.detach(&alias);
+            }
             return Err(sanitize_cloud_error(error, &credentials_to_redact));
         }
     };
@@ -1501,14 +2305,25 @@ pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connect
         alias,
         path,
         directory,
-        attached: true,
+        attached,
+        session: session_attachment,
         cache_directory: cache_directory.take(),
     });
     Ok(connection)
 }
 
 impl CloudConnectionUri {
-    fn parse(uri: &str) -> Result<Self> {
+    /// Parse an existing GCS or S3 BlockCacheVFS URI using the same validation
+    /// used by [`Connection::open`](crate::Connection::open).
+    ///
+    /// Errors are intentionally generic and never include the input URI,
+    /// which may contain cloud credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed URIs, invalid paths or credentials,
+    /// duplicate query options, or unsupported options.
+    pub fn parse(uri: &str) -> Result<Self> {
         let (scheme, rest) = uri
             .split_once("://")
             .ok_or_else(|| cbs_uri_error("expected a gcs:// or s3:// URI"))?;
@@ -1534,22 +2349,7 @@ impl CloudConnectionUri {
         {
             return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
         }
-        let has_trailing_slash = prefix.ends_with('/');
-        let prefix_without_trailing_slash = prefix.strip_suffix('/').unwrap_or(&prefix);
-        if prefix_without_trailing_slash.ends_with('/')
-            || prefix_without_trailing_slash.contains(['\\', '\0', '?', '#'])
-            || (!prefix_without_trailing_slash.is_empty()
-                && prefix_without_trailing_slash
-                    .split('/')
-                    .any(|component| component.is_empty() || component == "." || component == ".."))
-        {
-            return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
-        }
-        let prefix = if has_trailing_slash && !prefix_without_trailing_slash.is_empty() {
-            format!("{prefix_without_trailing_slash}/")
-        } else {
-            prefix_without_trailing_slash.to_owned()
-        };
+        let prefix = normalize_cloud_prefix(prefix)?;
 
         let mut options = std::collections::BTreeMap::new();
         for parameter in query.split('&') {
@@ -1577,8 +2377,8 @@ impl CloudConnectionUri {
                 .ok_or_else(|| cbs_uri_error("GCS URI requires a non-empty project"))?;
             let access_token = options
                 .remove("access_token")
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| cbs_uri_error("GCS URI requires a non-empty access_token"))?;
+                .filter(|value| valid_credential_component(value))
+                .ok_or_else(|| cbs_uri_error("GCS URI requires a valid access_token"))?;
             CloudStorageUri::Google {
                 project,
                 access_token,
@@ -1649,6 +2449,7 @@ impl CloudConnectionUri {
                 "CBS endpoint must be an HTTP(S) base URL without credentials, query, or fragment",
             ));
         }
+        let upload_concurrency = parse_upload_concurrency(options.remove("upload_concurrency"))?;
         if !options.is_empty() {
             return Err(cbs_uri_error("unsupported CBS URI option"));
         }
@@ -1658,7 +2459,90 @@ impl CloudConnectionUri {
             database,
             storage,
             endpoint,
+            upload_concurrency,
+            uri: uri.to_owned(),
         })
+    }
+
+    /// Build a validated GCS URI, percent-encoding each URI component.
+    ///
+    /// `prefix` is the database's bucket object prefix. `endpoint` may be
+    /// supplied for an emulator or compatible storage endpoint. The generated
+    /// URI contains `access_token`, so handle [`Self::as_str`] as a secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any supplied value violates the same validation
+    /// applied when parsing a cloud connection URI.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket` - GCS bucket name.
+    /// * `prefix` - Object prefix of the database in that bucket.
+    /// * `project` - GCP project used for GCS requests.
+    /// * `access_token` - OAuth access token for GCS.
+    /// * `database` - Database filename within the object prefix.
+    /// * `endpoint` - Optional HTTP(S) endpoint override, usually for a
+    ///   compatible emulator.
+    pub fn gcs(
+        bucket: &str,
+        prefix: &str,
+        project: &str,
+        access_token: &str,
+        database: &str,
+        endpoint: Option<&str>,
+    ) -> Result<Self> {
+        let mut uri = format!(
+            "gcs://{}/{}?vfs=blockcachevfs&project={}&access_token={}&database={}",
+            percent_encode_uri_component(bucket, false),
+            percent_encode_uri_component(prefix, true),
+            percent_encode_uri_component(project, false),
+            percent_encode_uri_component(access_token, false),
+            percent_encode_uri_component(database, false),
+        );
+        if let Some(endpoint) = endpoint {
+            uri.push_str("&endpoint=");
+            uri.push_str(&percent_encode_uri_component(endpoint, false));
+        }
+        Self::parse(&uri)
+    }
+
+    /// Return the original validated URI, including its credentials.
+    ///
+    /// Do not log or persist this value in a location accessible to
+    /// untrusted users.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.uri
+    }
+
+    /// Return the credential-free identity used to compare refreshed URIs.
+    #[must_use]
+    pub fn identity(&self) -> CloudConnectionIdentity {
+        let (provider, storage_scope) = match &self.storage {
+            CloudStorageUri::Google { project, .. } => ("gcs", project.clone()),
+            CloudStorageUri::S3 { region, .. } => ("s3", region.clone()),
+        };
+        CloudConnectionIdentity {
+            provider,
+            storage_scope,
+            bucket: self.bucket.clone(),
+            prefix: self.prefix.clone(),
+            database: self.database.clone(),
+            endpoint: self.endpoint.clone(),
+            upload_concurrency: self.upload_concurrency,
+        }
+    }
+
+    /// Return the decoded GCS OAuth token, or `None` for an S3 URI.
+    ///
+    /// Treat the returned value as a secret and avoid including it in logs.
+    #[must_use]
+    pub fn gcs_access_token(&self) -> Option<&str> {
+        match &self.storage {
+            CloudStorageUri::Google { access_token, .. } => Some(access_token),
+            CloudStorageUri::S3 { .. } => None,
+        }
     }
 
     fn storage_for_container(&self, container: &str) -> Storage {
@@ -1683,6 +2567,41 @@ impl CloudConnectionUri {
             ) => Storage::s3(access_id, container, region),
         }
     }
+}
+
+fn parse_upload_concurrency(value: Option<String>) -> Result<Option<u32>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(cbs_uri_error(
+            "upload_concurrency must be a decimal integer between 1 and i32::MAX",
+        ));
+    }
+    let upload_concurrency = value.parse::<u32>().map_err(|_| {
+        cbs_uri_error("upload_concurrency must be a decimal integer between 1 and i32::MAX")
+    })?;
+    validate_upload_concurrency(upload_concurrency)?;
+    Ok(Some(upload_concurrency))
+}
+
+pub(crate) fn validate_upload_concurrency(upload_concurrency: u32) -> Result<i64> {
+    if upload_concurrency == 0 || upload_concurrency > i32::MAX as u32 {
+        return Err(cbs_uri_error(
+            "upload_concurrency must be between 1 and i32::MAX",
+        ));
+    }
+    Ok(i64::from(upload_concurrency))
+}
+
+fn effective_upload_concurrency(
+    uri_upload_concurrency: Option<u32>,
+    session_upload_concurrency: Option<u32>,
+) -> Result<Option<i64>> {
+    session_upload_concurrency
+        .or(uri_upload_concurrency)
+        .map(validate_upload_concurrency)
+        .transpose()
 }
 
 fn valid_s3_region(region: &str) -> bool {
@@ -1749,6 +2668,49 @@ fn decode_uri_component(value: &str) -> Result<String> {
         }
     }
     String::from_utf8(decoded).map_err(|_| cbs_uri_error("CBS URI contains invalid UTF-8"))
+}
+
+fn normalize_cloud_prefix(prefix: String) -> Result<String> {
+    let has_trailing_slash = prefix.ends_with('/');
+    let prefix_without_trailing_slash = prefix.strip_suffix('/').unwrap_or(&prefix);
+    if prefix.starts_with('/')
+        || prefix_without_trailing_slash.ends_with('/')
+        || prefix_without_trailing_slash
+            .bytes()
+            .any(|byte| byte == b'\\' || byte == 0 || byte.is_ascii_control())
+        || prefix_without_trailing_slash.contains(['?', '#'])
+        || (!prefix_without_trailing_slash.is_empty()
+            && prefix_without_trailing_slash
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == ".."))
+    {
+        return Err(cbs_uri_error("invalid CBS bucket or object prefix"));
+    }
+    Ok(
+        if has_trailing_slash && !prefix_without_trailing_slash.is_empty() {
+            format!("{prefix_without_trailing_slash}/")
+        } else {
+            prefix_without_trailing_slash.to_owned()
+        },
+    )
+}
+
+fn percent_encode_uri_component(value: &str, preserve_slashes: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            || (preserve_slashes && byte == b'/')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
 }
 
 fn hex_digit(byte: u8) -> Result<u8> {
@@ -1907,6 +2869,11 @@ impl Connection {
     pub fn blockcachevfs_name(&self) -> Option<&str> {
         self.cbs.as_ref().map(|cbs| cbs.vfs.name())
     }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn blockcache_session(&self) -> Option<&SessionAttachment> {
+        self.cbs.as_ref().and_then(ConnectionVfs::session)
+    }
 }
 
 struct BcvHandle(*mut raw_util::sqlite3_bcv);
@@ -2053,6 +3020,110 @@ unsafe extern "C" fn auth_trampoline(
     crate::ffi::SQLITE_OK
 }
 
+#[cfg(feature = "remote")]
+unsafe extern "C" fn upload_progress_trampoline(
+    ctx: *mut c_void,
+    event: c_int,
+    blocks: crate::ffi::sqlite3_int64,
+    bytes: crate::ffi::sqlite3_int64,
+) {
+    if ctx.is_null() || blocks < 0 || bytes < 0 {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &*(ctx as *const AuthState) };
+        if let Some(progress) = state.upload_progress.as_ref() {
+            progress.report(event, blocks as u64, bytes as u64);
+        }
+    }));
+}
+
+#[cfg(feature = "remote")]
+unsafe extern "C" fn storage_failure_trampoline(
+    ctx: *mut c_void,
+    phase: c_int,
+    kind: c_int,
+    code: c_int,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &*(ctx as *const AuthState) };
+        let Some(slot) = state.storage_failure.as_ref() else {
+            return;
+        };
+        let Some(failure) = StorageFailure::from_raw(phase, kind, code) else {
+            return;
+        };
+        let mut stored = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stored.is_none() {
+            *stored = Some(failure);
+        }
+    }));
+}
+
+#[cfg(feature = "remote")]
+fn valid_refresh_token(token: &str) -> bool {
+    !token.is_empty() && !token.contains(['\r', '\n']) && !token.as_bytes().contains(&0)
+}
+
+#[cfg(feature = "remote")]
+unsafe extern "C" fn auth_refresh_trampoline(
+    ctx: *mut c_void,
+    storage: *const c_char,
+    account: *const c_char,
+    container: *const c_char,
+    reason: c_int,
+    out: *mut *mut c_char,
+) -> c_int {
+    if out.is_null() || ctx.is_null() {
+        return crate::ffi::SQLITE_IOERR_AUTH;
+    }
+    unsafe { *out = ptr::null_mut() };
+    if storage.is_null() || account.is_null() || container.is_null() {
+        return crate::ffi::SQLITE_IOERR_AUTH;
+    }
+    let reason = match reason {
+        raw::SQLITE_BCV_AUTH_REQUEST => AuthRefreshReason::Request,
+        raw::SQLITE_BCV_AUTH_UNAUTHORIZED => AuthRefreshReason::Unauthorized,
+        _ => return crate::ffi::SQLITE_IOERR_AUTH,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &*(ctx as *const AuthState) };
+        let callback = state.refresh_callback.as_ref()?;
+        let storage = unsafe { CStr::from_ptr(storage) }.to_str().ok()?;
+        let account = unsafe { CStr::from_ptr(account) }.to_str().ok()?;
+        let container = unsafe { CStr::from_ptr(container) }.to_str().ok()?;
+        callback(storage, account, container, reason).ok()
+    }));
+    let Some(Some(token)) = result.ok() else {
+        return crate::ffi::SQLITE_IOERR_AUTH;
+    };
+    if !valid_refresh_token(&token) {
+        return crate::ffi::SQLITE_IOERR_AUTH;
+    }
+    let Some(length) = token
+        .len()
+        .checked_add(1)
+        .and_then(|v| c_int::try_from(v).ok())
+    else {
+        return crate::ffi::SQLITE_TOOBIG;
+    };
+    let token_ptr = unsafe { crate::ffi::sqlite3_malloc(length) }.cast::<u8>();
+    if token_ptr.is_null() {
+        return crate::ffi::SQLITE_NOMEM;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(token.as_ptr(), token_ptr, token.len());
+        *token_ptr.add(token.len()) = 0;
+        *out = token_ptr.cast();
+    }
+    crate::ffi::SQLITE_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2182,6 +3253,25 @@ mod tests {
     }
 
     #[test]
+    fn request_operation_ids_are_stable_and_length_framed() {
+        let first = SessionOperationId::from_request("PUT", "/repo.db/refs-if", b"body")
+            .expect("derive operation ID");
+        let retry = SessionOperationId::from_request("PUT", "/repo.db/refs-if", b"body")
+            .expect("derive retry operation ID");
+        assert_eq!(first, retry);
+        assert_ne!(
+            first,
+            SessionOperationId::from_request("POST", "/repo.db/refs-if", b"body")
+                .expect("derive changed-method operation ID")
+        );
+        assert_ne!(
+            SessionOperationId::from_request("ab", "c", b"").expect("derive first framing"),
+            SessionOperationId::from_request("a", "bc", b"").expect("derive second framing")
+        );
+        assert_ne!(SessionOperationId::random(), SessionOperationId::random());
+    }
+
+    #[test]
     fn session_operation_status_maps_native_states() {
         assert_eq!(
             SessionOperationStatus::from_native(raw::SQLITE_BCVFS_SESSION_STATUS_NEW)
@@ -2286,12 +3376,206 @@ mod tests {
     }
 
     #[test]
+    fn gcs_uri_constructor_encodes_values_and_tracks_credential_free_identity() {
+        for bucket in ["bucket/other", "bucket?other", "bucket#other"] {
+            assert!(
+                CloudConnectionUri::gcs(bucket, "repo", "project", "token", "default.db", None)
+                    .is_err(),
+                "accepted invalid bucket {bucket:?}"
+            );
+        }
+
+        let first = CloudConnectionUri::gcs(
+            "bucket",
+            "repos/alice/project/.gen/graph_db/",
+            "my-project",
+            "short/lived+token=",
+            "default.db",
+            Some("http://127.0.0.1:4443"),
+        )
+        .expect("build validated GCS URI");
+        assert!(first
+            .as_str()
+            .contains("access_token=short%2Flived%2Btoken%3D"));
+        assert_eq!(first.gcs_access_token(), Some("short/lived+token="));
+        assert_eq!(
+            CloudConnectionUri::parse(first.as_str())
+                .unwrap()
+                .identity(),
+            first.identity()
+        );
+
+        let refreshed = CloudConnectionUri::gcs(
+            "bucket",
+            "repos/alice/project/.gen/graph_db/",
+            "my-project",
+            "refreshed-token",
+            "default.db",
+            Some("http://127.0.0.1:4443"),
+        )
+        .expect("build refreshed GCS URI");
+        assert_eq!(first.identity(), refreshed.identity());
+
+        let changed = [
+            CloudConnectionUri::gcs(
+                "other-bucket",
+                "repos/alice/project/.gen/graph_db/",
+                "my-project",
+                "token",
+                "default.db",
+                Some("http://127.0.0.1:4443"),
+            ),
+            CloudConnectionUri::gcs(
+                "bucket",
+                "repos/alice/other/.gen/graph_db/",
+                "my-project",
+                "token",
+                "default.db",
+                Some("http://127.0.0.1:4443"),
+            ),
+            CloudConnectionUri::gcs(
+                "bucket",
+                "repos/alice/project/.gen/graph_db/",
+                "other-project",
+                "token",
+                "default.db",
+                Some("http://127.0.0.1:4443"),
+            ),
+            CloudConnectionUri::gcs(
+                "bucket",
+                "repos/alice/project/.gen/graph_db/",
+                "my-project",
+                "token",
+                "other.db",
+                Some("http://127.0.0.1:4443"),
+            ),
+            CloudConnectionUri::gcs(
+                "bucket",
+                "repos/alice/project/.gen/graph_db/",
+                "my-project",
+                "token",
+                "default.db",
+                Some("http://127.0.0.1:4444"),
+            ),
+        ];
+        for changed in changed {
+            assert_ne!(
+                first.identity(),
+                changed.expect("build changed GCS URI").identity()
+            );
+        }
+
+        let changed_upload_concurrency = CloudConnectionUri::parse(
+            "gcs://bucket/repos/alice/project/.gen/graph_db/?vfs=blockcachevfs&project=my-project&access_token=token&database=default.db&endpoint=http%3A%2F%2F127.0.0.1%3A4443&upload_concurrency=2",
+        )
+        .expect("build GCS URI with changed upload concurrency");
+        assert_ne!(first.identity(), changed_upload_concurrency.identity());
+    }
+
+    #[test]
+    fn cloud_connection_uri_debug_redacts_gcs_and_s3_credentials() {
+        let gcs = CloudConnectionUri::parse(
+            "gcs://bucket/repo?vfs=blockcachevfs&project=project&access_token=gcs-secret-token",
+        )
+        .expect("parse GCS URI");
+        let gcs_debug = format!("{gcs:?}");
+        assert!(!gcs_debug.contains("gcs-secret-token"));
+        assert!(gcs_debug.contains("[redacted]"));
+
+        let s3 = CloudConnectionUri::parse(
+            "s3://bucket/repo?vfs=blockcachevfs&region=us-east-1&access_id=s3-secret-id&secret_access_key=s3-secret-key&session_token=s3-session-token",
+        )
+        .expect("parse S3 URI");
+        let s3_debug = format!("{s3:?}");
+        for credential in ["s3-secret-id", "s3-secret-key", "s3-session-token"] {
+            assert!(!s3_debug.contains(credential), "debug leaked {credential}");
+        }
+        assert!(s3_debug.contains("[redacted]"));
+
+        let rotated_s3 = CloudConnectionUri::parse(
+            "s3://bucket/repo?vfs=blockcachevfs&region=us-east-1&access_id=new-id&secret_access_key=new-key&session_token=new-session",
+        )
+        .expect("parse rotated S3 URI");
+        assert_eq!(s3.identity(), rotated_s3.identity());
+        assert_eq!(s3.gcs_access_token(), None);
+        assert!(!format!("{:?}", s3.identity()).contains("s3-secret"));
+    }
+
+    #[test]
+    fn public_cloud_uri_parse_rejects_duplicates_without_leaking_input() {
+        let error = CloudConnectionUri::parse(
+            "gcs://bucket/repo?vfs=blockcachevfs&project=project&access_token=do-not-leak&access_token=duplicate",
+        )
+        .expect_err("duplicate options should be rejected");
+        assert!(!error.to_string().contains("do-not-leak"));
+        assert!(!format!("{error:?}").contains("do-not-leak"));
+    }
+
+    #[test]
+    fn session_storage_layout_returns_exact_bucket_object_keys() {
+        let session =
+            SessionId::new("550e8400-e29b-41d4-a716-446655440000").expect("valid session id");
+        let layout = SessionStorageLayout::new("repos/alice/repo/.gen/graph_db/", &session)
+            .expect("valid graph prefix");
+        let base = "repos/alice/repo/.gen/graph_db";
+        let session_root = format!("{base}/bcv-session/v1");
+
+        assert_eq!(layout.layout_version, 1);
+        assert_eq!(layout.blocks_prefix, format!("{base}/blocks/"));
+        assert_eq!(
+            layout.attempt_prefix,
+            format!("{session_root}/attempt/{}/", session.as_str())
+        );
+        assert_eq!(
+            layout.checkpoint_prefix,
+            format!("{session_root}/checkpoint/{}/", session.as_str())
+        );
+        assert_eq!(
+            layout.history_prefix,
+            format!("{session_root}/history/{}/", session.as_str())
+        );
+        assert_eq!(
+            layout.head_object,
+            format!("{session_root}/head/{}.bcv", session.as_str())
+        );
+        assert_eq!(layout.manifest_object, format!("{base}/manifest.bcv"));
+        assert_eq!(layout.guard_object, format!("{session_root}/guard.bcv"));
+    }
+
+    #[test]
+    fn session_storage_layout_rejects_ambiguous_or_traversal_prefixes() {
+        let session =
+            SessionId::new("550e8400-e29b-41d4-a716-446655440000").expect("valid session id");
+        for prefix in [
+            "/repos/alice/repo",
+            "repos//alice/repo",
+            "repos/./repo",
+            "repos/../repo",
+            "../repo",
+            "repos\\alice\\repo",
+            "repos/?alice",
+            "repos/#alice",
+            "repos/\0alice",
+        ] {
+            assert!(
+                SessionStorageLayout::new(prefix, &session).is_err(),
+                "accepted unsafe prefix {prefix:?}"
+            );
+        }
+
+        let root = SessionStorageLayout::new("", &session).expect("empty root prefix is valid");
+        assert_eq!(root.blocks_prefix, "blocks/");
+        assert_eq!(root.manifest_object, "manifest.bcv");
+    }
+
+    #[test]
     fn cloud_connection_uris_use_provider_defaults_and_allow_endpoint_overrides() {
         let gcs = CloudConnectionUri::parse(
             "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token",
         )
         .expect("valid GCS URI without endpoint");
         assert!(gcs.endpoint.is_none());
+        assert_eq!(gcs.upload_concurrency, None);
         let gcs_storage = gcs.storage_for_container("bucket/repository");
         assert_eq!(gcs_storage.provider, "google?api=json");
         assert_eq!(gcs_storage.account, "project");
@@ -2301,6 +3585,7 @@ mod tests {
         )
         .expect("valid S3 URI without endpoint");
         assert!(s3.endpoint.is_none());
+        assert_eq!(s3.upload_concurrency, None);
         let s3_storage = s3.storage_for_container("bucket/repository");
         assert_eq!(s3_storage.provider, "s3?region=us-west-2");
         assert_eq!(s3_storage.account, "access");
@@ -2326,6 +3611,56 @@ mod tests {
                 .provider,
             "s3?region=us-west-2&endpoint=http://127.0.0.1:4566"
         );
+    }
+
+    #[test]
+    fn upload_concurrency_uri_option_accepts_native_integer_range_for_both_providers() {
+        let gcs = CloudConnectionUri::parse(
+            "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&upload_concurrency=1",
+        )
+        .expect("valid GCS upload_concurrency");
+        assert_eq!(gcs.upload_concurrency, Some(1));
+
+        let s3 = CloudConnectionUri::parse(
+            "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret&upload_concurrency=2147483647",
+        )
+        .expect("valid S3 upload_concurrency");
+        assert_eq!(s3.upload_concurrency, Some(i32::MAX as u32));
+    }
+
+    #[test]
+    fn upload_concurrency_uri_option_rejects_malformed_duplicate_and_out_of_range_values() {
+        for value in ["", "0", "-1", "+1", " 1", "1 ", "2147483648", "4294967296"] {
+            let uri = format!(
+                "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&upload_concurrency={value}"
+            );
+            assert!(CloudConnectionUri::parse(&uri).is_err(), "accepted {uri}");
+        }
+
+        for query in [
+            "upload_concurrency=2&upload_concurrency=3",
+            "upload_concurrency=2&%75pload_concurrency=3",
+        ] {
+            let uri = format!(
+                "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret&{query}"
+            );
+            assert!(CloudConnectionUri::parse(&uri).is_err(), "accepted {uri}");
+        }
+    }
+
+    #[test]
+    fn explicit_session_upload_concurrency_overrides_uri_and_omission_keeps_native_default() {
+        assert_eq!(effective_upload_concurrency(None, None).unwrap(), None);
+        assert_eq!(
+            effective_upload_concurrency(Some(2), None).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            effective_upload_concurrency(Some(2), Some(8)).unwrap(),
+            Some(8)
+        );
+        assert!(effective_upload_concurrency(Some(2), Some(0)).is_err());
+        assert!(effective_upload_concurrency(Some(2), Some(u32::MAX)).is_err());
     }
 
     #[test]
@@ -2410,6 +3745,10 @@ mod tests {
     fn config_maps_to_cbs_constants() {
         assert_eq!(Config::CacheSize(42).raw(), (raw::SQLITE_BCV_CACHESIZE, 42));
         assert_eq!(
+            Config::UploadConcurrency(i64::from(i32::MAX)).raw(),
+            (raw::SQLITE_BCV_NREQUEST, i64::from(i32::MAX))
+        );
+        assert_eq!(
             Config::CurlVerbose(true).raw(),
             (raw::SQLITE_BCV_CURLVERBOSE, 1)
         );
@@ -2417,6 +3756,41 @@ mod tests {
             Config::StageWatermark(75).raw(),
             (raw::SQLITE_BCV_STAGEWATERMARK, 75)
         );
+    }
+
+    #[test]
+    fn upload_concurrency_builder_config_enforces_native_integer_range() -> Result<()> {
+        let directory = tempfile::tempdir().expect("temporary CBS directory");
+
+        for value in [1, 10, i64::from(i32::MAX)] {
+            let vfs = BlockCacheVfs::builder(directory.path())?
+                .name(&format!(
+                    "upload-concurrency-valid-{}-{value}",
+                    std::process::id()
+                ))?
+                .config(Config::UploadConcurrency(value))
+                .init_owned()?;
+            drop(vfs);
+        }
+
+        for value in [0, -1, i64::from(i32::MAX) + 1] {
+            let result = BlockCacheVfs::builder(directory.path())?
+                .name(&format!(
+                    "upload-concurrency-invalid-{}-{value}",
+                    std::process::id()
+                ))?
+                .config(Config::UploadConcurrency(value))
+                .init_owned();
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::SqliteFailure(code, _))
+                        if code.extended_code == crate::ffi::SQLITE_MISUSE
+                ),
+                "native VFS should reject upload concurrency {value}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

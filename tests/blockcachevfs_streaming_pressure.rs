@@ -206,7 +206,7 @@ fn new_vfs(cache: &Path) -> &'static BlockCacheVfs {
         .expect("VFS builder")
         .auth_callback(|_, _, _| Ok("test".into()))
         .config(Config::CacheSize(CACHE_BYTES))
-        .config(Config::RequestCount(4))
+        .config(Config::UploadConcurrency(4))
         .config(Config::HttpTimeout(5))
         .init()
         .expect("initialize block-cache VFS")
@@ -525,6 +525,150 @@ impl Drop for HoldingProxy {
     }
 }
 
+struct ActivePutGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ActivePutGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Default)]
+struct ConcurrentPutState {
+    active: AtomicUsize,
+    high_water: AtomicUsize,
+    requests: AtomicUsize,
+    overlap_batches: AtomicUsize,
+}
+
+struct ConcurrentPutProxy {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    state: Arc<ConcurrentPutState>,
+    handlers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    thread: Option<thread::JoinHandle<()>>,
+    url: String,
+}
+
+impl ConcurrentPutProxy {
+    fn start(upstream: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind concurrent PUT proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("configure concurrent PUT proxy");
+        let address = listener.local_addr().expect("concurrent PUT proxy address");
+        let upstream = upstream
+            .trim_end_matches('/')
+            .strip_prefix("http://")
+            .or_else(|| upstream.trim_end_matches('/').strip_prefix("https://"))
+            .and_then(|value| value.split('/').next())
+            .expect("S3 emulator endpoint must have an HTTP authority")
+            .to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(ConcurrentPutState::default());
+        let handlers = Arc::new(Mutex::new(Vec::new()));
+        let thread_stop = Arc::clone(&stop);
+        let thread_state = Arc::clone(&state);
+        let thread_handlers = Arc::clone(&handlers);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                let (client, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let handler_upstream = upstream.clone();
+                let handler_state = Arc::clone(&thread_state);
+                let handler = thread::spawn(move || {
+                    let mut client = client;
+                    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+                    let _ = client.set_write_timeout(Some(Duration::from_secs(10)));
+                    let _ = handle_concurrent_put_request(
+                        &mut client,
+                        &handler_upstream,
+                        &handler_state,
+                    );
+                });
+                thread_handlers
+                    .lock()
+                    .expect("lock concurrent PUT handlers")
+                    .push(handler);
+            }
+        });
+        Self {
+            port: address.port(),
+            stop,
+            state,
+            handlers,
+            thread: Some(thread),
+            url: format!("http://{address}"),
+        }
+    }
+}
+
+impl Drop for ConcurrentPutProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        for handler in std::mem::take(
+            &mut *self
+                .handlers
+                .lock()
+                .expect("lock concurrent PUT handlers for join"),
+        ) {
+            let _ = handler.join();
+        }
+    }
+}
+
+fn handle_concurrent_put_request(
+    client: &mut TcpStream,
+    upstream_address: &str,
+    state: &ConcurrentPutState,
+) -> std::io::Result<()> {
+    let (method, target, request) = read_http_request(client)?;
+    let path = origin_target(&target)
+        .split_once('?')
+        .map_or(origin_target(&target), |(path, _)| path);
+    let is_block_put =
+        method.eq_ignore_ascii_case("PUT") && path.contains("/blocks/") && path.ends_with(".bcv");
+    let _active_guard = if is_block_put {
+        let active = state.active.fetch_add(1, Ordering::AcqRel) + 1;
+        state.requests.fetch_add(1, Ordering::AcqRel);
+        if active == 2 {
+            state.overlap_batches.fetch_add(1, Ordering::AcqRel);
+        }
+        let mut high_water = state.high_water.load(Ordering::Acquire);
+        while active > high_water {
+            match state.high_water.compare_exchange_weak(
+                high_water,
+                active,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => high_water = observed,
+            }
+        }
+        Some(ActivePutGuard(&state.active))
+    } else {
+        None
+    };
+    if is_block_put {
+        // A bounded delay lets a second real VFS request arrive while this
+        // upload is still in flight; the counter alone never manufactures
+        // overlap.
+        thread::sleep(Duration::from_millis(150));
+    }
+    forward_http_request(client, upstream_address, &method, &target, &request)
+}
+
 fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, String, Vec<u8>)> {
     let mut request = Vec::new();
     let header_end = loop {
@@ -774,6 +918,56 @@ fn run_pressure(vfs: &'static BlockCacheVfs, endpoint: &str, cache: &Path) {
     assert_cache_bound(cache, "after pressure-test detach");
 }
 
+fn run_producer_parallel_staging(vfs: &'static BlockCacheVfs, endpoint: &str, cache: &Path) {
+    let (_seed_storage, _bucket, container) = setup_two_databases(vfs, endpoint, cache);
+    let proxy = ConcurrentPutProxy::start(endpoint);
+    let storage = direct_storage(&proxy.url, &container);
+    let alias = format!("pressure_parallel_{}", std::process::id());
+    vfs.attach(&AttachSpec::new(storage).alias(&alias))
+        .expect("attach producer-overlap container through proxy");
+    let before = fetch_manifest(endpoint, &container);
+    let outcome = write_under_pressure(vfs, format!("/{alias}/first.sqlite"), cache.to_owned());
+    assert!(
+        matches!(outcome, WriterOutcome::Committed),
+        "producer/cache-pressure write should commit: {outcome:?}"
+    );
+    let requests_before_publish = proxy.state.requests.load(Ordering::Acquire);
+    let high_water = proxy.state.high_water.load(Ordering::Acquire);
+    assert!(
+        requests_before_publish >= 4,
+        "cache pressure should stage across multiple bounded batches before final upload: requests={requests_before_publish}"
+    );
+    let overlap_batches = proxy.state.overlap_batches.load(Ordering::Acquire);
+    assert!(
+        overlap_batches >= 2,
+        "producer/cache-pressure staging should overlap at least two batches: overlaps={overlap_batches}, high-water={high_water}, requests={requests_before_publish}"
+    );
+    assert!(
+        high_water <= 2,
+        "two cache slots bound concurrent block PUTs even though upload_concurrency is four: high-water={high_water}"
+    );
+    assert_cache_bound(cache, "after producer-parallel staging");
+
+    vfs.upload(&alias)
+        .expect("publish producer-parallel staging update");
+    assert_ne!(
+        before,
+        fetch_manifest(endpoint, &container),
+        "final upload should publish the blocks staged under producer pressure"
+    );
+    let published = vfs
+        .open(format!("/{alias}/first.sqlite"))
+        .expect("open producer-parallel database after publication");
+    let count: i64 = published
+        .query_row("SELECT count(*) FROM payload", [], |row| row.get(0))
+        .expect("read producer-parallel row count");
+    assert_eq!(count, SEED_ROWS + WRITE_ROWS);
+    drop(published);
+    vfs.detach(&alias)
+        .expect("detach producer-parallel database");
+    assert_cache_bound(cache, "after producer-parallel detach");
+}
+
 fn read_seed_database(vfs: &'static BlockCacheVfs, path: String) -> Result<(), Error> {
     let db = vfs.open(path)?;
     let count: i64 = db.query_row("SELECT count(*) FROM payload", [], |row| row.get(0))?;
@@ -925,6 +1119,7 @@ fn bounded_cache_handles_shared_database_pressure_and_failed_puts() {
     let cache = tempfile::tempdir().expect("pressure-test cache directory");
     let vfs = new_vfs(cache.path());
     run_pinned_exhaustion(vfs, &endpoint, cache.path());
+    run_producer_parallel_staging(vfs, &endpoint, cache.path());
     run_pressure(vfs, &endpoint, cache.path());
     run_failed_put(vfs, &endpoint, cache.path());
 }

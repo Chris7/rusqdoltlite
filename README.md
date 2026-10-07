@@ -18,9 +18,13 @@ The vendored checkout is from Fossil check-in
 `50e099ad7bf1d12d747f59b0af973d12809887480463fc9893846b0d6ee22e94`; the
 corresponding upstream source archive has SHA-256
 `b322811e8ec4224753f2d9309ed0f011d81c9f2540ce81bd7b5a6a9550d7d03a`.
-The target still needs libcurl and OpenSSL development headers and libraries.
-When pkg-config cannot locate them, set
-`BLOCKCACHEVFS_CURL_INCLUDE_DIR` and `BLOCKCACHEVFS_OPENSSL_INCLUDE_DIR`.
+The feature builds libcurl, OpenSSL, and zlib from Cargo-managed source, so
+builders do not need their system development headers, libraries, or
+`pkg-config`. A native C toolchain plus Perl and `make` are required to build
+vendored OpenSSL. Runtime images still need a system CA bundle (for example,
+`ca-certificates`) for HTTPS. The bundled curl honors `SSL_CERT_FILE` and
+`SSL_CERT_DIR`; when neither is set, it searches readable conventional CA
+bundle locations. The existing `CLOUDSQLITE_CAINFO` setting takes precedence.
 
 Google storage keeps its default endpoint exactly
 `https://storage.googleapis.com`. For a Google-compatible test service, pass
@@ -109,6 +113,32 @@ omitted, excluding raw credential-bearing HTTP headers from verbose output.
 The strict Floci emulator at the endpoint above is a convenient local SigV4
 test service.
 
+### Concurrent cloud block uploads
+
+Cloud database URIs accept an optional `upload_concurrency` query parameter
+for both GCS and S3. It is a positive decimal integer from `1` through `i32::MAX`; when
+omitted, the native VFS default is used (currently 10). This is an upper bound:
+the VFS can use fewer simultaneous block uploads to fit the local cache and its
+staging-buffer budget.
+
+```rust,no_run
+use rusqlite::Connection;
+
+# fn main() -> rusqlite::Result<()> {
+let db = Connection::open(
+    "gcs://bucket/prefix?vfs=blockcachevfs&project=project&access_token=TOKEN&database=file.db&upload_concurrency=8",
+)?;
+# drop(db);
+# Ok(())
+# }
+```
+
+For a session-owned URI server, `BlockCacheSessionOptions::upload_concurrency(8)`
+sets the same limit. If both the session option and URI parameter are present,
+the explicit session option takes precedence. A static process-lifetime VFS is
+configured when it is built with `.config(Config::UploadConcurrency(8))`; a
+session option cannot change the configuration of an already shared VFS.
+
 To reuse CBS's own emulator tests, run the shared runner once per backend. It
 uses the same vendored checkout, applies this repository's numbered patches to
 a disposable copy, and runs the upstream `util_api1.test` and
@@ -124,8 +154,9 @@ BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT=http://127.0.0.1:14091 \
 ```
 
 The runner requires Tcl, libcurl, and OpenSSL development headers to build
-CBS's Tcl test binary. It exits with status 77 when an endpoint is not
-configured.
+CBS's Tcl test binary. The Rust TLS trust test also uses the `openssl` and
+Python 3 command-line tools to run its local certificate fixtures. The runner
+exits with status 77 when an endpoint is not configured.
 
 For a multi-tenant endpoint, pass the remote container as `bucket/prefix` and
 choose a slash-free local alias. Attach, read, write, and upload paths then
