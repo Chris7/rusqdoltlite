@@ -1,7 +1,7 @@
 [package]
 name = "rusqdoltlite"
 # Note: Update version in README.md when you change this.
-version = "0.40.22"
+version = "0.41.0"
 authors = ["Chris Mitchell"]
 edition = "2021"
 description = "Rusqlite with DoltLite as the backend"
@@ -169,10 +169,10 @@ sha2 = { version = "0.10", optional = true }
 rusqlite-macros = { path = "rusqlite-macros", version = "0.4.3", optional = true }
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.22" }
+libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.23" }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.22", optional = true }
+libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.23", optional = true }
 sqlite-wasm-rs = { version = "0.5.1", default-features = false, optional = true }
 chrono = { version = "0.4.42", optional = true, default-features = false, features = ["wasmbind"] }
 jiff = { version = "0.2", optional = true, default-features = false, features = ["js"] }
