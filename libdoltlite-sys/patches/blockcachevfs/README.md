@@ -190,3 +190,11 @@ integration but remain separate native interfaces. Standalone CBS builds do not
 require DoltLite. This patch is applied only to staged CBS source; the separate
 `blockcachevfs-tests/` series carries CBS test changes and the emulator runner
 applies those tests after the production patch.
+
+`0018-pending-publish-byte-verification.patch` recovers an ambiguous manifest
+publication only when the durable candidate matches the fetched remote
+manifest, no newer staged rows exist, and every dirty resident block exactly
+matches the full immutable object at its candidate database/block position.
+After installation, verified resident mappings are persisted as clean and
+returned to the LRU. A newer local rewrite remains dirty and follows normal
+manifest conflict handling.

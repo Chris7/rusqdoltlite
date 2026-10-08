@@ -12,7 +12,7 @@ const CACHE_BYTES: u64 = 2 * 4 * 1024 * 1024;
 const BODY_BYTES: usize = 2048;
 const ROWS: i64 = 7_000;
 const DELETED_ROWS: i64 = 100;
-const SLOT_REWRITE_ROWS: i64 = 1_024;
+const SLOT_REWRITE_ROWS: i64 = ROWS - DELETED_ROWS;
 const CACHE_ENV: &str = "BCV_STREAMING_RESTART_CACHE";
 const STATE_ENV: &str = "BCV_STREAMING_RESTART_STATE";
 const ENDPOINT_ENV: &str = "BCV_STREAMING_RESTART_ENDPOINT";
@@ -156,6 +156,11 @@ fn rewritten_body() -> String {
 fn second_body(id: i64) -> String {
     let prefix = format!("second-{id:08}:");
     format!("{prefix}{}", "q".repeat(BODY_BYTES - prefix.len()))
+}
+
+fn third_body(id: i64) -> String {
+    let prefix = format!("third-{id:08}:");
+    format!("{prefix}{}", "z".repeat(BODY_BYTES - prefix.len()))
 }
 
 fn objects_before_path(state: &Path) -> PathBuf {
@@ -376,8 +381,9 @@ fn restart_phase_one() {
     );
     write_slot_map(&slot_map_path(&state, "first"), &first_slots);
 
-    // A second update rewrites nearly every surviving row. It must reuse the
-    // bounded physical slots rather than append another cachefile extent.
+    // The second and third updates rewrite nearly every surviving row. At
+    // least one later rewrite must reuse a physical slot rather than append
+    // another cachefile extent.
     let db = vfs
         .open(format!("/{alias}/streaming.sqlite"))
         .expect("reopen restart-test database for slot reuse");
@@ -402,6 +408,31 @@ fn restart_phase_one() {
 
     let second_slots = inspect_cache_slot_map(&cache);
     write_slot_map(&slot_map_path(&state, "second"), &second_slots);
+
+    let db = vfs
+        .open(format!("/{alias}/streaming.sqlite"))
+        .expect("reopen restart-test database for third rewrite");
+    db.execute_batch("BEGIN IMMEDIATE")
+        .expect("begin restart-test third slot-reuse update");
+    {
+        let mut update = db
+            .prepare("UPDATE payload SET body = ?1 WHERE id = ?2")
+            .expect("prepare restart-test third slot-reuse update");
+        for id in 1..SLOT_REWRITE_ROWS {
+            update
+                .execute(params![third_body(id), id])
+                .expect("rewrite restart-test third slot-reuse row");
+            if id % 256 == 0 {
+                assert_cache_bound(&cache, "restart phase one third slot-reuse write");
+            }
+        }
+    }
+    db.execute_batch("COMMIT")
+        .expect("commit restart-test third slot-reuse update");
+    drop(db);
+
+    let third_slots = inspect_cache_slot_map(&cache);
+    write_slot_map(&slot_map_path(&state, "third"), &third_slots);
 
     assert_cache_bound(&cache, "restart phase one");
     assert_eq!(
@@ -466,14 +497,14 @@ fn restart_phase_two() {
             )
         });
     assert!(rewritten.starts_with("rewritten"));
-    let second: String = db
+    let third: String = db
         .query_row(
             "SELECT body FROM payload WHERE id = ?1",
             [SLOT_REWRITE_ROWS / 2],
             |row| row.get(0),
         )
-        .expect("read second slot-reuse update after restart");
-    assert!(second.starts_with("second-"));
+        .expect("read third slot-reuse update after restart");
+    assert!(third.starts_with("third-"));
     for id in [ROWS / 2, ROWS - DELETED_ROWS - 1] {
         let length: i64 = db
             .query_row(
@@ -514,14 +545,14 @@ fn restart_phase_three() {
         })
         .expect("read rewritten row after fresh restart");
     assert!(rewritten.starts_with("rewritten"));
-    let second: String = db
+    let third: String = db
         .query_row(
             "SELECT body FROM payload WHERE id = ?1",
             [SLOT_REWRITE_ROWS / 2],
             |row| row.get(0),
         )
-        .expect("read second slot-reuse update after fresh restart");
-    assert!(second.starts_with("second-"));
+        .expect("read third slot-reuse update after fresh restart");
+    assert!(third.starts_with("third-"));
     drop(db);
     vfs.detach(alias)
         .expect("detach fresh restart-test database");
@@ -712,19 +743,24 @@ fn staged_cache_survives_process_restart_and_slot_reuse() {
     let objects_after = list_remote_objects(&endpoint, &container);
     let first_slots = read_slot_map(&slot_map_path(&state_file, "first"));
     let second_slots = read_slot_map(&slot_map_path(&state_file, "second"));
-    let reused_slot = first_slots.iter().any(|(position, blockid)| {
-        second_slots.iter().any(|(other_position, other_blockid)| {
-            other_position == position && other_blockid != blockid
-        })
-    });
+    let third_slots = read_slot_map(&slot_map_path(&state_file, "third"));
+    let reused_slot = first_slots
+        .iter()
+        .chain(&second_slots)
+        .any(|(position, blockid)| {
+            third_slots.iter().any(|(other_position, other_blockid)| {
+                other_position == position && other_blockid != blockid
+            })
+        });
     assert!(
         reused_slot,
-        "no physical slot changed block IDs across the two updates: first={first_slots:?}, second={second_slots:?}"
+        "no physical slot changed block IDs across three generations: first={first_slots:?}, second={second_slots:?}, third={third_slots:?}"
     );
     assert!(
-        objects_after > objects_before + second_slots.len(),
+        objects_after > objects_before + third_slots.len(),
         "remote object growth does not demonstrate slot reuse: before={objects_before}, \
-         after={objects_after}, first_slots={first_slots:?}, second_slots={second_slots:?}"
+         after={objects_after}, first_slots={first_slots:?}, second_slots={second_slots:?}, \
+         third_slots={third_slots:?}"
     );
     run_phase(&executable, "restart_phase_two", &values);
     run_phase(&executable, "restart_phase_three", &values);

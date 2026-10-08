@@ -1,5 +1,5 @@
 Subject: [PATCH] Bound and observe DoltLite HTTP session transfers
-Base: DoltLite v0.50.12 with local patches 0001-0008 applied
+Base: DoltLite v0.50.15 with local patches 0001-0008 applied
 
 This is a regenerated net patch from the state after DoltLite patches 0001-0008.
 Its source was produced by applying the former 0009-0016 series in order, then
@@ -643,7 +643,8 @@ index b53be0ead7a148a35afb4cd45bb6bdb5c2cc34cf..11b77500c51285c2fb05675d8ca83198
    u8 *pPendingRefs;
    int nPendingRefs;
 @@ -564814,7 +565235,10 @@ struct HttpRemote {
- #define HTTP_RESP_MAX_BYTES ((i64)128 * 1024 * 1024)
+-#define HTTP_RESP_MAX_BYTES ((i64)1024 * 1024 * 1024)
++#define HTTP_RESP_MAX_BYTES ((i64)128 * 1024 * 1024)
  #define HTTP_HEADER_MAX_BYTES ((i64)64 * 1024)
  #define HTTP_UPLOAD_BATCH_MAX ((i64)16 * 1024 * 1024)
 +/* Idle time allowed without transport progress during an HTTP request. */
@@ -1718,8 +1719,10 @@ index c989fe3f3af1654e6242f55ff3d5324eb0058efc..b89bafac34c5687a2bb71ecf56b3211a
    DoltliteTlsServer *tls;
 @@ -245,6 +248,10 @@ static int remoteSrvCommitPending(ChunkStore *pStore){
  ** batch get-chunks cannot materialize an unbounded reply. */
- #define MAX_CHUNK_BYTES    (64 * 1024 * 1024)
- #define MAX_REQUEST_BYTES  (128 * 1024 * 1024)
+-#define MAX_CHUNK_BYTES    ((i64)1024 * 1024 * 1024)
+-#define MAX_REQUEST_BYTES  MAX_CHUNK_BYTES
++#define MAX_CHUNK_BYTES    (64 * 1024 * 1024)
++#define MAX_REQUEST_BYTES  (128 * 1024 * 1024)
 +/* Larger request limits apply only to a session-owned loopback server; the
 +** public unauthenticated protocol keeps its 64 MiB chunk and 128 MiB request caps. */
 +#define MAX_REQUEST_BYTES_MAX 0x7fffffff
@@ -1809,7 +1812,7 @@ index c989fe3f3af1654e6242f55ff3d5324eb0058efc..b89bafac34c5687a2bb71ecf56b3211a
          | ((u32)pBody[offset+3] << 24);
      offset += 4;
  
--    if( len > (u32)MAX_CHUNK_BYTES
+-    if( (i64)len > MAX_CHUNK_BYTES
 -     || len > (u32)(nBody - offset) ){
 +    if( len > (u32)maxChunkBytes ){
 +      rc = SQLITE_TOOBIG;

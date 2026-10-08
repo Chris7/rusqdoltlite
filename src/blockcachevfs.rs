@@ -1379,7 +1379,37 @@ impl BlockCacheVfs {
         result_with_err(rc, &mut err)
     }
 
-    /// Attach a container to a validated application session.
+    /// Attach a container to an explicitly scoped application session.
+    ///
+    /// This method requires the caller principal, exact target database,
+    /// permitted operations, and a unique request operation ID so the native
+    /// VFS can authorize database opens and bind the session context. It is an
+    /// alias for [`Self::attach_session_scoped`].
+    pub fn attach_session(
+        &'static self,
+        spec: &AttachSpec,
+        session_id: impl AsRef<str>,
+        principal: &str,
+        database: &str,
+        operations: &str,
+        operation_id: &SessionOperationId,
+    ) -> Result<SessionAttachment> {
+        self.attach_session_scoped(
+            spec,
+            session_id,
+            principal,
+            database,
+            operations,
+            operation_id,
+        )
+    }
+
+    /// Attach and atomically bind an authorized request context.
+    ///
+    /// The native operation ID is mandatory and distinct from the client
+    /// session UUID. Native CBS rehydrates the accepted head internally after
+    /// binding this context; a missing head selects the zero initial
+    /// predecessor and sequence. Callers never supply an expected tip.
     ///
     /// Session attachments intentionally do not honor [`AttachSpec::if_not`]:
     /// accepting an existing alias would make it impossible to prove that the
@@ -1393,61 +1423,6 @@ impl BlockCacheVfs {
     /// key requires a fresh VFS/cache instance until rehydration can replace
     /// the local container credentials; changing only the callback's secret or
     /// session token does not change this local identity.
-    pub fn attach_session(
-        &'static self,
-        spec: &AttachSpec,
-        session_id: impl AsRef<str>,
-    ) -> Result<SessionAttachment> {
-        let session_id = SessionId::new(session_id)?;
-        if self.is_daemon() {
-            return Err(Error::SqliteFailure(
-                crate::ffi::Error::new(crate::ffi::SQLITE_MISUSE),
-                Some("session-aware attachments are unavailable through the CBS daemon".to_owned()),
-            ));
-        }
-        let mut canonical_spec = spec.clone();
-        canonical_spec.storage.provider =
-            canonical_session_storage_provider(&canonical_spec.storage.provider)?;
-        let alias_text = session_alias(&canonical_spec, &session_id)?;
-
-        let storage =
-            CString::new(canonical_spec.storage.provider.as_str()).map_err(Error::NulError)?;
-        let account =
-            CString::new(canonical_spec.storage.account.as_str()).map_err(Error::NulError)?;
-        let container =
-            CString::new(canonical_spec.storage.container.as_str()).map_err(Error::NulError)?;
-        let alias = CString::new(alias_text.as_str()).map_err(Error::NulError)?;
-        let session_id_c = CString::new(session_id.as_str()).map_err(Error::NulError)?;
-        let flags = canonical_spec.secure as c_int * raw::SQLITE_BCV_ATTACH_SECURE;
-        let mut err = ptr::null_mut();
-        let rc = unsafe {
-            raw::sqlite3_bcvfs_attach_session(
-                self.fs,
-                storage.as_ptr(),
-                account.as_ptr(),
-                container.as_ptr(),
-                alias.as_ptr(),
-                session_id_c.as_ptr(),
-                flags,
-                &mut err,
-            )
-        };
-        result_with_err(rc, &mut err)?;
-
-        Ok(SessionAttachment {
-            vfs: SessionVfs::Static(self),
-            alias: alias_text,
-            session_id,
-            operation_id: None,
-        })
-    }
-
-    /// Attach and atomically bind an authorized request context.
-    ///
-    /// The native operation ID is mandatory and distinct from the client
-    /// session UUID. Native CBS rehydrates the accepted head internally after
-    /// binding this context; a missing head selects the zero initial
-    /// predecessor and sequence. Callers never supply an expected tip.
     pub fn attach_session_scoped(
         &'static self,
         spec: &AttachSpec,
@@ -1650,12 +1625,13 @@ impl BlockCacheVfs {
         bcv_result("cleanup", rc, &handle)
     }
 
-    /// Upload a valid, non-empty local SQLite database as a new remote name.
+    /// Upload a valid, non-empty local SQLite database under a new remote name.
     ///
     /// The storage container must already have been initialized with
     /// [`Self::initialize_container`]. This is the bootstrap operation for a
     /// new remote database; [`Self::upload`] flushes changes to an attached
-    /// database and is not a replacement for this method.
+    /// database and is not a replacement for this method. `remote_name` must
+    /// be one path component; names containing `/` or `\` are rejected.
     pub fn create_database(
         &self,
         storage: &Storage,
@@ -1683,6 +1659,12 @@ impl BlockCacheVfs {
             return Err(Error::SqliteFailure(
                 crate::ffi::Error::new(crate::ffi::SQLITE_MISMATCH),
                 Some("create_database: remote name is empty".into()),
+            ));
+        }
+        if remote_name.contains('/') || remote_name.contains('\\') {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_MISMATCH),
+                Some("create_database: remote name must be a single path component".into()),
             ));
         }
 

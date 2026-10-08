@@ -162,6 +162,24 @@ fn row_body(id: i64) -> String {
     format!("{prefix}{}", "x".repeat(BODY_BYTES - prefix.len()))
 }
 
+fn newer_body(id: i64) -> String {
+    let prefix = format!("newer-{id:08}:");
+    format!("{prefix}{}", "n".repeat(BODY_BYTES - prefix.len()))
+}
+
+fn rewrite_body(id: i64) -> String {
+    let prefix = format!("rewrite-{id:08}:");
+    format!("{prefix}{}", "r".repeat(BODY_BYTES - prefix.len()))
+}
+
+fn assert_cache_bound(cache: &Path, context: &str) {
+    let size = fs::metadata(cache.join("cachefile.bcv")).map_or(0, |metadata| metadata.len());
+    assert!(
+        size <= CACHE_BYTES,
+        "cachefile.bcv grew beyond {CACHE_BYTES} bytes ({size}) during {context}"
+    );
+}
+
 fn new_vfs(cache: &Path) -> &'static BlockCacheVfs {
     BlockCacheVfs::builder(cache)
         .expect("VFS builder")
@@ -724,6 +742,30 @@ fn ambiguous_manifest_response_is_recoverable_after_restart() {
 }
 
 #[test]
+#[ignore = "requires the pinned local S3 emulator container"]
+fn ambiguous_publication_keeps_a_newer_local_write_conflicted() {
+    let cache = tempfile::tempdir().expect("ambiguous conflict cache directory");
+    let fresh_cache = tempfile::tempdir().expect("ambiguous conflict fresh cache directory");
+    let state = tempfile::tempdir().expect("ambiguous conflict state directory");
+    let endpoint = std::env::var("BLOCKCACHEVFS_S3_EMULATOR")
+        .unwrap_or_else(|_| "http://127.0.0.1:4566".into());
+    let container = format!("{}/cbs", unique_suffix());
+    let state_path = state.path().join("manifest-before.bin");
+    run_child_phases(
+        cache.path(),
+        fresh_cache.path(),
+        &state_path,
+        &endpoint,
+        &container,
+        &[
+            "ambiguous_phase_one",
+            "ambiguous_phase_two",
+            "ambiguous_newer_phase_three",
+        ],
+    );
+}
+
+#[test]
 #[ignore = "child phase for CAS conflict test"]
 fn cas_conflict_phase_one() {
     if std::env::var_os(CACHE_ENV).is_none() {
@@ -856,10 +898,165 @@ fn ambiguous_phase_three() {
     vfs.attach(&AttachSpec::new(storage).alias(STAGED_ALIAS).if_not(true))
         .expect("restart after ambiguous manifest response");
     assert_final_rows(vfs, STAGED_ALIAS);
+    let metadata = Connection::open(cache.join("blocksdb.bcv"))
+        .expect("open ambiguous-publication cache metadata");
+    let remote_manifest = fetch_manifest(&endpoint, &container);
+    let pending: Vec<u8> = metadata
+        .query_row("SELECT manifest FROM pending_publish LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read durable pending publication manifest");
+    assert_eq!(
+        pending, remote_manifest,
+        "recovery must match the exact durable candidate manifest"
+    );
     vfs.poll(STAGED_ALIAS)
         .expect("poll must reconcile the remotely installed manifest");
+
+    let pending_count: i64 = metadata
+        .query_row("SELECT count(*) FROM pending_publish", [], |row| row.get(0))
+        .expect("count pending publications after recovery");
+    assert_eq!(pending_count, 0, "recovery must clear the durable marker");
+    let staged_count: i64 = metadata
+        .query_row("SELECT count(*) FROM staged", [], |row| row.get(0))
+        .expect("count staged rows after recovery");
+    assert_eq!(staged_count, 0, "recovery must clear uploaded staged rows");
+    let dirty_count: i64 = metadata
+        .query_row(
+            "SELECT count(*) FROM block WHERE blockid IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count dirty cache mappings after recovery");
+    assert_eq!(
+        dirty_count, 0,
+        "recovery must persist dirty mappings as clean"
+    );
+    let clean_count: i64 = metadata
+        .query_row(
+            "SELECT count(*) FROM block WHERE blockid IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count clean cache mappings after recovery");
+    assert!(
+        clean_count > 0,
+        "recovery must retain clean resident mappings"
+    );
+
     vfs.upload(STAGED_ALIAS)
-        .expect("restart/retry must reconcile an already-installed manifest");
+        .expect("retry publication after the ambiguous manifest response");
+    assert_final_rows(vfs, STAGED_ALIAS);
+
+    // A rewrite larger than cache capacity exercises LRU eligibility of the
+    // recovered clean entries. Keep it local so phase four still verifies the
+    // remotely published candidate from a fresh cache.
+    let db = vfs
+        .open(format!("/{STAGED_ALIAS}/streaming.sqlite"))
+        .expect("open recovered database for bounded slot reuse");
+    db.execute_batch("BEGIN IMMEDIATE")
+        .expect("begin recovered database rewrite");
+    {
+        let mut update = db
+            .prepare("UPDATE payload SET body = ?1 WHERE id = ?2")
+            .expect("prepare recovered database rewrite");
+        for id in 0..ROWS {
+            update
+                .execute(params![rewrite_body(id), id])
+                .expect("rewrite recovered row");
+            if id % 256 == 0 {
+                assert_cache_bound(&cache, "post-recovery rewrite");
+            }
+        }
+    }
+    db.execute_batch("COMMIT")
+        .expect("commit recovered database rewrite");
+    assert_cache_bound(&cache, "post-recovery rewrite");
+}
+
+#[test]
+#[ignore = "child phase for newer-local-write ambiguity test"]
+fn ambiguous_newer_phase_three() {
+    if std::env::var_os(CACHE_ENV).is_none() {
+        return;
+    }
+    let (cache, _fresh, _state, endpoint, container) = phase_inputs();
+    let storage = storage(&endpoint, &container);
+    let vfs = new_vfs(&cache);
+    vfs.attach(&AttachSpec::new(storage).alias(STAGED_ALIAS).if_not(true))
+        .expect("restart after ambiguous manifest response");
+    assert_final_rows(vfs, STAGED_ALIAS);
+
+    let metadata =
+        Connection::open(cache.join("blocksdb.bcv")).expect("open newer-write cache metadata");
+    let candidate = fetch_manifest(&endpoint, &container);
+    let (pending, max_sequence): (Vec<u8>, i64) = metadata
+        .query_row(
+            "SELECT manifest, maxseq FROM pending_publish LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read pending manifest before newer local write");
+    assert_eq!(
+        pending, candidate,
+        "the ambiguity marker must identify the current remote candidate"
+    );
+
+    let db = vfs
+        .open(format!("/{STAGED_ALIAS}/streaming.sqlite"))
+        .expect("open database for newer local write");
+    db.execute_batch("BEGIN IMMEDIATE")
+        .expect("begin newer local write");
+    db.execute("UPDATE payload SET body = ?1 WHERE id = 0", [newer_body(0)])
+        .expect("update a row after ambiguous publication");
+    db.execute_batch("COMMIT")
+        .expect("commit newer local write");
+    let body: String = db
+        .query_row("SELECT body FROM payload WHERE id = 0", [], |row| {
+            row.get(0)
+        })
+        .expect("read newer local write");
+    assert_eq!(body, newer_body(0));
+    drop(db);
+
+    let newer_staged: i64 = metadata
+        .query_row(
+            "SELECT count(*) FROM staged WHERE sequence > ?1",
+            [max_sequence],
+            |row| row.get(0),
+        )
+        .expect("count staged rows after newer local write");
+    assert_eq!(
+        newer_staged, 0,
+        "the regression must exercise dirty-byte verification, not the newer-stage guard"
+    );
+
+    let error = vfs
+        .poll(STAGED_ALIAS)
+        .expect_err("poll must reject a candidate with a newer local write");
+    assert!(
+        error.to_string().contains("write collision"),
+        "poll must preserve ordinary manifest collision behavior: {error}"
+    );
+    assert_eq!(
+        candidate,
+        fetch_manifest(&endpoint, &container),
+        "a newer local write must not replace the remotely published candidate"
+    );
+    let pending_after: Vec<u8> = metadata
+        .query_row("SELECT manifest FROM pending_publish LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("retain pending marker after local-write collision");
+    assert_eq!(pending_after, candidate);
+    let body_after: String = vfs
+        .open(format!("/{STAGED_ALIAS}/streaming.sqlite"))
+        .expect("reopen database after write collision")
+        .query_row("SELECT body FROM payload WHERE id = 0", [], |row| {
+            row.get(0)
+        })
+        .expect("read newer local write after collision");
+    assert_eq!(body_after, newer_body(0));
 }
 
 #[test]

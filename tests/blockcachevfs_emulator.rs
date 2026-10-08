@@ -808,7 +808,7 @@ fn reassemble_checkpoint_database(
                 backend,
                 endpoint,
                 bucket,
-                &format!("{prefix}/{block_id}.bcv"),
+                &format!("{prefix}/blocks/{block_id}.bcv"),
             );
             assert_eq!(
                 block.len(),
@@ -2038,20 +2038,14 @@ fn run_session_server() {
     let no_sync_db = vfs
         .open(format!("/{alias}/session.sqlite"))
         .expect("open session database for no-xSync write");
-    // DoltLite's block-cache VFS deliberately rejects journal-mode changes;
-    // in particular, a request cannot silently switch this fixture to WAL.
-    // Keep this assertion explicit instead of treating the rejection as a
-    // reason to weaken the no-WAL coverage.
-    let wal_error = no_sync_db
-        .query_row::<String, _, _>("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-        .expect_err("bcvfs must reject a WAL journal-mode request");
+    // BlockcacheVfs supports WAL only; verify the mode without issuing a
+    // journal-mode change before exercising the synchronous=OFF write.
+    let journal_mode = no_sync_db
+        .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        .expect("read the no-xSync fixture journal mode");
     assert!(
-        matches!(
-            &wal_error,
-            rusqlite::Error::SqliteFailure(_, Some(message))
-                if message.contains("cannot use \"PRAGMA journal_mode\" with bcvfs")
-        ),
-        "unexpected journal-mode result: {wal_error:?}"
+        journal_mode.eq_ignore_ascii_case("wal"),
+        "no-xSync fixture must use WAL mode, got {journal_mode:?}"
     );
     no_sync_db
         .execute_batch(
@@ -3202,11 +3196,9 @@ fn handle_concurrent_block_put_connection(
                 injected_status,
             });
         state.wait_until_released(request_number, Duration::from_secs(8));
-        let result = if fail_this_put {
+        let response = if fail_this_put {
             state.rejected.fetch_add(1, Ordering::AcqRel);
-            stream.write_all(
-                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
         } else {
             let response = forward_storage_proxy_request(
                 authority,
@@ -3221,9 +3213,12 @@ fn handle_concurrent_block_put_connection(
             } else if status == 412 {
                 state.precondition_failed.fetch_add(1, Ordering::AcqRel);
             }
-            stream.write_all(&response)
+            response
         };
-        return result;
+        // The client can return as soon as it reads the response, before this
+        // handler's destructor runs; record the completed PUT before replying.
+        drop(_active_guard);
+        return stream.write_all(&response);
     }
     let response =
         forward_storage_proxy_request(authority, &method, &request_target, &headers, &body)?;
@@ -4045,7 +4040,7 @@ fn run_session_fault_case(
             let result = stage_session_update(&database);
             assert!(
                 proxy.faulted() > 0,
-                "{} did not intercept a block PUT (matched={})",
+                "{} did not intercept a block PUT (matched={}, result={result:?})",
                 window.label(),
                 proxy.matched()
             );
@@ -4254,25 +4249,30 @@ fn run_session_fault_matrix(backend: &str) {
     }
     let proxy = StorageFaultProxy::start(&endpoint);
     let vfs_name = format!("rusqdoltlite-fault-{suffix}");
-    // Builder::init returns a process-global VFS. Keep its cache root alive
-    // across the GCS and S3 matrices, which run sequentially in this process.
-    let vfs = BlockCacheVfs::builder(shared_cache())
-        .expect("fault VFS builder")
-        .name(&vfs_name)
-        .expect("fault VFS name")
-        .config(Config::CacheSize(4 * 1024 * 1024))
-        .config(Config::UploadConcurrency(1))
-        .config(Config::StageWatermark(50))
-        .config(Config::HttpTimeout(3))
-        .auth_callback(|provider, _account, _container| {
-            if provider.starts_with("google?") {
-                Ok("test-token".into())
-            } else {
-                Ok("test".into())
-            }
-        })
-        .init()
-        .expect("initialize fault VFS");
+    // Keep each fault matrix on an independently registered VFS. The regular
+    // init() is a process-global singleton, so later builder settings and
+    // authentication callbacks would otherwise be ignored.
+    let cache_root = shared_cache().join(&vfs_name);
+    std::fs::create_dir_all(&cache_root).expect("create isolated fault VFS cache root");
+    let vfs = Box::leak(Box::new(
+        BlockCacheVfs::builder(&cache_root)
+            .expect("fault VFS builder")
+            .name(&vfs_name)
+            .expect("fault VFS name")
+            .config(Config::CacheSize(4 * 1024 * 1024))
+            .config(Config::UploadConcurrency(1))
+            .config(Config::StageWatermark(50))
+            .config(Config::HttpTimeout(3))
+            .auth_callback(|provider, _account, _container| {
+                if provider.starts_with("google?") {
+                    Ok("test-token".into())
+                } else {
+                    Ok("test".into())
+                }
+            })
+            .init_owned()
+            .expect("initialize fault VFS"),
+    ));
     let windows = [
         SessionFaultWindow::BlockPut,
         SessionFaultWindow::XSyncCheckpoint,
@@ -6890,11 +6890,10 @@ fn database_name_fresh_vfs_child() {
         .expect("detach database-name container from fresh VFS");
 }
 
-// A library caller can reasonably choose public attach_session and receive
-// Ok, then find that no database opens because the required scope was never
-// bound. Scoped attach on the same seed is the positive control for usability.
+// Public attach_session must bind the caller's explicit database scope just
+// like attach_session_scoped: the target opens and a different name is denied.
 #[test]
-#[ignore = "reproduces validated review finding"]
+#[ignore = "requires the pinned local GCS emulator container"]
 fn google_json_emulator_public_attach_session_database_scope() {
     let (vfs, endpoint, bucket) = google_review_vfs();
     let suffix = unique_suffix();
@@ -6927,8 +6926,16 @@ fn google_json_emulator_public_attach_session_database_scope() {
     let direct_alias = format!("direct-review-{}", suffix.replace('-', "_"));
     let direct_session_id = Uuid::new_v4().to_string();
     let direct_spec = AttachSpec::new(storage).alias(&direct_alias);
+    let direct_operation_id = session_operation_id(2);
     let direct = vfs
-        .attach_session(&direct_spec, &direct_session_id)
+        .attach_session(
+            &direct_spec,
+            &direct_session_id,
+            "emulator-principal",
+            "session.sqlite",
+            "read,write",
+            &direct_operation_id,
+        )
         .expect("public lower-level attach_session should return an attachment");
     assert_eq!(direct.session_id(), direct_session_id);
     let direct_database = match vfs.open(format!("/{direct_alias}/session.sqlite")) {
@@ -6942,6 +6949,17 @@ fn google_json_emulator_public_attach_session_database_scope() {
         .expect("read seed through public attach_session attachment");
     assert_eq!(direct_payload, "public-api-review-seed");
     drop(direct_database);
+    let out_of_scope = vfs
+        .open(format!("/{direct_alias}/other.sqlite"))
+        .expect_err("public attach_session must reject a database outside its explicit scope");
+    assert!(
+        matches!(
+            &out_of_scope,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.extended_code == rusqlite::ffi::SQLITE_AUTH
+        ),
+        "out-of-scope open should be rejected as unauthorized, got {out_of_scope:?}"
+    );
     drop(direct);
 }
 
@@ -6949,7 +6967,7 @@ fn google_json_emulator_public_attach_session_database_scope() {
 // addressed by a fresh VFS because those characters delimit VFS paths. The
 // valid one-component name is the control for this reopenability regression.
 #[test]
-#[ignore = "reproduces validated review finding"]
+#[ignore = "requires the pinned local GCS emulator container"]
 fn google_json_emulator_create_database_rejects_path_separators() {
     let (vfs, endpoint, bucket) = google_review_vfs();
     let suffix = unique_suffix();

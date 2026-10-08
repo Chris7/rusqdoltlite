@@ -3,10 +3,10 @@
 pub const SQLITE_VERSION: &::core::ffi::CStr = c"3.54.0";
 pub const SQLITE_VERSION_NUMBER: i32 = 3054000;
 pub const SQLITE_SOURCE_ID: &::core::ffi::CStr =
-    c"2026-08-31 20:43:10 6f73383647fdf579dca72e15cc8a9627be72fd524e8e843e7d62dfc9253ealt1";
+    c"2026-10-01 11:21:02 92709f54d4c58cf174f305b58971a01878af313157a11549b588a2521670alt1";
 pub const SQLITE_SCM_BRANCH: &::core::ffi::CStr = c"trunk";
 pub const SQLITE_SCM_TAGS: &::core::ffi::CStr = c"";
-pub const SQLITE_SCM_DATETIME: &::core::ffi::CStr = c"2026-08-31T20:43:10.952Z";
+pub const SQLITE_SCM_DATETIME: &::core::ffi::CStr = c"2026-10-01T11:21:02.802Z";
 pub const SQLITE_OK: i32 = 0;
 pub const SQLITE_ERROR: i32 = 1;
 pub const SQLITE_INTERNAL: i32 = 2;

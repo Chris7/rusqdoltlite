@@ -159,10 +159,12 @@ fn list_remote_objects(endpoint: &str, container: &str) -> usize {
     );
     let code = String::from_utf8_lossy(&response.stdout);
     assert_eq!(code, "200", "object-list request returned {code}: {url}");
-    fs::read_to_string(body.path())
-        .expect("read object-list response")
-        .matches("<Key>")
-        .count()
+    let response = fs::read_to_string(body.path()).expect("read object-list response");
+    assert!(
+        response.contains("<IsTruncated>false</IsTruncated>"),
+        "object-list response must be complete before comparing object counts"
+    );
+    response.matches("<Key>").count()
 }
 
 fn row_body(id: i64) -> String {
@@ -345,7 +347,9 @@ fn handle_proxy_connection(
     client.set_read_timeout(Some(Duration::from_secs(20)))?;
     let request = read_http_request(&mut client)?;
     let (method, target) = request_line(&request);
-    let block_put = method == "PUT" && !request_path(target).ends_with("/manifest.bcv");
+    let path = request_path(target);
+    let block_put =
+        method.eq_ignore_ascii_case("PUT") && path.contains("/blocks/") && path.ends_with(".bcv");
     if block_put {
         block_puts.fetch_add(1, Ordering::Relaxed);
     }
@@ -653,9 +657,10 @@ fn phase_one() {
         fetch_manifest(&endpoint, &container),
         "staging a block must not publish the manifest"
     );
+    let objects_after = list_remote_objects(&endpoint, &container);
     assert!(
-        list_remote_objects(&endpoint, &container) > objects_before,
-        "the object store must contain the staged block despite the lost response"
+        objects_after > objects_before,
+        "the object store must contain the staged block despite the lost response: before={objects_before}, after={objects_after}"
     );
     fs::write(&state, before).expect("save pre-publication manifest");
     drop(proxy);
@@ -821,9 +826,10 @@ fn failure_phase_one() {
         fetch_manifest(&endpoint, &container),
         "an ambiguous staged block PUT must not publish the manifest"
     );
+    let objects_after = list_remote_objects(&endpoint, &container);
     assert!(
-        list_remote_objects(&endpoint, &container) > objects_before,
-        "the emulator must retain an object even though every response was dropped"
+        objects_after > objects_before,
+        "the emulator must retain an object even though every response was dropped: before={objects_before}, after={objects_after}"
     );
 
     // SQLite rolls back the interrupted transaction before this process
@@ -1036,9 +1042,10 @@ fn combined_phase_one() {
         fetch_manifest(&endpoint, &container),
         "combined failed update must not change the published baseline manifest"
     );
+    let objects_after = list_remote_objects(&endpoint, &container);
     assert!(
-        list_remote_objects(&endpoint, &container) > objects_before,
-        "combined ambiguous update must leave a stored remote block object"
+        objects_after > objects_before,
+        "combined ambiguous update must leave a stored remote block object: before={objects_before}, after={objects_after}"
     );
     fs::write(&state, baseline_manifest).expect("save combined baseline manifest");
     drop(proxy);

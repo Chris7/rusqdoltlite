@@ -4,13 +4,13 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 echo "$SCRIPT_DIR"
 cd "$SCRIPT_DIR" || { echo "fatal error" >&2; exit 1; }
 cargo clean -p libdoltlite-sys
-TARGET_DIR="$SCRIPT_DIR/../target"
+TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/../target}"
 export DOLTLITE_LIB_DIR="$SCRIPT_DIR/doltlite"
 export DOLTLITE_INCLUDE_DIR="$SCRIPT_DIR/doltlite"
 mkdir -p "$TARGET_DIR" "$DOLTLITE_LIB_DIR"
 
 # Set this to an exact upstream release tag for a reproducible upgrade.
-DOLTLITE_GIT_REF=v0.50.12
+DOLTLITE_GIT_REF=v0.50.15
 
 # Build pristine upstream artifacts from the configured Git ref. RusqDoltLite
 # behavior is maintained separately in patches/ and applied only to Cargo's
@@ -77,10 +77,14 @@ mkdir -p "$PATCH_CHECK_DIR"
 cp "$DOLTLITE_LIB_DIR/doltlite.c" "$PATCH_CHECK_DIR/doltlite.c"
 cp "$DOLTLITE_LIB_DIR/remote/doltlite_remotesrv.c" \
   "$DOLTLITE_LIB_DIR/remote/doltlite_remotesrv.h" \
+  "$DOLTLITE_LIB_DIR/remote/doltlite_tls.c" \
   "$PATCH_CHECK_DIR/"
 (
   cd "$PATCH_CHECK_DIR" || exit 1
-  git apply --check "$SCRIPT_DIR"/patches/*.patch
+  for PATCH_FILE in "$SCRIPT_DIR"/patches/*.patch; do
+    git apply --check "$PATCH_FILE"
+    git apply "$PATCH_FILE"
+  done
 )
 
 # Regenerate bindgen file for doltlite.h

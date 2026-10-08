@@ -227,9 +227,14 @@ jobs:
           }
 
           run_ignored_test blockcachevfs_emulator google_cleanup_deletes_prefixed_blocks
+          run_ignored_test blockcachevfs_emulator google_json_emulator_create_database_rejects_path_separators
+          run_ignored_test blockcachevfs_emulator google_json_emulator_public_attach_session_database_scope
           run_ignored_test blockcachevfs_emulator google_uri_staged_graph_is_private_until_server_publication
           run_ignored_test blockcachevfs_emulator google_uri_session_refences_after_guard_epoch_changes_between_reads
           run_ignored_test blockcachevfs_emulator google_json_emulator_crc32c_guards_media_integrity
+          run_ignored_test blockcachevfs_emulator google_json_emulator_session_server
+          run_ignored_test blockcachevfs_emulator google_json_emulator_session_http_flow
+          run_ignored_test blockcachevfs_emulator google_json_emulator_session_failure_windows
           run_ignored_test blockcachevfs_emulator google_uri_session_reports_complete_block_upload_progress
           run_ignored_test blockcachevfs_emulator google_uri_session_plan_stays_incomplete_after_final_checkpoint_403
           run_ignored_test blockcachevfs_emulator google_uri_session_records_terminal_checkpoint_and_accept_failures
@@ -239,7 +244,7 @@ jobs:
           run_ignored_test blockcachevfs_emulator google_uri_session_bounds_parallel_block_staging_and_recovers_failed_batch
           run_ignored_test blockcachevfs_emulator google_uri_session_remote_server_accepts_chunk_over_public_request_limit
           run_ignored_test remote_server uri_session_push_can_outlive_loopback_response_idle_timeout
-      - name: Run URI remote server smoke test against S3
+      - name: Run focused S3 session regressions
         if: always() && steps.emulator_readiness.outcome == 'success'
         env:
           BLOCKCACHEVFS_S3_EMULATOR: http://127.0.0.1:4566
@@ -248,15 +253,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          output="$(cargo test --test blockcachevfs_emulator --features 'blockcachevfs remote' -- --ignored --exact s3_uri_remote_server_publishes_repeated_pushes 2>&1)" || {
+          run_ignored_test() {
+            local target="$1"
+            local name="$2"
+            local output
+            if ! output="$(cargo test --features 'blockcachevfs remote' --test "$target" -- --ignored --exact "$name" 2>&1)"; then
+              printf '%s\n' "$output"
+              return 1
+            fi
             printf '%s\n' "$output"
-            exit 1
+            if ! grep -Eq '^running [1-9][0-9]* tests?$' <<<"$output"; then
+              echo "the requested ignored S3 test did not run: $target::$name" >&2
+              return 1
+            fi
           }
-          printf '%s\n' "$output"
-          grep -Eq '^running [1-9][0-9]* tests?$' <<<"$output" || {
-            echo "the requested ignored S3 smoke test did not run" >&2
-            exit 1
-          }
+
+          run_ignored_test blockcachevfs_emulator s3_emulator_session_http_flow
+          run_ignored_test blockcachevfs_emulator s3_emulator_session_failure_windows
+          run_ignored_test blockcachevfs_emulator s3_uri_remote_server_publishes_repeated_pushes
+          run_ignored_test blockcachevfs_streaming_conflict manifest_cas_conflict_retains_staged_objects_for_retry
+          run_ignored_test blockcachevfs_streaming_conflict ambiguous_manifest_response_is_recoverable_after_restart
+          run_ignored_test blockcachevfs_streaming_conflict ambiguous_publication_keeps_a_newer_local_write_conflicted
       - name: Run shared CBS suite against Google JSON
         if: always() && steps.emulator_readiness.outcome == 'success'
         env:

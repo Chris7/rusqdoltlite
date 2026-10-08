@@ -1,0 +1,232 @@
+Subject: [PATCH] Verify dirty blocks before recovering publication
+
+A durable pending marker and byte-identical remote manifest prove which
+manifest PUT succeeded, but random block IDs do not prove that a dirty cache
+slot still contains the bytes named by that manifest. Compare each dirty
+resident block with the exact immutable object at its candidate database and
+block position before installing the manifest. Only after every comparison
+succeeds, persist those resident cache mappings as clean. A mismatch leaves
+the pending marker intact and falls through to ordinary conflict handling.
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+index 3195379..ae88e87 100644
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -4468,22 +4468,162 @@ Container *bcvfsFindContAlias(
+   return pCont;
+ }
+ 
++typedef struct PendingPublishBlockVerify PendingPublishBlockVerify;
++struct PendingPublishBlockVerify {
++  const u8 *aLocal;
++  int nLocal;
++  int bDone;
++  int rc;
++};
++
++/* Compare the full cache block with the immutable object named by the
++** candidate manifest. Block IDs may be random rather than content hashes, so
++** matching the manifest name alone cannot prove that a dirty resident slot
++** still contains the bytes that were published. */
++static void bcvfsPendingPublishBlockCb(
++  void *pCtx,
++  int rc,
++  char *zETag,
++  const u8 *aData,
++  int nData,
++  const u8 *aHdrs,
++  int nHdrs
++){
++  PendingPublishBlockVerify *p = (PendingPublishBlockVerify*)pCtx;
++  (void)zETag;
++  (void)aHdrs;
++  (void)nHdrs;
++  p->bDone = 1;
++  if( rc==SQLITE_OK ){
++    if( nData<0 || nData!=p->nLocal || aData==0 ){
++      p->rc = SQLITE_CORRUPT;
++    }else if( memcmp(aData,p->aLocal,p->nLocal)!=0 ){
++      p->rc = SQLITE_NOTFOUND;
++    }else{
++      p->rc = SQLITE_OK;
++    }
++  }else{
++    p->rc = rc;
++  }
++}
++
++static int bcvfsPendingPublishDirtyMatches(
++  BcvDispatch *pDisp,
++  BcvContainer *pBcv,
++  Manifest *pMan,
++  CacheEntry *pEntry,
++  sqlite3_file *pCache,
++  u8 *aLocal
++){
++  ManifestDb *pDb = bcvfsFindDatabaseById(pMan,pEntry->iDbId);
++  const int nName = NAMEBYTES(pMan);
++  const u8 *aBlock;
++  char zBlock[BCV_MAX_FSNAMEBYTES];
++  PendingPublishBlockVerify verify = {aLocal,pMan->szBlk,0,SQLITE_OK};
++  int rc;
++
++  if( pDb==0 || pEntry->iDbPos<0 || pEntry->iDbPos>=pDb->nBlkOrig
++   || pDb->aBlkOrig==0 || pEntry->nName!=nName
++   || pMan->szBlk<=0 || pEntry->iPos<0
++  ){
++    return SQLITE_NOTFOUND;
++  }
++
++  aBlock = &pDb->aBlkOrig[(i64)pEntry->iDbPos*nName];
++  rc = bcvReadfile(
++      pCache,aLocal,pMan->szBlk,(i64)pEntry->iPos*pMan->szBlk
++  );
++  if( rc!=SQLITE_OK ) return rc;
++
++  bcvfsBlockidToName(aBlock,nName,zBlock);
++  rc = bcvDispatchFetch(
++      pDisp,pBcv,zBlock,0,0,(void*)&verify,bcvfsPendingPublishBlockCb
++  );
++  if( rc==SQLITE_OK ) rc = bcvDispatchRunAll(pDisp);
++  if( rc==SQLITE_OK ){
++    rc = verify.bDone ? verify.rc : SQLITE_IOERR;
++  }
++  return rc;
++}
++
++static int bcvfsPendingPublishCleanDirtyEntries(
++  sqlite3_bcvfs *pFs,
++  Container *pCont
++){
++  BcvCommon *pCommon = &pFs->c;
++  int ii;
++  int rc = SQLITE_OK;
++  int nName = NAMEBYTES(pCont->pMan);
++
++  for(ii=0; ii<pCommon->nHash && rc==SQLITE_OK; ii++){
++    CacheEntry *pEntry;
++    for(pEntry=pCommon->aHash[ii]; pEntry && rc==SQLITE_OK;){
++      CacheEntry *pNext = pEntry->pHashNext;
++      ManifestDb *pDb;
++      const u8 *aBlock;
++      u8 aOldName[BCV_MAX_NAMEBYTES];
++      int nOldName;
++      int bOldStaged;
++      if( pEntry->bDirty && pEntry->pCont==pCont ){
++        pDb = bcvfsFindDatabaseById(pCont->pMan,pEntry->iDbId);
++        if( pDb==0 || pEntry->iDbPos<0 || pEntry->iDbPos>=pDb->nBlkOrig
++         || pDb->aBlkOrig==0 || pEntry->nName!=nName
++        ){
++          return SQLITE_CORRUPT;
++        }
++        aBlock = &pDb->aBlkOrig[(i64)pEntry->iDbPos*nName];
++        nOldName = pEntry->nName;
++        bOldStaged = pEntry->bStaged;
++        memcpy(aOldName,pEntry->aName,nOldName);
++
++        bcvfsHashRemove(pCommon,pEntry);
++        memcpy(pEntry->aName,aBlock,nName);
++        pEntry->nName = nName;
++        pEntry->bDirty = 0;
++        pEntry->bStaged = 0;
++        bcvfsHashAdd(pCommon,pEntry);
++        rc = bcvfsWriteBlockClean(pCommon,pEntry);
++        if( rc==SQLITE_OK ) bcvfsLruAddIf(pCommon,pEntry);
++        if( rc!=SQLITE_OK ){
++          bcvfsHashRemove(pCommon,pEntry);
++          memcpy(pEntry->aName,aOldName,nOldName);
++          pEntry->nName = nOldName;
++          pEntry->bDirty = 1;
++          pEntry->bStaged = bOldStaged;
++          bcvfsHashAdd(pCommon,pEntry);
++          {
++            int rcDirty = bcvfsWriteBlock(pFs,0,0,pEntry);
++            if( rcDirty!=SQLITE_OK ) rc = rcDirty;
++          }
++        }
++      }
++      pEntry = pNext;
++    }
++  }
++  return rc;
++}
++
+ /*
+ ** Complete recovery of a publication whose remote PUT succeeded before the
+ ** local manifest install. This is used only after the caller has fetched the
+-** remote manifest and it matches the durable marker. If newer staged rows or
+-** dirty resident blocks exist, leave the marker and let normal collision
+-** handling preserve the newer local state.
++** remote manifest and it matches the durable marker. Newer staged rows or a
++** dirty resident block whose full bytes differ from the candidate leave the
++** marker in place for normal collision handling.
+ */
+ static int bcvfsPendingPublishTryInstall(
+   sqlite3_bcvfs *pFs,
++  BcvDispatch *pDisp,
++  BcvContainer *pBcv,
+   Container *pCont,
+   Manifest **ppMan
+ ){
+   Manifest *pMan = *ppMan;
++  sqlite3_file *pCache = 0;
++  u8 *aLocal = 0;
+   i64 iMax = 0;
+   int rc;
+   int ii;
++  int bHasDirty = 0;
+ 
+   rc = bcvfsPendingPublishMatches(
+       &pFs->c, pCont->zName, pMan, &iMax
+@@ -4497,14 +4637,42 @@ static int bcvfsPendingPublishTryInstall(
+     CacheEntry *pEntry;
+     for(pEntry=pFs->c.aHash[ii]; pEntry; pEntry=pEntry->pHashNext){
+       if( pEntry->bDirty && pEntry->pCont==pCont ){
+-        return SQLITE_NOTFOUND;
++        bHasDirty = 1;
++        break;
+       }
+     }
++    if( bHasDirty ) break;
++  }
++  if( bHasDirty ){
++    if( pMan->szBlk<=0 ) return SQLITE_CORRUPT;
++    aLocal = (u8*)sqlite3_malloc(pMan->szBlk);
++    if( aLocal==0 ) return SQLITE_NOMEM;
++    rc = bcvOpenLocal(pFs->zCacheFile,0,0,&pCache);
++    if( rc==SQLITE_OK ){
++      for(ii=0; ii<pFs->c.nHash && rc==SQLITE_OK; ii++){
++        CacheEntry *pEntry;
++        for(pEntry=pFs->c.aHash[ii]; pEntry && rc==SQLITE_OK;
++            pEntry=pEntry->pHashNext
++        ){
++          if( pEntry->bDirty && pEntry->pCont==pCont ){
++            rc = bcvfsPendingPublishDirtyMatches(
++                pDisp,pBcv,pMan,pEntry,pCache,aLocal
++            );
++          }
++        }
++      }
++    }
++    bcvCloseLocal(pCache);
++    sqlite3_free(aLocal);
++    if( rc!=SQLITE_OK ) return rc;
+   }
+ 
+   /* bcvManifestInstall() takes ownership of pMan even on an error. */
+   *ppMan = 0;
+   rc = bcvManifestInstall(&pFs->c, pCont, pMan);
++  if( rc==SQLITE_OK ){
++    rc = bcvfsPendingPublishCleanDirtyEntries(pFs,pCont);
++  }
+   if( rc==SQLITE_OK ){
+     for(ii=0; ii<pFs->c.nHash; ii++){
+       CacheEntry *pEntry;
+@@ -4564,7 +4732,7 @@ static int bcvfsPollContainer(
+     ENTER_VFS_MUTEX; {
+       if( rc==SQLITE_OK ){
+         int rcRecover = bcvfsPendingPublishTryInstall(
+-            pFs, pCont, &pMan
++            pFs, pDisp, pBcv, pCont, &pMan
+         );
+         if( rcRecover!=SQLITE_OK && rcRecover!=SQLITE_NOTFOUND ){
+           rc = rcRecover;

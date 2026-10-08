@@ -31,6 +31,7 @@ struct StagedRow {
     db: i64,
     dbpos: i64,
     blockid: String,
+    generation: String,
     sequence: i64,
 }
 
@@ -273,7 +274,7 @@ fn parse_manifest(bytes: &[u8]) -> ManifestBlocks {
 fn staged_rows(metadata: &Connection, container: &str) -> Vec<StagedRow> {
     let mut statement = metadata
         .prepare(
-            "SELECT db, dbpos, hex(blockid), sequence FROM staged \
+            "SELECT db, dbpos, hex(blockid), hex(generation), sequence FROM staged \
              WHERE container = ?1 ORDER BY sequence",
         )
         .expect("prepare staged-object query");
@@ -283,7 +284,8 @@ fn staged_rows(metadata: &Connection, container: &str) -> Vec<StagedRow> {
                 db: row.get(0)?,
                 dbpos: row.get(1)?,
                 blockid: row.get::<_, String>(2)?.to_ascii_lowercase(),
-                sequence: row.get(3)?,
+                generation: row.get::<_, String>(3)?.to_ascii_lowercase(),
+                sequence: row.get(4)?,
             })
         })
         .expect("query staged objects")
@@ -294,7 +296,7 @@ fn staged_rows(metadata: &Connection, container: &str) -> Vec<StagedRow> {
 fn staged_gc_rows(metadata: &Connection, container: &str) -> Vec<StagedRow> {
     let mut statement = metadata
         .prepare(
-            "SELECT db, dbpos, hex(blockid), sequence FROM staged_gc \
+            "SELECT db, dbpos, hex(blockid), hex(generation), sequence FROM staged_gc \
              WHERE container = ?1 ORDER BY sequence",
         )
         .expect("prepare staged-GC query");
@@ -304,7 +306,8 @@ fn staged_gc_rows(metadata: &Connection, container: &str) -> Vec<StagedRow> {
                 db: row.get(0)?,
                 dbpos: row.get(1)?,
                 blockid: row.get::<_, String>(2)?.to_ascii_lowercase(),
-                sequence: row.get(3)?,
+                generation: row.get::<_, String>(3)?.to_ascii_lowercase(),
+                sequence: row.get(4)?,
             })
         })
         .expect("query staged-GC rows")
@@ -680,14 +683,54 @@ fn run_backend(backend: &str, cache: &Path, vfs: &'static BlockCacheVfs) {
     // the exact metadata lookup predicate.  The metadata fixture is
     // deliberate: replaying SQL writes is not guaranteed to recreate
     // identical content-addressed page IDs after a rollback.
+    let control = vfs
+        .open(format!("/{alias}"))
+        .expect("open native block view for staged candidate selection");
+    let current_blocks = control
+        .prepare(
+            "SELECT blockno, blockid, cache, dirty FROM bcv_block \
+             WHERE container = ?1 AND database = 'streaming.sqlite'",
+        )
+        .expect("prepare current block view")
+        .query_map([alias.as_str()], |row| {
+            let blockid = row
+                .get::<_, Option<Vec<u8>>>(1)?
+                .map(|bytes| block_id(&bytes));
+            Ok((
+                row.get::<_, i64>(0)?,
+                blockid,
+                row.get::<_, bool>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .expect("query current block view")
+        .map(|row| {
+            let (blockno, blockid, cache, dirty) = row.expect("read current block view");
+            (blockno, (blockid, cache, dirty))
+        })
+        .collect::<BTreeMap<_, _>>();
+    drop(control);
+    // This candidate is a newly appended block, so the native control view
+    // has no original manifest block ID. With no resident cache entry and no
+    // newer staged row, its latest exact generation binding is the current
+    // local mapping.
     let same_content_restaged = staged
         .iter()
         .rev()
         .find(|row| {
             row.sequence > staged_gc_max_before_upload
+                && row.generation == row.blockid
                 && !staged.iter().any(|newer| {
                     newer.db == row.db && newer.dbpos == row.dbpos && newer.sequence > row.sequence
                 })
+                && current_blocks
+                    .get(&row.dbpos)
+                    .is_some_and(|(blockid, cached, dirty)| {
+                        (blockid.is_none()
+                            || blockid.as_deref() == Some(row.blockid.as_str()))
+                            && !cached
+                            && !dirty
+                    })
                 && metadata
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM block \
@@ -700,7 +743,9 @@ fn run_backend(backend: &str, cache: &Path, vfs: &'static BlockCacheVfs) {
         })
         .cloned()
         .unwrap_or_else(|| {
-            panic!("same-generation restage needs an evicted current mapping: staged={staged:?}")
+            panic!(
+                "same-generation restage needs the latest nonresident current mapping: staged={staged:?}, current_blocks={current_blocks:?}"
+            )
         });
     assert!(
         same_content_restaged.sequence > 0,
@@ -767,12 +812,12 @@ fn run_backend(backend: &str, cache: &Path, vfs: &'static BlockCacheVfs) {
         .map(|row| {
             let (bucket, prefix) = container.split_once('/').expect("container prefix");
             let _ = bucket;
-            format!("{prefix}/{}.bcv", row.blockid)
+            format!("{prefix}/blocks/{}.bcv", row.blockid)
         })
         .collect();
     let (bucket, prefix) = container.split_once('/').expect("container prefix");
     let _ = bucket;
-    let rollback_target_key = format!("{prefix}/{}.bcv", rollback_target.blockid);
+    let rollback_target_key = format!("{prefix}/blocks/{}.bcv", rollback_target.blockid);
     let after_stage_keys = list_remote_keys(backend, &endpoint, &container);
     assert!(
         after_stage_keys.contains(&rollback_target_key),
@@ -873,7 +918,7 @@ fn run_backend(backend: &str, cache: &Path, vfs: &'static BlockCacheVfs) {
     for id in &final_manifest.live {
         let (bucket, prefix) = container.split_once('/').expect("container prefix");
         let _ = bucket;
-        let key = format!("{prefix}/{id}.bcv");
+        let key = format!("{prefix}/blocks/{id}.bcv");
         assert!(
             after_cleanup_keys.contains(&key),
             "cleanup deleted live/pinned/shared block {id}"
@@ -881,7 +926,7 @@ fn run_backend(backend: &str, cache: &Path, vfs: &'static BlockCacheVfs) {
     }
     let removed_superseded = superseded_ids.iter().any(|id| {
         let (_, prefix) = container.split_once('/').expect("container prefix");
-        !after_cleanup_keys.contains(&format!("{prefix}/{id}.bcv"))
+        !after_cleanup_keys.contains(&format!("{prefix}/blocks/{id}.bcv"))
     });
     assert!(
         removed_superseded,
@@ -892,7 +937,7 @@ fn run_backend(backend: &str, cache: &Path, vfs: &'static BlockCacheVfs) {
         !after_cleanup_keys.contains(&rollback_target_key),
         "cleanup did not remove the exact reverted staged object: target={rollback_target:?}, keys={after_cleanup_keys:?}"
     );
-    let same_content_key = format!("{prefix}/{}.bcv", same_content_restaged.blockid);
+    let same_content_key = format!("{prefix}/blocks/{}.bcv", same_content_restaged.blockid);
     assert!(
         after_cleanup_keys.contains(&same_content_key),
         "cleanup deleted the live same-content restage: restaged={same_content_restaged:?}, keys={after_cleanup_keys:?}"

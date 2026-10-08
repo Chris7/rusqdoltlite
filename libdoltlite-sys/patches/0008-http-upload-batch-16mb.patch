@@ -3,7 +3,7 @@ diff --git a/doltlite.c b/doltlite.c
 +++ b/doltlite.c
 @@ -564675,7 +564675,7 @@
  
- #define HTTP_RESP_MAX_BYTES ((i64)128 * 1024 * 1024)
+ #define HTTP_RESP_MAX_BYTES ((i64)1024 * 1024 * 1024)
  #define HTTP_HEADER_MAX_BYTES ((i64)64 * 1024)
 -#define HTTP_UPLOAD_BATCH_MAX ((i64)32 * 1024 * 1024)
 +#define HTTP_UPLOAD_BATCH_MAX ((i64)16 * 1024 * 1024)
