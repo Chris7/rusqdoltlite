@@ -8,7 +8,6 @@ on:
   pull_request:
     branches:
       - master
-      - remoteserver-uri
   schedule:
     - cron: "00 01 * * *"
 env:

@@ -179,7 +179,7 @@ fn storage(endpoint: &str, container: &str) -> Storage {
 fn stage_large_update(cache: &Path, endpoint: &str, container: &str, state: &Path) {
     let storage = storage(endpoint, container);
     let vfs = new_vfs(cache);
-    vfs.initialize_container(&storage)
+    vfs.initialize_container(&storage, None)
         .expect("initialize conflict-test container");
 
     let local_dir = tempfile::tempdir().expect("local database directory");

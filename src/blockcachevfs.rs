@@ -18,6 +18,8 @@ use crate::{Connection, OpenFlags, Result};
 use crate::ffi::bcvutil as raw_util;
 use crate::ffi::blockcachevfs as raw;
 
+const MIN_CONTAINER_BLOCK_SIZE: u32 = 32 * 1024;
+
 /// An error returned by an authentication callback.
 #[derive(Debug, Clone)]
 pub struct AuthError(
@@ -1611,10 +1613,23 @@ impl BlockCacheVfs {
     /// call it for a new storage container or prefix. CBS also attempts to
     /// create a provider bucket when its backend supports that operation; for
     /// providers where bucket creation is privileged, create it with the
-    /// provider's management API first.
-    pub fn initialize_container(&self, storage: &Storage) -> Result<()> {
+    /// provider's management API first. Pass `None` to use CBS's native
+    /// default block size of 4 MiB. An explicit `Some(block_size)` is measured
+    /// in bytes and must be a power of two, at least 32 KiB, and representable
+    /// as the native signed C `int`. The choice applies only when creating a
+    /// new manifest. If a manifest already exists, initialization fails and
+    /// leaves it unchanged, regardless of its block size.
+    ///
+    /// Every container attached to one VFS/cache must use the same block size.
+    /// Configure the local cache to hold at least one block and to be an exact
+    /// multiple of the block size.
+    pub fn initialize_container(&self, storage: &Storage, block_size: Option<u32>) -> Result<()> {
+        let block_size = block_size
+            .map(validate_container_block_size)
+            .transpose()?
+            .unwrap_or(0);
         let handle = self.open_bcv(storage, "initialize_container")?;
-        let rc = unsafe { raw_util::sqlite3_bcv_create_if_not_exists(handle.0, 0, 0) };
+        let rc = unsafe { raw_util::sqlite3_bcv_create_if_not_exists(handle.0, 0, block_size) };
         bcv_result("initialize_container", rc, &handle)
     }
 
@@ -1853,6 +1868,7 @@ pub struct CloudConnectionUri {
     endpoint: Option<String>,
     upload_concurrency: Option<u32>,
     uri: String,
+    block_size: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -2026,6 +2042,7 @@ fn bootstrap_session_database(
     database: &str,
     flags: OpenFlags,
     create: bool,
+    block_size: Option<u32>,
     credentials_to_redact: &[String],
 ) -> Result<()> {
     let spec = AttachSpec::new(storage.clone());
@@ -2040,7 +2057,7 @@ fn bootstrap_session_database(
         if !create || !missing {
             return Err(sanitize_cloud_error(error, credentials_to_redact));
         }
-        let initialization_error = vfs.initialize_container(storage).err();
+        let initialization_error = vfs.initialize_container(storage, block_size).err();
         if let Err(attach_error) = vfs.attach(&bootstrap_spec) {
             let error =
                 initialization_error.unwrap_or_else(|| normalize_container_not_found(attach_error));
@@ -2207,6 +2224,7 @@ fn open_connection_uri_inner(
             &uri.database,
             flags,
             create,
+            uri.block_size,
             &credentials_to_redact,
         )?;
         let attachment = vfs
@@ -2235,7 +2253,7 @@ fn open_connection_uri_inner(
                 return Err(sanitize_cloud_error(error, &credentials_to_redact));
             }
 
-            let initialization_error = vfs.initialize_container(&storage).err();
+            let initialization_error = vfs.initialize_container(&storage, uri.block_size).err();
             if let Err(attach_error) = vfs.attach(&AttachSpec::new(storage).alias(&alias)) {
                 let error = initialization_error
                     .unwrap_or_else(|| normalize_container_not_found(attach_error));
@@ -2370,6 +2388,20 @@ impl CloudConnectionUri {
         if vfs != "blockcachevfs" {
             return Err(cbs_uri_error("CBS URI must select vfs=blockcachevfs"));
         }
+        let block_size = options
+            .remove("block_size")
+            .map(|value| {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(cbs_uri_error("invalid CBS block_size"));
+                }
+                let block_size = value
+                    .parse::<u32>()
+                    .map_err(|_| cbs_uri_error("invalid CBS block_size"))?;
+                validate_container_block_size(block_size)
+                    .map_err(|_| cbs_uri_error("invalid CBS block_size"))?;
+                Ok(block_size)
+            })
+            .transpose()?;
         let storage = if scheme == "gcs" {
             let project = options
                 .remove("project")
@@ -2461,6 +2493,7 @@ impl CloudConnectionUri {
             endpoint,
             upload_concurrency,
             uri: uri.to_owned(),
+            block_size,
         })
     }
 
@@ -2886,6 +2919,22 @@ impl Drop for BcvHandle {
     }
 }
 
+fn validate_container_block_size(block_size: u32) -> Result<c_int> {
+    if block_size < MIN_CONTAINER_BLOCK_SIZE || !block_size.is_power_of_two() {
+        return Err(container_block_size_error());
+    }
+    c_int::try_from(block_size).map_err(|_| container_block_size_error())
+}
+
+fn container_block_size_error() -> Error {
+    Error::SqliteFailure(
+        crate::ffi::Error::new(crate::ffi::SQLITE_RANGE),
+        Some(
+            "initialize_container: block size must be a power of two, at least 32768 bytes, and fit in a signed C int".into(),
+        ),
+    )
+}
+
 fn bcv_result(operation: &str, rc: c_int, handle: &BcvHandle) -> Result<()> {
     if rc == crate::ffi::SQLITE_OK {
         Ok(())
@@ -3127,6 +3176,40 @@ unsafe extern "C" fn auth_refresh_trampoline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_block_size_accepts_supported_boundaries() {
+        assert_eq!(validate_container_block_size(32 * 1024).unwrap(), 32 * 1024);
+        assert_eq!(validate_container_block_size(64 * 1024).unwrap(), 64 * 1024);
+        assert_eq!(
+            validate_container_block_size(1 << 30).unwrap(),
+            1 << 30,
+            "the largest representable power-of-two block size should be accepted"
+        );
+    }
+
+    #[test]
+    fn invalid_container_block_sizes_fail_before_opening_management_handle() -> Result<()> {
+        let directory = tempfile::tempdir().expect("temporary CBS directory");
+        let vfs = BlockCacheVfs::builder(directory.path())?
+            .auth_callback(|_, _, _| panic!("invalid sizes must fail before authentication"))
+            .init_owned()?;
+        let invalid_storage = Storage::new("google\0?api=json", "project", "bucket");
+
+        for block_size in [0, 16 * 1024, 32 * 1024 + 2, 48 * 1024, 1 << 31] {
+            let error = vfs
+                .initialize_container(&invalid_storage, Some(block_size))
+                .expect_err("invalid block size should be rejected");
+            assert!(
+                matches!(&error, Error::SqliteFailure(native, Some(message))
+                    if native.extended_code == crate::ffi::SQLITE_RANGE
+                        && message.contains("block size")),
+                "invalid block size {block_size} should fail validation before storage handling: {error:?}"
+            );
+        }
+
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3576,6 +3659,7 @@ mod tests {
         .expect("valid GCS URI without endpoint");
         assert!(gcs.endpoint.is_none());
         assert_eq!(gcs.upload_concurrency, None);
+        assert_eq!(gcs.block_size, None);
         let gcs_storage = gcs.storage_for_container("bucket/repository");
         assert_eq!(gcs_storage.provider, "google?api=json");
         assert_eq!(gcs_storage.account, "project");
@@ -3586,6 +3670,7 @@ mod tests {
         .expect("valid S3 URI without endpoint");
         assert!(s3.endpoint.is_none());
         assert_eq!(s3.upload_concurrency, None);
+        assert_eq!(s3.block_size, None);
         let s3_storage = s3.storage_for_container("bucket/repository");
         assert_eq!(s3_storage.provider, "s3?region=us-west-2");
         assert_eq!(s3_storage.account, "access");
@@ -3645,6 +3730,67 @@ mod tests {
                 "s3://bucket/repository?vfs=blockcachevfs&region=us-west-2&access_id=access&secret_access_key=secret&{query}"
             );
             assert!(CloudConnectionUri::parse(&uri).is_err(), "accepted {uri}");
+        }
+    }
+
+    #[test]
+    fn cloud_connection_uri_block_size_is_decimal_bytes_for_both_providers() {
+        let provider_queries = [
+            (
+                "gcs",
+                "vfs=blockcachevfs&project=project&access_token=gcs-secret",
+            ),
+            (
+                "s3",
+                "vfs=blockcachevfs&region=us-east-1&access_id=access&secret_access_key=s3-secret",
+            ),
+        ];
+
+        for (scheme, query) in provider_queries {
+            let base_uri = format!("{scheme}://bucket/repository?{query}");
+            assert_eq!(
+                CloudConnectionUri::parse(&base_uri)
+                    .expect("valid URI without an explicit block size")
+                    .block_size,
+                None,
+                "omitting block_size should use the native default for {scheme}"
+            );
+            assert_eq!(
+                CloudConnectionUri::parse(&format!("{base_uri}&block_size=65536"))
+                    .expect("valid URI with an explicit block size")
+                    .block_size,
+                Some(64 * 1024)
+            );
+
+            for invalid in [
+                "",
+                "0",
+                "zero",
+                "65536KiB",
+                "4294967296",
+                "16384",
+                "32769",
+                "32770",
+                "49152",
+                "2147483648",
+            ] {
+                let error = CloudConnectionUri::parse(&format!("{base_uri}&block_size={invalid}"))
+                    .err()
+                    .expect("invalid block_size must fail during URI parsing");
+                assert!(
+                    error.to_string().contains("invalid CBS block_size"),
+                    "block_size errors should be generic: {error}"
+                );
+                assert!(!error.to_string().contains("gcs-secret"));
+                assert!(!error.to_string().contains("s3-secret"));
+            }
+
+            let duplicate = CloudConnectionUri::parse(&format!(
+                "{base_uri}&block_size=65536&block_size=131072"
+            ))
+            .err()
+            .expect("duplicate block_size options must be rejected");
+            assert!(duplicate.to_string().contains("duplicate CBS URI option"));
         }
     }
 
