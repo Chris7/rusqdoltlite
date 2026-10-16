@@ -169,6 +169,8 @@ mod remote_progress;
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 pub mod remote_server;
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+pub use crate::remote_progress::{DoltCloneProgressEvent, DoltCloneProgressGuard};
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub use crate::remote_progress::{DoltPushProgressEvent, DoltPushProgressGuard};
 mod row;
