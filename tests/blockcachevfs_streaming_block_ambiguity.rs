@@ -30,6 +30,7 @@ const CACHE_ENV: &str = "BCV_STREAMING_BLOCK_AMBIGUITY_CACHE";
 const FRESH_CACHE_ENV: &str = "BCV_STREAMING_BLOCK_AMBIGUITY_FRESH_CACHE";
 const STATE_ENV: &str = "BCV_STREAMING_BLOCK_AMBIGUITY_STATE";
 const ENDPOINT_ENV: &str = "BCV_STREAMING_BLOCK_AMBIGUITY_ENDPOINT";
+const PROXY_CONTROL_ENV: &str = "BCV_STREAMING_BLOCK_AMBIGUITY_PROXY_CONTROL";
 const CONTAINER_ENV: &str = "BCV_STREAMING_BLOCK_AMBIGUITY_CONTAINER";
 const ALIAS: &str = "streaming_block_ambiguity";
 const FAILURE_PHASE_ENV: &str = "BCV_STREAMING_BLOCK_AMBIGUITY_FAILURE_PHASE";
@@ -187,48 +188,6 @@ fn new_vfs(cache: &Path) -> &'static BlockCacheVfs {
         .expect("initialize block-cache VFS")
 }
 
-fn set_proxy(proxy: &str) {
-    // SAFETY: each env-mutating phase runs in its own child process with an
-    // exact test filter. Proxy setup and VFS operations are sequential, and
-    // the proxy worker uses its captured URL rather than reading process env.
-    unsafe {
-        for name in [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ] {
-            std::env::set_var(name, proxy);
-        }
-        for name in ["NO_PROXY", "no_proxy"] {
-            std::env::set_var(name, "");
-        }
-    }
-}
-
-fn clear_proxy() {
-    // SAFETY: called after synchronous VFS operations complete in the
-    // dedicated child process described in `set_proxy`; the proxy worker uses
-    // captured values and does not read process env.
-    unsafe {
-        for name in [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ] {
-            std::env::remove_var(name);
-        }
-        for name in ["NO_PROXY", "no_proxy"] {
-            std::env::set_var(name, "127.0.0.1,localhost");
-        }
-    }
-}
-
 struct BlockPutAmbiguityProxy {
     stop: Arc<AtomicBool>,
     block_puts: Arc<AtomicUsize>,
@@ -311,12 +270,9 @@ impl BlockPutAmbiguityProxy {
         }
     }
 
-    fn drop_next_block_response(&self) {
-        self.drop_next_block.store(true, Ordering::Release);
-    }
-
-    fn set_drop_all_block_responses(&self, drop: bool) {
-        self.drop_all_blocks.store(drop, Ordering::Release);
+    fn clear_faults(&self) {
+        self.drop_next_block.store(false, Ordering::Release);
+        self.drop_all_blocks.store(false, Ordering::Release);
     }
 
     fn block_puts(&self) -> usize {
@@ -358,6 +314,21 @@ fn handle_proxy_connection(
     let request = read_http_request(&mut client)?;
     let (method, target) = request_line(&request);
     let path = request_path(target);
+    if method.eq_ignore_ascii_case("POST") && path.starts_with("/__control/") {
+        match path {
+            "/__control/drop-next-block-response" => drop_next_block.store(true, Ordering::Release),
+            "/__control/drop-all-block-responses" => drop_all_blocks.store(true, Ordering::Release),
+            "/__control/allow-block-responses" => drop_all_blocks.store(false, Ordering::Release),
+            _ => {
+                client.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )?;
+                return client.shutdown(Shutdown::Both);
+            }
+        }
+        client.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return client.shutdown(Shutdown::Both);
+    }
     let block_put =
         method.eq_ignore_ascii_case("PUT") && path.contains("/blocks/") && path.ends_with(".bcv");
     if block_put {
@@ -370,6 +341,34 @@ fn handle_proxy_connection(
         dropped_responses.fetch_add(1, Ordering::Relaxed);
     }
     forward_request(client, upstream_address, request, discard_response)
+}
+
+fn set_proxy_control(path: &str) {
+    let control_url = required_env(PROXY_CONTROL_ENV);
+    let address = control_url
+        .strip_prefix("http://")
+        .expect("proxy control URL must use HTTP");
+    let mut stream = TcpStream::connect(address).expect("connect to parent block proxy");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set block proxy control read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set block proxy control write timeout");
+    write!(
+        stream,
+        "POST /__control/{path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send block proxy control request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read block proxy control response");
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "block proxy rejected control request: {}",
+        String::from_utf8_lossy(&response)
+    );
 }
 
 fn request_line(request: &[u8]) -> (&str, &str) {
@@ -581,11 +580,22 @@ fn run_phase(
     phase_env: &str,
     phase: &str,
     values: &[(&str, &str)],
+    proxy: &BlockPutAmbiguityProxy,
 ) {
+    proxy.clear_faults();
     let status = Command::new(executable)
         .args(["--ignored", "--exact", test_name, "--nocapture"])
         .env(phase_env, phase)
         .envs(values.iter().copied())
+        .env("HTTP_PROXY", &proxy.url)
+        .env("http_proxy", &proxy.url)
+        .env("HTTPS_PROXY", &proxy.url)
+        .env("https_proxy", &proxy.url)
+        .env("ALL_PROXY", &proxy.url)
+        .env("all_proxy", &proxy.url)
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .env(PROXY_CONTROL_ENV, &proxy.url)
         .status()
         .unwrap_or_else(|error| panic!("spawn block ambiguity phase {phase}: {error}"));
     assert!(
@@ -600,8 +610,6 @@ fn phase_one() {
     let state = PathBuf::from(required_env(STATE_ENV));
     let container = required_env(CONTAINER_ENV);
     let storage = storage(&endpoint, &container);
-    let proxy = BlockPutAmbiguityProxy::start(&endpoint);
-    set_proxy(&proxy.url);
     let vfs = new_vfs(&cache);
     vfs.initialize_container(&storage, None)
         .expect("initialize block ambiguity container through proxy");
@@ -628,7 +636,7 @@ fn phase_one() {
         .expect("attach block ambiguity database");
     let before = fetch_manifest(&endpoint, &container);
     let objects_before = list_remote_objects(&endpoint, &container);
-    proxy.drop_next_block_response();
+    set_proxy_control("drop-next-block-response");
     let db = vfs
         .open(format!("/{ALIAS}/streaming.sqlite"))
         .expect("open block ambiguity database");
@@ -651,17 +659,7 @@ fn phase_one() {
         .expect("count locally committed rows after ambiguous PUT");
     assert_eq!(count, ROWS);
     drop(db);
-    clear_proxy();
-
-    assert_eq!(
-        proxy.dropped_responses(),
-        1,
-        "the proxy must drop exactly one staged block PUT response"
-    );
-    assert!(
-        proxy.block_puts() > 0,
-        "the update must issue at least one staged block PUT"
-    );
+    set_proxy_control("allow-block-responses");
     assert_eq!(
         before,
         fetch_manifest(&endpoint, &container),
@@ -673,7 +671,6 @@ fn phase_one() {
         "the object store must contain the staged block despite the lost response: before={objects_before}, after={objects_after}"
     );
     fs::write(&state, before).expect("save pre-publication manifest");
-    drop(proxy);
 }
 
 fn assert_rows(vfs: &'static BlockCacheVfs, alias: &str) {
@@ -740,8 +737,6 @@ fn failure_phase_one() {
     let state = PathBuf::from(required_env(FAILURE_STATE_ENV));
     let container = required_env(FAILURE_CONTAINER_ENV);
     let storage = storage(&endpoint, &container);
-    let proxy = BlockPutAmbiguityProxy::start(&endpoint);
-    set_proxy(&proxy.url);
     let vfs = new_vfs(&cache);
     vfs.initialize_container(&storage, None)
         .expect("initialize block ambiguity failure container through proxy");
@@ -789,7 +784,7 @@ fn failure_phase_one() {
     let before = fetch_manifest(&endpoint, &container);
     let objects_before = list_remote_objects(&endpoint, &container);
 
-    proxy.set_drop_all_block_responses(true);
+    set_proxy_control("drop-all-block-responses");
     let db = vfs
         .open(format!("/{FAILURE_ALIAS}/streaming.sqlite"))
         .expect("reopen database for ambiguous failure update");
@@ -816,20 +811,12 @@ fn failure_phase_one() {
         }
     }
     let _ = db.execute_batch("ROLLBACK");
-    clear_proxy();
+    set_proxy_control("allow-block-responses");
 
     let error = failed.expect("dropping every block PUT response must surface an error");
     assert!(
         matches!(error, rusqlite::Error::SqliteFailure(_, _)),
         "unexpected ambiguous block PUT error: {error:?}"
-    );
-    assert!(
-        proxy.dropped_responses() > 0,
-        "the failure update must drop at least one staged block response"
-    );
-    assert!(
-        proxy.block_puts() > 0,
-        "the failure update must issue a staged block PUT"
     );
     assert_eq!(
         before,
@@ -848,7 +835,6 @@ fn failure_phase_one() {
     drop(db);
     assert_rows(vfs, FAILURE_ALIAS);
     fs::write(&state, before).expect("save baseline manifest");
-    drop(proxy);
 }
 
 fn failure_phase_two() {
@@ -873,8 +859,6 @@ fn open_upload_phase() {
     let cache = PathBuf::from(required_env(OPEN_UPLOAD_CACHE_ENV));
     let container = required_env(OPEN_UPLOAD_CONTAINER_ENV);
     let storage = storage(&endpoint, &container);
-    let proxy = BlockPutAmbiguityProxy::start(&endpoint);
-    set_proxy(&proxy.url);
     let vfs = new_vfs(&cache);
     vfs.initialize_container(&storage, None)
         .expect("initialize open-upload container");
@@ -924,7 +908,7 @@ fn open_upload_phase() {
     // crash cannot be converted into a Result: the parent phase runner will
     // observe a signal and fail this test.
     let result = vfs.upload(OPEN_UPLOAD_ALIAS);
-    clear_proxy();
+    set_proxy_control("allow-block-responses");
     match result {
         Ok(()) => assert_ne!(
             before,
@@ -944,7 +928,6 @@ fn open_upload_phase() {
         }
     }
     drop(db);
-    drop(proxy);
 }
 
 fn combined_phase_one() {
@@ -953,8 +936,6 @@ fn combined_phase_one() {
     let state = PathBuf::from(required_env(COMBINED_STATE_ENV));
     let container = required_env(COMBINED_CONTAINER_ENV);
     let storage = storage(&endpoint, &container);
-    let proxy = BlockPutAmbiguityProxy::start(&endpoint);
-    set_proxy(&proxy.url);
     let vfs = new_vfs(&cache);
     vfs.initialize_container(&storage, None)
         .expect("initialize combined open-upload container");
@@ -1008,7 +989,7 @@ fn combined_phase_one() {
     drop(db);
     let objects_before = list_remote_objects(&endpoint, &container);
 
-    proxy.set_drop_all_block_responses(true);
+    set_proxy_control("drop-all-block-responses");
     let db = vfs
         .open(format!("/{COMBINED_ALIAS}/streaming.sqlite"))
         .expect("reopen combined database for ambiguous update");
@@ -1036,16 +1017,12 @@ fn combined_phase_one() {
     }
     let _ = db.execute_batch("ROLLBACK");
     drop(db);
-    clear_proxy();
+    set_proxy_control("allow-block-responses");
 
     let error = failed.expect("combined ambiguous update must return an error");
     assert!(
         matches!(error, rusqlite::Error::SqliteFailure(_, _)),
         "unexpected combined ambiguous update error: {error:?}"
-    );
-    assert!(
-        proxy.dropped_responses() > 0,
-        "combined ambiguous update must drop a staged block response"
     );
     assert_eq!(
         baseline_manifest,
@@ -1058,7 +1035,6 @@ fn combined_phase_one() {
         "combined ambiguous update must leave a stored remote block object: before={objects_before}, after={objects_after}"
     );
     fs::write(&state, baseline_manifest).expect("save combined baseline manifest");
-    drop(proxy);
 }
 
 fn combined_phase_two() {
@@ -1098,6 +1074,7 @@ fn ambiguous_staged_block_put_failure_preserves_committed_data() {
     let state = tempfile::tempdir().expect("block ambiguity failure state directory");
     let container = format!("{}/cbs", unique_suffix());
     let state_path = state.path().join("manifest-before.bin");
+    let proxy = BlockPutAmbiguityProxy::start(&endpoint);
     let values = [
         (
             FAILURE_CACHE_ENV,
@@ -1117,7 +1094,18 @@ fn ambiguous_staged_block_put_failure_preserves_committed_data() {
             FAILURE_PHASE_ENV,
             phase,
             &values,
+            &proxy,
         );
+        if phase == "one" {
+            assert!(
+                proxy.dropped_responses() > 0,
+                "the failure update must drop at least one staged block response"
+            );
+            assert!(
+                proxy.block_puts() > 0,
+                "the failure update must issue a staged block PUT"
+            );
+        }
     }
 }
 
@@ -1138,6 +1126,7 @@ fn open_connection_upload_returns_controlled_result() {
         .unwrap_or_else(|_| "http://127.0.0.1:4566".into());
     let cache = tempfile::tempdir().expect("open-upload cache directory");
     let container = format!("{}/cbs", unique_suffix());
+    let proxy = BlockPutAmbiguityProxy::start(&endpoint);
     let values = [
         (
             OPEN_UPLOAD_CACHE_ENV,
@@ -1155,6 +1144,7 @@ fn open_connection_upload_returns_controlled_result() {
         OPEN_UPLOAD_PHASE_ENV,
         "one",
         &values,
+        &proxy,
     );
 }
 
@@ -1178,6 +1168,7 @@ fn open_upload_then_ambiguous_update_preserves_baseline() {
     let state = tempfile::tempdir().expect("combined ambiguity state directory");
     let container = format!("{}/cbs", unique_suffix());
     let state_path = state.path().join("manifest-before.bin");
+    let proxy = BlockPutAmbiguityProxy::start(&endpoint);
     let values = [
         (
             COMBINED_CACHE_ENV,
@@ -1197,7 +1188,14 @@ fn open_upload_then_ambiguous_update_preserves_baseline() {
             COMBINED_PHASE_ENV,
             phase,
             &values,
+            &proxy,
         );
+        if phase == "one" {
+            assert!(
+                proxy.dropped_responses() > 0,
+                "combined ambiguous update must drop a staged block response"
+            );
+        }
     }
 }
 
@@ -1223,6 +1221,7 @@ fn ambiguous_staged_block_put_is_recoverable_after_restart() {
     let state = tempfile::tempdir().expect("block ambiguity state directory");
     let container = format!("{}/cbs", unique_suffix());
     let state_path = state.path().join("manifest-before.bin");
+    let proxy = BlockPutAmbiguityProxy::start(&endpoint);
     let values = [
         (
             CACHE_ENV,
@@ -1246,6 +1245,18 @@ fn ambiguous_staged_block_put_is_recoverable_after_restart() {
             PHASE_ENV,
             phase,
             &values,
+            &proxy,
         );
+        if phase == "one" {
+            assert_eq!(
+                proxy.dropped_responses(),
+                1,
+                "the proxy must drop exactly one staged block PUT response"
+            );
+            assert!(
+                proxy.block_puts() > 0,
+                "the update must issue at least one staged block PUT"
+            );
+        }
     }
 }

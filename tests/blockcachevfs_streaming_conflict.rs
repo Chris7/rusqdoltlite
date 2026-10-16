@@ -29,6 +29,7 @@ const CACHE_ENV: &str = "BCV_STREAMING_CONFLICT_CACHE";
 const FRESH_CACHE_ENV: &str = "BCV_STREAMING_CONFLICT_FRESH_CACHE";
 const STATE_ENV: &str = "BCV_STREAMING_CONFLICT_STATE";
 const ENDPOINT_ENV: &str = "BCV_STREAMING_CONFLICT_ENDPOINT";
+const PROXY_CONTROL_ENV: &str = "BCV_STREAMING_CONFLICT_PROXY_CONTROL";
 const CONTAINER_ENV: &str = "BCV_STREAMING_CONFLICT_CONTAINER";
 const STAGED_ALIAS: &str = "streaming_conflict";
 
@@ -281,54 +282,33 @@ fn assert_final_rows(vfs: &'static BlockCacheVfs, alias: &str) {
     drop(db);
 }
 
-fn set_proxy(proxy: &str) {
-    // SAFETY: each env-mutating phase runs in its own child process with an
-    // exact test filter. Proxy setup and VFS operations are sequential, and
-    // the proxy worker uses its captured URL rather than reading process env.
-    unsafe {
-        for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
-            // The test endpoint is HTTP; setting both proxy spellings prevents
-            // libcurl/environment differences from bypassing the fault point.
-            std::env::set_var(name, proxy);
-        }
-        for name in ["NO_PROXY", "no_proxy"] {
-            std::env::set_var(name, "");
-        }
-    }
-}
-
-fn clear_proxy() {
-    // SAFETY: called after synchronous VFS operations complete in the
-    // dedicated child process described in `set_proxy`; the proxy worker uses
-    // captured values and does not read process env.
-    unsafe {
-        for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
-            std::env::remove_var(name);
-        }
-        for name in ["NO_PROXY", "no_proxy"] {
-            std::env::set_var(name, "127.0.0.1,localhost");
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FaultMode {
+    ForwardOnly,
     RejectManifestOnce,
     DropManifestResponseOnce,
 }
 
 struct FaultProxy {
     stop: Arc<AtomicBool>,
-    manifest_requests: Arc<AtomicUsize>,
-    forwarded_manifests: Arc<AtomicUsize>,
-    dropped_responses: Arc<AtomicUsize>,
+    reject_manifest_once: Arc<AtomicBool>,
+    drop_manifest_response_once: Arc<AtomicBool>,
+    metrics: Arc<ProxyMetrics>,
     handlers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     thread: Option<thread::JoinHandle<()>>,
     url: String,
 }
 
+#[derive(Default)]
+struct ProxyMetrics {
+    manifest_requests: AtomicUsize,
+    rejected_manifests: AtomicUsize,
+    forwarded_manifests: AtomicUsize,
+    dropped_responses: AtomicUsize,
+}
+
 impl FaultProxy {
-    fn start(endpoint: &str, mode: FaultMode) -> Self {
+    fn start(endpoint: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fault proxy");
         listener
             .set_nonblocking(true)
@@ -342,13 +322,13 @@ impl FaultProxy {
             .expect("fault proxy requires an HTTP emulator endpoint")
             .to_owned();
         let stop = Arc::new(AtomicBool::new(false));
-        let manifest_requests = Arc::new(AtomicUsize::new(0));
-        let forwarded_manifests = Arc::new(AtomicUsize::new(0));
-        let dropped_responses = Arc::new(AtomicUsize::new(0));
+        let reject_manifest_once = Arc::new(AtomicBool::new(false));
+        let drop_manifest_response_once = Arc::new(AtomicBool::new(false));
+        let metrics = Arc::new(ProxyMetrics::default());
         let thread_stop = Arc::clone(&stop);
-        let thread_requests = Arc::clone(&manifest_requests);
-        let thread_forwarded = Arc::clone(&forwarded_manifests);
-        let thread_dropped = Arc::clone(&dropped_responses);
+        let thread_reject = Arc::clone(&reject_manifest_once);
+        let thread_drop = Arc::clone(&drop_manifest_response_once);
+        let thread_metrics = Arc::clone(&metrics);
         let handlers = Arc::new(Mutex::new(Vec::new()));
         let thread_handlers = Arc::clone(&handlers);
         let thread = thread::spawn(move || {
@@ -362,17 +342,16 @@ impl FaultProxy {
                     Err(_) => break,
                 };
                 let handler_upstream = upstream.clone();
-                let handler_requests = Arc::clone(&thread_requests);
-                let handler_forwarded = Arc::clone(&thread_forwarded);
-                let handler_dropped = Arc::clone(&thread_dropped);
+                let handler_reject = Arc::clone(&thread_reject);
+                let handler_drop = Arc::clone(&thread_drop);
+                let handler_metrics = Arc::clone(&thread_metrics);
                 let handler = thread::spawn(move || {
                     let _ = handle_proxy_connection(
                         stream,
                         &handler_upstream,
-                        mode,
-                        &handler_requests,
-                        &handler_forwarded,
-                        &handler_dropped,
+                        &handler_reject,
+                        &handler_drop,
+                        &handler_metrics,
                     );
                 });
                 thread_handlers
@@ -383,25 +362,51 @@ impl FaultProxy {
         });
         Self {
             stop,
-            manifest_requests,
-            forwarded_manifests,
-            dropped_responses,
+            reject_manifest_once,
+            drop_manifest_response_once,
+            metrics,
             handlers,
             thread: Some(thread),
             url,
         }
     }
 
+    fn arm(&self, mode: FaultMode) {
+        self.reject_manifest_once.store(false, Ordering::Release);
+        self.drop_manifest_response_once
+            .store(false, Ordering::Release);
+        match mode {
+            FaultMode::ForwardOnly => {}
+            FaultMode::RejectManifestOnce => {
+                self.reject_manifest_once.store(true, Ordering::Release);
+            }
+            FaultMode::DropManifestResponseOnce => self
+                .drop_manifest_response_once
+                .store(true, Ordering::Release),
+        }
+    }
+
+    fn reset_counts(&self) {
+        self.metrics.manifest_requests.store(0, Ordering::Release);
+        self.metrics.rejected_manifests.store(0, Ordering::Release);
+        self.metrics.forwarded_manifests.store(0, Ordering::Release);
+        self.metrics.dropped_responses.store(0, Ordering::Release);
+    }
+
     fn manifest_requests(&self) -> usize {
-        self.manifest_requests.load(Ordering::Relaxed)
+        self.metrics.manifest_requests.load(Ordering::Relaxed)
+    }
+
+    fn rejected_manifests(&self) -> usize {
+        self.metrics.rejected_manifests.load(Ordering::Relaxed)
     }
 
     fn forwarded_manifests(&self) -> usize {
-        self.forwarded_manifests.load(Ordering::Relaxed)
+        self.metrics.forwarded_manifests.load(Ordering::Relaxed)
     }
 
     fn dropped_responses(&self) -> usize {
-        self.dropped_responses.load(Ordering::Relaxed)
+        self.metrics.dropped_responses.load(Ordering::Relaxed)
     }
 }
 
@@ -426,39 +431,47 @@ impl Drop for FaultProxy {
 fn handle_proxy_connection(
     mut client: TcpStream,
     upstream_address: &str,
-    mode: FaultMode,
-    manifest_requests: &AtomicUsize,
-    forwarded_manifests: &AtomicUsize,
-    dropped_responses: &AtomicUsize,
+    reject_manifest_once: &AtomicBool,
+    drop_manifest_response_once: &AtomicBool,
+    metrics: &ProxyMetrics,
 ) -> std::io::Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(20)))?;
     let request = read_http_request(&mut client)?;
     let (method, target) = request_line(&request);
+    if method.eq_ignore_ascii_case("GET") && target == "/__control/manifest-requests" {
+        let body = metrics
+            .manifest_requests
+            .load(Ordering::Relaxed)
+            .to_string();
+        write!(
+            client,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )?;
+        return client.shutdown(Shutdown::Both);
+    }
     let manifest = method == "PUT" && request_path(target).ends_with("/manifest.bcv");
     if !manifest {
         return forward_request(client, upstream_address, request, false);
     }
 
-    let request_number = manifest_requests.fetch_add(1, Ordering::Relaxed);
-    match mode {
-        FaultMode::RejectManifestOnce if request_number == 0 => {
-            client.write_all(b"HTTP/1.1 412 Precondition Failed\r\n")?;
-            client.write_all(b"Content-Length: 0\r\nConnection: close\r\n\r\n")?;
-            client.shutdown(Shutdown::Both)
-        }
-        FaultMode::DropManifestResponseOnce if request_number == 0 => {
-            forwarded_manifests.fetch_add(1, Ordering::Relaxed);
-            dropped_responses.fetch_add(1, Ordering::Relaxed);
-            // The request is sent to the emulator and its complete response
-            // is consumed, proving that the manifest PUT reached the remote
-            // store before the client-side response is made ambiguous.
-            let _ = forward_request(client, upstream_address, request, true);
-            Ok(())
-        }
-        _ => {
-            forwarded_manifests.fetch_add(1, Ordering::Relaxed);
-            forward_request(client, upstream_address, request, false)
-        }
+    metrics.manifest_requests.fetch_add(1, Ordering::Relaxed);
+    if reject_manifest_once.swap(false, Ordering::AcqRel) {
+        metrics.rejected_manifests.fetch_add(1, Ordering::Relaxed);
+        client.write_all(b"HTTP/1.1 412 Precondition Failed\r\n")?;
+        client.write_all(b"Content-Length: 0\r\nConnection: close\r\n\r\n")?;
+        client.shutdown(Shutdown::Both)
+    } else if drop_manifest_response_once.swap(false, Ordering::AcqRel) {
+        metrics.forwarded_manifests.fetch_add(1, Ordering::Relaxed);
+        metrics.dropped_responses.fetch_add(1, Ordering::Relaxed);
+        // The request is sent to the emulator and its complete response
+        // is consumed, proving that the manifest PUT reached the remote
+        // store before the client-side response is made ambiguous.
+        let _ = forward_request(client, upstream_address, request, true);
+        Ok(())
+    } else {
+        metrics.forwarded_manifests.fetch_add(1, Ordering::Relaxed);
+        forward_request(client, upstream_address, request, false)
     }
 }
 
@@ -669,12 +682,61 @@ fn read_http_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn run_phase(executable: &Path, name: &str, values: &[(&str, &str)]) -> ExitStatus {
+fn run_phase(
+    executable: &Path,
+    name: &str,
+    values: &[(&str, &str)],
+    proxy: &FaultProxy,
+) -> ExitStatus {
     Command::new(executable)
         .args(["--ignored", "--exact", name, "--nocapture"])
         .envs(values.iter().copied())
+        .env("HTTP_PROXY", &proxy.url)
+        .env("http_proxy", &proxy.url)
+        .env("ALL_PROXY", &proxy.url)
+        .env("all_proxy", &proxy.url)
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .env(PROXY_CONTROL_ENV, &proxy.url)
         .status()
         .unwrap_or_else(|error| panic!("spawn {name}: {error}"))
+}
+
+fn proxy_manifest_requests() -> usize {
+    let proxy_url = required_env(PROXY_CONTROL_ENV);
+    let address = proxy_url
+        .strip_prefix("http://")
+        .expect("conflict proxy control URL must use HTTP");
+    let mut stream = TcpStream::connect(address).expect("connect to parent conflict proxy");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set conflict proxy control read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set conflict proxy control write timeout");
+    write!(
+        stream,
+        "GET /__control/manifest-requests HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("request conflict proxy manifest count");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read conflict proxy manifest count");
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "conflict proxy rejected metric request: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let body_start = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .expect("conflict proxy metric response headers");
+    std::str::from_utf8(&response[body_start..])
+        .expect("conflict proxy metric response is UTF-8")
+        .parse()
+        .expect("conflict proxy manifest count is numeric")
 }
 
 fn run_child_phases(
@@ -684,6 +746,7 @@ fn run_child_phases(
     endpoint: &str,
     container: &str,
     phases: &[&str],
+    proxy: &FaultProxy,
 ) {
     let executable = std::env::current_exe().expect("locate conflict-test executable");
     let cache = cache.to_str().expect("cache path is UTF-8");
@@ -697,8 +760,39 @@ fn run_child_phases(
         (CONTAINER_ENV, container),
     ];
     for phase in phases {
-        let status = run_phase(&executable, phase, &values);
+        proxy.reset_counts();
+        match *phase {
+            "cas_conflict_phase_two" => proxy.arm(FaultMode::RejectManifestOnce),
+            "ambiguous_phase_two" => proxy.arm(FaultMode::DropManifestResponseOnce),
+            _ => proxy.arm(FaultMode::ForwardOnly),
+        }
+        let status = run_phase(&executable, phase, &values, proxy);
         assert!(status.success(), "conflict phase {phase} failed: {status}");
+        match *phase {
+            "cas_conflict_phase_two" => assert_eq!(
+                proxy.rejected_manifests(),
+                1,
+                "the proxy must reject exactly one manifest PUT"
+            ),
+            "ambiguous_phase_two" => {
+                let manifest_requests = proxy.manifest_requests();
+                assert!(
+                    manifest_requests >= 2,
+                    "the client must retry after the first ambiguous manifest PUT"
+                );
+                assert_eq!(
+                    proxy.forwarded_manifests(),
+                    manifest_requests,
+                    "every manifest PUT, including the retry, must reach the remote emulator"
+                );
+                assert_eq!(
+                    proxy.dropped_responses(),
+                    1,
+                    "the proxy must drop exactly the first manifest response"
+                );
+            }
+            _ => {}
+        }
     }
 }
 
@@ -712,6 +806,7 @@ fn manifest_cas_conflict_retains_staged_objects_for_retry() {
         .unwrap_or_else(|_| "http://127.0.0.1:4566".into());
     let container = format!("{}/cbs", unique_suffix());
     let state_path = state.path().join("manifest-before.bin");
+    let proxy = FaultProxy::start(&endpoint);
     run_child_phases(
         cache.path(),
         fresh_cache.path(),
@@ -723,6 +818,7 @@ fn manifest_cas_conflict_retains_staged_objects_for_retry() {
             "cas_conflict_phase_two",
             "cas_conflict_phase_three",
         ],
+        &proxy,
     );
 }
 
@@ -736,6 +832,7 @@ fn ambiguous_manifest_response_is_recoverable_after_restart() {
         .unwrap_or_else(|_| "http://127.0.0.1:4566".into());
     let container = format!("{}/cbs", unique_suffix());
     let state_path = state.path().join("manifest-before.bin");
+    let proxy = FaultProxy::start(&endpoint);
     run_child_phases(
         cache.path(),
         fresh_cache.path(),
@@ -748,6 +845,7 @@ fn ambiguous_manifest_response_is_recoverable_after_restart() {
             "ambiguous_phase_three",
             "ambiguous_phase_four",
         ],
+        &proxy,
     );
 }
 
@@ -761,6 +859,7 @@ fn ambiguous_publication_keeps_a_newer_local_write_conflicted() {
         .unwrap_or_else(|_| "http://127.0.0.1:4566".into());
     let container = format!("{}/cbs", unique_suffix());
     let state_path = state.path().join("manifest-before.bin");
+    let proxy = FaultProxy::start(&endpoint);
     run_child_phases(
         cache.path(),
         fresh_cache.path(),
@@ -772,6 +871,7 @@ fn ambiguous_publication_keeps_a_newer_local_write_conflicted() {
             "ambiguous_phase_two",
             "ambiguous_newer_phase_three",
         ],
+        &proxy,
     );
 }
 
@@ -800,19 +900,15 @@ fn cas_conflict_phase_two() {
     assert_eq!(before, fetch_manifest(&endpoint, &container));
     let objects_before = list_remote_objects(&endpoint, &container);
 
-    let proxy = FaultProxy::start(&endpoint, FaultMode::RejectManifestOnce);
-    set_proxy(&proxy.url);
     let first = vfs.upload(STAGED_ALIAS);
-    clear_proxy();
-    let requests = proxy.manifest_requests();
-    drop(proxy);
     assert!(
         first.is_err(),
         "a 412 manifest CAS conflict must surface as an error"
     );
     assert_eq!(
-        requests, 1,
-        "the proxy must reject exactly one manifest PUT"
+        proxy_manifest_requests(),
+        1,
+        "the failed upload must issue exactly one manifest PUT before the explicit retry"
     );
     assert_eq!(before, fetch_manifest(&endpoint, &container));
     assert!(
@@ -865,29 +961,10 @@ fn ambiguous_phase_two() {
     let before = fs::read(&state).expect("read pre-ambiguous manifest");
     assert_eq!(before, fetch_manifest(&endpoint, &container));
 
-    let proxy = FaultProxy::start(&endpoint, FaultMode::DropManifestResponseOnce);
-    set_proxy(&proxy.url);
     let result = vfs.upload(STAGED_ALIAS);
-    clear_proxy();
-    let manifest_requests = proxy.manifest_requests();
-    let forwarded_manifests = proxy.forwarded_manifests();
-    let dropped_responses = proxy.dropped_responses();
-    drop(proxy);
     assert!(
         result.is_err(),
         "a dropped manifest response must remain ambiguous to the caller"
-    );
-    assert!(
-        manifest_requests >= 2,
-        "the client must retry after the first ambiguous manifest PUT"
-    );
-    assert_eq!(
-        forwarded_manifests, manifest_requests,
-        "every manifest PUT, including the retry, must reach the remote emulator"
-    );
-    assert_eq!(
-        dropped_responses, 1,
-        "the proxy must drop exactly the first manifest response"
     );
     assert_ne!(
         before,
