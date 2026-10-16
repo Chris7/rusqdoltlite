@@ -13,14 +13,14 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, Storage};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 const CACHE_BYTES: i64 = 2 * 4 * 1024 * 1024;
 const BODY_BYTES: usize = 2048;
@@ -188,34 +188,44 @@ fn new_vfs(cache: &Path) -> &'static BlockCacheVfs {
 }
 
 fn set_proxy(proxy: &str) {
-    for name in [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        std::env::set_var(name, proxy);
-    }
-    for name in ["NO_PROXY", "no_proxy"] {
-        std::env::set_var(name, "");
+    // SAFETY: each env-mutating phase runs in its own child process with an
+    // exact test filter. Proxy setup and VFS operations are sequential, and
+    // the proxy worker uses its captured URL rather than reading process env.
+    unsafe {
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            std::env::set_var(name, proxy);
+        }
+        for name in ["NO_PROXY", "no_proxy"] {
+            std::env::set_var(name, "");
+        }
     }
 }
 
 fn clear_proxy() {
-    for name in [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        std::env::remove_var(name);
-    }
-    for name in ["NO_PROXY", "no_proxy"] {
-        std::env::set_var(name, "127.0.0.1,localhost");
+    // SAFETY: called after synchronous VFS operations complete in the
+    // dedicated child process described in `set_proxy`; the proxy worker uses
+    // captured values and does not read process env.
+    unsafe {
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            std::env::remove_var(name);
+        }
+        for name in ["NO_PROXY", "no_proxy"] {
+            std::env::set_var(name, "127.0.0.1,localhost");
+        }
     }
 }
 

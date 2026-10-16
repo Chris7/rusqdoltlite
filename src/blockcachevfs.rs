@@ -1,6 +1,6 @@
 //! Safe, process-lifetime access to Cloud Backed SQLite's block-cache VFS.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt as _;
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{check, Error};
+use crate::error::{Error, check};
 use crate::{Connection, OpenFlags, Result};
 
 use crate::ffi::bcvutil as raw_util;
@@ -1729,13 +1729,13 @@ impl BlockCacheVfs {
                 return Err(Error::SqliteFailure(
                     crate::ffi::Error::new(crate::ffi::SQLITE_AUTH),
                     Some(format!("CBS authentication callback failed: {error}")),
-                ))
+                ));
             }
             Err(_) => {
                 return Err(Error::SqliteFailure(
                     crate::ffi::Error::new(crate::ffi::SQLITE_ERROR),
                     Some("CBS authentication callback panicked".into()),
-                ))
+                ));
             }
         };
         CString::new(token).map_err(Error::NulError)
@@ -3014,11 +3014,14 @@ unsafe extern "C" fn auth_trampoline(
     if out.is_null() || ctx.is_null() {
         return crate::ffi::SQLITE_ERROR;
     }
-    *out = ptr::null_mut();
+    // SAFETY: CBS passes a valid writable output pointer to its auth callback.
+    unsafe { *out = ptr::null_mut() };
     if storage.is_null() || account.is_null() || container.is_null() {
         return crate::ffi::SQLITE_ERROR;
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        // SAFETY: CBS retains the registered AuthState until VFS destruction,
+        // and its callback contract supplies NUL-terminated input strings.
         let callback = &*(ctx as *const AuthState);
         let storage = CStr::from_ptr(storage).to_str().ok()?;
         let account = CStr::from_ptr(account).to_str().ok()?;
@@ -3039,7 +3042,8 @@ unsafe extern "C" fn auth_trampoline(
         Some(len) => len,
         None => return crate::ffi::SQLITE_TOOBIG,
     };
-    let ptr = crate::ffi::sqlite3_malloc(len).cast::<u8>();
+    // SAFETY: the length is positive and within SQLite's signed size range.
+    let ptr = unsafe { crate::ffi::sqlite3_malloc(len) }.cast::<u8>();
     if ptr.is_null() {
         return crate::ffi::SQLITE_NOMEM;
     }
@@ -3228,14 +3232,14 @@ mod tests {
             cleanup_age_seconds(Duration::from_secs(c_int::MAX as u64)).unwrap(),
             c_int::MAX
         );
-        assert!(cleanup_age_seconds(
-            Duration::from_secs(c_int::MAX as u64) + Duration::from_nanos(1)
-        )
-        .is_err());
-        assert!(cleanup_age_seconds(
-            Duration::from_secs(c_int::MAX as u64) + Duration::from_secs(1)
-        )
-        .is_err());
+        assert!(
+            cleanup_age_seconds(Duration::from_secs(c_int::MAX as u64) + Duration::from_nanos(1))
+                .is_err()
+        );
+        assert!(
+            cleanup_age_seconds(Duration::from_secs(c_int::MAX as u64) + Duration::from_secs(1))
+                .is_err()
+        );
         assert!(cleanup_age_seconds(Duration::MAX).is_err());
     }
 
@@ -3459,9 +3463,11 @@ mod tests {
             Some("http://127.0.0.1:4443"),
         )
         .expect("build validated GCS URI");
-        assert!(first
-            .as_str()
-            .contains("access_token=short%2Flived%2Btoken%3D"));
+        assert!(
+            first
+                .as_str()
+                .contains("access_token=short%2Flived%2Btoken%3D")
+        );
         assert_eq!(first.gcs_access_token(), Some("short/lived+token="));
         assert_eq!(
             CloudConnectionUri::parse(first.as_str())

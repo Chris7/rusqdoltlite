@@ -9,18 +9,18 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(all(feature = "remote", unix))]
 use std::os::unix::process::ExitStatusExt as _;
 #[cfg(feature = "remote")]
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 #[cfg(feature = "remote")]
 use std::path::PathBuf;
 use std::process::Command;
 use std::ptr;
+use std::sync::{Arc, Barrier, OnceLock, mpsc};
 #[cfg(feature = "remote")]
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     Mutex,
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
-use std::sync::{mpsc, Arc, Barrier, OnceLock};
 #[cfg(feature = "remote")]
 use std::thread;
 use std::time::Duration;
@@ -28,9 +28,11 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "remote")]
+use rusqlite::SessionOperationStatus;
 use rusqlite::blockcachevfs::{
-    AttachSpec, BlockCacheVfs, Config, SessionAttachment, SessionOperationId, Storage,
-    SESSION_OPERATION_ID_BYTES,
+    AttachSpec, BlockCacheVfs, Config, SESSION_OPERATION_ID_BYTES, SessionAttachment,
+    SessionOperationId, Storage,
 };
 #[cfg(feature = "remote")]
 use rusqlite::blockcachevfs::{
@@ -39,10 +41,8 @@ use rusqlite::blockcachevfs::{
 };
 use rusqlite::ffi::{self, blockcachevfs as raw_bcv};
 #[cfg(feature = "remote")]
-use rusqlite::SessionOperationStatus;
-use rusqlite::{params, Connection, OpenFlags};
-#[cfg(feature = "remote")]
 use rusqlite::{BlockCacheSessionOptions, RemoteServer, RemoteServerOptions, SessionScope};
+use rusqlite::{Connection, OpenFlags, params};
 #[cfg(feature = "remote")]
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -232,9 +232,11 @@ fn run_uri_auto_create(backend: &str) {
     let error = database
         .query_row::<String, _, _>("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
         .expect_err("CBS must reject unsupported journal mode changes");
-    assert!(error
-        .to_string()
-        .contains("blockcachevfs supports only journal_mode=WAL"));
+    assert!(
+        error
+            .to_string()
+            .contains("blockcachevfs supports only journal_mode=WAL")
+    );
     let schema_entries: i64 = database
         .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
         .expect("new CBS database should be a valid empty SQLite database");
@@ -9119,7 +9121,9 @@ fn google_uri_session_reports_complete_block_upload_progress() {
         "session block staging should read the cleanup guard around its attempt marker: {guard_gets:?}"
     );
     assert!(
-        guard_gets.iter().all(|observation| observation.status == 404),
+        guard_gets
+            .iter()
+            .all(|observation| observation.status == 404),
         "a missing or CAB-inaccessible global guard should return 404 and be treated as idle: {guard_gets:?}"
     );
 
@@ -9816,7 +9820,10 @@ fn spawn_staging_visibility_probe(
                     state.release();
                     return Err(format!(
                         "no completed-block progress arrived while a sibling PUT remained in flight; active={active}, events={:?}",
-                        events.lock().expect("lock final in-flight upload progress").as_slice()
+                        events
+                            .lock()
+                            .expect("lock final in-flight upload progress")
+                            .as_slice()
                     ));
                 }
             }

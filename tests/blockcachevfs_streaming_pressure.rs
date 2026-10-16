@@ -14,14 +14,14 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, Storage};
-use rusqlite::{params, Connection, Error, ErrorCode};
+use rusqlite::{Connection, Error, ErrorCode, params};
 
 const BLOCK_BYTES: u64 = 4 * 1024 * 1024;
 const CACHE_BYTES: i64 = (2 * BLOCK_BYTES) as i64;

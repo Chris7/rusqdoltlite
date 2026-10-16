@@ -2,6 +2,8 @@
 
 This project is a fork of [`Rusqlite`](https://github.com/rusqlite/rusqlite) using [`DoltLite`](https://github.com/dolthub/doltlite) as the SQLite backend. It should be possible to use this library just as you would use rusqlite.
 
+The Rust wrapper is synced to upstream `rusqlite` commit `0f491a0e19d7a956031ea4ce354e085680766b28` and requires SQLite 3.45.3 or newer.
+
 ## Cloud Backed SQLite block-cache VFS
 
 The optional `blockcachevfs` feature builds Cloud Backed SQLite's VFS into the

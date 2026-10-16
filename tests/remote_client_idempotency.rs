@@ -4,14 +4,14 @@ use std::{
     io::{self, Read as _, Write as _},
     net::{TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use rusqlite::{params, Connection, RemoteServer, Result};
+use rusqlite::{Connection, RemoteServer, Result, params};
 
 const CAPABILITY_PREFIX: &str = "/api/repositories/test/push/opaque-capability";
 
@@ -374,12 +374,16 @@ fn push(connection: &Connection, force: bool) -> Result<()> {
 
 fn assert_capability_requests(requests: &[CapturedRequest]) {
     assert!(!requests.is_empty(), "the push should make HTTP requests");
-    assert!(requests
-        .iter()
-        .all(|request| request.idempotency_token.is_none()));
-    assert!(requests
-        .iter()
-        .all(|request| request.path.starts_with(CAPABILITY_PREFIX)));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.idempotency_token.is_none())
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path.starts_with(CAPABILITY_PREFIX))
+    );
 }
 
 #[test]
@@ -464,12 +468,16 @@ fn test_push_uses_opaque_capability_url_and_finalizes_noop_without_token_header(
     assert!(failed_push.is_err(), "refs-if error must propagate");
     let failed_requests = proxy.snapshot()[start..].to_vec();
     assert_capability_requests(&failed_requests);
-    assert!(failed_requests
-        .iter()
-        .any(|request| request.path.ends_with("/refs-if")));
-    assert!(!failed_requests
-        .iter()
-        .any(|request| request.path.ends_with("/commit")));
+    assert!(
+        failed_requests
+            .iter()
+            .any(|request| request.path.ends_with("/refs-if"))
+    );
+    assert!(
+        !failed_requests
+            .iter()
+            .any(|request| request.path.ends_with("/commit"))
+    );
 
     let clone = Connection::open(temp.path().join("clone.db"))?;
     let start = proxy.snapshot().len();

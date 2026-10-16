@@ -56,10 +56,8 @@ pub enum DbConfig {
     SQLITE_DBCONFIG_TRUSTED_SCHEMA = 1017, // 3.31.0
     /// Sets or clears a flag that enables collection of the
     /// `sqlite3_stmt_scanstatus_v2()` statistics
-    #[cfg(feature = "modern_sqlite")]
     SQLITE_DBCONFIG_STMT_SCANSTATUS = 1018, // 3.42.0
     /// Changes the default order in which tables and indexes are scanned
-    #[cfg(feature = "modern_sqlite")]
     SQLITE_DBCONFIG_REVERSE_SCANORDER = 1019, // 3.42.0
     /// Enables or disables the ability of the ATTACH DATABASE SQL command
     /// to create a new database file if the database filed named in the ATTACH command does not already exist.
@@ -129,7 +127,7 @@ impl Connection {
             check(ffi::sqlite3_db_config(
                 c.db(),
                 config as c_int,
-                new_val as c_int,
+                c_int::from(new_val),
                 &mut val,
             ))?;
             Ok(val != 0)

@@ -29,8 +29,14 @@ impl Sql {
         }
         const SQL: &str = "SELECT 1 FROM pragma_pragma_list WHERE name = ?";
         let mut stmt = cfg_select! {
-            feature = "cache" => {conn.prepare_cached(SQL)}
-            _ => conn.prepare(SQL)
+            feature = "cache" => {
+                // no_fmt
+                conn.prepare_cached(SQL)
+            }
+            _ => {
+                // no_fmt
+                conn.prepare(SQL)
+            }
         }?;
         if stmt.exists([pragma_name])? {
             self.buf.push_str(pragma_name);
@@ -320,7 +326,7 @@ mod test {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     use super::Sql;
-    use crate::{error::error_from_sqlite_code, ffi, pragma, Connection, Result};
+    use crate::{Connection, Result, error::error_from_sqlite_code, ffi, pragma};
 
     #[test]
     #[cfg_attr(miri, ignore)]

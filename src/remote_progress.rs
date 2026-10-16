@@ -1,7 +1,7 @@
 use std::ffi::c_void;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::{ffi, Connection, Error, Result};
+use crate::{Connection, Error, Result, ffi};
 
 type Callback = dyn Fn(DoltPushProgressEvent) + Send + Sync + 'static;
 

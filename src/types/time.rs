@@ -82,7 +82,7 @@ impl FromSql for OffsetDateTime {
             }
             // Formats 2-7 without timezone
             PrimitiveDateTime::parse(s, &UTC_DATE_TIME_FORMAT)
-                .map(|p| p.assume_utc())
+                .map(PrimitiveDateTime::assume_utc)
                 .map_err(FromSqlError::other)
         })
     }

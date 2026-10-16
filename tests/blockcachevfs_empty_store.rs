@@ -4,7 +4,7 @@ use std::ffi::CString;
 
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 use rusqlite::params;
-use rusqlite::{ffi, Connection, OpenFlags, Result};
+use rusqlite::{Connection, OpenFlags, Result, ffi};
 
 const SQLITE_OPEN_DOLTLITE_NO_SEED: i32 = 0x0080_0000;
 

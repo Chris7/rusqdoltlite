@@ -7,14 +7,14 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, Storage};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 const CACHE_BYTES: i64 = 2 * 4 * 1024 * 1024;
 const BODY_BYTES: usize = 2048;
@@ -133,11 +133,16 @@ fn row_body(id: i64) -> String {
 }
 
 fn restore_env(snapshot: Vec<(&'static str, Option<OsString>)>) {
-    for (name, value) in snapshot {
-        if let Some(value) = value {
-            std::env::set_var(name, value);
-        } else {
-            std::env::remove_var(name);
+    // SAFETY: the failure-test phases run in dedicated child processes with
+    // exact test filters; restoration follows the VFS operations and no
+    // concurrent code in that process accesses these proxy variables.
+    unsafe {
+        for (name, value) in snapshot {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
         }
     }
 }
@@ -470,11 +475,15 @@ fn failure_phase_one() {
     // Configure the forwarding proxy before CBS creates its libcurl handles.
     // It forwards normal requests to Floci, and can reject only PUT requests
     // after the first committed update has proven that block staging works.
-    for name in proxy_names {
-        std::env::set_var(name, &proxy.url);
-    }
-    for name in no_proxy_names {
-        std::env::set_var(name, "");
+    // SAFETY: this phase runs in a dedicated child process with an exact test
+    // filter, and configures the proxy before VFS network handles are created.
+    unsafe {
+        for name in proxy_names {
+            std::env::set_var(name, &proxy.url);
+        }
+        for name in no_proxy_names {
+            std::env::set_var(name, "");
+        }
     }
     let vfs = BlockCacheVfs::builder(&cache)
         .expect("VFS builder")

@@ -4,7 +4,7 @@
 //! "function"](https://sqlite.org/src/file/ext/misc/series.c):
 //! `https://www.sqlite.org/series.html`
 use std::borrow::Cow;
-use std::ffi::{c_int, CStr};
+use std::ffi::{CStr, c_int};
 use std::marker::PhantomData;
 
 use crate::ffi;
@@ -114,7 +114,6 @@ unsafe impl<'vtab> VTab<'vtab> for SeriesTab {
             let mut constraint_usage = info.constraint_usage(*j);
             constraint_usage.set_argv_index(n_arg);
             constraint_usage.set_omit(true);
-            #[cfg(all(test, feature = "modern_sqlite"))]
             debug_assert_eq!(Ok("BINARY"), info.collation(*j));
         }
         if !(unusable_mask & !idx_num).is_empty() {
@@ -262,7 +261,7 @@ unsafe impl VTabCursor for SeriesTabCursor<'_> {
             SERIES_COLUMN_STEP => self.step,
             _ => self.value,
         };
-        ctx.set_result(&x)
+        ctx.set_result(x)
     }
 
     fn rowid(&self) -> Result<i64> {
