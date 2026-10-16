@@ -69,6 +69,15 @@ or the fixed 128 MiB response limit, and decodes strict HTTP/1.1 chunked bodies
 with bounded extensions, trailers, and encoded/decoded sizes. A single chunk
 that exceeds the limit remains an error, and the final chunk is recognized on a
 keepalive connection without waiting for EOF.
+
+`0010-clone-progress.patch` adds an opt-in connection-scoped callback for
+full `dolt_clone` progress. It reports clone start, cumulative verified chunk
+transfers and client-local reuse, finalization, and successful completion. It
+does not scan the source graph for totals or percentages, so observed clones
+make no extra source payload reads for planning. When a destination chunk is
+already present, the observed traversal reads it locally to find any missing
+descendants and count reuse. Clones without an observer keep the existing
+transfer path, and lazy clones reject an active full-clone observer.
 Patches under `blockcachevfs/` apply only to the staged CBS sources; patches in
 this directory apply only to DoltLite sources.
 

@@ -319,8 +319,21 @@ mod remote {
     pub const DOLTLITE_PUSH_PROGRESS_PLAN: c_int = 1;
     pub const DOLTLITE_PUSH_PROGRESS_UPLOADED: c_int = 2;
 
+    pub const DOLTLITE_CLONE_PROGRESS_STARTED: c_int = 1;
+    pub const DOLTLITE_CLONE_PROGRESS_PROGRESS: c_int = 2;
+    pub const DOLTLITE_CLONE_PROGRESS_FINALIZING: c_int = 3;
+    pub const DOLTLITE_CLONE_PROGRESS_COMPLETED: c_int = 4;
+
     pub type sqlite3_doltlite_push_progress_callback =
         unsafe extern "C" fn(*mut c_void, c_int, sqlite3_int64, sqlite3_int64);
+    pub type sqlite3_doltlite_clone_progress_callback = unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        sqlite3_int64,
+        sqlite3_int64,
+        sqlite3_int64,
+        sqlite3_int64,
+    );
 
     #[repr(C)]
     pub struct DoltliteServer {
@@ -354,6 +367,22 @@ mod remote {
 
         /// Clear the callback only if `context` still owns the registration.
         pub fn sqlite3_doltlite_clear_push_progress_callback(
+            db: *mut sqlite3,
+            context: *mut c_void,
+        ) -> c_int;
+
+        /// Install a connection-scoped callback for opt-in native `dolt_clone` progress.
+        ///
+        /// On success, `context` must remain valid until the matching clear call.
+        /// On failure, ownership remains with the caller.
+        pub fn sqlite3_doltlite_set_clone_progress_callback(
+            db: *mut sqlite3,
+            context: *mut c_void,
+            callback: Option<sqlite3_doltlite_clone_progress_callback>,
+        ) -> c_int;
+
+        /// Clear the clone callback only if `context` still owns the registration.
+        pub fn sqlite3_doltlite_clear_clone_progress_callback(
             db: *mut sqlite3,
             context: *mut c_void,
         ) -> c_int;

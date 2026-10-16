@@ -15,7 +15,8 @@ use std::{
 };
 
 use rusqlite::{
-    ffi, params, Connection, Error, RemoteAuthenticator, RemoteServer, RemoteServerOptions, Result,
+    ffi, params, Connection, DoltCloneProgressEvent, Error, RemoteAuthenticator, RemoteServer,
+    RemoteServerOptions, Result,
 };
 
 #[cfg(feature = "blockcachevfs")]
@@ -571,6 +572,17 @@ fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
 
 #[test]
 fn fresh_clone_splits_aggregate_get_chunks_413_and_recovers_partial_failure() -> Result<()> {
+    fresh_clone_splits_aggregate_get_chunks_413_and_recovers_partial_failure_case(false)
+}
+
+#[test]
+fn observed_clone_splits_aggregate_get_chunks_413_and_recovers_partial_failure() -> Result<()> {
+    fresh_clone_splits_aggregate_get_chunks_413_and_recovers_partial_failure_case(true)
+}
+
+fn fresh_clone_splits_aggregate_get_chunks_413_and_recovers_partial_failure_case(
+    observe_progress: bool,
+) -> Result<()> {
     const ROWS: i64 = 1_024;
     let temp = tempfile::tempdir().expect("tempdir");
     let server_root = temp.path().join("server");
@@ -656,6 +668,18 @@ fn fresh_clone_splits_aggregate_get_chunks_413_and_recovers_partial_failure() ->
         GetChunksProxyFailure::FailAfterFirstSplitSingletonOnce,
     );
     let clone = Connection::open(temp.path().join("adaptive-clone.db"))?;
+    let clone_progress = Arc::new(Mutex::new(Vec::new()));
+    let _progress_guard = if observe_progress {
+        let callback_progress = Arc::clone(&clone_progress);
+        Some(clone.dolt_clone_progress_callback(move |event| {
+            callback_progress
+                .lock()
+                .expect("should lock adaptive clone progress events")
+                .push(event);
+        })?)
+    } else {
+        None
+    };
     let remote_url = limited.database_url("origin.db");
     let first_attempt =
         clone.query_row::<i64, _, _>("SELECT dolt_clone(?1)", params![remote_url], |row| {
@@ -686,16 +710,72 @@ fn fresh_clone_splits_aggregate_get_chunks_413_and_recovers_partial_failure() ->
         "at least one split singleton must complete before the injected failure: {partial_stats:?}"
     );
     assert_eq!(partial_stats.singleton_413_responses, 1);
+    if observe_progress {
+        let failed_progress = clone_progress
+            .lock()
+            .expect("should read failed clone progress events")
+            .clone();
+        assert!(!failed_progress.contains(&DoltCloneProgressEvent::Completed));
+        assert!(
+            failed_progress.iter().any(|event| matches!(
+                event,
+                DoltCloneProgressEvent::Progress {
+                    downloaded_chunk_count: 1..,
+                    ..
+                }
+            )),
+            "a successful split response is acknowledged before the later failure"
+        );
+    }
     let usable: i64 = clone.query_row("SELECT 1", [], |row| row.get(0))?;
     assert_eq!(
         usable, 1,
         "failed clone must leave its SQLite handle usable"
     );
 
+    let retry_start = clone_progress
+        .lock()
+        .expect("should read clone progress before retry")
+        .len();
     clone.query_row::<i64, _, _>("SELECT dolt_clone(?1)", params![remote_url], |row| {
         row.get(0)
     })?;
     assert_batch_clone_contents(&clone, &source_hash, ROWS)?;
+    if observe_progress {
+        let retry_progress = clone_progress
+            .lock()
+            .expect("should read retry clone progress events")
+            .clone()
+            .split_off(retry_start);
+        assert_eq!(
+            retry_progress.first(),
+            Some(&DoltCloneProgressEvent::Started)
+        );
+        assert_eq!(
+            retry_progress.last(),
+            Some(&DoltCloneProgressEvent::Completed)
+        );
+        let retry_counts = retry_progress
+            .iter()
+            .filter_map(|event| match event {
+                DoltCloneProgressEvent::Progress {
+                    downloaded_chunk_count,
+                    downloaded_payload_bytes,
+                    reused_chunk_count,
+                    reused_payload_bytes,
+                } => Some((
+                    *downloaded_chunk_count,
+                    *downloaded_payload_bytes,
+                    *reused_chunk_count,
+                    *reused_payload_bytes,
+                )),
+                _ => None,
+            })
+            .next_back()
+            .expect("retry reports transferred and reused chunk accounting");
+        assert!(retry_counts.0 + retry_counts.2 > 0);
+        assert!(retry_counts.1 + retry_counts.3 > 0);
+    }
     let completed_stats = limited.stats();
     assert!(
         completed_stats.proxy_errors.is_empty(),
