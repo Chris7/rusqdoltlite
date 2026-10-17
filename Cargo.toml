@@ -187,6 +187,12 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 wasm-bindgen-test = "0.3.54"
 wasm-bindgen = "0.2.104"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Keep the native RemoteServer TLS fixture self-contained, without system
+# OpenSSL or process-wide trust-store changes, and out of Wasm builds.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
 [dev-dependencies]
 doc-comment = "0.3"
 tempfile = "3.1.0"

@@ -4,6 +4,7 @@ use std::{
     ffi::{c_char, c_int, c_void, CString},
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
+    path::PathBuf,
     process::Command,
     ptr,
     sync::{
@@ -17,6 +18,11 @@ use std::{
 use rusqlite::{
     ffi, params, Connection, DoltCloneProgressEvent, Error, RemoteAuthenticator, RemoteServer,
     RemoteServerOptions, Result,
+};
+use rustls::{
+    client::ClientConnection,
+    pki_types::{CertificateDer, ServerName},
+    ClientConfig, RootCertStore, StreamOwned,
 };
 
 #[cfg(feature = "blockcachevfs")]
@@ -133,6 +139,130 @@ fn send_http_request(port: u16, request: &[u8]) -> String {
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read response");
     response
+}
+
+fn send_http_request_headers(port: u16, request: &[u8]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .expect("should connect to remote server for response headers");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("should set response header read timeout");
+    stream
+        .write_all(request)
+        .expect("should write HTTP request for response headers");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("should read HTTP response bytes");
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("should receive complete HTTP response headers");
+    String::from_utf8(response[..header_end].to_vec())
+        .expect("should receive UTF-8 HTTP response headers")
+}
+
+fn create_remote_server_tls_identity(
+    directory: &std::path::Path,
+) -> (PathBuf, PathBuf, CertificateDer<'static>) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+
+    let mut ca_params = CertificateParams::new(vec!["remote-test-ca.invalid".to_owned()])
+        .expect("should create test CA parameters");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca_key = KeyPair::generate().expect("should generate test CA key");
+    let ca_certificate = ca_params
+        .self_signed(&ca_key)
+        .expect("should sign test CA certificate");
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let mut server_params = CertificateParams::new(vec!["localhost".to_owned()])
+        .expect("should create TLS server certificate parameters");
+    server_params
+        .key_usages
+        .push(KeyUsagePurpose::DigitalSignature);
+    server_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+    let server_key = KeyPair::generate().expect("should generate TLS server key");
+    let server_certificate = server_params
+        .signed_by(&server_key, &issuer)
+        .expect("should sign TLS server certificate");
+
+    let certificate_path = directory.join("remote-server.pem");
+    let private_key_path = directory.join("remote-server-key.pem");
+    std::fs::write(&certificate_path, server_certificate.pem())
+        .expect("should write TLS server certificate");
+    std::fs::write(&private_key_path, server_key.serialize_pem())
+        .expect("should write TLS server private key");
+
+    (
+        certificate_path,
+        private_key_path,
+        CertificateDer::from(ca_certificate.der().to_vec()),
+    )
+}
+
+fn send_tls_http_request(port: u16, config: Arc<ClientConfig>, request: &[u8]) -> String {
+    let socket = TcpStream::connect(("127.0.0.1", port)).expect("should connect TLS client");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("should set TLS client read timeout");
+    let server_name = ServerName::try_from("localhost".to_owned())
+        .expect("should use the TLS certificate's localhost name");
+    let connection = ClientConnection::new(config, server_name)
+        .expect("should create a trusted TLS client connection");
+    let mut stream = StreamOwned::new(connection, socket);
+    stream
+        .write_all(request)
+        .expect("should send an HTTP request over TLS");
+    stream
+        .flush()
+        .expect("should complete the TLS request write");
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let mut body_length = None;
+    loop {
+        let count = stream
+            .read(&mut buffer)
+            .expect("should read the TLS HTTP response headers");
+        assert_ne!(count, 0, "should receive an HTTP response over TLS");
+        response.extend_from_slice(&buffer[..count]);
+        if body_length.is_none() {
+            if let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header = std::str::from_utf8(&response[..header_end])
+                    .expect("should receive UTF-8 HTTP response headers");
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| {
+                            value
+                                .trim()
+                                .parse::<usize>()
+                                .expect("should parse body length")
+                        })
+                    })
+                    .expect("should receive a Content-Length response header");
+                body_length = Some((header_end + 4, length));
+            }
+        }
+        if body_length.is_some_and(|(header_end, length)| response.len() >= header_end + length) {
+            break;
+        }
+    }
+    let (header_end, _) = body_length.expect("should receive a complete TLS response body");
+    String::from_utf8(response[..header_end - 4].to_vec())
+        .expect("should receive UTF-8 TLS HTTP response headers")
 }
 
 fn post_chunk_batch(port: u16, body: &[u8]) -> String {
@@ -1367,6 +1497,7 @@ fn remote_server_persists_across_restarts() -> Result<()> {
 
     {
         let server = RemoteServer::start(&server_root)?;
+        assert!(server.port() > 0, "should bind an operating-system port");
         let source = Connection::open(&source_path)?;
         source.execute_batch(
             "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
@@ -1382,9 +1513,17 @@ fn remote_server_persists_across_restarts() -> Result<()> {
         )?;
         let _: i64 =
             source.query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))?;
+
+        let refs = send_http_request_headers(
+            server.port(),
+            b"GET /origin.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(refs.starts_with("HTTP/1.1 200 OK\r\n"));
+        server.close()?;
     }
 
     let restarted = RemoteServer::start(&server_root)?;
+    assert!(restarted.port() > 0, "should bind after a clean restart");
     let clone = Connection::open(temp.path().join("clone.db"))?;
     let _: i64 = clone.query_row(
         "SELECT dolt_clone(?1)",
@@ -1396,6 +1535,141 @@ fn remote_server_persists_across_restarts() -> Result<()> {
     })?;
 
     assert_eq!(value, "persisted");
+    restarted.close()?;
+    Ok(())
+}
+
+#[test]
+fn remote_server_close_stops_active_and_queued_partial_http_requests() {
+    const PARTIAL_CLIENTS: usize = 12;
+
+    let temp = tempfile::tempdir().expect("should create server directory");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("should create server root");
+    let options = RemoteServerOptions::new().request_timeout(Duration::from_secs(10));
+    let server = RemoteServer::start_with_options(&server_root, &options)
+        .expect("should start server with a bounded request timeout");
+    let port = server.port();
+    assert!(port > 0, "should bind an operating-system port");
+
+    // Keep more incomplete requests open than the native server has workers,
+    // so shutdown must release both workers blocked on partial HTTP headers
+    // and requests waiting in its accepted-socket queue.
+    let mut clients = Vec::with_capacity(PARTIAL_CLIENTS);
+    for _ in 0..PARTIAL_CLIENTS {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", port)).expect("should connect a partial HTTP client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("should set a bounded shutdown read timeout");
+        stream
+            .write_all(b"GET /partial.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .expect("should send an incomplete HTTP header");
+        clients.push(stream);
+    }
+    thread::sleep(Duration::from_millis(100));
+
+    let started = std::time::Instant::now();
+    server
+        .close()
+        .expect("should close the server after stopping partial requests");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "should stop blocked request workers before their ten-second request timeout"
+    );
+
+    for mut client in clients {
+        let mut byte = [0_u8; 1];
+        let result = client.read(&mut byte);
+        assert!(
+            matches!(result, Ok(0))
+                || result.as_ref().is_err_and(|error| matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                )),
+            "should close every incomplete client connection, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn remote_server_tls_handles_concurrent_requests_trusting_a_test_ca() -> Result<()> {
+    const CONCURRENT_CLIENTS: usize = 8;
+
+    let temp = tempfile::tempdir().expect("should create remote TLS test directory");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("should create remote server root");
+    let source_path = temp.path().join("source.db");
+
+    {
+        let server = RemoteServer::start(&server_root)?;
+        let source = Connection::open(&source_path)?;
+        source.execute_batch(
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO widgets VALUES(1, 'tls remote value');",
+        )?;
+        let _: String = source.query_row(
+            "SELECT dolt_commit('-A', '-m', 'seed TLS remote')",
+            [],
+            |row| row.get(0),
+        )?;
+        let _: i64 = source.query_row(
+            "SELECT dolt_remote('add', 'origin', ?1)",
+            params![server.database_url("origin.db")],
+            |row| row.get(0),
+        )?;
+        let _: i64 =
+            source.query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))?;
+        drop(source);
+        server.close()?;
+    }
+
+    let (certificate_path, private_key_path, test_ca) =
+        create_remote_server_tls_identity(temp.path());
+    let options = RemoteServerOptions::new().tls(certificate_path, private_key_path);
+    let tls_server = RemoteServer::start_with_options(&server_root, &options)?;
+    assert!(
+        tls_server.database_url("origin.db").starts_with("https://"),
+        "should publish an HTTPS remote URL when TLS is enabled"
+    );
+
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(test_ca)
+        .expect("should trust the generated test CA");
+    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_config = Arc::new(
+        ClientConfig::builder_with_provider(crypto_provider)
+            .with_safe_default_protocol_versions()
+            .expect("should select supported TLS protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let port = tls_server.port();
+    let requests = (0..CONCURRENT_CLIENTS)
+        .map(|_| {
+            let config = Arc::clone(&client_config);
+            thread::spawn(move || {
+                send_tls_http_request(
+                    port,
+                    config,
+                    b"GET /origin.db/refs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for request in requests {
+        let response = request.join().expect("should join concurrent TLS request");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "should serve the committed remote refs to concurrent TLS clients: {response:?}"
+        );
+    }
+
+    tls_server.close()?;
     Ok(())
 }
 
