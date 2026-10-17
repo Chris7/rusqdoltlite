@@ -203,4 +203,8 @@ local to the TLS translation unit. Workers send TLS close-notify while their
 sockets are still tracked; final cleanup then only frees and closes the
 connection after stop can no longer race a reused handle. The build stages the
 Mbed TLS socket source so the same startup fix applies to the non-amalgamated
-fallback.
+fallback. Windows server sockets use nonblocking I/O with bounded readiness
+waits because `shutdown()` does not cancel a receive already in progress; each
+wait checks the server stop state while the worker retains final socket-close
+ownership. This keeps partial HTTP and TLS handshakes from delaying server
+shutdown without shortening the configured request-idle timeout.

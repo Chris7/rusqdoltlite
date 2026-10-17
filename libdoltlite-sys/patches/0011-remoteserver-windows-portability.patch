@@ -20,9 +20,11 @@ the staged upstream sources:
   than relying on declarations or stubs.
 - Use alternate mutex hooks for TLS 1.3/PSA global state and the shared server
   DRBG; do not rely on separate per-connection contexts for thread safety.
+- Keep Windows worker sockets nonblocking and check server stop between
+  bounded readiness waits; preserve per-I/O timeouts and worker-owned final close.
 
 diff --git a/doltlite.c b/doltlite.c
-index 11b7750..77ec49f 100644
+index 11b77500c51285c2fb05675d8ca83198ec717978..77ec49f586baaa850a2c4d4065e82d495136184a 100644
 --- a/doltlite.c
 +++ b/doltlite.c
 @@ -24388,14 +24388,20 @@ static inline int doltliteSocketSetTimeout(int fd, int timeoutMs) {
@@ -202,7 +204,7 @@ index 11b7750..77ec49f 100644
    snprintf(portstr, sizeof(portstr), "%d", port);
 diff --git a/doltlite_mbedtls_config.h b/doltlite_mbedtls_config.h
 new file mode 100644
-index 0000000..c7052fd
+index 0000000000000000000000000000000000000000..c7052fde6f6a0569b36f9ed13d14bf9958db0560
 --- /dev/null
 +++ b/doltlite_mbedtls_config.h
 @@ -0,0 +1,39 @@
@@ -246,7 +248,7 @@ index 0000000..c7052fd
 +
 +#endif /* DOLTLITE_MBEDTLS_CONFIG_H */
 diff --git a/doltlite_net.h b/doltlite_net.h
-index 7cc079c..4126b96 100644
+index 7cc079c762256eeadf7af379e7dd57325814f1f8..4126b967bb42eec458b45cd237ffd699c8864fc6 100644
 --- a/doltlite_net.h
 +++ b/doltlite_net.h
 @@ -32,14 +32,20 @@ static inline int doltliteSocketSetTimeout(int fd, int timeoutMs) {
@@ -278,7 +280,7 @@ index 7cc079c..4126b96 100644
  
  #else
 diff --git a/doltlite_remotesrv.c b/doltlite_remotesrv.c
-index b89bafa..3ae4267 100644
+index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a910c2a13 100644
 --- a/doltlite_remotesrv.c
 +++ b/doltlite_remotesrv.c
 @@ -8,6 +8,8 @@
@@ -629,9 +631,11 @@ index b89bafa..3ae4267 100644
    char zMethod[16];
    char zPath[512];
    char zDbName[256];
-@@ -1287,40 +1288,47 @@ static void handleRequest(DoltliteServer *pSrv, DoltliteConn *fd){
+@@ -1286,41 +1287,52 @@ static void handleRequest(DoltliteServer *pSrv, DoltliteConn *fd){
+ }
  
  static void serverCleanup(DoltliteServer *pSrv);
++static int serverStopRequested(void *pContext);
  
 -static void *serverWorkerEntry(void *pArg){
 +DOLTLITE_THREAD_ENTRY(serverWorkerEntry){
@@ -662,8 +666,11 @@ index b89bafa..3ae4267 100644
 -    pthread_mutex_unlock(&pSrv->mutex);
 +    doltliteMutexUnlock(&pSrv->mutex);
 +
-+    conn = pSrv->tls ? doltliteServerConnAccept(pSrv->tls, clientFd)
-+                     : doltliteServerConnFromSocket(clientFd);
++    conn = pSrv->tls
++      ? doltliteServerConnAccept(pSrv->tls, clientFd, pSrv->timeoutMs,
++                                 serverStopRequested, pSrv)
++      : doltliteServerConnFromSocket(clientFd, pSrv->timeoutMs,
++                                     serverStopRequested, pSrv);
 +    if( conn ) handleRequest(pSrv, conn);
 +
 +    /* TLS close-notify can write; keep the socket tracked so stop can interrupt it. */
@@ -693,7 +700,7 @@ index b89bafa..3ae4267 100644
  }
  
  static int serverStartWorkers(DoltliteServer *pSrv){
-@@ -1328,14 +1336,14 @@ static int serverStartWorkers(DoltliteServer *pSrv){
+@@ -1328,14 +1340,14 @@ static int serverStartWorkers(DoltliteServer *pSrv){
    for(i=0; i<SERVER_WORKERS; i++){
      pSrv->workerArgs[i].pSrv = pSrv;
      pSrv->workerArgs[i].index = i;
@@ -714,7 +721,7 @@ index b89bafa..3ae4267 100644
        }
        return SQLITE_ERROR;
      }
-@@ -1346,38 +1354,38 @@ static int serverStartWorkers(DoltliteServer *pSrv){
+@@ -1346,41 +1358,46 @@ static int serverStartWorkers(DoltliteServer *pSrv){
  
  static void serverRequestStop(DoltliteServer *pSrv){
    int i;
@@ -731,7 +738,9 @@ index b89bafa..3ae4267 100644
 +    doltliteServerSocketShutdown(fd);
 +    doltliteServerSocketClose(fd);
    }
-   /* shutdown() wakes blocking I/O without descriptor reuse. */
+-  /* shutdown() wakes blocking I/O without descriptor reuse. */
++  /* POSIX shutdown wakes blocking I/O; Windows workers observe stop in bounded
++     nonblocking polls and retain final close ownership. */
    for(i=0; i<pSrv->nWorkers; i++){
 -    if( pSrv->activeFd[i]>=0 ){
 -      doltliteShutdownSocket(pSrv->activeFd[i]);
@@ -764,7 +773,14 @@ index b89bafa..3ae4267 100644
    return running;
  }
  
-@@ -1393,14 +1401,14 @@ static char *dupStr(const char *z){
++static int serverStopRequested(void *pContext){
++  return !serverIsRunning((DoltliteServer*)pContext);
++}
++
+ static char *dupStr(const char *z){
+   int n;
+   char *s;
+@@ -1393,14 +1410,14 @@ static char *dupStr(const char *z){
  
  static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
    struct sockaddr_in addr;
@@ -781,7 +797,7 @@ index b89bafa..3ae4267 100644
    if( o->bSessionLoopbackTransfer!=0 && o->bSessionLoopbackTransfer!=1 ){
      return SQLITE_MISUSE;
    }
-@@ -1411,10 +1419,12 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+@@ -1411,10 +1428,12 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
    if( !pSrv->pVfs ) return SQLITE_ERROR;
    pSrv->timeoutMs = o->timeoutMs>0 ? o->timeoutMs
                                     : SERVER_DEFAULT_TIMEOUT_MS;
@@ -797,7 +813,7 @@ index b89bafa..3ae4267 100644
      serverCleanup(pSrv);
      return SQLITE_ERROR;
    }
-@@ -1459,7 +1469,7 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+@@ -1459,7 +1478,7 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
      if( !pSrv->audience ){ serverCleanup(pSrv); return SQLITE_NOMEM; }
    }
    if( o->certFile && o->keyFile ){
@@ -806,7 +822,7 @@ index b89bafa..3ae4267 100644
      if( !pSrv->tls ){ serverCleanup(pSrv); return SQLITE_ERROR; }
    }
  
-@@ -1483,8 +1493,11 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+@@ -1483,8 +1502,11 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
    }
  
    if( doltliteNetInit()!=0 ){ serverCleanup(pSrv); return SQLITE_ERROR; }
@@ -820,21 +836,30 @@ index b89bafa..3ae4267 100644
  
    setsockopt(pSrv->listenFd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
  
-@@ -1493,11 +1506,11 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+@@ -1493,14 +1515,20 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
    addr.sin_addr = bindIn;
    addr.sin_port = htons((u16)o->port);
  
 -  if( bind(pSrv->listenFd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ){
 +  if( bind(pSrv->listenFd, (struct sockaddr*)&addr, sizeof(addr)) != 0 ){
-     serverCleanup(pSrv);
-     return SQLITE_ERROR;
-   }
--  if( listen(pSrv->listenFd, 5) < 0 ){
++    serverCleanup(pSrv);
++    return SQLITE_ERROR;
++  }
 +  if( listen(pSrv->listenFd, 5) != 0 ){
      serverCleanup(pSrv);
      return SQLITE_ERROR;
    }
-@@ -1519,42 +1532,42 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+-  if( listen(pSrv->listenFd, 5) < 0 ){
++#ifdef _WIN32
++  if( doltliteServerSocketSetNonblocking(pSrv->listenFd)!=0 ){
+     serverCleanup(pSrv);
+     return SQLITE_ERROR;
+   }
++#endif
+ 
+   addrLen = sizeof(addr);
+   if( getsockname(pSrv->listenFd, (struct sockaddr*)&addr, &addrLen)==0 ){
+@@ -1519,42 +1547,49 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
  
  static void serverLoop(DoltliteServer *pSrv){
    while( serverIsRunning(pSrv) ){
@@ -857,6 +882,13 @@ index b89bafa..3ae4267 100644
 -      doltliteCloseSocket(clientFd);
 +    clientFd = accept(pSrv->listenFd, NULL, NULL);
 +    if( !doltliteServerSocketIsValid(clientFd) ) continue;
++#ifdef _WIN32
++    /* Worker I/O stays pollable so stop can interrupt partial requests. */
++    if( doltliteServerSocketSetNonblocking(clientFd)!=0 ){
++      doltliteServerSocketClose(clientFd);
++      continue;
++    }
++#endif
 +    if( doltliteServerSocketSetTimeout(clientFd, pSrv->timeoutMs)!=0 ){
 +      doltliteServerSocketClose(clientFd);
        continue;
@@ -894,7 +926,7 @@ index b89bafa..3ae4267 100644
      pSrv->tls = 0;
    }
    remoteDbCacheClear(pSrv);
-@@ -1565,11 +1578,11 @@ static void serverCleanup(DoltliteServer *pSrv){
+@@ -1565,11 +1600,11 @@ static void serverCleanup(DoltliteServer *pSrv){
    sqlite3_free(pSrv->audience);
    pSrv->audience = 0;
    if( pSrv->condInit ){
@@ -908,7 +940,7 @@ index b89bafa..3ae4267 100644
      pSrv->mutexInit = 0;
    }
  }
-@@ -1616,10 +1629,10 @@ int doltliteServe(const char *zDir, int port, const char *zBindAddr){
+@@ -1616,10 +1651,10 @@ int doltliteServe(const char *zDir, int port, const char *zBindAddr){
    return doltliteServeOpts(&o);
  }
  
@@ -921,7 +953,7 @@ index b89bafa..3ae4267 100644
  }
  
  DoltliteServer *doltliteServeAsyncOpts(const DoltliteServeOpts *o){
-@@ -1635,7 +1648,7 @@ DoltliteServer *doltliteServeAsyncOpts(const DoltliteServeOpts *o){
+@@ -1635,7 +1670,7 @@ DoltliteServer *doltliteServeAsyncOpts(const DoltliteServeOpts *o){
      return 0;
    }
  
@@ -930,7 +962,7 @@ index b89bafa..3ae4267 100644
      serverRequestStop(pSrv);
      serverJoinWorkers(pSrv);
      serverCleanup(pSrv);
-@@ -1659,7 +1672,7 @@ DoltliteServer *doltliteServeAsync(const char *zDir, int port,
+@@ -1659,7 +1694,7 @@ DoltliteServer *doltliteServeAsync(const char *zDir, int port,
  void doltliteServerStop(DoltliteServer *pServer){
    if( !pServer ) return;
    serverRequestStop(pServer);
@@ -941,10 +973,10 @@ index b89bafa..3ae4267 100644
    sqlite3_free(pServer);
 diff --git a/doltlite_server_socket.h b/doltlite_server_socket.h
 new file mode 100644
-index 0000000..29f4dfa
+index 0000000000000000000000000000000000000000..701805476a4a565399360c6511b83350ec764579
 --- /dev/null
 +++ b/doltlite_server_socket.h
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,122 @@
 +#ifndef DOLTLITE_SERVER_SOCKET_H
 +#define DOLTLITE_SERVER_SOCKET_H
 +
@@ -963,6 +995,10 @@ index 0000000..29f4dfa
 +#define doltliteServerSocketShutdown(fd) shutdown((fd), SD_BOTH)
 +#define doltliteServerPoll(fds, n, ms) WSAPoll((fds), (ULONG)(n), (ms))
 +#define DOLTLITE_SERVER_POLLIN POLLRDNORM
++#define DOLTLITE_SERVER_POLLOUT POLLWRNORM
++#define DOLTLITE_SERVER_POLLERR POLLERR
++#define DOLTLITE_SERVER_POLLHUP POLLHUP
++#define DOLTLITE_SERVER_POLLNVAL POLLNVAL
 +
 +static inline int doltliteServerSocketIsValid(doltlite_server_socket_t fd) {
 +  return fd != INVALID_SOCKET;
@@ -998,6 +1034,13 @@ index 0000000..29f4dfa
 +  return rc1 == 0 && rc2 == 0 ? 0 : 1;
 +}
 +
++static inline int doltliteServerSocketSetNonblocking(
++  doltlite_server_socket_t fd
++){
++  u_long enabled = 1;
++  return ioctlsocket(fd, FIONBIO, &enabled) == 0 ? 0 : 1;
++}
++
 +#else
 +#include <poll.h>
 +#include <sys/socket.h>
@@ -1012,6 +1055,10 @@ index 0000000..29f4dfa
 +#define doltliteServerSocketShutdown(fd) shutdown((fd), SHUT_RDWR)
 +#define doltliteServerPoll(fds, n, ms) poll((fds), (n), (ms))
 +#define DOLTLITE_SERVER_POLLIN POLLIN
++#define DOLTLITE_SERVER_POLLOUT POLLOUT
++#define DOLTLITE_SERVER_POLLERR POLLERR
++#define DOLTLITE_SERVER_POLLHUP POLLHUP
++#define DOLTLITE_SERVER_POLLNVAL POLLNVAL
 +
 +static inline int doltliteServerSocketIsValid(doltlite_server_socket_t fd) {
 +  return fd >= 0;
@@ -1054,7 +1101,7 @@ index 0000000..29f4dfa
 +#endif
 diff --git a/doltlite_thread.h b/doltlite_thread.h
 new file mode 100644
-index 0000000..0a72a2f
+index 0000000000000000000000000000000000000000..0a72a2f66384c8d499b86eb9dab50f9779d5f70a
 --- /dev/null
 +++ b/doltlite_thread.h
 @@ -0,0 +1,128 @@
@@ -1187,7 +1234,7 @@ index 0000000..0a72a2f
 +
 +#endif
 diff --git a/doltlite_tls.c b/doltlite_tls.c
-index 85a1aa2..8312ce8 100644
+index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a48d47e67 100644
 --- a/doltlite_tls.c
 +++ b/doltlite_tls.c
 @@ -7,8 +7,11 @@
@@ -1202,20 +1249,23 @@ index 85a1aa2..8312ce8 100644
  #ifdef _WIN32
  #include <wincrypt.h>
  #endif
-@@ -35,6 +38,12 @@ struct DoltliteConn {
+@@ -35,6 +38,15 @@ struct DoltliteConn {
  };
  
  #ifndef DOLTLITE_AUTH_CLIENT_ONLY
 +struct DoltliteServerConn {
 +  int useTls;
 +  doltlite_server_socket_t serverFd;
++  int timeoutMs;
++  DoltliteServerStopCheck stopCheck;
++  void *stopContext;
 +  mbedtls_ssl_context ssl;
 +};
 +
  struct DoltliteTlsServer {
    mbedtls_x509_crt cert;
    mbedtls_pk_context key;
-@@ -44,7 +53,7 @@ struct DoltliteTlsServer {
+@@ -44,7 +56,7 @@ struct DoltliteTlsServer {
  };
  #endif
  
@@ -1224,27 +1274,96 @@ index 85a1aa2..8312ce8 100644
  #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
    int one = 1;
    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-@@ -53,6 +62,19 @@ static void configureSocket(int fd) {
+@@ -53,6 +65,88 @@ static void configureSocket(int fd) {
  #endif
  }
  
 +
++static int serverConnWait(
++  DoltliteServerConn *c,
++  short events,
++  unsigned long long startMs
++){
++#ifdef _WIN32
++  for (;;) {
++    doltlite_server_pollfd pfd;
++    unsigned long long nowMs = (unsigned long long)doltliteMonotonicMs();
++    int waitMs = 100;
++    int rc;
++
++    if (c->stopCheck && c->stopCheck(c->stopContext)) return -1;
++    if (c->timeoutMs > 0) {
++      unsigned long long elapsedMs = nowMs - startMs;
++      if (elapsedMs >= (unsigned)c->timeoutMs) return -1;
++      if ((unsigned long long)waitMs > (unsigned)c->timeoutMs - elapsedMs) {
++        waitMs = c->timeoutMs - (int)elapsedMs;
++      }
++    }
++
++    pfd.fd = c->serverFd;
++    pfd.events = events;
++    pfd.revents = 0;
++    rc = WSAPoll(&pfd, 1, waitMs);
++    if (rc > 0
++        && (pfd.revents & (events | DOLTLITE_SERVER_POLLERR
++                           | DOLTLITE_SERVER_POLLHUP
++                           | DOLTLITE_SERVER_POLLNVAL)) != 0) {
++      return c->stopCheck && c->stopCheck(c->stopContext) ? -1 : 0;
++    }
++    if (rc < 0 && WSAGetLastError() != WSAEINTR) return -1;
++  }
++#else
++  (void)c;
++  (void)events;
++  (void)startMs;
++  return 0;
++#endif
++}
++
 +static int serverConnSend(void *pCtx, const unsigned char *pBuf, size_t nBuf) {
 +  DoltliteServerConn *c = (DoltliteServerConn *)pCtx;
-+  int n = doltliteServerSocketSend(c->serverFd, pBuf, nBuf);
-+  return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
++  unsigned long long startMs = 0;
++#ifdef _WIN32
++  startMs = (unsigned long long)doltliteMonotonicMs();
++#endif
++  for (;;) {
++    int n;
++    if (serverConnWait(c, DOLTLITE_SERVER_POLLOUT, startMs) != 0) {
++      return MBEDTLS_ERR_NET_SEND_FAILED;
++    }
++    n = doltliteServerSocketSend(c->serverFd, pBuf, nBuf);
++#ifdef _WIN32
++    if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) continue;
++    if (n < 0 && WSAGetLastError() == WSAEINTR) continue;
++#endif
++    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
++  }
 +}
 +
 +static int serverConnRecv(void *pCtx, unsigned char *pBuf, size_t nBuf) {
 +  DoltliteServerConn *c = (DoltliteServerConn *)pCtx;
-+  int n = doltliteServerSocketRecv(c->serverFd, pBuf, nBuf);
-+  return n < 0 ? MBEDTLS_ERR_NET_RECV_FAILED : n;
++  unsigned long long startMs = 0;
++#ifdef _WIN32
++  startMs = (unsigned long long)doltliteMonotonicMs();
++#endif
++  for (;;) {
++    int n;
++    if (serverConnWait(c, DOLTLITE_SERVER_POLLIN, startMs) != 0) {
++      return MBEDTLS_ERR_NET_RECV_FAILED;
++    }
++    n = doltliteServerSocketRecv(c->serverFd, pBuf, nBuf);
++#ifdef _WIN32
++    if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) continue;
++    if (n < 0 && WSAGetLastError() == WSAEINTR) continue;
++#endif
++    return n < 0 ? MBEDTLS_ERR_NET_RECV_FAILED : n;
++  }
 +}
 +
  static int connApplyDeadline(DoltliteConn *c) {
    long long remaining;
    if (c->deadlineMs == 0) return 0;
-@@ -138,6 +160,10 @@ DoltliteConn *doltliteConnOpenTimeout(
+@@ -138,6 +232,10 @@ DoltliteConn *doltliteConnOpenTimeout(
    if (!c) return NULL;
    memset(c, 0, sizeof(*c));
    c->useTls = useTls;
@@ -1255,7 +1374,7 @@ index 85a1aa2..8312ce8 100644
    c->ownsConf = 1;
    if (timeoutMs > 0) {
      c->deadlineMs = doltliteMonotonicMs() + timeoutMs;
-@@ -261,10 +287,14 @@ void doltliteConnClose(DoltliteConn *c) {
+@@ -261,10 +359,14 @@ void doltliteConnClose(DoltliteConn *c) {
  }
  
  #ifndef DOLTLITE_AUTH_CLIENT_ONLY
@@ -1271,7 +1390,7 @@ index 85a1aa2..8312ce8 100644
  
    mbedtls_x509_crt_init(&s->cert);
    mbedtls_pk_init(&s->key);
-@@ -295,11 +325,11 @@ DoltliteTlsServer *doltliteTlsServerNew(const char *certFile, const char *keyFil
+@@ -295,11 +397,11 @@ DoltliteTlsServer *doltliteTlsServerNew(const char *certFile, const char *keyFil
    return s;
  
  fail:
@@ -1285,14 +1404,18 @@ index 85a1aa2..8312ce8 100644
    if (!s) return;
    mbedtls_ssl_config_free(&s->conf);
    mbedtls_x509_crt_free(&s->cert);
-@@ -309,23 +339,24 @@ void doltliteTlsServerFree(DoltliteTlsServer *s) {
+@@ -309,23 +411,31 @@ void doltliteTlsServerFree(DoltliteTlsServer *s) {
    sqlite3_free(s);
  }
  
 -DoltliteConn *doltliteConnServerAccept(DoltliteTlsServer *s, int clientFd) {
 -  DoltliteConn *c = (DoltliteConn *)sqlite3_malloc((int)sizeof(*c));
 +DoltliteServerConn *doltliteServerConnAccept(
-+  DoltliteTlsServer *s, doltlite_server_socket_t clientFd
++  DoltliteTlsServer *s,
++  doltlite_server_socket_t clientFd,
++  int timeoutMs,
++  DoltliteServerStopCheck stopCheck,
++  void *stopContext
 +) {
 +  DoltliteServerConn *c = (DoltliteServerConn *)sqlite3_malloc((int)sizeof(*c));
    int ret;
@@ -1307,6 +1430,9 @@ index 85a1aa2..8312ce8 100644
 -  mbedtls_net_init(&c->net);
 -  c->net.fd = clientFd;
 +  c->serverFd = clientFd;
++  c->timeoutMs = timeoutMs;
++  c->stopCheck = stopCheck;
++  c->stopContext = stopContext;
    configureSocket(clientFd);
 +  if (doltliteMbedtlsThreadingInit() != 0) {
 +    sqlite3_free(c);
@@ -1320,7 +1446,7 @@ index 85a1aa2..8312ce8 100644
    do {
      ret = mbedtls_ssl_handshake(&c->ssl);
    } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-@@ -334,23 +365,56 @@ DoltliteConn *doltliteConnServerAccept(DoltliteTlsServer *s, int clientFd) {
+@@ -334,23 +444,62 @@ DoltliteConn *doltliteConnServerAccept(DoltliteTlsServer *s, int clientFd) {
  
  fail:
    mbedtls_ssl_free(&c->ssl);
@@ -1336,7 +1462,10 @@ index 85a1aa2..8312ce8 100644
 -    return NULL;
 -  }
 +DoltliteServerConn *doltliteServerConnFromSocket(
-+  doltlite_server_socket_t clientFd
++  doltlite_server_socket_t clientFd,
++  int timeoutMs,
++  DoltliteServerStopCheck stopCheck,
++  void *stopContext
 +) {
 +  DoltliteServerConn *c = (DoltliteServerConn *)sqlite3_malloc((int)sizeof(*c));
 +  if (!c) return NULL;
@@ -1346,6 +1475,9 @@ index 85a1aa2..8312ce8 100644
 -  mbedtls_net_init(&c->net);
 -  c->net.fd = clientFd;
 +  c->serverFd = clientFd;
++  c->timeoutMs = timeoutMs;
++  c->stopCheck = stopCheck;
++  c->stopContext = stopContext;
    configureSocket(clientFd);
    return c;
  }
@@ -1355,7 +1487,7 @@ index 85a1aa2..8312ce8 100644
 +  while (off < nbuf) {
 +    int n = c->useTls
 +      ? mbedtls_ssl_write(&c->ssl, p + off, (size_t)(nbuf - off))
-+      : doltliteServerSocketSend(c->serverFd, p + off, (size_t)(nbuf - off));
++      : serverConnSend(c, p + off, (size_t)(nbuf - off));
 +    if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
 +    if (n <= 0) return 1;
 +    off += n;
@@ -1365,7 +1497,7 @@ index 85a1aa2..8312ce8 100644
 +int doltliteServerConnRead(DoltliteServerConn *c, void *buf, int nbuf) {
 +  for (;;) {
 +    int n = c->useTls ? mbedtls_ssl_read(&c->ssl, (unsigned char *)buf, (size_t)nbuf)
-+                      : doltliteServerSocketRecv(c->serverFd, buf, (size_t)nbuf);
++                      : serverConnRecv(c, buf, (size_t)nbuf);
 +    if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
 +    if (c->useTls && n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
 +    return n < 0 ? -1 : n;
@@ -1388,7 +1520,7 @@ index 85a1aa2..8312ce8 100644
 +
  #endif
 diff --git a/doltlite_tls.h b/doltlite_tls.h
-index 790d01b..56632bd 100644
+index 790d01b86e9241403a2a61eb2b066b93b3141bb9..a684acd0f4399e9fd106a7474936b2e1ac17dca7 100644
 --- a/doltlite_tls.h
 +++ b/doltlite_tls.h
 @@ -2,6 +2,7 @@
@@ -1399,11 +1531,12 @@ index 790d01b..56632bd 100644
  
  #ifdef __cplusplus
  extern "C" {
-@@ -21,12 +22,19 @@ static inline DoltliteConn *doltliteConnOpen(const char *host, int port, int use
+@@ -21,12 +22,29 @@ static inline DoltliteConn *doltliteConnOpen(const char *host, int port, int use
  
  #ifndef DOLTLITE_AUTH_CLIENT_ONLY
  typedef struct DoltliteTlsServer DoltliteTlsServer;
 +typedef struct DoltliteServerConn DoltliteServerConn;
++typedef int (*DoltliteServerStopCheck)(void *context);
  
 -DoltliteTlsServer *doltliteTlsServerNew(const char *certFile, const char *keyFile);
 -void doltliteTlsServerFree(DoltliteTlsServer *s);
@@ -1413,9 +1546,18 @@ index 790d01b..56632bd 100644
 +DoltliteTlsServer *doltliteServerTlsNew(const char *certFile, const char *keyFile);
 +void doltliteServerTlsFree(DoltliteTlsServer *s);
 +DoltliteServerConn *doltliteServerConnAccept(
-+  DoltliteTlsServer *s, doltlite_server_socket_t clientFd
++  DoltliteTlsServer *s,
++  doltlite_server_socket_t clientFd,
++  int timeoutMs,
++  DoltliteServerStopCheck stopCheck,
++  void *stopContext
 +);
-+DoltliteServerConn *doltliteServerConnFromSocket(doltlite_server_socket_t clientFd);
++DoltliteServerConn *doltliteServerConnFromSocket(
++  doltlite_server_socket_t clientFd,
++  int timeoutMs,
++  DoltliteServerStopCheck stopCheck,
++  void *stopContext
++);
 +void doltliteServerConnCloseNotify(DoltliteServerConn *conn);
 +int doltliteServerConnWriteAll(DoltliteServerConn *conn, const void *buf, int nbuf);
 +int doltliteServerConnRead(DoltliteServerConn *conn, void *buf, int nbuf);
@@ -1424,7 +1566,7 @@ index 790d01b..56632bd 100644
  #endif
  
  int doltliteConnWriteAll(DoltliteConn *conn, const void *buf, int nbuf);
-@@ -37,6 +45,9 @@ int doltliteConnSetTimeout(DoltliteConn *conn, int timeoutMs);
+@@ -37,6 +55,9 @@ int doltliteConnSetTimeout(DoltliteConn *conn, int timeoutMs);
  
  void doltliteConnClose(DoltliteConn *conn);
  
@@ -1435,7 +1577,7 @@ index 790d01b..56632bd 100644
  }
  #endif
 diff --git a/mbedtls/library/net_sockets.c b/mbedtls/library/net_sockets.c
-index c919f6f..64b109f 100644
+index c919f6f5748b70eb4274045b8cca6e4bf1a131ef..64b109ff2c1b7339dc810e5b7ee5f52b6b0ad4ea 100644
 --- a/mbedtls/library/net_sockets.c
 +++ b/mbedtls/library/net_sockets.c
 @@ -35,9 +35,8 @@
@@ -1488,7 +1630,7 @@ index c919f6f..64b109f 100644
  #if !defined(EFIX64) && !defined(EFI32)
 diff --git a/threading_alt.h b/threading_alt.h
 new file mode 100644
-index 0000000..8a5bdbb
+index 0000000000000000000000000000000000000000..8a5bdbbcad12f1ae9fe385381d590d50ae21ec04
 --- /dev/null
 +++ b/threading_alt.h
 @@ -0,0 +1,8 @@

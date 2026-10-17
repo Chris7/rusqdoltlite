@@ -32,6 +32,7 @@ jobs:
           - name: Windows MSVC with blockcachevfs
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            rust_host: -x86_64-pc-windows-msvc
             features: blockcachevfs remote
             blockcachevfs: true
           - name: Windows GNU remote server

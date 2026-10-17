@@ -211,6 +211,52 @@ fn create_remote_server_tls_identity(
     )
 }
 
+fn test_tls_client_config(test_ca: CertificateDer<'static>) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(test_ca)
+        .expect("should trust the generated test CA");
+    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
+    Arc::new(
+        ClientConfig::builder_with_provider(crypto_provider)
+            .with_safe_default_protocol_versions()
+            .expect("should select supported TLS protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+fn partial_tls_client_hello(client_config: Arc<ClientConfig>) -> Vec<u8> {
+    const PARTIAL_RECORD_BYTES: usize = 16;
+    const TLS_RECORD_HEADER_BYTES: usize = 5;
+
+    let server_name =
+        ServerName::try_from("localhost".to_owned()).expect("should use the TLS certificate name");
+    let mut client = ClientConnection::new(client_config, server_name)
+        .expect("should create a TLS client for the generated identity");
+    let mut client_hello = Vec::new();
+    client
+        .write_tls(&mut client_hello)
+        .expect("should serialize a TLS ClientHello");
+
+    assert_eq!(
+        client_hello[0], 22,
+        "should begin with a TLS handshake record"
+    );
+    let declared_record_bytes = usize::from(u16::from_be_bytes([client_hello[3], client_hello[4]]));
+    assert!(
+        client_hello.len() >= TLS_RECORD_HEADER_BYTES + declared_record_bytes,
+        "should serialize the complete ClientHello record"
+    );
+    assert!(
+        PARTIAL_RECORD_BYTES > TLS_RECORD_HEADER_BYTES
+            && PARTIAL_RECORD_BYTES < TLS_RECORD_HEADER_BYTES + declared_record_bytes,
+        "should leave the valid ClientHello record incomplete"
+    );
+    client_hello.truncate(PARTIAL_RECORD_BYTES);
+    client_hello
+}
+
 fn send_tls_http_request(port: u16, config: Arc<ClientConfig>, request: &[u8]) -> String {
     let socket = TcpStream::connect(("127.0.0.1", port)).expect("should connect TLS client");
     socket
@@ -1605,6 +1651,82 @@ fn remote_server_close_stops_active_and_queued_partial_http_requests() {
 }
 
 #[test]
+fn remote_server_close_stops_active_and_queued_partial_tls_handshakes() -> Result<()> {
+    const PARTIAL_CLIENTS: usize = 12;
+    const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(100);
+    const SHUTDOWN_LIMIT: Duration = Duration::from_secs(5);
+
+    let temp = tempfile::tempdir().expect("should create TLS shutdown test directory");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("should create TLS server root");
+    let (certificate_path, private_key_path, test_ca) =
+        create_remote_server_tls_identity(temp.path());
+    let client_config = test_tls_client_config(test_ca);
+    let partial_client_hello = partial_tls_client_hello(Arc::clone(&client_config));
+    let options = RemoteServerOptions::new()
+        .tls(certificate_path, private_key_path)
+        .request_timeout(Duration::from_secs(10));
+    let server = RemoteServer::start_with_options(&server_root, &options)?;
+    let port = server.port();
+
+    // DoltLite has four workers. Holding twelve valid-but-incomplete TLS
+    // ClientHello records blocks every worker and leaves additional accepted
+    // sockets queued, matching the shutdown condition that must not wait for
+    // its ten-second socket timeout.
+    let mut clients = Vec::with_capacity(PARTIAL_CLIENTS);
+    for _ in 0..PARTIAL_CLIENTS {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .expect("should connect a partial TLS handshake client");
+        stream
+            .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))
+            .expect("should set a bounded TLS handshake read timeout");
+        stream
+            .write_all(&partial_client_hello)
+            .expect("should send the beginning of a valid TLS ClientHello record");
+        clients.push(stream);
+    }
+
+    for (index, client) in clients.iter_mut().enumerate() {
+        let mut byte = [0_u8; 1];
+        let result = client.read(&mut byte);
+        assert!(
+            result.as_ref().is_err_and(|error| matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )),
+            "should wait for the remaining ClientHello record bytes for client {index}, got {result:?}"
+        );
+    }
+
+    let started = std::time::Instant::now();
+    server.close()?;
+    assert!(
+        started.elapsed() < SHUTDOWN_LIMIT,
+        "should stop blocked TLS handshake workers before their ten-second request timeout"
+    );
+
+    for mut client in clients {
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("should allow the server a bounded time to close TLS clients");
+        let mut byte = [0_u8; 1];
+        let result = client.read(&mut byte);
+        assert!(
+            matches!(result, Ok(0))
+                || result.as_ref().is_err_and(|error| matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                )),
+            "should close every incomplete TLS client connection, got {result:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn remote_server_tls_handles_concurrent_requests_trusting_a_test_ca() -> Result<()> {
     const CONCURRENT_CLIENTS: usize = 8;
 
@@ -1645,18 +1767,7 @@ fn remote_server_tls_handles_concurrent_requests_trusting_a_test_ca() -> Result<
         "should publish an HTTPS remote URL when TLS is enabled"
     );
 
-    let mut roots = RootCertStore::empty();
-    roots
-        .add(test_ca)
-        .expect("should trust the generated test CA");
-    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
-    let client_config = Arc::new(
-        ClientConfig::builder_with_provider(crypto_provider)
-            .with_safe_default_protocol_versions()
-            .expect("should select supported TLS protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
+    let client_config = test_tls_client_config(test_ca);
     let port = tls_server.port();
     let requests = (0..CONCURRENT_CLIENTS)
         .map(|_| {
