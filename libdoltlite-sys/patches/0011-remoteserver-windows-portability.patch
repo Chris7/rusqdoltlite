@@ -412,6 +412,17 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    sendStructuredError(fd, 401, "Unauthorized", "unauthorized", SQLITE_AUTH,
                        "unauthorized");
  }
+@@ -251,9 +252,7 @@
+ #define SERVER_BODY_MIN_RATE     (64 * 1024)
+ 
+ static i64 monotonicMs(void){
+-  struct timespec ts;
+-  clock_gettime(CLOCK_MONOTONIC, &ts);
+-  return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++  return (i64)doltliteMonotonicMs();
+ }
+ 
+ /* Grow *pp to need bytes, capped at MAX_RESPONSE_BYTES (realloc64). */
 @@ -289,11 +290,11 @@ static int remoteSrvGrowBuf(u8 **pp, i64 *pnAlloc, i64 need){
    return SQLITE_OK;
  }
