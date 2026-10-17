@@ -190,10 +190,11 @@ provides the separate logical chunk plan and callback; these CBS edits apply
 only to build.rs's OUT_DIR copy and remain separate from the pristine vendored
 CBS tree.
 
-`0011-remoteserver-windows-portability.patch` enables the native RemoteServer
-on Windows and supplies matching Win32 and POSIX worker-thread, mutex,
-condition-variable, socket, polling, timeout, and shutdown primitives. Windows
-server sockets retain the full `SOCKET` width. The embedded and staged Mbed
+`0011-remoteserver-windows-portability.patch` is based on DoltLite v0.50.15
+after patches 0001-0010, including clone progress, and enables the native
+RemoteServer on Windows and supplies matching Win32 and POSIX worker-thread,
+mutex, condition-variable, socket, polling, timeout, and shutdown primitives.
+Windows server sockets retain the full `SOCKET` width. The embedded and staged Mbed
 TLS network initializers use `INIT_ONCE` for Winsock startup. The patch stages
 one Mbed TLS configuration for the amalgamation and TLS sidecar, enables the
 actual TLS 1.2/1.3 server and threading implementations, and uses alternate

@@ -1,5 +1,5 @@
 Subject: [PATCH] Port native RemoteServer workers and sockets to Windows
-Base: DoltLite v0.50.12 with local patches 0001-0009 applied
+Base: DoltLite v0.50.15 with local patches 0001-0010 applied
 
 This patch enables the native RemoteServer on Windows and preserves the
 existing public SQL and HTTP interfaces. Keep these behaviors when refreshing
@@ -24,10 +24,10 @@ the staged upstream sources:
   bounded readiness waits; preserve per-I/O timeouts and worker-owned final close.
 
 diff --git a/doltlite.c b/doltlite.c
-index 11b77500c51285c2fb05675d8ca83198ec717978..77ec49f586baaa850a2c4d4065e82d495136184a 100644
+index 22bc4a1604a5ff3aaea4f8b910313ffdc9e271c5..8007722d4ed0e87811d1d4cdf348c7860dd652da 100644
 --- a/doltlite.c
 +++ b/doltlite.c
-@@ -24388,14 +24388,20 @@ static inline int doltliteSocketSetTimeout(int fd, int timeoutMs) {
+@@ -24612,14 +24612,20 @@ static inline int doltliteSocketSetTimeout(int fd, int timeoutMs) {
    return rc1 == 0 && rc2 == 0 ? 0 : 1;
  }
  
@@ -55,7 +55,7 @@ index 11b77500c51285c2fb05675d8ca83198ec717978..77ec49f586baaa850a2c4d4065e82d49
  }
  
  #else
-@@ -297974,37 +297980,7 @@ int ed25519_verify(const unsigned char *signature, const unsigned char *message,
+@@ -300924,37 +300930,7 @@ int ed25519_verify(const unsigned char *signature, const unsigned char *message,
  
  /************** End of mbedtls_config.h **************************************/
  /************** Begin file doltlite_mbedtls_config.h *************************/
@@ -94,7 +94,7 @@ index 11b77500c51285c2fb05675d8ca83198ec717978..77ec49f586baaa850a2c4d4065e82d49
  /************** End of doltlite_mbedtls_config.h *****************************/
  /************** Continuing where we left off in build_info.h *****************/
  #else
-@@ -414648,7 +414624,16 @@ void mbedtls_net_free(mbedtls_net_context *ctx);
+@@ -417598,7 +417574,16 @@ void mbedtls_net_free(mbedtls_net_context *ctx);
  #define write(fd, buf, len)       send(fd, (char *) (buf), (int) (len), 0)
  #define close(fd)               closesocket(fd)
  
@@ -112,7 +112,7 @@ index 11b77500c51285c2fb05675d8ca83198ec717978..77ec49f586baaa850a2c4d4065e82d49
  
  #else /* ( _WIN32 || _WIN32_WCE ) && !EFIX64 && !EFI32 */
  
-@@ -414691,14 +414676,9 @@ static int net_prepare(void)
+@@ -417641,14 +417626,9 @@ static int net_prepare(void)
  {
  #if (defined(_WIN32) || defined(_WIN32_WCE)) && !defined(EFIX64) && \
      !defined(EFI32)
@@ -130,7 +130,7 @@ index 11b77500c51285c2fb05675d8ca83198ec717978..77ec49f586baaa850a2c4d4065e82d49
      }
  #else
  #if !defined(EFIX64) && !defined(EFI32)
-@@ -473258,6 +473238,58 @@ void doltliteConnClose(DoltliteConn *conn);
+@@ -476202,6 +476182,58 @@ void doltliteConnClose(DoltliteConn *conn);
  SQLITE_API void *sqlite3_malloc(int);
  SQLITE_API void sqlite3_free(void*);
  
@@ -189,7 +189,7 @@ index 11b77500c51285c2fb05675d8ca83198ec717978..77ec49f586baaa850a2c4d4065e82d49
  struct DoltliteConn {
    int useTls;
    int ownsConf;
-@@ -473394,6 +473426,12 @@ DoltliteConn *doltliteConnOpenTimeout(
+@@ -476338,6 +476370,12 @@ DoltliteConn *doltliteConnOpenTimeout(
    if (timeoutMs > 0) {
      c->deadlineMs = doltliteMonotonicMs() + timeoutMs;
    }
