@@ -22,6 +22,9 @@ the staged upstream sources:
   DRBG; do not rely on separate per-connection contexts for thread safety.
 - Keep Windows worker sockets nonblocking and check server stop between
   bounded readiness waits; preserve per-I/O timeouts and worker-owned final close.
+- On POSIX, retry interrupted blocking reads and writes through Mbed TLS WANT
+  results, while keeping socket-timeout EAGAIN terminal so request limits remain
+  effective.
 
 diff --git a/doltlite.c b/doltlite.c
 index 22bc4a1604a5ff3aaea4f8b910313ffdc9e271c5..8007722d4ed0e87811d1d4cdf348c7860dd652da 100644
@@ -1248,7 +1251,7 @@ diff --git a/doltlite_tls.c b/doltlite_tls.c
 index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a48d47e67 100644
 --- a/doltlite_tls.c
 +++ b/doltlite_tls.c
-@@ -7,8 +7,11 @@
+@@ -7,8 +7,12 @@
  #include "mbedtls/pk.h"
  #include "mbedtls/ssl.h"
  #include "mbedtls/x509_crt.h"
@@ -1257,6 +1260,7 @@ index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a
  #include "doltlite_net.h"
 +#include "doltlite_thread.h"
 +#include "doltlite_server_socket.h"
++#include <errno.h>
  #ifdef _WIN32
  #include <wincrypt.h>
  #endif
@@ -1285,7 +1289,7 @@ index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a
  #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
    int one = 1;
    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-@@ -53,6 +65,88 @@ static void configureSocket(int fd) {
+@@ -53,6 +65,92 @@ static void configureSocket(int fd) {
  #endif
  }
  
@@ -1346,6 +1350,8 @@ index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a
 +#ifdef _WIN32
 +    if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) continue;
 +    if (n < 0 && WSAGetLastError() == WSAEINTR) continue;
++#else
++    if (n < 0 && errno == EINTR) return MBEDTLS_ERR_SSL_WANT_WRITE;
 +#endif
 +    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
 +  }
@@ -1366,6 +1372,8 @@ index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a
 +#ifdef _WIN32
 +    if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) continue;
 +    if (n < 0 && WSAGetLastError() == WSAEINTR) continue;
++#else
++    if (n < 0 && errno == EINTR) return MBEDTLS_ERR_SSL_WANT_READ;
 +#endif
 +    return n < 0 ? MBEDTLS_ERR_NET_RECV_FAILED : n;
 +  }

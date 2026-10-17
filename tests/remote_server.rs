@@ -5,14 +5,14 @@ use std::{
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     ptr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Barrier, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rusqlite::{
@@ -29,8 +29,6 @@ use rustls::{
 use rusqlite::blockcachevfs::SessionOperationId;
 #[cfg(feature = "blockcachevfs")]
 use rusqlite::{BlockCacheSessionOptions, OpenFlags, SessionOperationStatus, SessionScope};
-#[cfg(feature = "blockcachevfs")]
-use std::time::Instant;
 
 unsafe extern "C" {
     #[link_name = "doltliteHttpRemoteOpen"]
@@ -160,6 +158,38 @@ fn send_http_request_headers(port: u16, request: &[u8]) -> String {
         .expect("should receive complete HTTP response headers");
     String::from_utf8(response[..header_end].to_vec())
         .expect("should receive UTF-8 HTTP response headers")
+}
+
+fn run_child_with_deadline(mut command: Command, timeout: Duration) -> std::process::Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("should start isolated remote server test process");
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .expect("should check isolated test process")
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .expect("should collect isolated test process output");
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("should collect timed-out test process output");
+            panic!(
+                "isolated remote server test exceeded {timeout:?}; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn create_remote_server_tls_identity(
@@ -753,6 +783,169 @@ fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
 
     server.close()?;
 
+    Ok(())
+}
+
+#[test]
+fn remote_server_idle_partial_request_obeys_configured_timeout() -> Result<()> {
+    const CHILD_ENV: &str = "RUSQ_REMOTE_TIMEOUT_CHILD";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let temp = tempfile::tempdir().expect("should create request-timeout fixture directory");
+        let server_root = temp.path().join("server");
+        std::fs::create_dir(&server_root).expect("should create request-timeout server root");
+        let request_timeout = Duration::from_millis(400);
+        let server = RemoteServer::start_with_options(
+            &server_root,
+            &RemoteServerOptions::new().request_timeout(request_timeout),
+        )?;
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port()))
+            .expect("should connect an incomplete request client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("should set a watchdog on the incomplete request client");
+        let started = Instant::now();
+        stream
+            .write_all(b"GET /partial.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .expect("should send an incomplete HTTP request");
+
+        let mut response = Vec::new();
+        let read_result = stream.read_to_end(&mut response);
+        let elapsed = started.elapsed();
+        if read_result.as_ref().is_err_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        }) {
+            eprintln!("server did not close its idle request before the client watchdog");
+            std::process::exit(71);
+        }
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "should retain blocking socket timeout semantics, closed after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "should close the incomplete request within its configured timeout"
+        );
+        server.close()?;
+        return Ok(());
+    }
+
+    let mut command = Command::new(std::env::current_exe().expect("should locate test binary"));
+    command
+        .args([
+            "--exact",
+            "remote_server_idle_partial_request_obeys_configured_timeout",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1");
+    let output = run_child_with_deadline(command, Duration::from_secs(8));
+    assert!(
+        output.status.success(),
+        "isolated timeout regression failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_server_retries_interrupted_plaintext_and_tls_io() -> Result<()> {
+    const CHILD_ENV: &str = "RUSQ_REMOTE_EINTR_CHILD";
+    const MARKER_ENV: &str = "RUSQ_REMOTE_EINTR_MARKER";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return remote_server_interrupted_io_child();
+    }
+
+    let temp = tempfile::tempdir().expect("should create EINTR test directory");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/remote_server_eintr.c");
+    let shim = temp.path().join("remote_server_eintr.so");
+    let compile = Command::new("cc")
+        .args(["-shared", "-fPIC", "-pthread", "-o"])
+        .arg(&shim)
+        .arg(&fixture)
+        .arg("-ldl")
+        .output()
+        .expect("should compile the child-only socket fault injector");
+    assert!(
+        compile.status.success(),
+        "should compile socket fault injector; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let marker = temp.path().join("interrupted-operations.txt");
+    let mut preload = shim.to_string_lossy().into_owned();
+    if let Some(existing) = std::env::var_os("LD_PRELOAD") {
+        if !existing.is_empty() {
+            preload.push(':');
+            preload.push_str(&existing.to_string_lossy());
+        }
+    }
+    let mut command = Command::new(std::env::current_exe().expect("should locate test binary"));
+    command
+        .args([
+            "--exact",
+            "remote_server_retries_interrupted_plaintext_and_tls_io",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .env(MARKER_ENV, &marker)
+        .env("LD_PRELOAD", preload);
+    let output = run_child_with_deadline(command, Duration::from_secs(30));
+    assert!(
+        output.status.success(),
+        "isolated EINTR regression failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let interrupted = std::fs::read_to_string(marker)
+        .expect("should observe injected receive and send interruptions");
+    assert_eq!(
+        interrupted.lines().filter(|line| *line == "recv").count(),
+        2,
+        "should inject one receive interruption into plaintext and TLS sessions: {interrupted:?}"
+    );
+    assert_eq!(
+        interrupted.lines().filter(|line| *line == "send").count(),
+        2,
+        "should inject one send interruption into plaintext and TLS sessions: {interrupted:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remote_server_interrupted_io_child() -> Result<()> {
+    let temp = tempfile::tempdir().expect("should create isolated server directory");
+    let plain_root = temp.path().join("plain");
+    std::fs::create_dir(&plain_root).expect("should create plaintext server root");
+    let plain_server = RemoteServer::start(&plain_root)?;
+    let response = send_http_request(
+        plain_server.port(),
+        b"GET /missing.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    plain_server.close()?;
+
+    let tls_root = temp.path().join("tls");
+    std::fs::create_dir(&tls_root).expect("should create TLS server root");
+    let (certificate_path, private_key_path, test_ca) =
+        create_remote_server_tls_identity(temp.path());
+    let options = RemoteServerOptions::new().tls(certificate_path, private_key_path);
+    let tls_server = RemoteServer::start_with_options(&tls_root, &options)?;
+    let response = send_tls_http_request(
+        tls_server.port(),
+        test_tls_client_config(test_ca),
+        b"GET /missing.db/refs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    tls_server.close()?;
     Ok(())
 }
 
@@ -3202,14 +3395,41 @@ fn concurrent_pushes_reject_one_stale_ref_update() -> Result<()> {
 
     assert_eq!(
         successes, 1,
-        "exactly one concurrent push should advance the remote ref"
+        "exactly one concurrent push should advance the remote ref; results: {results:?}"
     );
-    assert!(results.iter().any(|result| {
-        matches!(
-            result,
-            Err(Error::SqliteFailure(code, _))
-                if matches!(code.extended_code, rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_BUSY_SNAPSHOT | rusqlite::ffi::SQLITE_ERROR)
-        )
-    }));
+    // The barrier starts both SQL statements but does not synchronize their
+    // remote-head reads. A late loser can see the winner's published head and
+    // receive the normal non-fast-forward rejection instead of a stale-head
+    // conflict.
+    assert!(
+        results.iter().any(|result| {
+            matches!(result, Err(Error::SqliteFailure(code, _))
+                if matches!(code.extended_code, rusqlite::ffi::SQLITE_BUSY
+                    | rusqlite::ffi::SQLITE_BUSY_SNAPSHOT
+                    | rusqlite::ffi::SQLITE_ERROR))
+                || matches!(result, Err(Error::SqliteFailure(code, Some(message)))
+                    if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT
+                        && message == "not a fast-forward of the remote branch (use force to overwrite)")
+        }),
+        "the losing push should report a stale-ref rejection; results: {results:?}"
+    );
+
+    let winning_client = if results[0].is_ok() {
+        "first"
+    } else {
+        "second"
+    };
+    let remote_clone = Connection::open(temp.path().join("remote-verification.db"))?;
+    let _: i64 = remote_clone.query_row("SELECT dolt_clone(?1)", params![remote_url], |row| {
+        row.get(0)
+    })?;
+    let remote_value: String =
+        remote_clone.query_row("SELECT name FROM widgets WHERE id = 1", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(
+        remote_value, winning_client,
+        "the remote must contain the successful concurrent push"
+    );
     Ok(())
 }
