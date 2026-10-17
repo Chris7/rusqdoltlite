@@ -92,6 +92,13 @@ impl RecordingProxy {
                 if worker_stopped.load(Ordering::Acquire) {
                     break;
                 }
+                if let Err(error) = client.set_nonblocking(false) {
+                    save_proxy_error(
+                        &worker_error,
+                        format!("could not make accepted progress socket blocking: {error}"),
+                    );
+                    continue;
+                }
                 let _ = client.set_read_timeout(Some(Duration::from_secs(60)));
                 let _ = client.set_write_timeout(Some(Duration::from_secs(60)));
                 if let Err(error) = handle_proxy_request(

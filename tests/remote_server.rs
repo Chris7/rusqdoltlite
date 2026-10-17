@@ -356,6 +356,16 @@ impl SlowGcsProxy {
                 if thread_stopped.load(Ordering::Acquire) != 0 {
                     break;
                 }
+                if let Err(error) = client.set_nonblocking(false) {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        if failure.is_none() {
+                            *failure = Some(format!(
+                                "reset accepted GCS proxy socket to blocking mode failed: {error}"
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 let result = relay_gcs_request(
                     &mut client,
                     &authority,
@@ -2098,6 +2108,9 @@ impl GetChunksProxy {
                 if thread_stopped.load(Ordering::Acquire) != 0 {
                     break;
                 }
+                client
+                    .set_nonblocking(false)
+                    .expect("should reset accepted get-chunks proxy socket to blocking mode");
                 loop {
                     let request = match read_http_request_or_eof(&mut client) {
                         Ok(Some(request)) => request,
@@ -2504,6 +2517,9 @@ fn spawn_chunk_stalling_http_proxy(backend_port: u16) -> (String, thread::JoinHa
                 }
                 Err(error) => panic!("accept proxied HTTP request: {error}"),
             };
+            client
+                .set_nonblocking(false)
+                .expect("should reset accepted transport proxy socket to blocking mode");
             let request = read_http_request(&mut client);
             let header_end = request
                 .windows(4)
