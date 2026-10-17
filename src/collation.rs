@@ -1,6 +1,6 @@
 //! Add, remove, or modify a collation
 use std::cmp::Ordering;
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::panic::catch_unwind;
 use std::ptr;
 use std::slice;
@@ -71,24 +71,23 @@ impl InnerConnection {
         where
             C: Fn(&str, &str) -> Ordering,
         {
-            let r = catch_unwind(|| {
-                let boxed_f: *mut C = arg1.cast::<C>();
-                assert!(!boxed_f.is_null(), "Internal error - null function pointer");
-                let s1 = {
-                    let c_slice = slice::from_raw_parts(arg3.cast::<u8>(), arg2 as usize);
-                    String::from_utf8_lossy(c_slice)
-                };
-                let s2 = {
-                    let c_slice = slice::from_raw_parts(arg5.cast::<u8>(), arg4 as usize);
-                    String::from_utf8_lossy(c_slice)
-                };
-                (*boxed_f)(s1.as_ref(), s2.as_ref())
-            });
-            let t = match r {
-                Err(_) => {
-                    return -1; // FIXME How ?
-                }
-                Ok(r) => r,
+            let r = unsafe {
+                catch_unwind(|| {
+                    let boxed_f: *mut C = arg1.cast::<C>();
+                    assert!(!boxed_f.is_null(), "Internal error - null function pointer");
+                    let s1 = {
+                        let c_slice = slice::from_raw_parts(arg3.cast::<u8>(), arg2 as usize);
+                        String::from_utf8_lossy(c_slice)
+                    };
+                    let s2 = {
+                        let c_slice = slice::from_raw_parts(arg5.cast::<u8>(), arg4 as usize);
+                        String::from_utf8_lossy(c_slice)
+                    };
+                    (*boxed_f)(s1.as_ref(), s2.as_ref())
+                })
+            };
+            let Ok(t) = r else {
+                return -1; // FIXME How ?
             };
 
             match t {
@@ -138,28 +137,29 @@ impl InnerConnection {
                 // TODO: validate
                 return;
             }
-
-            let callback: fn(&Connection, &str) -> Result<()> = mem::transmute(arg1);
-            let res = catch_unwind(|| {
-                let conn = Connection::from_handle(arg2).unwrap();
-                let collation_name = CStr::from_ptr(arg3)
-                    .to_str()
-                    .expect("illegal collation sequence name");
-                callback(&conn, collation_name)
-            })
-            .unwrap_or_else(|_| Err(Error::UnwindingPanic));
-            if let Err(err) = res {
-                #[cfg(feature = "modern_sqlite")]
-                // 3.51.0
-                if let Ok(msg) = std::ffi::CString::new(format!("{}", err)) {
-                    let _ = crate::error::set_errmsg(
-                        arg2,
-                        err.sqlite_extended_error_code()
-                            .unwrap_or(ffi::SQLITE_ERROR),
-                        Some(&msg),
-                    );
+            unsafe {
+                let callback: fn(&Connection, &str) -> Result<()> = mem::transmute(arg1);
+                let res = catch_unwind(|| {
+                    let conn = Connection::from_handle(arg2).unwrap();
+                    let collation_name = CStr::from_ptr(arg3)
+                        .to_str()
+                        .expect("illegal collation sequence name");
+                    callback(&conn, collation_name)
+                })
+                .unwrap_or_else(|_| Err(Error::UnwindingPanic));
+                if let Err(err) = res {
+                    #[cfg(feature = "modern_sqlite")]
+                    // 3.51.0
+                    if let Ok(msg) = std::ffi::CString::new(format!("{err}")) {
+                        let _ = crate::error::set_errmsg(
+                            arg2,
+                            err.sqlite_extended_error_code()
+                                .unwrap_or(ffi::SQLITE_ERROR),
+                            Some(&msg),
+                        );
+                    }
+                    return;
                 }
-                return;
             }
         }
 

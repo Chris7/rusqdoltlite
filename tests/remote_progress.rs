@@ -5,15 +5,15 @@ use std::{
     io::{self, Read as _, Write as _},
     net::{TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use rusqlite::{
-    params, Connection, DoltCloneProgressEvent, DoltPushProgressEvent, Error, RemoteServer, Result,
+    Connection, DoltCloneProgressEvent, DoltPushProgressEvent, Error, RemoteServer, Result, params,
 };
 
 type Trace = Arc<Mutex<Vec<TraceEntry>>>;
@@ -755,9 +755,11 @@ fn http_progress_plans_first_and_counts_only_acknowledged_batches_across_resume(
         !retry_requests.is_empty(),
         "retry should upload previously missing chunks"
     );
-    assert!(retry_requests
-        .iter()
-        .all(|(_, request)| request.status == Some(200) || request.status == Some(204)));
+    assert!(
+        retry_requests
+            .iter()
+            .all(|(_, request)| request.status == Some(200) || request.status == Some(204))
+    );
     let retry_events = progress_events(retry_attempt);
     let retry_plan = retry_events
         .iter()
@@ -1039,9 +1041,11 @@ fn observed_http_clone_reports_actual_transfers_without_extra_source_io() -> Res
         !unobserved_fetches.is_empty(),
         "ordinary clone fetches graph chunks"
     );
-    assert!(unobserved_fetches
-        .iter()
-        .all(|(_, request)| request.status == Some(200)));
+    assert!(
+        unobserved_fetches
+            .iter()
+            .all(|(_, request)| request.status == Some(200))
+    );
 
     let clone = Connection::open(observed_path)?;
     context.trace.lock().expect("should clear trace").clear();
@@ -1119,9 +1123,11 @@ fn observed_http_clone_reports_actual_transfers_without_extra_source_io() -> Res
         })
         .collect::<Vec<_>>();
     assert!(!progress_snapshots.is_empty());
-    assert!(progress_snapshots
-        .iter()
-        .all(|(position, ..)| 0 < *position && *position < finalizing_position));
+    assert!(
+        progress_snapshots
+            .iter()
+            .all(|(position, ..)| 0 < *position && *position < finalizing_position)
+    );
     for pair in progress_snapshots.windows(2) {
         let previous_count = pair[0].1 + pair[0].3;
         let current_count = pair[1].1 + pair[1].3;
@@ -1164,9 +1170,11 @@ fn observed_http_clone_reports_actual_transfers_without_extra_source_io() -> Res
         !observed_fetches.is_empty(),
         "observed clone fetches graph chunks"
     );
-    assert!(observed_fetches
-        .iter()
-        .all(|(_, request)| request.status == Some(200)));
+    assert!(
+        observed_fetches
+            .iter()
+            .all(|(_, request)| request.status == Some(200))
+    );
     let fetched_payload_lengths = observed_fetches
         .iter()
         .flat_map(|(_, request)| get_chunk_payload_lengths(request))
@@ -1220,10 +1228,12 @@ fn observed_lazy_clone_is_rejected() -> Result<()> {
         |row| row.get(0),
     );
     assert!(result.is_err(), "observed lazy clone is unsupported");
-    assert!(!events
-        .lock()
-        .expect("should read lazy clone progress events")
-        .contains(&DoltCloneProgressEvent::Completed));
+    assert!(
+        !events
+            .lock()
+            .expect("should read lazy clone progress events")
+            .contains(&DoltCloneProgressEvent::Completed)
+    );
     assert!(
         get_chunks_requests(&trace_snapshot(&context.trace)).is_empty(),
         "lazy clone does not acquire graph chunks"

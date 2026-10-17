@@ -1,3 +1,9 @@
+# Unreleased
+
+- Synced the Rusqlite wrapper with upstream commit `0f491a0e19d7a956031ea4ce354e085680766b28`. This includes callback ownership and soundness fixes, iterator-based statement column APIs, virtual-table value subtype support, serialization error cleanup, and macro/dependency updates.
+- The minimum SQLite version is now 3.45.3. The wrapper and macro crates use Rust 2024 with MSRV 1.88. Callback registration requires mutable connection access and `Send + 'static` callbacks; deprecated `trace` and `profile` APIs were removed. Serialization methods now require mutable connection access, and `ZeroBlob` lengths use `u64`.
+- The latest fork changes include native clone-progress reporting through numbered patch `0010`; upstream SQLite and SQLCipher source updates remain outside this sync.
+
 For version 0.15.0 and above, see [Releases](https://github.com/rusqlite/rusqlite/releases) page.
 
 # Version 0.14.0 (2018-08-17)

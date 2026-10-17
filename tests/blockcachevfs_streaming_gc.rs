@@ -1,7 +1,7 @@
 #![cfg(feature = "blockcachevfs")]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::fs;
 use std::os::raw::c_int;
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, Storage};
 use rusqlite::ffi::{bcvutil as raw_util, blockcachevfs as raw_vfs};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 unsafe extern "C" {
     fn sqlite3_bcv_cleanup(handle: *mut raw_util::sqlite3_bcv, n_second: c_int) -> c_int;
@@ -875,9 +875,7 @@ fn run_backend(backend: &str, cache: &Path, vfs: &'static BlockCacheVfs) {
         final_manifest.live
     );
     assert!(
-        final_manifest
-            .live
-            .contains(&same_content_restaged.blockid),
+        final_manifest.live.contains(&same_content_restaged.blockid),
         "same-content restage is missing from the final manifest live set: restaged={same_content_restaged:?}, live={:?}",
         final_manifest.live
     );

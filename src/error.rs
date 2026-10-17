@@ -1,11 +1,32 @@
 use crate::types::FromSqlError;
 use crate::types::Type;
-use crate::{errmsg_to_string, ffi, Result};
+use crate::{Result, errmsg_to_string, ffi};
 use std::error;
-use std::ffi::{c_char, c_int, NulError};
+use std::ffi::{NulError, c_char, c_int};
 use std::fmt;
 use std::path::PathBuf;
 use std::str;
+
+// Just to keep MSRV low
+macro_rules! cfg_select {
+    ({ $($tt:tt)* }) => {{
+        $crate::cfg_select! { $($tt)* }
+    }};
+    (_ => { $($output:tt)* }) => {
+        $($output)*
+    };
+    (
+        $cfg:meta => $output:tt
+        $($( $rest:tt )+)?
+    ) => {{
+        #[cfg($cfg)]
+        cfg_select! { _ => $output }
+        $(
+            #[cfg(not($cfg))]
+            cfg_select! { $($rest)+ }
+        )?
+    }}
+}
 
 /// A stable category for errors produced by remote graph transfer operations.
 ///
@@ -138,7 +159,6 @@ pub enum Error {
     #[cfg(feature = "blob")]
     BlobSizeError,
     /// Error referencing a specific token in the input SQL
-    #[cfg(feature = "modern_sqlite")] // 3.38.0
     SqlInputError {
         /// error code
         error: ffi::Error,
@@ -154,7 +174,6 @@ pub enum Error {
     InitError(ffi::InitError),
     /// Error when the schema of a particular database is requested, but the index
     /// is out of range.
-    #[cfg(feature = "modern_sqlite")] // 3.39.0
     InvalidDatabaseIndex(usize),
 }
 
@@ -200,7 +219,6 @@ impl PartialEq for Error {
             }
             #[cfg(feature = "blob")]
             (Self::BlobSizeError, Self::BlobSizeError) => true,
-            #[cfg(feature = "modern_sqlite")]
             (
                 Self::SqlInputError {
                     error: e1,
@@ -217,7 +235,6 @@ impl PartialEq for Error {
             ) => e1 == e2 && m1 == m2 && s1 == s2 && o1 == o2,
             #[cfg(feature = "loadable_extension")]
             (Self::InitError(e1), Self::InitError(e2)) => e1 == e2,
-            #[cfg(feature = "modern_sqlite")]
             (Self::InvalidDatabaseIndex(i1), Self::InvalidDatabaseIndex(i2)) => i1 == i2,
             (..) => false,
         }
@@ -278,24 +295,24 @@ impl fmt::Display for Error {
                 "SQLite was compiled or configured for single-threaded use only"
             ),
             Self::FromSqlConversionFailure(i, ref t, ref err) => {
-                if i != UNKNOWN_COLUMN {
-                    write!(f, "Conversion error from type {t} at index: {i}, {err}")
-                } else {
+                if i == UNKNOWN_COLUMN {
                     err.fmt(f)
+                } else {
+                    write!(f, "Conversion error from type {t} at index: {i}, {err}")
                 }
             }
             Self::IntegralValueOutOfRange(col, val) => {
-                if col != UNKNOWN_COLUMN {
-                    write!(f, "Integer {val} out of range at index {col}")
-                } else {
+                if col == UNKNOWN_COLUMN {
                     write!(f, "Integer {val} out of range")
+                } else {
+                    write!(f, "Integer {val} out of range at index {col}")
                 }
             }
             Self::Utf8Error(col, ref err) => {
-                if col != UNKNOWN_COLUMN {
-                    write!(f, "{err} at index {col}")
-                } else {
+                if col == UNKNOWN_COLUMN {
                     err.fmt(f)
+                } else {
+                    write!(f, "{err} at index {col}")
                 }
             }
             Self::NulError(ref err) => err.fmt(f),
@@ -337,7 +354,6 @@ impl fmt::Display for Error {
             Self::MultipleStatement => write!(f, "Multiple statements provided"),
             #[cfg(feature = "blob")]
             Self::BlobSizeError => "Blob size is insufficient".fmt(f),
-            #[cfg(feature = "modern_sqlite")]
             Self::SqlInputError {
                 ref msg,
                 offset,
@@ -346,7 +362,6 @@ impl fmt::Display for Error {
             } => write!(f, "{msg} in {sql} at offset {offset}"),
             #[cfg(feature = "loadable_extension")]
             Self::InitError(ref err) => err.fmt(f),
-            #[cfg(feature = "modern_sqlite")]
             Self::InvalidDatabaseIndex(i) => write!(f, "Invalid database index: {i}"),
         }
     }
@@ -395,11 +410,9 @@ impl error::Error for Error {
 
             #[cfg(feature = "blob")]
             Self::BlobSizeError => None,
-            #[cfg(feature = "modern_sqlite")]
             Self::SqlInputError { ref error, .. } => Some(error),
             #[cfg(feature = "loadable_extension")]
             Self::InitError(ref err) => Some(err),
-            #[cfg(feature = "modern_sqlite")]
             Self::InvalidDatabaseIndex(_) => None,
         }
     }
@@ -488,19 +501,21 @@ macro_rules! err {
 
 #[cold]
 pub unsafe fn error_from_handle(db: *mut ffi::sqlite3, code: c_int) -> Error {
-    error_from_sqlite_code(code, error_msg(db, code))
+    error_from_sqlite_code(code, unsafe { error_msg(db, code) })
 }
 
 unsafe fn error_msg(db: *mut ffi::sqlite3, code: c_int) -> Option<String> {
-    if db.is_null() || ffi::sqlite3_errcode(db) != code {
-        let err_str = ffi::sqlite3_errstr(code);
-        if err_str.is_null() {
-            None
+    unsafe {
+        if db.is_null() || ffi::sqlite3_errcode(db) != code {
+            let err_str = ffi::sqlite3_errstr(code);
+            if err_str.is_null() {
+                None
+            } else {
+                Some(errmsg_to_string(err_str))
+            }
         } else {
-            Some(errmsg_to_string(err_str))
+            Some(errmsg_to_string(ffi::sqlite3_errmsg(db)))
         }
-    } else {
-        Some(errmsg_to_string(ffi::sqlite3_errmsg(db)))
     }
 }
 
@@ -508,42 +523,40 @@ pub unsafe fn decode_result_raw(db: *mut ffi::sqlite3, code: c_int) -> Result<()
     if code == ffi::SQLITE_OK {
         Ok(())
     } else {
-        Err(error_from_handle(db, code))
+        Err(unsafe { error_from_handle(db, code) })
     }
 }
 
 #[cold]
 #[allow(unused_variables)]
 pub unsafe fn error_with_offset(db: *mut ffi::sqlite3, code: c_int, sql: &str) -> Error {
-    cfg_select! {
-      feature = "modern_sqlite" => // SQLite >= 3.38.0
-          if db.is_null() {
-              error_from_sqlite_code(code, None)
-          } else {
-              let error = ffi::Error::new(code);
-              let msg = error_msg(db, code);
-              if ffi::ErrorCode::Unknown == error.code {
-                  let offset = ffi::sqlite3_error_offset(db);
-                  if offset >= 0 {
-                      return Error::SqlInputError {
-                          error,
-                          msg: msg.unwrap_or("error".to_owned()),
-                          sql: sql.to_owned(),
-                          offset,
-                      };
-                  }
-              }
-              Error::SqliteFailure(error, msg)
-          }
-      _ => error_from_handle(db, code)
+    unsafe {
+        if db.is_null() {
+            error_from_sqlite_code(code, None)
+        } else {
+            let error = ffi::Error::new(code);
+            let msg = error_msg(db, code);
+            if ffi::ErrorCode::Unknown == error.code {
+                let offset = ffi::sqlite3_error_offset(db);
+                if offset >= 0 {
+                    return Error::SqlInputError {
+                        error,
+                        msg: msg.unwrap_or("error".to_owned()),
+                        sql: sql.to_owned(),
+                        offset,
+                    };
+                }
+            }
+            Error::SqliteFailure(error, msg)
+        }
     }
 }
 
 pub fn check(code: c_int) -> Result<()> {
-    if code != ffi::SQLITE_OK {
-        Err(error_from_sqlite_code(code, None))
-    } else {
+    if code == ffi::SQLITE_OK {
         Ok(())
+    } else {
+        Err(error_from_sqlite_code(code, None))
     }
 }
 
@@ -552,15 +565,16 @@ pub fn check(code: c_int) -> Result<()> {
 /// This function is unsafe because it uses raw pointer
 pub unsafe fn to_sqlite_error(e: &Error, err_msg: *mut *mut c_char) -> c_int {
     use crate::util::alloc;
+
     match e {
         Error::SqliteFailure(err, s) => {
             if let Some(s) = s {
-                *err_msg = alloc(s);
+                unsafe { *err_msg = alloc(s) };
             }
             err.extended_code
         }
         err => {
-            *err_msg = alloc(&err.to_string());
+            unsafe { *err_msg = alloc(&err.to_string()) };
             ffi::SQLITE_ERROR
         }
     }

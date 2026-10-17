@@ -2,15 +2,15 @@
 
 #[cfg(feature = "blockcachevfs")]
 use crate::blockcachevfs::{
-    session_alias, AttachSpec, AuthError, AuthRefreshCallback, AuthRefreshReason, BlockCacheVfs,
+    AttachSpec, AuthError, AuthRefreshCallback, AuthRefreshReason, BlockCacheVfs,
     SessionAttachment, SessionOperationId, SessionOperationStatus, StorageFailure,
-    StorageFailureSlot, UploadProgressCallback, UriSessionContext,
+    StorageFailureSlot, UploadProgressCallback, UriSessionContext, session_alias,
 };
 use crate::error::error_from_sqlite_code;
-use crate::{ffi, path_to_cstring, Result};
 #[cfg(feature = "blockcachevfs")]
 use crate::{Connection, OpenFlags};
-use std::ffi::{c_int, c_long, CStr, CString};
+use crate::{Result, ffi, path_to_cstring};
+use std::ffi::{CStr, CString, c_int, c_long};
 use std::fmt;
 #[cfg(feature = "blockcachevfs")]
 use std::net::Ipv4Addr;
@@ -1192,7 +1192,7 @@ impl RemoteServer {
             };
             match session.operation_status()? {
                 SessionOperationStatus::Accepted | SessionOperationStatus::Committed => {
-                    return Ok(())
+                    return Ok(());
                 }
                 SessionOperationStatus::Conflict => {
                     return Err(remote_server_error(
@@ -1410,7 +1410,7 @@ impl Drop for RemoteServer {
 #[cfg(all(test, feature = "blockcachevfs"))]
 mod tests {
     use super::*;
-    use crate::blockcachevfs::{AttachSpec, Storage, SESSION_OPERATION_ID_BYTES};
+    use crate::blockcachevfs::{AttachSpec, SESSION_OPERATION_ID_BYTES, Storage};
 
     fn initialized_test_vfs() -> &'static BlockCacheVfs {
         let directory = tempfile::tempdir().expect("create VFS directory");
@@ -1492,24 +1492,30 @@ mod tests {
         assert!(SessionScope::new("principal", ".hidden", "read").is_err());
         assert!(SessionScope::new("principal", "session/name.sqlite", "read").is_err());
         assert!(SessionScope::new("principal", "séssion.sqlite", "read").is_err());
-        assert!(SessionScope::new(
-            "x".repeat(SESSION_SCOPE_MAX_FIELD_BYTES + 1),
-            "session.sqlite",
-            "read",
-        )
-        .is_err());
-        assert!(SessionScope::new(
-            "principal",
-            "x".repeat(SESSION_SCOPE_MAX_FIELD_BYTES + 1),
-            "read",
-        )
-        .is_err());
-        assert!(SessionScope::new(
-            "principal",
-            "session.sqlite",
-            "x".repeat(SESSION_SCOPE_MAX_FIELD_BYTES + 1),
-        )
-        .is_err());
+        assert!(
+            SessionScope::new(
+                "x".repeat(SESSION_SCOPE_MAX_FIELD_BYTES + 1),
+                "session.sqlite",
+                "read",
+            )
+            .is_err()
+        );
+        assert!(
+            SessionScope::new(
+                "principal",
+                "x".repeat(SESSION_SCOPE_MAX_FIELD_BYTES + 1),
+                "read",
+            )
+            .is_err()
+        );
+        assert!(
+            SessionScope::new(
+                "principal",
+                "session.sqlite",
+                "x".repeat(SESSION_SCOPE_MAX_FIELD_BYTES + 1),
+            )
+            .is_err()
+        );
 
         let scope =
             SessionScope::new("principal", "session.sqlite", "read,write").expect("valid scope");
@@ -1632,14 +1638,16 @@ mod tests {
                 if code.extended_code == crate::ffi::SQLITE_MISUSE
                     && message.contains("Azure session selectors")
         ));
-        assert!(BlockCacheSessionOptions::new(
-            vfs,
-            attachment.clone(),
-            "missing",
-            test_scope(),
-            test_operation_id(6),
-        )
-        .is_err());
+        assert!(
+            BlockCacheSessionOptions::new(
+                vfs,
+                attachment.clone(),
+                "missing",
+                test_scope(),
+                test_operation_id(6),
+            )
+            .is_err()
+        );
 
         let session = BlockCacheSessionOptions::new(
             vfs,

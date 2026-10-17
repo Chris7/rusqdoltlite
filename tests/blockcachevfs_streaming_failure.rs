@@ -1,20 +1,19 @@
 #![cfg(feature = "blockcachevfs")]
 
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, Storage};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 const CACHE_BYTES: i64 = 2 * 4 * 1024 * 1024;
 const BODY_BYTES: usize = 2048;
@@ -23,6 +22,7 @@ const FAILURE_PHASE_ENV: &str = "BCV_STREAMING_FAILURE_PHASE";
 const FAILURE_CACHE_ENV: &str = "BCV_STREAMING_FAILURE_CACHE";
 const FAILURE_CONTAINER_ENV: &str = "BCV_STREAMING_FAILURE_CONTAINER";
 const FAILURE_MANIFEST_ENV: &str = "BCV_STREAMING_FAILURE_MANIFEST";
+const FAILURE_PROXY_CONTROL_ENV: &str = "BCV_STREAMING_FAILURE_PROXY_CONTROL";
 
 fn unique_suffix() -> String {
     format!(
@@ -132,22 +132,8 @@ fn row_body(id: i64) -> String {
     format!("{prefix}{}", "x".repeat(BODY_BYTES - prefix.len()))
 }
 
-fn restore_env(snapshot: Vec<(&'static str, Option<OsString>)>) {
-    for (name, value) in snapshot {
-        if let Some(value) = value {
-            std::env::set_var(name, value);
-        } else {
-            std::env::remove_var(name);
-        }
-    }
-}
-
 struct ForwardingProxy {
     stop: Arc<AtomicBool>,
-    requests: Arc<AtomicUsize>,
-    put_requests: Arc<AtomicUsize>,
-    rejected_puts: Arc<AtomicUsize>,
-    reject_puts: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
     url: String,
 }
@@ -185,11 +171,11 @@ impl ForwardingProxy {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                thread_requests.fetch_add(1, Ordering::Relaxed);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let result = proxy_request(
                     &mut stream,
                     &authority,
+                    &thread_requests,
                     &thread_put_requests,
                     &thread_rejected_puts,
                     &thread_reject_puts,
@@ -207,29 +193,9 @@ impl ForwardingProxy {
         });
         Self {
             stop,
-            requests,
-            put_requests,
-            rejected_puts,
-            reject_puts,
             thread: Some(thread),
             url,
         }
-    }
-
-    fn requests(&self) -> usize {
-        self.requests.load(Ordering::Relaxed)
-    }
-
-    fn put_requests(&self) -> usize {
-        self.put_requests.load(Ordering::Relaxed)
-    }
-
-    fn rejected_puts(&self) -> usize {
-        self.rejected_puts.load(Ordering::Relaxed)
-    }
-
-    fn set_reject_puts(&self, reject: bool) {
-        self.reject_puts.store(reject, Ordering::Release);
     }
 }
 
@@ -245,6 +211,7 @@ impl Drop for ForwardingProxy {
 fn proxy_request(
     stream: &mut TcpStream,
     authority: &str,
+    requests: &AtomicUsize,
     put_requests: &AtomicUsize,
     rejected_puts: &AtomicUsize,
     reject_puts: &AtomicBool,
@@ -300,6 +267,28 @@ fn proxy_request(
             "proxy only supports HTTP/1.1 requests",
         ));
     }
+
+    match target.as_str() {
+        "/__control/reject-puts" => {
+            reject_puts.store(true, Ordering::Release);
+            return control_response(stream, "");
+        }
+        "/__control/allow-puts" => {
+            reject_puts.store(false, Ordering::Release);
+            return control_response(stream, "");
+        }
+        "/__control/stats" => {
+            let body = format!(
+                "{} {} {}",
+                requests.load(Ordering::Relaxed),
+                put_requests.load(Ordering::Relaxed),
+                rejected_puts.load(Ordering::Relaxed)
+            );
+            return control_response(stream, &body);
+        }
+        _ => {}
+    }
+    requests.fetch_add(1, Ordering::Relaxed);
 
     let mut headers = Vec::new();
     let mut content_length = 0_usize;
@@ -397,6 +386,78 @@ fn proxy_request(
     Ok(())
 }
 
+fn control_response(stream: &mut TcpStream, body: &str) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn proxy_control(path: &str) -> String {
+    let proxy_url = std::env::var(FAILURE_PROXY_CONTROL_ENV)
+        .expect("failure-test proxy control address must be set");
+    let address = proxy_url
+        .strip_prefix("http://")
+        .expect("failure proxy URL must use HTTP");
+    let (method, target) = if path == "stats" {
+        ("GET", "/__control/stats")
+    } else {
+        (
+            "POST",
+            match path {
+                "reject-puts" => "/__control/reject-puts",
+                "allow-puts" => "/__control/allow-puts",
+                other => panic!("unknown failure proxy control {other}"),
+            },
+        )
+    };
+    let mut stream = TcpStream::connect(address).expect("connect to parent failure proxy");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set failure proxy control read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set failure proxy control write timeout");
+    write!(
+        stream,
+        "{method} {target} HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send failure proxy control request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read failure proxy control response");
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "failure proxy rejected control request: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let body_start = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .expect("failure proxy control response headers");
+    String::from_utf8_lossy(&response[body_start..]).into_owned()
+}
+
+fn proxy_stats() -> (usize, usize, usize) {
+    let body = proxy_control("stats");
+    let mut values = body.split_whitespace().map(|value| {
+        value
+            .parse::<usize>()
+            .expect("failure proxy returned numeric statistics")
+    });
+    let requests = values.next().expect("failure proxy request count");
+    let puts = values.next().expect("failure proxy PUT count");
+    let rejected_puts = values.next().expect("failure proxy rejected PUT count");
+    assert!(
+        values.next().is_none(),
+        "unexpected extra failure proxy stats"
+    );
+    (requests, puts, rejected_puts)
+}
+
 #[test]
 #[ignore = "requires the pinned local S3 emulator container"]
 fn failed_staged_block_put_preserves_manifest_and_returns_error() {
@@ -421,6 +482,7 @@ fn failed_staged_block_put_preserves_manifest_and_returns_error() {
     let cache_path = cache.path().to_str().expect("cache path is UTF-8");
     let manifest_path = manifest.path().join("before.bin");
     let manifest_path = manifest_path.to_str().expect("manifest path is UTF-8");
+    let proxy = ForwardingProxy::start(&endpoint);
     for (phase, label) in [("one", "failure phase one"), ("two", "failure phase two")] {
         let status = Command::new(&executable)
             .args([
@@ -433,7 +495,16 @@ fn failed_staged_block_put_preserves_manifest_and_returns_error() {
             .env(FAILURE_CACHE_ENV, cache_path)
             .env(FAILURE_CONTAINER_ENV, &container)
             .env(FAILURE_MANIFEST_ENV, manifest_path)
+            .env(FAILURE_PROXY_CONTROL_ENV, &proxy.url)
             .env("BLOCKCACHEVFS_S3_EMULATOR", &endpoint)
+            .env("HTTP_PROXY", &proxy.url)
+            .env("http_proxy", &proxy.url)
+            .env("HTTPS_PROXY", &proxy.url)
+            .env("https_proxy", &proxy.url)
+            .env("ALL_PROXY", &proxy.url)
+            .env("all_proxy", &proxy.url)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
             .status()
             .unwrap_or_else(|error| panic!("spawn {label}: {error}"));
         assert!(status.success(), "{label} failed: {status}");
@@ -452,30 +523,6 @@ fn failure_phase_one() {
         std::env::var(FAILURE_MANIFEST_ENV).expect("failure-test manifest path must be set"),
     );
     let storage = Storage::s3_with_endpoint("test", &container, "us-east-1", &endpoint);
-    let proxy_names = [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ];
-    let no_proxy_names = ["NO_PROXY", "no_proxy"];
-    let saved_env = proxy_names
-        .iter()
-        .chain(no_proxy_names.iter())
-        .map(|name| (*name, std::env::var_os(name)))
-        .collect();
-    let proxy = ForwardingProxy::start(&endpoint);
-    // Configure the forwarding proxy before CBS creates its libcurl handles.
-    // It forwards normal requests to Floci, and can reject only PUT requests
-    // after the first committed update has proven that block staging works.
-    for name in proxy_names {
-        std::env::set_var(name, &proxy.url);
-    }
-    for name in no_proxy_names {
-        std::env::set_var(name, "");
-    }
     let vfs = BlockCacheVfs::builder(&cache)
         .expect("VFS builder")
         .auth_callback(|_, _, _| Ok("test".into()))
@@ -485,10 +532,10 @@ fn failure_phase_one() {
         .init()
         .expect("initialize block-cache VFS");
     if let Err(error) = vfs.initialize_container(&storage, None) {
+        let (requests, puts, _) = proxy_stats();
         panic!(
             "initialize remote CBS container through proxy (requests={}, puts={}): {error:?}",
-            proxy.requests(),
-            proxy.put_requests()
+            requests, puts
         );
     }
 
@@ -512,7 +559,7 @@ fn failure_phase_one() {
         .expect("attach failure-test database");
     let before = fetch_manifest(&endpoint, &container);
     let objects_before = list_remote_objects(&endpoint, &container);
-    let puts_before = proxy.put_requests();
+    let (_, puts_before, _) = proxy_stats();
     let db = vfs
         .open(format!("/{alias}/streaming.sqlite"))
         .expect("open failure-test database");
@@ -540,8 +587,9 @@ fn failure_phase_one() {
         "initial committed update did not stage any remote blocks: before={objects_before}, \
          after={objects_after_initial}"
     );
+    let (_, puts_after_initial, _) = proxy_stats();
     assert!(
-        proxy.put_requests() > puts_before,
+        puts_after_initial > puts_before,
         "initial committed update did not issue a block PUT through the forwarding proxy"
     );
     assert_eq!(
@@ -550,7 +598,7 @@ fn failure_phase_one() {
         "initial staging update must not publish a manifest"
     );
 
-    proxy.set_reject_puts(true);
+    proxy_control("reject-puts");
     let mut failed = None;
     db.execute_batch("BEGIN IMMEDIATE")
         .expect("begin failing staging update");
@@ -574,11 +622,12 @@ fn failure_phase_one() {
         }
     }
     let _ = db.execute_batch("ROLLBACK");
+    let (proxy_requests, proxy_puts, rejected_puts) = proxy_stats();
     assert!(
-        proxy.rejected_puts() > 0,
+        rejected_puts > 0,
         "failing update did not reach a rejected block PUT (proxy requests={}, PUTs={})",
-        proxy.requests(),
-        proxy.put_requests()
+        proxy_requests,
+        proxy_puts
     );
 
     let error = failed.expect("failed block PUT must surface as a write error");
@@ -616,11 +665,9 @@ fn failure_phase_one() {
         );
     }
     fs::write(&manifest_path, before).expect("save pre-failure manifest");
-    proxy.set_reject_puts(false);
+    proxy_control("allow-puts");
     drop(db);
-    restore_env(saved_env);
     let _ = vfs.detach(alias);
-    drop(proxy);
 }
 
 fn failure_phase_two() {

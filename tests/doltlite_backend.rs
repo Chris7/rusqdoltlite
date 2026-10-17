@@ -3,7 +3,7 @@
 use std::ffi::CStr;
 use std::fs;
 
-use rusqlite::{ffi, Connection, Result};
+use rusqlite::{Connection, Result, ffi};
 
 #[test]
 fn bundled_backend_reports_doltlite_source_id() {

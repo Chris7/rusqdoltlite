@@ -13,7 +13,7 @@ categories = ["external-ffi-bindings"]
 exclude = ["/upgrade_git.sh"]
 
 [features]
-default = ["min_sqlite_version_3_34_1"]
+default = ["min_sqlite_version_3_45_3"]
 # Use bundled DoltLite sources.
 bundled = ["cc", "bundled_bindings"]
 bundled-windows = ["cc", "bundled_bindings"]
@@ -23,8 +23,8 @@ blockcachevfs = ["bundled", "pkg-config", "dep:curl-sys", "dep:openssl-sys", "de
 # Enable the HTTP remote client and in-process remote server APIs.
 remote = []
 buildtime_bindgen = ["bindgen", "pkg-config", "vcpkg"]
-# Minimal version required by rusqlite
-min_sqlite_version_3_34_1 = ["pkg-config", "vcpkg"]
+# Minimal version required by rusqdoltlite
+min_sqlite_version_3_45_3 = ["pkg-config", "vcpkg"]
 # Bundle only the bindings file. Note that this does nothing if
 # `buildtime_bindgen` is enabled.
 bundled_bindings = []
@@ -50,18 +50,18 @@ openssl-sys = { version = "0.9.64", optional = true, default-features = false, f
 libz-sys = { version = "1.1", optional = true, default-features = false, features = ["static"] }
 
 [build-dependencies]
-bindgen = { version = "0.72", optional = true, default-features = false, features = [
+bindgen = { version = "0.73", optional = true, default-features = false, features = [
     "runtime",
 ] }
 pkg-config = { version = "0.3.19", optional = true }
 cc = { version = "1.2.27", optional = true }
 vcpkg = { version = "0.2.15", optional = true }
 # for loadable_extension:
-prettyplease = { version = "0.2.20", optional = true }
+prettyplease = { version = "0.3.0", optional = true }
 # like bindgen
 quote = { version = "1.0.36", optional = true, default-features = false }
 # like bindgen
-syn = { version = "2.0.89", optional = true, features = [
+syn = { version = "3.0.1", optional = true, features = [
     "full",
     "extra-traits",
     "visit-mut",

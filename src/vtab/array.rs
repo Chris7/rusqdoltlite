@@ -27,7 +27,7 @@
 //! ```
 
 use std::borrow::Cow;
-use std::ffi::{c_int, CStr};
+use std::ffi::{CStr, c_int};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -173,7 +173,7 @@ unsafe impl VTabCursor for ArrayTabCursor<'_> {
             _ => {
                 if let Some(array) = self.ptr {
                     let value = &array[(self.row_id - 1) as usize];
-                    ctx.set_result(&value)
+                    ctx.set_result(value)
                 } else {
                     Ok(())
                 }

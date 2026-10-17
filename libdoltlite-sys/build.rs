@@ -179,7 +179,6 @@ mod build_bundled {
             .flag("-DSQLITE_ENABLE_FTS5")
             .flag("-DSQLITE_ENABLE_JSON1")
             .flag("-DSQLITE_ENABLE_LOAD_EXTENSION=1")
-            .flag("-DSQLITE_ENABLE_MEMORY_MANAGEMENT")
             .flag("-DSQLITE_ENABLE_RTREE")
             .flag("-DSQLITE_ENABLE_STAT4")
             .flag("-DSQLITE_SOUNDEX")
@@ -724,7 +723,7 @@ mod build_linked {
             env::set_var("PKG_CONFIG_PATH", pkgconfig_path);
             #[cfg(not(feature = "loadable_extension"))]
             if pkg_config::Config::new()
-                .atleast_version("3.34.1")
+                .atleast_version("3.45.3")
                 .probe(link_lib)
                 .is_err()
             {
@@ -741,7 +740,7 @@ mod build_linked {
 
         // See if pkg-config can do everything for us.
         if let Ok(mut lib) = pkg_config::Config::new()
-            .atleast_version("3.34.1")
+            .atleast_version("3.45.3")
             .print_system_libs(false)
             .probe(link_lib)
         {
@@ -783,7 +782,7 @@ mod bindings {
 
     use std::path::Path;
 
-    static PREBUILT_BINDGENS: &[&str] = &["bindgen_3.34.1"];
+    static PREBUILT_BINDGENS: &[&str] = &["bindgen_3.45.3"];
 
     pub fn write_to_out_dir(_header: HeaderLocation, out_path: &Path) {
         let name = PREBUILT_BINDGENS[PREBUILT_BINDGENS.len() - 1];
@@ -831,6 +830,7 @@ mod bindings {
         let mut bindings = bindgen::builder()
             .default_macro_constant_type(bindgen::MacroTypeVariation::Signed)
             .disable_nested_struct_naming()
+            .generate_comments(false)
             .generate_cstr(true)
             .use_core()
             .trust_clang_mangling(false)
@@ -1080,7 +1080,7 @@ mod loadable_extension {
         output.push('\n');
     }
 
-    fn extract_method(ty: &syn::Type) -> Option<&syn::TypeBareFn> {
+    fn extract_method(ty: &syn::Type) -> Option<&syn::TypeFnPtr> {
         match ty {
             syn::Type::Path(tp) => tp.path.segments.last(),
             _ => None,
@@ -1094,7 +1094,7 @@ mod loadable_extension {
             _ => None,
         })?
         .map(|ty| match ty {
-            syn::Type::BareFn(r) => Some(r),
+            syn::Type::FnPtr(r) => Some(r),
             _ => None,
         })?
     }

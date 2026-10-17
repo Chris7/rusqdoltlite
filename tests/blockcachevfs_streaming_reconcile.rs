@@ -7,7 +7,7 @@ use std::process::{Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, Storage};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 
 const BLOCK_BYTES: u64 = 4 * 1024 * 1024;
 const CACHE_BYTES: i64 = 2 * BLOCK_BYTES as i64;

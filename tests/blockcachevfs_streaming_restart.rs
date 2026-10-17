@@ -6,7 +6,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, Storage};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 
 const CACHE_BYTES: u64 = 2 * 4 * 1024 * 1024;
 const BODY_BYTES: usize = 2048;

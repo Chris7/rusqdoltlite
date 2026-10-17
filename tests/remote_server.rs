@@ -1,22 +1,22 @@
 #![cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 
 use std::{
-    ffi::{c_char, c_int, c_void, CString},
+    ffi::{CString, c_char, c_int, c_void},
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
     process::Command,
     ptr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Barrier, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
 };
 
 use rusqlite::{
-    ffi, params, Connection, DoltCloneProgressEvent, Error, RemoteAuthenticator, RemoteServer,
-    RemoteServerOptions, Result,
+    Connection, DoltCloneProgressEvent, Error, RemoteAuthenticator, RemoteServer,
+    RemoteServerOptions, Result, ffi, params,
 };
 
 #[cfg(feature = "blockcachevfs")]
@@ -56,11 +56,15 @@ unsafe extern "C" fn counting_vfs_access(
     flags: c_int,
     result: *mut c_int,
 ) -> c_int {
-    let state = &*((*vfs).pAppData.cast::<CountingVfsState>());
-    state.accesses.fetch_add(1, Ordering::Relaxed);
-    ((*state.underlying)
-        .xAccess
-        .expect("default VFS has xAccess"))(state.underlying, name, flags, result)
+    // SAFETY: this callback is registered with the stable `CountingVfs` box;
+    // `pAppData` points to its boxed state and the default VFS owns xAccess.
+    unsafe {
+        let state = &*((*vfs).pAppData.cast::<CountingVfsState>());
+        state.accesses.fetch_add(1, Ordering::Relaxed);
+        ((*state.underlying)
+            .xAccess
+            .expect("default VFS has xAccess"))(state.underlying, name, flags, result)
+    }
 }
 
 unsafe extern "C" fn counting_vfs_open(
@@ -70,15 +74,19 @@ unsafe extern "C" fn counting_vfs_open(
     flags: c_int,
     output_flags: *mut c_int,
 ) -> c_int {
-    let state = &*((*vfs).pAppData.cast::<CountingVfsState>());
-    state.opens.fetch_add(1, Ordering::Relaxed);
-    ((*state.underlying).xOpen.expect("default VFS has xOpen"))(
-        state.underlying,
-        name,
-        file,
-        flags,
-        output_flags,
-    )
+    // SAFETY: this callback is registered with the stable `CountingVfs` box;
+    // `pAppData` points to its boxed state and the default VFS owns xOpen.
+    unsafe {
+        let state = &*((*vfs).pAppData.cast::<CountingVfsState>());
+        state.opens.fetch_add(1, Ordering::Relaxed);
+        ((*state.underlying).xOpen.expect("default VFS has xOpen"))(
+            state.underlying,
+            name,
+            file,
+            flags,
+            output_flags,
+        )
+    }
 }
 
 impl CountingVfs {

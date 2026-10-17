@@ -305,7 +305,7 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Test unit and integration tests
-        run: wasm-pack test --node --features modern-full
+        run: wasm-pack test --node --features modern-full,sqlite-wasm-rs/wasm-bindgen
 
   sanitizer:
     name: Address Sanitizer

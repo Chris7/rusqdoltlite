@@ -1,6 +1,6 @@
 #![cfg(feature = "blockcachevfs")]
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::ptr;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::blockcachevfs::{s3_secret_with_session_token, AttachSpec, BlockCacheVfs, Config};
+use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, s3_secret_with_session_token};
 use rusqlite::ffi::bcvutil as raw_util;
 
 unsafe extern "C" {
@@ -301,7 +301,8 @@ fn verify_tls_case_with_ca_environment(
 unsafe extern "C" fn route_log(ctx: *mut c_void, message: *const c_char) {
     let _ = ctx;
     if !message.is_null() {
-        let message = CStr::from_ptr(message).to_string_lossy();
+        // SAFETY: CBS passes a NUL-terminated log message for this callback.
+        let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
         let mut stdout = std::io::stdout().lock();
         let _ = writeln!(stdout, "{message}");
         let _ = stdout.flush();

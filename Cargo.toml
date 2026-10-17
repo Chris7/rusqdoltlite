@@ -3,7 +3,8 @@ name = "rusqdoltlite"
 # Note: Update version in README.md when you change this.
 version = "0.41.0"
 authors = ["Chris Mitchell"]
-edition = "2021"
+edition = "2024"
+rust-version = "1.88.0"
 description = "Rusqlite with DoltLite as the backend"
 repository = "https://github.com/chris7/rusqdoltlite"
 documentation = "https://docs.rs/rusqdoltlite/"
@@ -81,7 +82,7 @@ window = ["functions"]
 series = ["vtab"]
 # check for invalid query.
 extra_check = []
-# ]3.34.1, last]
+# ]3.45.3, last]
 modern_sqlite = ["libdoltlite-sys?/bundled_bindings"]
 in_gecko = ["modern_sqlite", "libdoltlite-sys?/in_gecko"]
 bundled-windows = ["libdoltlite-sys?/bundled-windows"]
@@ -173,15 +174,15 @@ libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.23" }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 libdoltlite-sys = { path = "libdoltlite-sys", version = "0.38.23", optional = true }
-sqlite-wasm-rs = { version = "0.5.1", default-features = false, optional = true }
+sqlite-wasm-rs = { version = ">=0.5.1, <0.7.0", default-features = false, optional = true }
 chrono = { version = "0.4.42", optional = true, default-features = false, features = ["wasmbind"] }
 jiff = { version = "0.2", optional = true, default-features = false, features = ["js"] }
 time = { version = "0.3.47", optional = true, features = ["wasm-bindgen"] }
 uuid = { version = "1.0", optional = true, features = ["js"] }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
-# Something is dependent on them, we use feature to override it.
-sqlite-wasm-rs = { version = "0.5.1", default-features = false }
+# The wasm test job selects the host shims needed by its runtime.
+sqlite-wasm-rs = { version = ">=0.5.1, <0.7.0", default-features = false }
 uuid = { version = "1.0", features = ["js"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 wasm-bindgen-test = "0.3.54"

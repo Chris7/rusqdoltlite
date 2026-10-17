@@ -5,10 +5,10 @@ use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, Storage};
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 use rusqlite::RemoteServer;
-use rusqlite::{params, Connection};
+use rusqlite::blockcachevfs::{AttachSpec, BlockCacheVfs, Config, Storage};
+use rusqlite::{Connection, params};
 
 const CACHE_BYTES: i64 = 2 * 4 * 1024 * 1024;
 const BODY_BYTES: usize = 2048;

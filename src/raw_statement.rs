@@ -1,8 +1,8 @@
-use super::ffi;
 use super::StatementStatus;
+use super::ffi;
 use crate::util::ParamIndexCache;
 use crate::util::SqliteMallocString;
-use std::ffi::{c_int, CStr};
+use std::ffi::{CStr, c_int};
 use std::ptr;
 #[cfg(feature = "cache")]
 use std::sync::Arc;
@@ -144,34 +144,37 @@ impl RawStatement {
     #[inline]
     pub fn step(&self) -> c_int {
         cfg_select! {
-          feature = "unlock_notify" => {
-              use crate::unlock_notify;
-              let mut db = ptr::null_mut::<ffi::sqlite3>();
-              loop {
-                  unsafe {
-                      let mut rc = ffi::sqlite3_step(self.ptr);
-                      // Bail out early for success and errors unrelated to locking. We
-                      // still need check `is_locked` after this, but checking now lets us
-                      // avoid one or two (admittedly cheap) calls into SQLite that we
-                      // don't need to make.
-                      if (rc & 0xff) != ffi::SQLITE_LOCKED {
-                          break rc;
-                      }
-                      if db.is_null() {
-                          db = ffi::sqlite3_db_handle(self.ptr);
-                      }
-                      if !unlock_notify::is_locked(db, rc) {
-                          break rc;
-                      }
-                      rc = unlock_notify::wait_for_unlock_notify(db);
-                      if rc != ffi::SQLITE_OK {
-                          break rc;
-                      }
-                      self.reset();
-                  }
-              }
-          }
-          _ => unsafe { ffi::sqlite3_step(self.ptr) }
+            feature = "unlock_notify" => {
+                use crate::unlock_notify;
+                let mut db = ptr::null_mut::<ffi::sqlite3>();
+                loop {
+                    unsafe {
+                        let mut rc = ffi::sqlite3_step(self.ptr);
+                        // Bail out early for success and errors unrelated to locking. We
+                        // still need check `is_locked` after this, but checking now lets us
+                        // avoid one or two (admittedly cheap) calls into SQLite that we
+                        // don't need to make.
+                        if (rc & 0xff) != ffi::SQLITE_LOCKED {
+                            break rc;
+                        }
+                        if db.is_null() {
+                            db = ffi::sqlite3_db_handle(self.ptr);
+                        }
+                        if !unlock_notify::is_locked(db, rc) {
+                            break rc;
+                        }
+                        rc = unlock_notify::wait_for_unlock_notify(db);
+                        if rc != ffi::SQLITE_OK {
+                            break rc;
+                        }
+                        self.reset();
+                    }
+                }
+            }
+            _ => {
+                // no_fmt
+                unsafe { ffi::sqlite3_step(self.ptr) }
+            }
         }
     }
 
@@ -262,7 +265,7 @@ impl RawStatement {
 
 #[inline]
 pub(crate) unsafe fn expanded_sql(ptr: *mut ffi::sqlite3_stmt) -> Option<SqliteMallocString> {
-    SqliteMallocString::from_raw(ffi::sqlite3_expanded_sql(ptr))
+    unsafe { SqliteMallocString::from_raw(ffi::sqlite3_expanded_sql(ptr)) }
 }
 #[inline]
 pub(crate) unsafe fn stmt_status(
@@ -271,7 +274,7 @@ pub(crate) unsafe fn stmt_status(
     reset: bool,
 ) -> i32 {
     assert!(!ptr.is_null());
-    ffi::sqlite3_stmt_status(ptr, status as i32, reset as i32)
+    unsafe { ffi::sqlite3_stmt_status(ptr, status as c_int, c_int::from(reset)) }
 }
 
 impl Drop for RawStatement {
