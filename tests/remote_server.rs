@@ -19,11 +19,9 @@ use rusqlite::{
     ffi, params, Connection, DoltCloneProgressEvent, Error, RemoteAuthenticator, RemoteServer,
     RemoteServerOptions, Result,
 };
-use rustls::{
-    client::ClientConnection,
-    pki_types::{CertificateDer, ServerName},
-    ClientConfig, RootCertStore, StreamOwned,
-};
+use rustls::client::ClientConnection;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, RootCertStore, StreamOwned};
 
 #[cfg(feature = "blockcachevfs")]
 use rusqlite::blockcachevfs::SessionOperationId;
