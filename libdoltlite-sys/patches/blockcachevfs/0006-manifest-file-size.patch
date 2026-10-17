@@ -1,11 +1,11 @@
 diff --git a/blockcachevfs.c b/blockcachevfs.c
 --- a/blockcachevfs.c
 +++ b/blockcachevfs.c
-@@ -1919,7 +1919,21 @@ static int bcvfsFileSize(sqlite3_file *pFd, sqlite3_int64 *pSize){
+@@ -1919,8 +1919,22 @@ static int bcvfsFileSize(sqlite3_file *pFd, sqlite3_int64 *pSize){
      case BCVFS_PASSTHRU_FILE:
        rc = pFile->pFile->pMethods->xFileSize(pFile->pFile, pSize);
        break;
-
+ 
      default: {
 +      if( eType==BCVFS_DATABASE_FILE ){
 +        sqlite3_bcvfs *pFs = pFile->pFs;

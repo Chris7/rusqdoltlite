@@ -51,6 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: remote-server-${{ matrix.target }}
+          cache-on-failure: true
 
       - name: Select native Perl for vendored OpenSSL
         if: runner.os == 'Windows' && matrix.blockcachevfs
