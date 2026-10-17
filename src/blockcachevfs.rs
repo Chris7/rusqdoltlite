@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, check};
 use crate::{Connection, OpenFlags, Result};

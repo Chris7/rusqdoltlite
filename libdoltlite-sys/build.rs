@@ -106,13 +106,14 @@ mod build_bundled {
         );
         let staged_remote_dir = patched_source
             .parent()
-            .expect("patched DoltLite source must have a parent directory");
+            .expect("should have a parent directory for the patched DoltLite source");
         let staged_remote_server = staged_remote_dir.join("doltlite_remotesrv.c");
         let staged_remote_tls = staged_remote_dir.join("doltlite_tls.c");
-        // Remote-auth server uses pthreads, unported to Windows/MSVC.
+        let staged_mbedtls_net = staged_remote_dir.join("mbedtls/library/net_sockets.c");
+        // The native server sidecar provides platform-specific thread and
+        // socket shims for Windows and POSIX targets.
         let remote_supported = cfg!(feature = "remote")
-            && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"))
-            && !win_target();
+            && !env::var("TARGET").is_ok_and(|target| target.starts_with("wasm32"));
         let remote_dir = Path::new(lib_name).join("remote");
         let auth_is_in_amalgamation = if remote_supported {
             append_remote_server_if_missing(&patched_source, &staged_remote_server)
@@ -136,23 +137,48 @@ mod build_bundled {
         if remote_supported {
             let ed25519_dir = remote_dir.join("ed25519");
             let mbedtls_dir = remote_dir.join("mbedtls");
-            let mut mbedtls_sources = std::fs::read_dir(mbedtls_dir.join("library"))
-                .expect("could not read bundled mbedTLS sources")
-                .map(|entry| entry.expect("could not read bundled mbedTLS source").path())
+            let mbedtls_library_dir = mbedtls_dir.join("library");
+            let mut mbedtls_sources = std::fs::read_dir(&mbedtls_library_dir)
+                .expect("should read bundled mbedTLS sources")
+                .map(|entry| {
+                    entry
+                        .expect("should read bundled mbedTLS source entry")
+                        .path()
+                })
                 .filter(|path| path.extension().is_some_and(|ext| ext == "c"))
                 .collect::<Vec<_>>();
+            mbedtls_sources.retain(|path| {
+                path.file_name().and_then(|name| name.to_str()) != Some("net_sockets.c")
+            });
+            mbedtls_sources.push(staged_mbedtls_net.clone());
             mbedtls_sources.sort();
 
             println!("cargo:rerun-if-changed={}", remote_dir.display());
             cfg.define("DOLTLITE_HAVE_AUTH", None)
+                .define("DOLTLITE_REMOTE_SERVER", None)
                 .include(staged_remote_dir)
                 .include(&remote_dir)
                 .include(&ed25519_dir)
                 .include(mbedtls_dir.join("include"))
-                .include(mbedtls_dir.join("library"));
-            if !auth_is_in_amalgamation {
-                cfg.file(remote_dir.join("doltlite_creds.c"))
-                    .file(remote_dir.join("doltlite_tls.c"))
+                .include(&mbedtls_library_dir);
+            if auth_is_in_amalgamation {
+                cfg.define("MBEDTLS_USER_CONFIG_FILE", "\"doltlite_mbedtls_config.h\"")
+                    .files(
+                        [
+                            "threading.c",
+                            "ssl_tls12_server.c",
+                            "ssl_tls13_server.c",
+                            "ssl_cache.c",
+                            "ssl_cookie.c",
+                            "ssl_ticket.c",
+                        ]
+                        .map(|name| mbedtls_library_dir.join(name)),
+                    );
+            } else {
+                cfg.define("MBEDTLS_THREADING_C", None)
+                    .define("MBEDTLS_THREADING_ALT", None)
+                    .file(remote_dir.join("doltlite_creds.c"))
+                    .file(&staged_remote_tls)
                     .files(
                         [
                             "fe.c",
@@ -290,7 +316,7 @@ mod build_bundled {
             println!("cargo:rustc-link-lib=crypt32");
         }
         if remote_supported && auth_is_in_amalgamation {
-            compile_server_tls(&remote_dir, &staged_remote_tls);
+            compile_server_tls(&remote_dir, staged_remote_dir, &staged_remote_tls);
         }
 
         println!("cargo:lib_dir={out_dir}");
@@ -502,10 +528,12 @@ mod build_bundled {
         auth_is_in_amalgamation
     }
 
-    fn compile_server_tls(remote_dir: &Path, staged_tls_source: &Path) {
+    fn compile_server_tls(remote_dir: &Path, staged_remote_dir: &Path, staged_tls_source: &Path) {
         let mbedtls_dir = remote_dir.join("mbedtls");
         let mut cfg = cc::Build::new();
         cfg.file(staged_tls_source)
+            .define("DOLTLITE_REMOTE_SERVER", None)
+            .define("MBEDTLS_USER_CONFIG_FILE", "\"doltlite_mbedtls_config.h\"")
             .define(
                 "doltliteConnOpenTimeout",
                 "doltliteBundledClientConnOpenTimeout",
@@ -518,6 +546,7 @@ mod build_bundled {
                 "doltliteBundledClientConnSetTimeout",
             )
             .define("doltliteConnClose", "doltliteBundledClientConnClose")
+            .include(staged_remote_dir)
             .include(remote_dir)
             .include(mbedtls_dir.join("include"))
             .include(mbedtls_dir.join("library"))
@@ -529,6 +558,31 @@ mod build_bundled {
     }
 
     fn apply_local_patches(upstream_source: &Path, patch_dir: &Path, output_dir: &Path) -> PathBuf {
+        match std::fs::symlink_metadata(output_dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                std::fs::remove_dir_all(output_dir).unwrap_or_else(|error| {
+                    panic!(
+                        "could not clear staged DoltLite patch directory {}: {error}",
+                        output_dir.display()
+                    )
+                });
+            }
+            Ok(_) => {
+                std::fs::remove_file(output_dir).unwrap_or_else(|error| {
+                    panic!(
+                        "could not remove staged DoltLite patch path {}: {error}",
+                        output_dir.display()
+                    )
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                panic!(
+                    "could not inspect staged DoltLite patch path {}: {error}",
+                    output_dir.display()
+                );
+            }
+        }
         std::fs::create_dir_all(output_dir).unwrap_or_else(|error| {
             panic!(
                 "could not create DoltLite patch directory {}: {error}",
@@ -546,10 +600,12 @@ mod build_bundled {
             "doltlite_remotesrv.c",
             "doltlite_remotesrv.h",
             "doltlite_tls.c",
+            "doltlite_tls.h",
+            "doltlite_net.h",
         ] {
             let upstream_sidecar = upstream_source
                 .parent()
-                .expect("DoltLite amalgamation must have a parent directory")
+                .expect("should have a parent directory for the DoltLite amalgamation")
                 .join("remote")
                 .join(sidecar);
             std::fs::copy(&upstream_sidecar, output_dir.join(sidecar)).unwrap_or_else(|error| {
@@ -559,6 +615,23 @@ mod build_bundled {
                 )
             });
         }
+        let upstream_mbedtls_net = upstream_source
+            .parent()
+            .expect("should have a parent directory for the DoltLite amalgamation")
+            .join("remote/mbedtls/library/net_sockets.c");
+        let staged_mbedtls_net = output_dir.join("mbedtls/library/net_sockets.c");
+        std::fs::create_dir_all(
+            staged_mbedtls_net
+                .parent()
+                .expect("should have a parent directory for the staged Mbed TLS source"),
+        )
+        .expect("should create the staged Mbed TLS source directory");
+        std::fs::copy(&upstream_mbedtls_net, &staged_mbedtls_net).unwrap_or_else(|error| {
+            panic!(
+                "could not stage pristine Mbed TLS network source {}: {error}",
+                upstream_mbedtls_net.display()
+            )
+        });
 
         let mut patches = std::fs::read_dir(patch_dir)
             .unwrap_or_else(|error| {
