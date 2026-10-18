@@ -4,27 +4,29 @@ use std::{
     ffi::{CString, c_char, c_int, c_void},
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
-    process::Command,
+    path::PathBuf,
+    process::{Command, Stdio},
     ptr,
     sync::{
         Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rusqlite::{
     Connection, DoltCloneProgressEvent, Error, RemoteAuthenticator, RemoteServer,
     RemoteServerOptions, Result, ffi, params,
 };
+use rustls::client::ClientConnection;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, RootCertStore, StreamOwned};
 
 #[cfg(feature = "blockcachevfs")]
 use rusqlite::blockcachevfs::SessionOperationId;
 #[cfg(feature = "blockcachevfs")]
 use rusqlite::{BlockCacheSessionOptions, OpenFlags, SessionOperationStatus, SessionScope};
-#[cfg(feature = "blockcachevfs")]
-use std::time::Instant;
 
 unsafe extern "C" {
     #[link_name = "doltliteHttpRemoteOpen"]
@@ -143,6 +145,208 @@ fn send_http_request(port: u16, request: &[u8]) -> String {
     response
 }
 
+fn send_http_request_headers(port: u16, request: &[u8]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .expect("should connect to remote server for response headers");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("should set response header read timeout");
+    stream
+        .write_all(request)
+        .expect("should write HTTP request for response headers");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("should read HTTP response bytes");
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("should receive complete HTTP response headers");
+    String::from_utf8(response[..header_end].to_vec())
+        .expect("should receive UTF-8 HTTP response headers")
+}
+
+fn run_child_with_deadline(mut command: Command, timeout: Duration) -> std::process::Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("should start isolated remote server test process");
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .expect("should check isolated test process")
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .expect("should collect isolated test process output");
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("should collect timed-out test process output");
+            panic!(
+                "isolated remote server test exceeded {timeout:?}; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn create_remote_server_tls_identity(
+    directory: &std::path::Path,
+) -> (PathBuf, PathBuf, CertificateDer<'static>) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+
+    let mut ca_params = CertificateParams::new(vec!["remote-test-ca.invalid".to_owned()])
+        .expect("should create test CA parameters");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca_key = KeyPair::generate().expect("should generate test CA key");
+    let ca_certificate = ca_params
+        .self_signed(&ca_key)
+        .expect("should sign test CA certificate");
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let mut server_params = CertificateParams::new(vec!["localhost".to_owned()])
+        .expect("should create TLS server certificate parameters");
+    server_params
+        .key_usages
+        .push(KeyUsagePurpose::DigitalSignature);
+    server_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+    let server_key = KeyPair::generate().expect("should generate TLS server key");
+    let server_certificate = server_params
+        .signed_by(&server_key, &issuer)
+        .expect("should sign TLS server certificate");
+
+    let certificate_path = directory.join("remote-server.pem");
+    let private_key_path = directory.join("remote-server-key.pem");
+    std::fs::write(&certificate_path, server_certificate.pem())
+        .expect("should write TLS server certificate");
+    std::fs::write(&private_key_path, server_key.serialize_pem())
+        .expect("should write TLS server private key");
+
+    (
+        certificate_path,
+        private_key_path,
+        CertificateDer::from(ca_certificate.der().to_vec()),
+    )
+}
+
+fn test_tls_client_config(test_ca: CertificateDer<'static>) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(test_ca)
+        .expect("should trust the generated test CA");
+    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
+    Arc::new(
+        ClientConfig::builder_with_provider(crypto_provider)
+            .with_safe_default_protocol_versions()
+            .expect("should select supported TLS protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+fn partial_tls_client_hello(client_config: Arc<ClientConfig>) -> Vec<u8> {
+    const PARTIAL_RECORD_BYTES: usize = 16;
+    const TLS_RECORD_HEADER_BYTES: usize = 5;
+
+    let server_name =
+        ServerName::try_from("localhost".to_owned()).expect("should use the TLS certificate name");
+    let mut client = ClientConnection::new(client_config, server_name)
+        .expect("should create a TLS client for the generated identity");
+    let mut client_hello = Vec::new();
+    client
+        .write_tls(&mut client_hello)
+        .expect("should serialize a TLS ClientHello");
+
+    assert_eq!(
+        client_hello[0], 22,
+        "should begin with a TLS handshake record"
+    );
+    let declared_record_bytes = usize::from(u16::from_be_bytes([client_hello[3], client_hello[4]]));
+    assert!(
+        client_hello.len() >= TLS_RECORD_HEADER_BYTES + declared_record_bytes,
+        "should serialize the complete ClientHello record"
+    );
+    assert!(
+        PARTIAL_RECORD_BYTES > TLS_RECORD_HEADER_BYTES
+            && PARTIAL_RECORD_BYTES < TLS_RECORD_HEADER_BYTES + declared_record_bytes,
+        "should leave the valid ClientHello record incomplete"
+    );
+    client_hello.truncate(PARTIAL_RECORD_BYTES);
+    client_hello
+}
+
+fn send_tls_http_request(port: u16, config: Arc<ClientConfig>, request: &[u8]) -> String {
+    let socket = TcpStream::connect(("127.0.0.1", port)).expect("should connect TLS client");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("should set TLS client read timeout");
+    let server_name = ServerName::try_from("localhost".to_owned())
+        .expect("should use the TLS certificate's localhost name");
+    let connection = ClientConnection::new(config, server_name)
+        .expect("should create a trusted TLS client connection");
+    let mut stream = StreamOwned::new(connection, socket);
+    stream
+        .write_all(request)
+        .expect("should send an HTTP request over TLS");
+    stream
+        .flush()
+        .expect("should complete the TLS request write");
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let mut body_length = None;
+    loop {
+        let count = stream
+            .read(&mut buffer)
+            .expect("should read the TLS HTTP response headers");
+        assert_ne!(count, 0, "should receive an HTTP response over TLS");
+        response.extend_from_slice(&buffer[..count]);
+        if body_length.is_none() {
+            if let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header = std::str::from_utf8(&response[..header_end])
+                    .expect("should receive UTF-8 HTTP response headers");
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| {
+                            value
+                                .trim()
+                                .parse::<usize>()
+                                .expect("should parse body length")
+                        })
+                    })
+                    .expect("should receive a Content-Length response header");
+                body_length = Some((header_end + 4, length));
+            }
+        }
+        if body_length.is_some_and(|(header_end, length)| response.len() >= header_end + length) {
+            break;
+        }
+    }
+    let (header_end, _) = body_length.expect("should receive a complete TLS response body");
+    String::from_utf8(response[..header_end - 4].to_vec())
+        .expect("should receive UTF-8 TLS HTTP response headers")
+}
+
 fn post_chunk_batch(port: u16, body: &[u8]) -> String {
     let header = format!(
         "POST /large.db/chunks HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -233,6 +437,16 @@ impl SlowGcsProxy {
                 };
                 if thread_stopped.load(Ordering::Acquire) != 0 {
                     break;
+                }
+                if let Err(error) = client.set_nonblocking(false) {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        if failure.is_none() {
+                            *failure = Some(format!(
+                                "reset accepted GCS proxy socket to blocking mode failed: {error}"
+                            ));
+                        }
+                    }
+                    continue;
                 }
                 let result = relay_gcs_request(
                     &mut client,
@@ -575,6 +789,169 @@ fn in_process_remote_server_supports_push_and_clone() -> Result<()> {
 
     server.close()?;
 
+    Ok(())
+}
+
+#[test]
+fn remote_server_idle_partial_request_obeys_configured_timeout() -> Result<()> {
+    const CHILD_ENV: &str = "RUSQ_REMOTE_TIMEOUT_CHILD";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let temp = tempfile::tempdir().expect("should create request-timeout fixture directory");
+        let server_root = temp.path().join("server");
+        std::fs::create_dir(&server_root).expect("should create request-timeout server root");
+        let request_timeout = Duration::from_millis(400);
+        let server = RemoteServer::start_with_options(
+            &server_root,
+            &RemoteServerOptions::new().request_timeout(request_timeout),
+        )?;
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port()))
+            .expect("should connect an incomplete request client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("should set a watchdog on the incomplete request client");
+        let started = Instant::now();
+        stream
+            .write_all(b"GET /partial.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .expect("should send an incomplete HTTP request");
+
+        let mut response = Vec::new();
+        let read_result = stream.read_to_end(&mut response);
+        let elapsed = started.elapsed();
+        if read_result.as_ref().is_err_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        }) {
+            eprintln!("server did not close its idle request before the client watchdog");
+            std::process::exit(71);
+        }
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "should retain blocking socket timeout semantics, closed after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "should close the incomplete request within its configured timeout"
+        );
+        server.close()?;
+        return Ok(());
+    }
+
+    let mut command = Command::new(std::env::current_exe().expect("should locate test binary"));
+    command
+        .args([
+            "--exact",
+            "remote_server_idle_partial_request_obeys_configured_timeout",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1");
+    let output = run_child_with_deadline(command, Duration::from_secs(8));
+    assert!(
+        output.status.success(),
+        "isolated timeout regression failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_server_retries_interrupted_plaintext_and_tls_io() -> Result<()> {
+    const CHILD_ENV: &str = "RUSQ_REMOTE_EINTR_CHILD";
+    const MARKER_ENV: &str = "RUSQ_REMOTE_EINTR_MARKER";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return remote_server_interrupted_io_child();
+    }
+
+    let temp = tempfile::tempdir().expect("should create EINTR test directory");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/remote_server_eintr.c");
+    let shim = temp.path().join("remote_server_eintr.so");
+    let compile = Command::new("cc")
+        .args(["-shared", "-fPIC", "-pthread", "-o"])
+        .arg(&shim)
+        .arg(&fixture)
+        .arg("-ldl")
+        .output()
+        .expect("should compile the child-only socket fault injector");
+    assert!(
+        compile.status.success(),
+        "should compile socket fault injector; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let marker = temp.path().join("interrupted-operations.txt");
+    let mut preload = shim.to_string_lossy().into_owned();
+    if let Some(existing) = std::env::var_os("LD_PRELOAD") {
+        if !existing.is_empty() {
+            preload.push(':');
+            preload.push_str(&existing.to_string_lossy());
+        }
+    }
+    let mut command = Command::new(std::env::current_exe().expect("should locate test binary"));
+    command
+        .args([
+            "--exact",
+            "remote_server_retries_interrupted_plaintext_and_tls_io",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .env(MARKER_ENV, &marker)
+        .env("LD_PRELOAD", preload);
+    let output = run_child_with_deadline(command, Duration::from_secs(30));
+    assert!(
+        output.status.success(),
+        "isolated EINTR regression failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let interrupted = std::fs::read_to_string(marker)
+        .expect("should observe injected receive and send interruptions");
+    assert_eq!(
+        interrupted.lines().filter(|line| *line == "recv").count(),
+        2,
+        "should inject one receive interruption into plaintext and TLS sessions: {interrupted:?}"
+    );
+    assert_eq!(
+        interrupted.lines().filter(|line| *line == "send").count(),
+        2,
+        "should inject one send interruption into plaintext and TLS sessions: {interrupted:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remote_server_interrupted_io_child() -> Result<()> {
+    let temp = tempfile::tempdir().expect("should create isolated server directory");
+    let plain_root = temp.path().join("plain");
+    std::fs::create_dir(&plain_root).expect("should create plaintext server root");
+    let plain_server = RemoteServer::start(&plain_root)?;
+    let response = send_http_request(
+        plain_server.port(),
+        b"GET /missing.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    plain_server.close()?;
+
+    let tls_root = temp.path().join("tls");
+    std::fs::create_dir(&tls_root).expect("should create TLS server root");
+    let (certificate_path, private_key_path, test_ca) =
+        create_remote_server_tls_identity(temp.path());
+    let options = RemoteServerOptions::new().tls(certificate_path, private_key_path);
+    let tls_server = RemoteServer::start_with_options(&tls_root, &options)?;
+    let response = send_tls_http_request(
+        tls_server.port(),
+        test_tls_client_config(test_ca),
+        b"GET /missing.db/refs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    tls_server.close()?;
     Ok(())
 }
 
@@ -1375,6 +1752,7 @@ fn remote_server_persists_across_restarts() -> Result<()> {
 
     {
         let server = RemoteServer::start(&server_root)?;
+        assert!(server.port() > 0, "should bind an operating-system port");
         let source = Connection::open(&source_path)?;
         source.execute_batch(
             "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
@@ -1390,9 +1768,17 @@ fn remote_server_persists_across_restarts() -> Result<()> {
         )?;
         let _: i64 =
             source.query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))?;
+
+        let refs = send_http_request_headers(
+            server.port(),
+            b"GET /origin.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(refs.starts_with("HTTP/1.1 200 OK\r\n"));
+        server.close()?;
     }
 
     let restarted = RemoteServer::start(&server_root)?;
+    assert!(restarted.port() > 0, "should bind after a clean restart");
     let clone = Connection::open(temp.path().join("clone.db"))?;
     let _: i64 = clone.query_row(
         "SELECT dolt_clone(?1)",
@@ -1404,6 +1790,206 @@ fn remote_server_persists_across_restarts() -> Result<()> {
     })?;
 
     assert_eq!(value, "persisted");
+    restarted.close()?;
+    Ok(())
+}
+
+#[test]
+fn remote_server_close_stops_active_and_queued_partial_http_requests() {
+    const PARTIAL_CLIENTS: usize = 12;
+
+    let temp = tempfile::tempdir().expect("should create server directory");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("should create server root");
+    let options = RemoteServerOptions::new().request_timeout(Duration::from_secs(10));
+    let server = RemoteServer::start_with_options(&server_root, &options)
+        .expect("should start server with a bounded request timeout");
+    let port = server.port();
+    assert!(port > 0, "should bind an operating-system port");
+
+    // Keep more incomplete requests open than the native server has workers,
+    // so shutdown must release both workers blocked on partial HTTP headers
+    // and requests waiting in its accepted-socket queue.
+    let mut clients = Vec::with_capacity(PARTIAL_CLIENTS);
+    for _ in 0..PARTIAL_CLIENTS {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", port)).expect("should connect a partial HTTP client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("should set a bounded shutdown read timeout");
+        stream
+            .write_all(b"GET /partial.db/refs HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .expect("should send an incomplete HTTP header");
+        clients.push(stream);
+    }
+    thread::sleep(Duration::from_millis(100));
+
+    let started = std::time::Instant::now();
+    server
+        .close()
+        .expect("should close the server after stopping partial requests");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "should stop blocked request workers before their ten-second request timeout"
+    );
+
+    for mut client in clients {
+        let mut byte = [0_u8; 1];
+        let result = client.read(&mut byte);
+        assert!(
+            matches!(result, Ok(0))
+                || result.as_ref().is_err_and(|error| matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                )),
+            "should close every incomplete client connection, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn remote_server_close_stops_active_and_queued_partial_tls_handshakes() -> Result<()> {
+    const PARTIAL_CLIENTS: usize = 12;
+    const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(100);
+    const SHUTDOWN_LIMIT: Duration = Duration::from_secs(5);
+
+    let temp = tempfile::tempdir().expect("should create TLS shutdown test directory");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("should create TLS server root");
+    let (certificate_path, private_key_path, test_ca) =
+        create_remote_server_tls_identity(temp.path());
+    let client_config = test_tls_client_config(test_ca);
+    let partial_client_hello = partial_tls_client_hello(Arc::clone(&client_config));
+    let options = RemoteServerOptions::new()
+        .tls(certificate_path, private_key_path)
+        .request_timeout(Duration::from_secs(10));
+    let server = RemoteServer::start_with_options(&server_root, &options)?;
+    let port = server.port();
+
+    // DoltLite has four workers. Holding twelve valid-but-incomplete TLS
+    // ClientHello records blocks every worker and leaves additional accepted
+    // sockets queued, matching the shutdown condition that must not wait for
+    // its ten-second socket timeout.
+    let mut clients = Vec::with_capacity(PARTIAL_CLIENTS);
+    for _ in 0..PARTIAL_CLIENTS {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .expect("should connect a partial TLS handshake client");
+        stream
+            .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))
+            .expect("should set a bounded TLS handshake read timeout");
+        stream
+            .write_all(&partial_client_hello)
+            .expect("should send the beginning of a valid TLS ClientHello record");
+        clients.push(stream);
+    }
+
+    for (index, client) in clients.iter_mut().enumerate() {
+        let mut byte = [0_u8; 1];
+        let result = client.read(&mut byte);
+        assert!(
+            result.as_ref().is_err_and(|error| matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )),
+            "should wait for the remaining ClientHello record bytes for client {index}, got {result:?}"
+        );
+    }
+
+    let started = std::time::Instant::now();
+    server.close()?;
+    assert!(
+        started.elapsed() < SHUTDOWN_LIMIT,
+        "should stop blocked TLS handshake workers before their ten-second request timeout"
+    );
+
+    for mut client in clients {
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("should allow the server a bounded time to close TLS clients");
+        let mut byte = [0_u8; 1];
+        let result = client.read(&mut byte);
+        assert!(
+            matches!(result, Ok(0))
+                || result.as_ref().is_err_and(|error| matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                )),
+            "should close every incomplete TLS client connection, got {result:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn remote_server_tls_handles_concurrent_requests_trusting_a_test_ca() -> Result<()> {
+    const CONCURRENT_CLIENTS: usize = 8;
+
+    let temp = tempfile::tempdir().expect("should create remote TLS test directory");
+    let server_root = temp.path().join("server");
+    std::fs::create_dir(&server_root).expect("should create remote server root");
+    let source_path = temp.path().join("source.db");
+
+    {
+        let server = RemoteServer::start(&server_root)?;
+        let source = Connection::open(&source_path)?;
+        source.execute_batch(
+            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO widgets VALUES(1, 'tls remote value');",
+        )?;
+        let _: String = source.query_row(
+            "SELECT dolt_commit('-A', '-m', 'seed TLS remote')",
+            [],
+            |row| row.get(0),
+        )?;
+        let _: i64 = source.query_row(
+            "SELECT dolt_remote('add', 'origin', ?1)",
+            params![server.database_url("origin.db")],
+            |row| row.get(0),
+        )?;
+        let _: i64 =
+            source.query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))?;
+        drop(source);
+        server.close()?;
+    }
+
+    let (certificate_path, private_key_path, test_ca) =
+        create_remote_server_tls_identity(temp.path());
+    let options = RemoteServerOptions::new().tls(certificate_path, private_key_path);
+    let tls_server = RemoteServer::start_with_options(&server_root, &options)?;
+    assert!(
+        tls_server.database_url("origin.db").starts_with("https://"),
+        "should publish an HTTPS remote URL when TLS is enabled"
+    );
+
+    let client_config = test_tls_client_config(test_ca);
+    let port = tls_server.port();
+    let requests = (0..CONCURRENT_CLIENTS)
+        .map(|_| {
+            let config = Arc::clone(&client_config);
+            thread::spawn(move || {
+                send_tls_http_request(
+                    port,
+                    config,
+                    b"GET /origin.db/refs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for request in requests {
+        let response = request.join().expect("should join concurrent TLS request");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "should serve the committed remote refs to concurrent TLS clients: {response:?}"
+        );
+    }
+
+    tls_server.close()?;
     Ok(())
 }
 
@@ -1832,6 +2418,9 @@ impl GetChunksProxy {
                 if thread_stopped.load(Ordering::Acquire) != 0 {
                     break;
                 }
+                client
+                    .set_nonblocking(false)
+                    .expect("should reset accepted get-chunks proxy socket to blocking mode");
                 loop {
                     let request = match read_http_request_or_eof(&mut client) {
                         Ok(Some(request)) => request,
@@ -2238,6 +2827,9 @@ fn spawn_chunk_stalling_http_proxy(backend_port: u16) -> (String, thread::JoinHa
                 }
                 Err(error) => panic!("accept proxied HTTP request: {error}"),
             };
+            client
+                .set_nonblocking(false)
+                .expect("should reset accepted transport proxy socket to blocking mode");
             let request = read_http_request(&mut client);
             let header_end = request
                 .windows(4)
@@ -2809,14 +3401,41 @@ fn concurrent_pushes_reject_one_stale_ref_update() -> Result<()> {
 
     assert_eq!(
         successes, 1,
-        "exactly one concurrent push should advance the remote ref"
+        "exactly one concurrent push should advance the remote ref; results: {results:?}"
     );
-    assert!(results.iter().any(|result| {
-        matches!(
-            result,
-            Err(Error::SqliteFailure(code, _))
-                if matches!(code.extended_code, rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_BUSY_SNAPSHOT | rusqlite::ffi::SQLITE_ERROR)
-        )
-    }));
+    // The barrier starts both SQL statements but does not synchronize their
+    // remote-head reads. A late loser can see the winner's published head and
+    // receive the normal non-fast-forward rejection instead of a stale-head
+    // conflict.
+    assert!(
+        results.iter().any(|result| {
+            matches!(result, Err(Error::SqliteFailure(code, _))
+                if matches!(code.extended_code, rusqlite::ffi::SQLITE_BUSY
+                    | rusqlite::ffi::SQLITE_BUSY_SNAPSHOT
+                    | rusqlite::ffi::SQLITE_ERROR))
+                || matches!(result, Err(Error::SqliteFailure(code, Some(message)))
+                    if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT
+                        && message == "not a fast-forward of the remote branch (use force to overwrite)")
+        }),
+        "the losing push should report a stale-ref rejection; results: {results:?}"
+    );
+
+    let winning_client = if results[0].is_ok() {
+        "first"
+    } else {
+        "second"
+    };
+    let remote_clone = Connection::open(temp.path().join("remote-verification.db"))?;
+    let _: i64 = remote_clone.query_row("SELECT dolt_clone(?1)", params![remote_url], |row| {
+        row.get(0)
+    })?;
+    let remote_value: String =
+        remote_clone.query_row("SELECT name FROM widgets WHERE id = 1", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(
+        remote_value, winning_client,
+        "the remote must contain the successful concurrent push"
+    );
     Ok(())
 }

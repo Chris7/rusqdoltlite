@@ -189,3 +189,23 @@ continue to form batches. DoltLite's 0009 patch
 provides the separate logical chunk plan and callback; these CBS edits apply
 only to build.rs's OUT_DIR copy and remain separate from the pristine vendored
 CBS tree.
+
+`0011-remoteserver-windows-portability.patch` is based on DoltLite v0.50.15
+after patches 0001-0010, including clone progress, and enables the native
+RemoteServer on Windows and supplies matching Win32 and POSIX worker-thread,
+mutex, condition-variable, socket, polling, timeout, and shutdown primitives.
+Windows server sockets retain the full `SOCKET` width. The embedded and staged Mbed
+TLS network initializers use `INIT_ONCE` for Winsock startup. The patch stages
+one Mbed TLS configuration for the amalgamation and TLS sidecar, enables the
+actual TLS 1.2/1.3 server and threading implementations, and uses alternate
+mutex hooks to protect shared TLS 1.3/PSA state and the server DRBG. Server TLS
+uses namespaced connection functions so its opaque connection layout stays
+local to the TLS translation unit. Workers send TLS close-notify while their
+sockets are still tracked; final cleanup then only frees and closes the
+connection after stop can no longer race a reused handle. The build stages the
+Mbed TLS socket source so the same startup fix applies to the non-amalgamated
+fallback. Windows server sockets use nonblocking I/O with bounded readiness
+waits because `shutdown()` does not cancel a receive already in progress; each
+wait checks the server stop state while the worker retains final socket-close
+ownership. This keeps partial HTTP and TLS handshakes from delaying server
+shutdown without shortening the configured request-idle timeout.
