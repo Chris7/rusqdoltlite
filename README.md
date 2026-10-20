@@ -280,7 +280,7 @@ Enable the `remote` feature to embed DoltLite's HTTP remote server:
 
 ```toml
 [dependencies]
-rusqlite = { package = "rusqdoltlite", version = "0.41.0", features = ["remote"] }
+rusqlite = { package = "rusqdoltlite", version = "0.41.1", features = ["remote"] }
 ```
 
 The server uses SQLite's process-default VFS unless
