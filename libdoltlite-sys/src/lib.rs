@@ -10,12 +10,17 @@ mod error;
 
 // Keep Cargo's native curl/OpenSSL/zlib link metadata reachable through this
 // sys crate without exposing those low-level crates as part of its API.
-#[cfg(feature = "blockcachevfs")]
+#[cfg(all(feature = "blockcachevfs", not(target_os = "emscripten")))]
 extern crate curl_sys as _;
-#[cfg(feature = "blockcachevfs")]
+#[cfg(all(feature = "blockcachevfs", not(target_os = "emscripten")))]
 extern crate libz_sys as _;
-#[cfg(feature = "blockcachevfs")]
+#[cfg(all(feature = "blockcachevfs", not(target_os = "emscripten")))]
 extern crate openssl_sys as _;
+
+// The browser CBS transport calls these RustCrypto-backed digest functions,
+// keeping Emscripten builds off the native OpenSSL/curl dependency path.
+#[cfg(all(feature = "blockcachevfs", any(target_os = "emscripten", test)))]
+mod browser_crypto;
 
 #[must_use]
 pub fn SQLITE_STATIC() -> sqlite3_destructor_type {

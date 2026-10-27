@@ -1,0 +1,936 @@
+diff --git a/bcv_int.h b/bcv_int.h
+index 7ed299a..d8e260c 100644
+--- a/bcv_int.h
++++ b/bcv_int.h
+@@ -43,7 +43,17 @@ typedef unsigned short u16;
+ #include "bcvutil.h"
+ #include "bcvmodule.h"
+ #include "simplexml.h"
++#ifdef __EMSCRIPTEN__
++struct curl_waitfd;
++typedef struct BcvHttpHeader BcvHttpHeader;
++struct BcvHttpHeader {
++  char *data;
++  BcvHttpHeader *next;
++};
++#else
+ #include <curl/curl.h>
++typedef struct curl_slist BcvHttpHeader;
++#endif
+ 
+ #define BCV_MANIFEST_FILE            "manifest.bcv"
+ #define BCV_KV_FILE                  "bcv_kv.bcv"
+diff --git a/bcvmodule.c b/bcvmodule.c
+index e25d6bd..862a5e7 100644
+--- a/bcvmodule.c
++++ b/bcvmodule.c
+@@ -21,9 +21,13 @@
+ #include <errno.h>
+ #include <ctype.h>
+ #include <time.h>
++#ifdef __EMSCRIPTEN__
++#include "bcv_browser_crypto.h"
++#else
+ #include <openssl/hmac.h>
+ #include <openssl/sha.h>
+ #include <openssl/md5.h>
++#endif
+ 
+ #define AZURE_DATEHEADER_SIZE     128
+ #define AZURE_VERSION_HDR         "x-ms-version:2020-10-02"
+@@ -49,6 +53,7 @@
+ **   of the base64 access-key stored in zKey. nKey is the size of the buffer
+ **   in bytes. If bSas!=0, then aKey and nKey are both 0.
+ */
++#ifndef __EMSCRIPTEN__
+ typedef struct BcvAzure BcvAzure;
+ struct BcvAzure {
+   int bSas;                       /* True to use SAS tokens */
+@@ -61,6 +66,7 @@ struct BcvAzure {
+   u8 *aKey;                       /* Decoded version of zKey (if bSas==0) */
+   int nKey;                       /* Size of aKey[] in bytes */
+ };
++#endif
+ 
+ /*
+ ** The first argument passed to this function is a nul-terminated string
+@@ -346,6 +352,7 @@ static void bcvModuleListCb(
+ }
+ 
+ 
++#ifndef __EMSCRIPTEN__
+ /*
+ ** Cross-platform version of gmtime_r().   
+ */
+@@ -554,7 +561,9 @@ static int bcvAzureOpen(
+   return rc;
+ }
+ 
+-/*
++#endif /* !__EMSCRIPTEN__ -- Azure setup */
++
++ /*
+ ** Set the URI of request pReq based on the printf() style format string
+ ** and its arguments passed as the third and subsequent parameters.
+ */
+@@ -659,6 +668,7 @@ char *bcvBase64Encode(const unsigned char *aIn, int nIn){
+ }
+ 
+ 
++#ifndef __EMSCRIPTEN__
+ static void bcvAzureAuthHeader(
+   BcvAzure *p,
+   sqlite3_bcv_job *pCtx,
+@@ -1029,6 +1039,8 @@ static void bcvAzureDestroy(
+   }
+ }
+ 
++#endif /* !__EMSCRIPTEN__ -- Azure module */
++
+ /*
+ ** Small, strict JSON helpers used by the Google JSON API.  This is not a
+ ** general-purpose JSON implementation: it validates the structure while
+@@ -2165,6 +2177,7 @@ static void bcvGoogleDestroy(
+ ** built-in cloud modules, so every request (including list/create/delete)
+ ** is signed before it is handed to the common curl dispatcher.
+ */
++#ifndef __EMSCRIPTEN__
+ typedef struct BcvS3 BcvS3;
+ struct BcvS3 {
+   char *zAccessKey;
+@@ -2954,8 +2967,10 @@ static void bcvS3List(
+ ){
+   bcvS3ListFiles(pCont, pCtx, 0);
+ }
++#endif /* !__EMSCRIPTEN__ -- S3 module */
+ 
+ int bcvInstallBuiltinModules(void){
++#ifndef __EMSCRIPTEN__
+   static sqlite3_bcv_module mAzure = {
+     bcvAzureOpen,
+     bcvAzureClose,
+@@ -2966,6 +2981,7 @@ int bcvInstallBuiltinModules(void){
+     bcvAzureCreate,
+     bcvAzureDestroy
+   };
++#endif
+   static sqlite3_bcv_module mGoogle = {
+     bcvGoogleOpen,
+     bcvGoogleClose,
+@@ -2978,10 +2994,14 @@ int bcvInstallBuiltinModules(void){
+   };
+ 
+   int rc;
++  rc = SQLITE_OK;
++#ifndef __EMSCRIPTEN__
+   rc = bcvCreateModuleUnsafe("azure", &mAzure, 0);
++#endif
+   if( rc==SQLITE_OK ){
+     rc = bcvCreateModuleUnsafe("google", &mGoogle, 0);
+   }
++#ifndef __EMSCRIPTEN__
+   if( rc==SQLITE_OK ){
+     static sqlite3_bcv_module mS3 = {
+       bcvS3Open,
+@@ -2995,5 +3015,6 @@ int bcvInstallBuiltinModules(void){
+     };
+     rc = bcvCreateModuleUnsafe("s3", &mS3, 0);
+   }
++#endif
+   return rc;
+ }
+diff --git a/bcvutil.c b/bcvutil.c
+index 25fac98..36680b9 100644
+--- a/bcvutil.c
++++ b/bcvutil.c
+@@ -21,8 +21,44 @@
+ #include <unistd.h>
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#include "bcv_browser_crypto.h"
++#else
+ #include <openssl/md5.h>
+ #include <openssl/sha.h>
++#endif
++
++#ifdef __EMSCRIPTEN__
++#define CURLE_OK 0
++static BcvHttpHeader *bcvHttpHeaderAppend(
++  BcvHttpHeader *pList, const char *zHeader
++){
++  BcvHttpHeader *pNew = sqlite3_malloc64(sizeof(*pNew));
++  BcvHttpHeader **pp = &pList;
++  if( pNew==0 ) return 0;
++  pNew->data = sqlite3_mprintf("%s", zHeader);
++  if( pNew->data==0 ){
++    sqlite3_free(pNew);
++    return 0;
++  }
++  pNew->next = 0;
++  while( *pp ) pp = &(*pp)->next;
++  *pp = pNew;
++  return pList ? pList : pNew;
++}
++static void bcvHttpHeaderFree(BcvHttpHeader *pList){
++  while( pList ){
++    BcvHttpHeader *pNext = pList->next;
++    sqlite3_free(pList->data);
++    sqlite3_free(pList);
++    pList = pNext;
++  }
++}
++#else
++#define bcvHttpHeaderAppend curl_slist_append
++#define bcvHttpHeaderFree curl_slist_free_all
++#endif
+ 
+ /*
+ ** If SQLITE_BCV_CURL_HANDLE_CONFIG is defined, it must be set to the name
+@@ -124,7 +160,9 @@ typedef struct sqlite3_bcv_job BcvDispatchJob;
+ typedef struct sqlite3_bcv_request BcvDispatchReq;
+ 
+ struct BcvDispatch {
++#ifndef __EMSCRIPTEN__
+   CURLM *pMulti;                  /* The libcurl dispatcher ("multi-handle") */
++#endif
+   int bVerbose;                   /* True to make libcurl verbose */
+   int nHttpTimeout;
+   int iNextRequestId;             /* Next request-id (for logging only) */
+@@ -199,7 +237,7 @@ struct sqlite3_bcv_request {
+   i64 iRetryTime;                 /* Do not retry before this time */
+   char *zUri;                     /* URI */
+   char *zUriLog;                  /* URI value for logging */
+-  struct curl_slist *pList;       /* List of HTTP headers for request */
++  BcvHttpHeader *pList;           /* List of HTTP headers for request */
+   void *pApp;                     /* 3rd argument to xCallback */
+   void (*xCallback)(sqlite3_bcv_job*, sqlite3_bcv_request*, void*);
+ 
+@@ -210,7 +248,10 @@ struct sqlite3_bcv_request {
+   int iBody;                      /* Current offset in aBody[] */
+ 
+   int rc;
+-  CURLcode code;
++  int code;
++#ifdef __EMSCRIPTEN__
++  long iHttpStatus;
++#endif
+   char *zStatus;                  /* Most recent Status header from server */
+   BcvBuffer body;                 /* Body of reply */
+   BcvBuffer hdr;                  /* Headers */
+@@ -218,7 +259,9 @@ struct sqlite3_bcv_request {
+   int nMaxHdrs;                   /* Maximum raw header bytes, or -1 */
+   int nHdrSeen;                   /* Raw response header bytes seen */
+ 
++#ifndef __EMSCRIPTEN__
+   CURL *pCurl;                    /* Curl easy-handle */
++#endif
+   BcvDispatchReq *pNext;          /* Next in pPending or pWaiting list */
+ };
+ 
+@@ -5228,9 +5271,12 @@ sqlite3_bcv_request *sqlite3_bcv_job_request(
+     pNew->pJob = pJob;
+     pNew->nMaxBody = pJob->nMaxBody;
+     pNew->nMaxHdrs = pJob->nMaxHdrs;
++#ifndef __EMSCRIPTEN__
+     pNew->pCurl = curl_easy_init();
++#endif
+     pJob->pPending = pNew;
+ 
++#ifndef __EMSCRIPTEN__
+     if( pCont->bRevokeBestEffort ){
+       curl_easy_setopt(
+           pNew->pCurl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_REVOKE_BEST_EFFORT
+@@ -5243,6 +5289,7 @@ sqlite3_bcv_request *sqlite3_bcv_job_request(
+       bcvCurlSetDefaultCaLocations(pNew->pCurl);
+ #endif
+     }
++#endif
+   }
+   return pNew;
+ }
+@@ -5264,7 +5311,7 @@ void sqlite3_bcv_request_set_log(sqlite3_bcv_request *pReq, const char *zUri){
+ }
+ void sqlite3_bcv_request_set_header(sqlite3_bcv_request *pReq, const char *z){
+   if( pReq && z ){
+-    pReq->pList = curl_slist_append(pReq->pList, z);
++    pReq->pList = bcvHttpHeaderAppend(pReq->pList, z);
+   }
+ }
+ void sqlite3_bcv_request_set_body(
+@@ -5286,12 +5333,21 @@ int sqlite3_bcv_request_status(
+     httpcode = (long)(pReq->rc);
+     *pzStatus = pReq->zStatus;
+   }else{
++#ifdef __EMSCRIPTEN__
++    httpcode = pReq->iHttpStatus;
++    if( httpcode==0 || pReq->code!=CURLE_OK ){
++      pReq->pJob->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++      httpcode = SQLITE_ERROR;
++      *pzStatus = pReq->zStatus;
++    }else{
++#else
+     curl_easy_getinfo(pReq->pCurl, CURLINFO_RESPONSE_CODE, &httpcode);
+     if( httpcode==0 || pReq->code!=CURLE_OK ){
+       pReq->pJob->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
+       httpcode = SQLITE_ERROR;
+       *pzStatus = curl_easy_strerror(pReq->code);
+     }else{
++#endif
+       if( (httpcode/100)==2 ){
+         httpcode = SQLITE_OK;
+         pReq->pJob->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
+@@ -5644,27 +5700,27 @@ static int bcvRequestReplaceBearerHeader(
+   BcvDispatchReq *pReq,
+   const char *zToken
+ ){
+-  struct curl_slist *pNew = 0;
+-  struct curl_slist *pHdr;
++  BcvHttpHeader *pNew = 0;
++  BcvHttpHeader *pHdr;
+   char *zHeader = sqlite3_mprintf("Authorization: Bearer %s", zToken);
+   int rc = zHeader ? SQLITE_OK : SQLITE_NOMEM;
+   for(pHdr=pReq->pList; rc==SQLITE_OK && pHdr; pHdr=pHdr->next){
+-    struct curl_slist *pAppend;
++    BcvHttpHeader *pAppend;
+     if( sqlite3_strnicmp(pHdr->data,"Authorization:",14)==0 ) continue;
+-    pAppend = curl_slist_append(pNew,pHdr->data);
++    pAppend = bcvHttpHeaderAppend(pNew,pHdr->data);
+     if( pAppend==0 ) rc = SQLITE_NOMEM;
+     else pNew = pAppend;
+   }
+   if( rc==SQLITE_OK ){
+-    struct curl_slist *pWithAuth = curl_slist_append(pNew,zHeader);
++    BcvHttpHeader *pWithAuth = bcvHttpHeaderAppend(pNew,zHeader);
+     if( pWithAuth==0 ) rc = SQLITE_NOMEM;
+     else pNew = pWithAuth;
+   }
+   if( rc==SQLITE_OK ){
+-    curl_slist_free_all(pReq->pList);
++    bcvHttpHeaderFree(pReq->pList);
+     pReq->pList = pNew;
+   }else{
+-    curl_slist_free_all(pNew);
++    bcvHttpHeaderFree(pNew);
+   }
+   sqlite3_free(zHeader);
+   return rc;
+@@ -5691,8 +5747,10 @@ void bcvContainerClose(BcvContainer *p){
+ }
+ 
+ static void bcvDispatchReqFree(BcvDispatchReq *pReq){
++#ifndef __EMSCRIPTEN__
+   curl_easy_cleanup(pReq->pCurl);
+-  curl_slist_free_all(pReq->pList);
++#endif
++  bcvHttpHeaderFree(pReq->pList);
+   sqlite3_free(pReq->zUri);
+   sqlite3_free(pReq->zUriLog);
+   sqlite3_free(pReq->zStatus);
+@@ -5789,7 +5847,9 @@ int bcvDispatchNew(BcvDispatch **pp){
+   if( pNew==0 ){
+     rc = SQLITE_NOMEM;
+   }else{
++#ifndef __EMSCRIPTEN__
+     pNew->pMulti = curl_multi_init();
++#endif
+     sqlite3_mutex_enter( sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_APP2) );
+     pNew->iDispatchId = g_bcv.iNextDispatchId++;
+     sqlite3_mutex_leave( sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_APP2) );
+@@ -5880,7 +5940,9 @@ void bcvDispatchFree(BcvDispatch *p){
+       bcvDispatchJobFree(pJob);
+     }
+     
++#ifndef __EMSCRIPTEN__
+     curl_multi_cleanup(p->pMulti);
++#endif
+     sqlite3_free(p);
+   }
+ }
+@@ -5962,6 +6024,7 @@ static size_t bcvHeaderFunction(
+   return pReq->rc==SQLITE_OK ? nData : 0;
+ }
+ 
++#ifndef __EMSCRIPTEN__
+ /*
+ ** The following two functions are used as CURLOPT_READFUNCTION and
+ ** CURLOPT_SEEKFUNCTION callbacks when uploading a blob that is in 
+@@ -5980,7 +6043,175 @@ static size_t bcvSeekFunction(void *pCtx, curl_off_t offset, int origin){
+   p->iBody = (int)offset;
+   return CURL_SEEKFUNC_OK;
+ }
++#endif
++
+ 
++#ifdef __EMSCRIPTEN__
++/*
++** The browser's worker performs the same Google storage HTTP request that
++** native CBS sends through libcurl. It carries only the explicit CAB bearer,
++** never browser cookies, and keeps request bytes and conditional headers
++** inside the existing CBS callback and retry path.
++*/
++EM_JS(int, bcv_http_request_js,
++      (const char *method, const char *url, const char **headers, int count,
++       const u8 *body, size_t body_length, uint32_t *status,
++       size_t *response_length, size_t *headers_length,
++       uint32_t timeout_seconds), {
++  Module.__bcv_body = null;
++  Module.__bcv_headers = null;
++  try {
++    const request_url = UTF8ToString(url);
++    if (new URL(request_url).origin === self.location.origin) return -1;
++    const xhr = new XMLHttpRequest();
++    xhr.open(UTF8ToString(method), request_url, false);
++    xhr.withCredentials = false;
++    xhr.responseType = "arraybuffer";
++    if (timeout_seconds > 0) {
++      xhr.timeout = Math.min(timeout_seconds * 1000, 0xffffffff);
++    }
++    for (let index = 0; index < count; index += 1) {
++      const pointer = HEAPU32[(headers >> 2) + index];
++      const line = UTF8ToString(pointer);
++      const separator = line.indexOf(":");
++      if (separator <= 0) return -1;
++      const name = line.slice(0, separator).trim();
++      if (name.toLowerCase() === "cookie" || name.toLowerCase() === "cookie2") {
++        return -1;
++      }
++      xhr.setRequestHeader(name, line.slice(separator + 1).trim());
++    }
++    const request_body = body_length === 0
++        ? null : HEAPU8.slice(body, body + body_length).buffer;
++    xhr.send(request_body);
++    if (xhr.status === 0) return -1;
++    const response_body = xhr.response == null
++        ? new Uint8Array(0) : new Uint8Array(xhr.response);
++    const response_headers = xhr.getAllResponseHeaders() || "";
++    Module.__bcv_body = response_body;
++    Module.__bcv_headers = response_headers;
++    HEAPU32[status >> 2] = xhr.status;
++    HEAPU32[response_length >> 2] = response_body.length;
++    HEAPU32[headers_length >> 2] = lengthBytesUTF8(response_headers);
++    return 0;
++  } catch (_) {
++    Module.__bcv_body = null;
++    Module.__bcv_headers = null;
++    return -1;
++  }
++});
++EM_JS(void, bcv_http_clear_js, (), {
++  Module.__bcv_body = null;
++  Module.__bcv_headers = null;
++});
++EM_JS(void, bcv_http_copy_body_js, (u8 *destination), {
++  const data = Module.__bcv_body;
++  if (data && data.length > 0) HEAPU8.set(data, destination);
++});
++EM_JS(void, bcv_http_copy_headers_js, (char *destination, size_t capacity), {
++  stringToUTF8(Module.__bcv_headers || "", destination, capacity);
++});
++
++/* Concrete C wrappers ensure Emscripten links the JavaScript imports. */
++int bcv_http_request(const char *method, const char *url,
++    const char **headers, int count, const u8 *body, size_t body_length,
++    uint32_t *status, size_t *response_length, size_t *headers_length,
++    uint32_t timeout_seconds){
++  return bcv_http_request_js(method, url, headers, count, body, body_length,
++      status, response_length, headers_length, timeout_seconds);
++}
++void bcv_http_clear(void){ bcv_http_clear_js(); }
++void bcv_http_copy_body(u8 *destination){ bcv_http_copy_body_js(destination); }
++void bcv_http_copy_headers(char *destination, size_t capacity){
++  bcv_http_copy_headers_js(destination, capacity);
++}
++
++static int bcvBrowserRequest(BcvDispatchReq *request){
++  BcvHttpHeader *header;
++  const char **headers = 0;
++  int count = 0;
++  int index = 0;
++  const char *method;
++  uint32_t status = 0;
++  size_t body_length = 0;
++  size_t headers_length = 0;
++  char *response_headers;
++  u8 *response_body;
++  request->rc = SQLITE_OK;
++  switch(request->eMethod){
++    case SQLITE_BCV_METHOD_GET: method = "GET"; break;
++    case SQLITE_BCV_METHOD_PUT: method = "PUT"; break;
++    case SQLITE_BCV_METHOD_POST: method = "POST"; break;
++    case SQLITE_BCV_METHOD_HEAD: method = "HEAD"; break;
++    case SQLITE_BCV_METHOD_DELETE: method = "DELETE"; break;
++    default:
++      request->rc = SQLITE_MISUSE;
++      return request->rc;
++  }
++  for(header=request->pList; header; header=header->next) count++;
++  if(count>0){
++    headers = sqlite3_malloc64(sizeof(*headers) * (sqlite3_uint64)count);
++    if(headers==0){
++      request->rc = SQLITE_NOMEM;
++      return request->rc;
++    }
++    for(header=request->pList; header; header=header->next) headers[index++] = header->data;
++  }
++  request->code = CURLE_OK;
++  request->iHttpStatus = 0;
++  int rc = bcv_http_request(method, request->zUri, headers, count,
++      request->aBody, (size_t)request->nBody, &status, &body_length,
++      &headers_length,
++      request->pJob->pDispatch->nHttpTimeout > 0
++          ? (uint32_t)request->pJob->pDispatch->nHttpTimeout : 0);
++  sqlite3_free(headers);
++  if(rc!=0){
++    request->rc = SQLITE_ERROR;
++    request->zStatus = bcvMprintfRc(&request->rc, "browser cloud HTTP request failed");
++    bcv_http_clear();
++    return request->rc;
++  }
++  if(body_length>0x7fffffff || headers_length>0x7fffffff
++   || (request->nMaxBody>=0 && body_length>(size_t)request->nMaxBody)
++   || (request->nMaxHdrs>=0 && headers_length>(size_t)request->nMaxHdrs)
++  ){
++    request->rc = SQLITE_TOOBIG;
++    bcv_http_clear();
++    return request->rc;
++  }
++  request->iHttpStatus = (long)status;
++  request->zStatus = bcvMprintfRc(&request->rc, "HTTP/1.1 %ld", request->iHttpStatus);
++  response_headers = sqlite3_malloc64(headers_length + 1);
++  if(response_headers==0){
++    request->rc = SQLITE_NOMEM;
++    bcv_http_clear();
++    return request->rc;
++  }
++  bcv_http_copy_headers(response_headers, headers_length + 1);
++  response_headers[headers_length] = '\0';
++  for(char *line=response_headers; *line; ){
++    char *end = strstr(line, "\r\n");
++    if(end==0) end = line + strlen(line);
++    if(end>line) bcvHeaderFunction(line, 1, (size_t)(end-line), request);
++    if(*end=='\0') break;
++    line = end + 2;
++  }
++  sqlite3_free(response_headers);
++  if(body_length>0){
++    response_body = sqlite3_malloc64(body_length);
++    if(response_body==0){
++      request->rc = SQLITE_NOMEM;
++      bcv_http_clear();
++      return request->rc;
++    }
++    bcv_http_copy_body(response_body);
++    bcvWriteFunction((char*)response_body, 1, body_length, request);
++    sqlite3_free(response_body);
++  }
++  bcv_http_clear();
++  return request->rc;
++}
++#endif
+ /*
+ ** CURLOPT_VERBOSE normally writes the complete request and response headers,
+ ** including Authorization and x-amz-security-token values, to stderr. Keep
+@@ -5989,6 +6220,7 @@ static size_t bcvSeekFunction(void *pCtx, curl_off_t offset, int origin){
+ ** splits one header line across several callbacks or a server reflects a
+ ** credential in its response.
+ */
++#ifndef __EMSCRIPTEN__
+ static int bcvCurlDebug(
+   CURL *pCurl, curl_infotype eType, char *pData, size_t nData, void *pCtx
+ ){
+@@ -6006,6 +6238,7 @@ static int bcvCurlDebug(
+   fflush(stderr);
+   return 0;
+ }
++#endif
+ 
+ static void bcvDispatchLogRequest(BcvDispatch *p, BcvDispatchReq *pReq){
+   const char *zUri = pReq->zUriLog ? pReq->zUriLog : pReq->zUri;
+@@ -6047,7 +6280,11 @@ static void bcvDispatchLogReply(
+   long httpcode = 0;
+   i64 iMs = 0;
+ 
++#ifdef __EMSCRIPTEN__
++  httpcode = pReq->iHttpStatus;
++#else
+   curl_easy_getinfo(pReq->pCurl, CURLINFO_RESPONSE_CODE, &httpcode);
++#endif
+   bcvLogReply(p->pLog, pReq->iLogId, httpcode, &iMs);
+ 
+   if( p->xLog ){
+@@ -6095,12 +6332,17 @@ static void bcvDispatchJobUpdate(BcvDispatchJob *pJob){
+   BcvDispatch *p = pJob->pDispatch;
+   BcvDispatchReq **ppReq;
+   i64 iNow = 0;
++#ifndef __EMSCRIPTEN__
++  CURL *pCurl;
++#endif
+ 
+   /* Issue any scheduled HTTP requests. */
+   ppReq = &pJob->pPending;
+   while( *ppReq ){
+     BcvDispatchReq *pReq = *ppReq;
+-    CURL *pCurl = pReq->pCurl;
++#ifndef __EMSCRIPTEN__
++    pCurl = pReq->pCurl;
++#endif
+ 
+     /* If iRetryTime is non-zero, do not issue this request until the 
+     ** time according to sqlite_timestamp() is equal to or greater than
+@@ -6117,7 +6359,7 @@ static void bcvDispatchJobUpdate(BcvDispatchJob *pJob){
+     *ppReq = pReq->pNext;
+     pReq->pNext = 0;
+ 
+-#ifdef SQLITE_BCV_CURL_HANDLE_CONFIG
++#if defined(SQLITE_BCV_CURL_HANDLE_CONFIG) && !defined(__EMSCRIPTEN__)
+     if( pJob->rc==SQLITE_OK ){
+       pJob->rc = SQLITE_BCV_CURL_HANDLE_CONFIG(pCurl,pReq->eMethod,pReq->zUri);
+       if( pJob->rc!=SQLITE_OK ){
+@@ -6162,6 +6404,7 @@ static void bcvDispatchJobUpdate(BcvDispatchJob *pJob){
+     /* Invoke the log callback if one is configured */
+     bcvDispatchLogRequest(p, pReq);
+ 
++#ifndef __EMSCRIPTEN__
+     curl_easy_setopt(pCurl, CURLOPT_PRIVATE, (void*)pReq);
+     curl_easy_setopt(pCurl, CURLOPT_URL, pReq->zUri);
+     curl_easy_setopt(pCurl, CURLOPT_PATH_AS_IS, 1L);
+@@ -6211,6 +6454,7 @@ static void bcvDispatchJobUpdate(BcvDispatchJob *pJob){
+     }
+ 
+     curl_multi_add_handle(p->pMulti, pCurl);
++#endif
+   }
+ 
+   /* Check if job is finished. */
+@@ -6276,7 +6520,9 @@ static void bcvDispatchFail(
+       pReq->zStatus = (char*)zErr;
+       pReq->xCallback(pJob, pReq, pReq->pApp);
+       pReq->zStatus = 0;
++#ifndef __EMSCRIPTEN__
+       curl_multi_remove_handle(pDisp->pMulti, pReq->pCurl);
++#endif
+       bcvDispatchReqFree(pReq);
+     }
+     bcvDispatchJobUpdate(pJob);
+@@ -6328,9 +6574,13 @@ static int bcvDispatchRetry(
+ int bcvDispatchShouldRetry(BcvDispatchReq *pReq, int *piMs){
+   const char *zDummy = 0;
+   int eStatus = sqlite3_bcv_request_status(pReq, &zDummy);
++#ifdef __EMSCRIPTEN__
++  return bcvDispatchRetry(eStatus, 0, pReq->nRetry, piMs);
++#else
+   curl_off_t nSecond = 0;
+   curl_easy_getinfo(pReq->pCurl, CURLINFO_RETRY_AFTER, &nSecond);
+   return bcvDispatchRetry(eStatus, nSecond, pReq->nRetry, piMs);
++#endif
+ }
+ 
+ /*
+@@ -6341,7 +6591,9 @@ int bcvDispatchShouldRetry(BcvDispatchReq *pReq, int *piMs){
+ ** return zero.
+ */
+ static void bcvDispatchRetryRequest(BcvDispatchReq *pReq, int iDelay){
++#ifndef __EMSCRIPTEN__
+   curl_easy_reset(pReq->pCurl);
++#endif
+   pReq->pJob->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
+   sqlite3_free(pReq->zStatus);
+   pReq->zStatus = 0;
+@@ -6352,11 +6604,198 @@ static void bcvDispatchRetryRequest(BcvDispatchReq *pReq, int iDelay){
+   pReq->code = 0;
+   pReq->iBody = 0;
+   pReq->nHdrSeen = 0;
++#ifdef __EMSCRIPTEN__
++  /* Synchronous worker XHR cannot yield to a backoff timer. */
++  (void)iDelay;
++  pReq->iRetryTime = 0;
++#else
+   pReq->iRetryTime = iDelay ? (sqlite_timestamp() + iDelay) : 0;
++#endif
+   pReq->pNext = pReq->pJob->pPending;
+   pReq->pJob->pPending = pReq;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++/*
++** Browser workers cannot wait for the delayed retry schedule used by native
++** curl. Keep the same one-time bearer refresh on 401/403, and permit only the
++** first retry when its native delay is zero. Later retries need an async wait
++** primitive that synchronous worker XHR does not provide.
++*/
++static int bcvDispatchBrowserReply(BcvDispatchReq *pReq, int *piDelay){
++  const char *zStatus = 0;
++  int eStatus = sqlite3_bcv_request_status(pReq, &zStatus);
++  int bRetry = 0;
++  *piDelay = 0;
++
++  if( pReq->bBearerAuth
++   && (eStatus==HTTP_UNAUTHORIZED || eStatus==HTTP_AUTH_ERROR)
++  ){
++    if( pReq->nAuthRetry==0 ){
++      int rcAuth = bcvDispatchRequestAuth(
++          pReq, SQLITE_BCV_AUTH_UNAUTHORIZED
++      );
++      if( rcAuth==SQLITE_OK ){
++        pReq->nAuthRetry++;
++        pReq->bSkipAuthRefresh = 1;
++        bRetry = 1;
++      }else{
++        pReq->rc = rcAuth==SQLITE_NOMEM ? rcAuth : SQLITE_IOERR_AUTH;
++        pReq->pJob->eCauseKind = SQLITE_BCVFS_STORAGE_FAILURE_CAUSE_SQLITE;
++        pReq->code = CURLE_OK;
++        sqlite3_free(pReq->zStatus);
++        pReq->zStatus = 0;
++        bcvBufferZero(&pReq->body);
++        bcvBufferZero(&pReq->hdr);
++      }
++    }
++  }else{
++    int iDelay = 0;
++    if( bcvDispatchShouldRetry(pReq, &iDelay)
++     && pReq->nRetry==0
++     && iDelay==0
++    ){
++      bRetry = 1;
++      *piDelay = iDelay;
++    }
++  }
++  return bRetry;
++}
++
++#ifdef BCV_BROWSER_CLOUD_TESTS
++typedef struct BcvBrowserTestAuth BcvBrowserTestAuth;
++struct BcvBrowserTestAuth {
++  int nCall;
++  int eReason;
++  int bFail;
++};
++
++static int bcvBrowserTestAuthRefresh(
++  void *pCtx,
++  const char *zStorage,
++  const char *zAccount,
++  const char *zContainer,
++  int eReason,
++  char **pzToken
++){
++  BcvBrowserTestAuth *pAuth = (BcvBrowserTestAuth*)pCtx;
++  (void)zStorage;
++  (void)zAccount;
++  (void)zContainer;
++  pAuth->nCall++;
++  pAuth->eReason = eReason;
++  if( pAuth->bFail ) return SQLITE_AUTH;
++  *pzToken = sqlite3_mprintf("renewed-token");
++  return *pzToken ? SQLITE_OK : SQLITE_NOMEM;
++}
++
++static int bcvBrowserTestHasHeader(BcvHttpHeader *pList, const char *zHeader){
++  for(; pList; pList=pList->next){
++    if( strcmp(pList->data,zHeader)==0 ) return 1;
++  }
++  return 0;
++}
++
++/* Exercise the production reply decision without invoking browser networking. */
++int bcv_browser_test_auth_replay(
++  int firstStatus,
++  int secondStatus,
++  int bFailRefresh,
++  int *pnAuthCall,
++  int *peAuthReason,
++  int *pbRequestPreserved,
++  int *pbSkipAuthRefresh,
++  int *pnSecondRetry,
++  int *prc,
++  int *peCause
++){
++  static const u8 aRequestBody[] = { 0x00, 0x01, 0x7f, 0xff };
++  BcvBrowserTestAuth auth = {0, -1, bFailRefresh};
++  BcvContainer cont = {0};
++  BcvDispatchJob job = {0};
++  BcvDispatchReq req = {0};
++  int iDelay = 0;
++  int bFirstRetry;
++  int bSecondRetry = 0;
++
++  cont.pAuthCtx = &auth;
++  cont.xAuthRefresh = bcvBrowserTestAuthRefresh;
++  job.pCont = &cont;
++  req.pJob = &job;
++  req.bBearerAuth = 1;
++  req.iHttpStatus = firstStatus;
++  req.code = CURLE_OK;
++  req.aBody = aRequestBody;
++  req.nBody = sizeof(aRequestBody);
++  req.pList = bcvHttpHeaderAppend(req.pList,
++      "Authorization: Bearer stale-token");
++  req.pList = bcvHttpHeaderAppend(req.pList,
++      "If-Match: generation-17");
++  req.pList = bcvHttpHeaderAppend(req.pList,
++      "X-Goog-Hash: crc32c=deadbeef");
++  if( req.pList==0 ) return SQLITE_NOMEM;
++
++  bFirstRetry = bcvDispatchBrowserReply(&req, &iDelay);
++  if( bFirstRetry && !bFailRefresh ){
++    bcvDispatchRetryRequest(&req, iDelay);
++    job.pPending = 0;
++    req.pNext = 0;
++    req.iHttpStatus = secondStatus;
++    bSecondRetry = bcvDispatchBrowserReply(&req, &iDelay);
++  }
++
++  *pnAuthCall = auth.nCall;
++  *peAuthReason = auth.eReason;
++  *pbSkipAuthRefresh = req.bSkipAuthRefresh;
++  *pbRequestPreserved =
++      req.aBody==aRequestBody
++      && req.nBody==(int)sizeof(aRequestBody)
++      && memcmp(req.aBody,aRequestBody,sizeof(aRequestBody))==0
++      && bcvBrowserTestHasHeader(req.pList,
++          "Authorization: Bearer renewed-token")
++      && bcvBrowserTestHasHeader(req.pList,
++          "If-Match: generation-17")
++      && bcvBrowserTestHasHeader(req.pList,
++          "X-Goog-Hash: crc32c=deadbeef");
++  *pnSecondRetry = bSecondRetry;
++  *prc = req.rc;
++  *peCause = job.eCauseKind;
++  bcvHttpHeaderFree(req.pList);
++  sqlite3_free(req.zStatus);
++  sqlite3_free(req.body.aData);
++  sqlite3_free(req.hdr.aData);
++  return bFirstRetry;
++}
++
++int bcv_browser_test_retry_attempt_count(int httpStatus){
++  BcvDispatchJob job = {0};
++  BcvDispatchReq req = {0};
++  int nAttempt = 0;
++  int bRetry;
++  int iDelay = 0;
++  req.pJob = &job;
++  req.iHttpStatus = httpStatus;
++  req.code = CURLE_OK;
++  do{
++    req.iHttpStatus = httpStatus;
++    req.rc = SQLITE_OK;
++    req.code = CURLE_OK;
++    bRetry = bcvDispatchBrowserReply(&req, &iDelay);
++    nAttempt++;
++    if( bRetry ){
++      bcvDispatchRetryRequest(&req, iDelay);
++      job.pPending = 0;
++      req.pNext = 0;
++    }
++  }while( bRetry && nAttempt<10 );
++  sqlite3_free(req.zStatus);
++  sqlite3_free(req.body.aData);
++  sqlite3_free(req.hdr.aData);
++  return nAttempt;
++}
++#endif /* BCV_BROWSER_CLOUD_TESTS */
++#endif /* __EMSCRIPTEN__ */
++
+ i64 bcvDispatchJobRetryTime(BcvDispatchJob *pJob){
+   BcvDispatchReq *pReq;
+   i64 iRet = 0;
+@@ -6369,6 +6808,35 @@ i64 bcvDispatchJobRetryTime(BcvDispatchJob *pJob){
+ }
+ 
+ int bcvDispatchRun(BcvDispatch *p, struct curl_waitfd *aFd, int nFd, int ms){
++#ifdef __EMSCRIPTEN__
++  (void)aFd;
++  (void)nFd;
++  (void)ms;
++  while(p->pJobList){
++    BcvDispatchJob *pJob = p->pJobList;
++    if(pJob->pPending){
++      bcvDispatchJobUpdate(pJob);
++      continue;
++    }
++    if(pJob->pWaiting){
++      BcvDispatchReq *pReq = pJob->pWaiting;
++      int bRetry;
++      int iDelay = 0;
++      pJob->pWaiting = pReq->pNext;
++      pReq->pNext = 0;
++      bcvBrowserRequest(pReq);
++      bRetry = bcvDispatchBrowserReply(pReq, &iDelay);
++      bcvDispatchLogReply(p, pReq, bRetry, iDelay);
++      if(bRetry) bcvDispatchRetryRequest(pReq, iDelay);
++      else{
++        pReq->xCallback(pJob, pReq, pReq->pApp);
++        bcvDispatchReqFree(pReq);
++      }
++      bcvDispatchJobUpdate(pJob);
++    }
++  }
++  return SQLITE_OK;
++#else
+   int nDummy = 0;
+   CURLMcode mc;
+   struct CURLMsg *pMsg;
+@@ -6491,6 +6959,7 @@ int bcvDispatchRun(BcvDispatch *p, struct curl_waitfd *aFd, int nFd, int ms){
+   }
+ 
+   return SQLITE_OK;
++#endif
+ }
+ 
+ int bcvDispatchRunAll(BcvDispatch *p){
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+index ae88e87..d3b8955 100644
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -11,9 +11,13 @@
+ #include <string.h>
+ #include <assert.h>
+ 
++#ifdef __EMSCRIPTEN__
++#include "bcv_browser_crypto.h"
++#else
+ #include <openssl/hmac.h>
+ #include <openssl/sha.h>
+ #include <openssl/md5.h>
++#endif
+ 
+ #ifdef SQLITE_BCVFS_TESTING
+ extern int bcv_test_event(int);
+diff --git a/bcv_browser_crypto.h b/bcv_browser_crypto.h
+new file mode 100644
+index 0000000..7c71fc7
+--- /dev/null
++++ b/bcv_browser_crypto.h
+@@ -0,0 +1,29 @@
++#ifndef BCV_BROWSER_CRYPTO_H
++#define BCV_BROWSER_CRYPTO_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define MD5_DIGEST_LENGTH 16
++#define SHA256_DIGEST_LENGTH 32
++
++typedef struct BcvBrowserSha256Context {
++  uint64_t opaque[32];
++} SHA256_CTX;
++
++int bcv_browser_sha256_init(SHA256_CTX *context);
++int bcv_browser_sha256_update(SHA256_CTX *context, const unsigned char *data,
++                              size_t length);
++int bcv_browser_sha256_final(unsigned char *output, SHA256_CTX *context);
++unsigned char *bcv_browser_sha256(const unsigned char *data, size_t length,
++                                  unsigned char *output);
++unsigned char *bcv_browser_md5(const unsigned char *data, size_t length,
++                               unsigned char *output);
++
++#define SHA256_Init bcv_browser_sha256_init
++#define SHA256_Update bcv_browser_sha256_update
++#define SHA256_Final bcv_browser_sha256_final
++#define SHA256 bcv_browser_sha256
++#define MD5 bcv_browser_md5
++
++#endif

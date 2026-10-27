@@ -50,6 +50,7 @@ trace = []
 bundled = ["libdoltlite-sys?/bundled", "modern_sqlite"]
 # Cloud Backed SQLite block-cache VFS (requires a bundled native backend).
 blockcachevfs = ["bundled", "dep:sha2", "libdoltlite-sys?/blockcachevfs"]
+browser-cloud = ["blockcachevfs", "remote", "libdoltlite-sys?/browser-cloud"]
 buildtime_bindgen = ["libdoltlite-sys?/buildtime_bindgen", "sqlite-wasm-rs?/bindgen"]
 # sqlite3_limit
 limits = []

@@ -8601,7 +8601,7 @@ fn google_uri_session_handoff_keeps_accepted_graph_private_until_upload() {
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 #[test]
 #[ignore = "requires the pinned local GCS emulator container"]
-fn google_uri_staged_graph_is_private_until_server_publication() {
+fn google_cloud_session_file_remote_reads_and_stages_until_server_publication() {
     let suffix = unique_suffix();
     let endpoint = std::env::var("BLOCKCACHEVFS_GCS_EMULATOR")
         .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
@@ -8625,69 +8625,131 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
             .expect("derive stable graph publication operation ID")
     };
     let temp = tempfile::tempdir().expect("staged graph tempdir");
-    let source =
-        Connection::open(temp.path().join("source.db")).expect("create direct GCS push source");
-    source
-        .execute_batch(
-            "CREATE TABLE widgets(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO widgets VALUES(1, 'staged');",
-        )
-        .expect("write source graph row");
-    let _: String = source
-        .query_row(
-            "SELECT dolt_commit('-A', '-m', 'staged graph')",
-            [],
-            |row| row.get(0),
-        )
-        .expect("commit source graph");
+    let seed_path = temp.path().join("seed.db");
+    let seed = Connection::open(&seed_path).expect("create published base graph");
+    seed.execute_batch(
+        "CREATE TABLE widgets(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO widgets VALUES(1, 'base');",
+    )
+    .expect("write base graph row");
+    let _: i64 = seed
+        .query_row("SELECT dolt_add('-A')", [], |row| row.get(0))
+        .expect("stage base graph");
+    let base_hash: String = seed
+        .query_row("SELECT dolt_commit('-m', 'base graph')", [], |row| {
+            row.get(0)
+        })
+        .expect("commit base graph");
+    seed.close().expect("close base graph seed database");
 
-    let mut client_server = start_graph_uri_session_server(&uri, &session_id, operation_id())
-        .expect("start client-owned session server");
+    let storage =
+        Storage::google_json_with_endpoint("test-project", format!("{bucket}/{prefix}"), &endpoint);
+    let bootstrap_cache = tempfile::tempdir().expect("base graph CBS cache directory");
+    let bootstrap_vfs = BlockCacheVfs::builder(bootstrap_cache.path())
+        .expect("base graph CBS VFS builder")
+        .auth_callback(|_, _, _| Ok("bootstrap-token".to_owned()))
+        .init_owned()
+        .expect("initialize base graph CBS VFS");
+    bootstrap_vfs
+        .initialize_container(&storage, None)
+        .expect("initialize the published graph container");
+    bootstrap_vfs
+        .create_database(&storage, &seed_path, "default.db")
+        .expect("publish base graph before the CAB session opens");
+    drop(bootstrap_vfs);
     let manifest_name = layout.manifest_object.clone();
     let initial_manifest = fetch_google_object(&endpoint, bucket, &manifest_name);
-    let remote_url = client_server.database_url("default.db");
+
+    let scope = SessionScope::new("graph-transfer", "default.db", "push,read")
+        .expect("valid direct cloud session scope");
+    let mut client_session = BlockCacheSessionOptions::for_uri(&session_id, scope, operation_id())
+        .expect("create direct cloud session options")
+        .auth_callback(|_, _, _, _| Ok("remote-server-token".to_owned()))
+        .open_cloud_uri(&uri)
+        .expect("open the published graph through a CAB-scoped cloud session");
+    let remote_url = client_session.database_url().to_owned();
+    assert!(
+        remote_url.starts_with("file://") && remote_url.contains("?vfs="),
+        "Dolt must use its file remote against the session-owned VFS: {remote_url}"
+    );
+    assert!(
+        !remote_url.contains("remote-server-token"),
+        "the remote URL must not include CAB credentials"
+    );
+
+    // Clone first to exercise direct client reads of the published graph, then
+    // push a new commit through the same ordinary Dolt file-remote interface.
+    let source = Connection::open(temp.path().join("source.db"))
+        .expect("create local clone for direct GCS file remote");
+    let _: i64 = source
+        .query_row("SELECT dolt_clone(?1)", params![remote_url], |row| {
+            row.get(0)
+        })
+        .expect("read the published graph through Dolt's file remote");
+    let cloned_base_hash: String = source
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("read cloned base branch hash");
+    assert_eq!(cloned_base_hash, base_hash);
+    let base_value: String = source
+        .query_row("SELECT value FROM widgets WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read published base graph row through Dolt clone");
+    assert_eq!(base_value, "base");
+
+    source
+        .execute("INSERT INTO widgets VALUES(2, 'staged')", [])
+        .expect("write graph update to direct-push clone");
+    let _: i64 = source
+        .query_row("SELECT dolt_add('-A')", [], |row| row.get(0))
+        .expect("stage direct-push graph update");
+    let pushed_hash: String = source
+        .query_row("SELECT dolt_commit('-m', 'staged graph')", [], |row| {
+            row.get(0)
+        })
+        .expect("commit direct-push graph update");
     let _: i64 = source
         .query_row(
-            "SELECT dolt_remote('add', 'origin', ?1)",
+            "SELECT dolt_remote('set-url', 'origin', ?1)",
             params![remote_url],
             |row| row.get(0),
         )
-        .expect("add direct GCS session server as source remote");
+        .expect("point the clone's ordinary Dolt remote at the CAB VFS path");
     let _: i64 = source
         .query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))
-        .expect("push committed graph to the client-owned session server");
-    let pushed_hash: String = source
-        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
-        .expect("read source branch hash");
-    let client_database = client_server
+        .expect("push directly to the session-owned VFS without a Dolt TCP server");
+    let staged_hash: String = client_session
         .database_connection()
-        .expect("running URI server exposes its database for inspection");
-    let staged_hash: String = client_database
+        .expect("direct cloud session exposes its database for ref validation")
         .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
-        .expect("read accepted branch before staging");
+        .expect("validate target branch after direct push");
     assert_eq!(staged_hash, pushed_hash);
+    assert!(
+        client_session.first_storage_error().is_none(),
+        "direct GCS push must not leave a terminal storage failure"
+    );
 
-    client_server
+    client_session
         .stage_request()
         .expect("checkpoint and accept the graph without publication");
     assert!(
-        client_server.database_connection().is_none(),
-        "the SQL accessor must be unavailable after the server is quiesced"
+        client_session.database_connection().is_err(),
+        "the direct session must close SQL before staging and accepting"
     );
     assert_eq!(
-        client_server
+        client_session
             .operation_status()
-            .expect("read accepted operation status"),
+            .expect("read accepted direct operation status"),
         SessionOperationStatus::Accepted
     );
-    client_server
+    client_session
         .close()
-        .expect("close staged client server without publication");
+        .expect("close staged client session without publication");
 
     assert_eq!(
         fetch_google_object(&endpoint, bucket, &manifest_name),
         initial_manifest,
-        "staging must leave the published manifest byte-for-byte unchanged"
+        "client staging must leave the published manifest byte-for-byte unchanged"
     );
     let listing = list_google_objects(&endpoint, bucket, &prefix);
     let blocks_prefix = layout.blocks_prefix.clone();
@@ -8749,11 +8811,15 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
     );
 
     let unpublished = Connection::open_with_flags(&uri, read_only_flags)
-        .expect("read published graph before final server upload");
-    let unpublished_branches: i64 = unpublished
-        .query_row("SELECT count(*) FROM dolt_branches", [], |row| row.get(0))
-        .expect("read published refs before final upload");
-    assert_eq!(unpublished_branches, 0);
+        .expect("read published base graph before final server upload");
+    let unpublished_hash: String = unpublished
+        .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))
+        .expect("read published base branch before final upload");
+    assert_eq!(unpublished_hash, base_hash);
+    let unpublished_rows: i64 = unpublished
+        .query_row("SELECT count(*) FROM widgets", [], |row| row.get(0))
+        .expect("read published base rows before final upload");
+    assert_eq!(unpublished_rows, 1);
     unpublished
         .close()
         .expect("close reader before final server upload");
@@ -8776,7 +8842,7 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
     let accepted_rows: i64 = server_database
         .query_row("SELECT count(*) FROM widgets", [], |row| row.get(0))
         .expect("inspect accepted graph rows before final upload");
-    assert_eq!(accepted_rows, 1);
+    assert_eq!(accepted_rows, 2);
 
     server
         .upload()
@@ -8794,9 +8860,15 @@ fn google_uri_staged_graph_is_private_until_server_publication() {
         .expect("read published branch hash");
     let published_rows: i64 = published
         .query_row("SELECT count(*) FROM widgets", [], |row| row.get(0))
-        .expect("read published graph row");
+        .expect("read published graph rows");
     assert_eq!(published_hash, pushed_hash);
-    assert_eq!(published_rows, 1);
+    assert_eq!(published_rows, 2);
+    let published_value: String = published
+        .query_row("SELECT value FROM widgets WHERE id = 2", [], |row| {
+            row.get(0)
+        })
+        .expect("read published direct-push row");
+    assert_eq!(published_value, "staged");
     published.close().expect("close published graph reader");
     source.close().expect("close direct GCS push source");
 }

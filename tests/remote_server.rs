@@ -1705,6 +1705,72 @@ fn remote_server_uses_named_vfs_for_access_and_open() -> Result<()> {
 }
 
 #[test]
+fn file_remote_selects_named_vfs_and_rejects_ambiguous_queries() -> Result<()> {
+    let temp = tempfile::tempdir().expect("should create file remote test directory");
+    let source_path = temp.path().join("source.db");
+    let remote_path = temp.path().join("remote.db");
+    let counting_vfs = CountingVfs::new();
+    let named_remote_url = format!(
+        "file://{}?vfs={}",
+        remote_path.display(),
+        counting_vfs.name()
+    );
+    let ordinary_remote_url = format!("file://{}", remote_path.display());
+
+    let source = Connection::open(source_path)?;
+    source.execute_batch(
+        "CREATE TABLE widgets(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO widgets VALUES(1, 'file remote');",
+    )?;
+    let _: i64 = source.query_row("SELECT dolt_add('-A')", [], |row| row.get(0))?;
+    let _: String = source.query_row("SELECT dolt_commit('-m', 'seed')", [], |row| row.get(0))?;
+    let _: i64 = source.query_row(
+        "SELECT dolt_remote('add', 'origin', ?1)",
+        params![named_remote_url],
+        |row| row.get(0),
+    )?;
+    let _: i64 = source.query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))?;
+    assert!(
+        counting_vfs.opens() > 0,
+        "a named file remote must open through its selected VFS"
+    );
+
+    let ordinary_clone = Connection::open(temp.path().join("ordinary-clone.db"))?;
+    let _: i64 = ordinary_clone.query_row(
+        "SELECT dolt_clone(?1)",
+        params![ordinary_remote_url],
+        |row| row.get(0),
+    )?;
+    let value: String =
+        ordinary_clone.query_row("SELECT value FROM widgets WHERE id = 1", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(value, "file remote");
+
+    for (index, query) in [
+        format!("vfs={}&vfs={}", counting_vfs.name(), counting_vfs.name()),
+        format!("vfs={}&unknown=value", counting_vfs.name()),
+        format!("vfs=%{}", counting_vfs.name()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let clone = Connection::open(temp.path().join(format!("invalid-clone-{index}.db")))?;
+        let invalid_url = format!("file://{}?{query}", remote_path.display());
+        let result =
+            clone.query_row::<i64, _, _>("SELECT dolt_clone(?1)", params![invalid_url], |row| {
+                row.get(0)
+            });
+        assert!(
+            result.is_err(),
+            "ambiguous file remote query must fail: {query}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn remote_server_options_enable_authentication_and_timeout() -> Result<()> {
     let temp = tempfile::tempdir().expect("tempdir");
     let server_root = temp.path().join("server");
