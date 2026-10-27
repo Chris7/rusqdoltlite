@@ -78,6 +78,13 @@ make no extra source payload reads for planning. When a destination chunk is
 already present, the observed traversal reads it locally to find any missing
 descendants and count reuse. Clones without an observer keep the existing
 transfer path, and lazy clones reject an active full-clone observer.
+`0012-file-remote-vfs.patch` lets normal Dolt `file://` remotes select one
+registered SQLite VFS with a strict `?vfs=<name>` query. URLs without a query
+keep the existing process-default VFS behavior. It rejects additional,
+duplicated, encoded, or malformed query parameters instead of treating them as
+part of a filesystem path; CAB-backed cloud sessions use this to route native
+push and clone I/O through the session-owned VFS.
+
 Patches under `blockcachevfs/` apply only to the staged CBS sources; patches in
 this directory apply only to DoltLite sources.
 

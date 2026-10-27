@@ -1,0 +1,63 @@
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -572703,13 +572703,47 @@
+       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_DB);
+ }
+ 
++/* A file remote may name the VFS that owns its remote database. This is
++** used by CAB-backed direct sessions, whose registered VFS is distinct from
++** the local graph connection's default VFS. Only a single plain vfs= query
++** parameter is accepted; every other query spelling remains invalid rather
++** than becoming part of a filesystem path. */
++static DoltliteRemote *doltliteFileRemoteOpen(
++  sqlite3_vfs *pVfs,
++  const char *zUrl,
++  int flags
++){
++  const char *zPath = zUrl + 7;
++  const char *zQuery = strchr(zPath, '?');
++  char *zPathCopy = 0;
++  DoltliteRemote *pRemote;
++
++  if( zQuery ){
++    const char *zVfs = zQuery + 5;
++    const char *z;
++    if( strncmp(zQuery, "?vfs=", 5)!=0 || zVfs[0]=='\0' ) return 0;
++    for(z=zVfs; z[0]; z++){
++      if( !( (*z>='A' && *z<='Z') || (*z>='a' && *z<='z')
++          || (*z>='0' && *z<='9') || *z=='_' || *z=='-' ) ) return 0;
++    }
++    pVfs = sqlite3_vfs_find(zVfs);
++    if( !pVfs || zQuery-zPath>INT_MAX ) return 0;
++    zPathCopy = sqlite3_mprintf("%.*s", (int)(zQuery-zPath), zPath);
++    if( !zPathCopy ) return 0;
++    zPath = zPathCopy;
++  }
++  pRemote = fsRemoteOpen(pVfs, zPath, flags);
++  sqlite3_free(zPathCopy);
++  return pRemote;
++}
++
+ DoltliteRemote *doltliteRemoteOpenReadOnly(
+   sqlite3_vfs *pVfs,
+   const char *zUrl
+ ){
+   if( strncmp(zUrl, "file://", 7)==0 ){
+-    return fsRemoteOpen(pVfs, zUrl + 7,
+-                        SQLITE_OPEN_READONLY | SQLITE_OPEN_MAIN_DB);
++    return doltliteFileRemoteOpen(pVfs, zUrl,
++                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_MAIN_DB);
+   }
+   if( strncmp(zUrl, "http://", 7)==0 || strncmp(zUrl, "https://", 8)==0 ){
+     return doltliteHttpRemoteOpen(zUrl);
+@@ -574231,7 +574265,9 @@
+ ){
+   DoltliteRemote *pRemote = 0;
+   if( strncmp(zUrl, "file://", 7)==0 ){
+-    pRemote = doltliteFsRemoteOpen(pVfs, zUrl + 7);
++    pRemote = doltliteFileRemoteOpen(
++        pVfs, zUrl, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_DB
++    );
+     doltliteRemoteSetBusyHandler(pRemote, remoteSqlBusyHandler, db);
+     return pRemote;
+   }

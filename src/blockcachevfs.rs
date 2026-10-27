@@ -13,12 +13,15 @@ use std::time::Duration;
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, check};
-use crate::{Connection, OpenFlags, Result};
+use crate::{Connection, OpenFlags, Result, ffi};
 
 use crate::ffi::bcvutil as raw_util;
 use crate::ffi::blockcachevfs as raw;
 
 const MIN_CONTAINER_BLOCK_SIZE: u32 = 32 * 1024;
+
+#[cfg(feature = "remote")]
+pub(crate) const SQLITE_OPEN_DOLTLITE_NO_SEED: i32 = 0x0080_0000;
 
 /// An error returned by an authentication callback.
 #[derive(Debug, Clone)]
@@ -2002,6 +2005,670 @@ pub(crate) struct UriSessionContext {
     pub(crate) upload_progress: Option<Arc<UploadProgressCallback>>,
     #[cfg(feature = "remote")]
     pub(crate) storage_failure: StorageFailureSlot,
+}
+
+/// Build a credential-free SQLite error for session validation and lifecycle failures.
+fn session_error(code: c_int, message: &str) -> Error {
+    Error::SqliteFailure(crate::ffi::Error::new(code), Some(message.to_owned()))
+}
+
+/// Maximum UTF-8 bytes accepted for one session-scope field.
+///
+/// This mirrors the limit used by the staged native scope-hash format. These
+/// values bind caller-supplied context into session records and accepted-head
+/// fences; they are not credentials, and the library neither authenticates the
+/// caller nor derives or enforces database and operation permissions. An
+/// application must perform those checks before opening or publishing a
+/// session.
+#[cfg(feature = "remote")]
+pub const SESSION_SCOPE_MAX_FIELD_BYTES: usize = 4096;
+
+/// Caller-authorized context bound to one session-owned cloud database.
+///
+/// `principal` identifies the already-authenticated caller, `target_database`
+/// is the exact database name this context is for, and `operations` is an
+/// opaque permitted-operation scope supplied by the caller. The library does
+/// not authenticate the principal or infer, grant, or enforce permissions from
+/// this value.
+#[cfg(feature = "remote")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionScope {
+    principal: String,
+    target_database: String,
+    operations: String,
+}
+
+#[cfg(feature = "remote")]
+impl SessionScope {
+    /// Validate and construct a caller-authorized session scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a field is empty, too long, or contains control
+    /// characters, or if the target database is not a safe DoltLite name or
+    /// ends with a reserved SQLite sidecar suffix.
+    pub fn new(
+        principal: impl AsRef<str>,
+        target_database: impl AsRef<str>,
+        operations: impl AsRef<str>,
+    ) -> Result<Self> {
+        let target_database = validate_scope_field("target database", target_database)?;
+        if !is_native_database_name(&target_database) {
+            return Err(session_error(
+                ffi::SQLITE_MISUSE,
+                "session target database must be an ASCII DoltLite database name",
+            ));
+        }
+        // SQLite interprets these exact lowercase endings as sidecars of a
+        // shorter database name. Leading-dot names are already excluded by
+        // `is_native_database_name`; that also prevents `.repo.db-lock` from
+        // colliding with DoltLite's local lock sidecar. Longer suffix
+        // near-misses such as `repo.db-wal-old` remain valid database names.
+        if ["-wal", "-shm", "-journal"]
+            .iter()
+            .any(|suffix| target_database.ends_with(*suffix))
+        {
+            return Err(session_error(
+                ffi::SQLITE_MISUSE,
+                "session target database must not end in a reserved SQLite sidecar suffix",
+            ));
+        }
+        Ok(Self {
+            principal: validate_scope_field("principal", principal)?,
+            target_database,
+            operations: validate_scope_field("operation scope", operations)?,
+        })
+    }
+
+    /// Return the caller-supplied principal binding.
+    #[must_use]
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// Return the exact target database name.
+    #[must_use]
+    pub fn target_database(&self) -> &str {
+        &self.target_database
+    }
+
+    /// Return the opaque permitted-operation scope.
+    #[must_use]
+    pub fn operations(&self) -> &str {
+        &self.operations
+    }
+
+    /// Check an exact database-name match without normalizing or interpreting
+    /// the caller's value. This comparison alone does not authenticate the
+    /// caller or authorize access to the database.
+    #[must_use]
+    pub fn matches_database(&self, database: &str) -> bool {
+        self.target_database == database
+    }
+}
+
+/// Reject malformed caller-supplied values before binding them into CBS session metadata.
+#[cfg(feature = "remote")]
+fn validate_scope_field(name: &str, value: impl AsRef<str>) -> Result<String> {
+    let value = value.as_ref();
+    let invalid = value.is_empty()
+        || value.len() > SESSION_SCOPE_MAX_FIELD_BYTES
+        || value.bytes().any(|byte| byte < 0x20 || byte == 0x7f);
+    if invalid {
+        return Err(session_error(
+            ffi::SQLITE_MISUSE,
+            &format!(
+                "session {name} must be non-empty, control-free, and at most {SESSION_SCOPE_MAX_FIELD_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+/// Keep the scoped database name to one safe DoltLite path component.
+#[cfg(feature = "remote")]
+fn is_native_database_name(value: &str) -> bool {
+    !value.starts_with('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// Distinguish a shared VFS attachment from a URI-owned cloud VFS session.
+#[cfg(feature = "remote")]
+#[derive(Clone)]
+enum BlockCacheSessionTarget {
+    Vfs {
+        vfs: &'static BlockCacheVfs,
+        attachment: AttachSpec,
+        alias: String,
+    },
+    Uri,
+}
+
+/// One-call construction payload for a scoped cloud session.
+///
+/// A payload can attach an existing process-lifetime VFS or own a VFS opened
+/// from a GCS/S3 database URI. Both forms bind a session UUID, caller-supplied
+/// scope, and one opaque per-request operation ID. The application remains
+/// responsible for authenticating the caller and authorizing the operation.
+#[cfg(feature = "remote")]
+#[derive(Clone)]
+pub struct BlockCacheSessionOptions {
+    target: BlockCacheSessionTarget,
+    session_id: crate::blockcachevfs::SessionId,
+    scope: SessionScope,
+    operation_id: SessionOperationId,
+    auth_refresh: Option<Arc<AuthRefreshCallback>>,
+    upload_progress: Option<Arc<UploadProgressCallback>>,
+    pub(crate) upload_concurrency: Option<u32>,
+}
+
+#[cfg(feature = "remote")]
+impl fmt::Debug for BlockCacheSessionOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("BlockCacheSessionOptions");
+        match &self.target {
+            BlockCacheSessionTarget::Vfs {
+                vfs,
+                attachment,
+                alias,
+            } => {
+                debug
+                    .field("vfs", &vfs.name())
+                    .field("attachment", attachment)
+                    .field("alias", alias);
+            }
+            BlockCacheSessionTarget::Uri => {
+                debug.field("target", &"uri");
+            }
+        }
+        debug
+            .field("session_id", &self.session_id)
+            .field("scope", &self.scope)
+            .field("operation_id", &self.operation_id)
+            .field("upload_concurrency", &self.upload_concurrency)
+            .field("auth_callback_configured", &self.auth_refresh.is_some())
+            .field(
+                "upload_progress_callback_configured",
+                &self.upload_progress.is_some(),
+            )
+            .finish()
+    }
+}
+
+#[cfg(feature = "remote")]
+impl BlockCacheSessionOptions {
+    /// Construct a session payload for an existing process-lifetime VFS.
+    ///
+    /// The session UUID, caller-authorized scope, and per-request operation
+    /// ID are validated before the storage attachment is opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session ID is invalid, the provider is not
+    /// supported for scoped attachments, or a safe local alias cannot be
+    /// derived from the attachment and session ID.
+    pub fn new(
+        vfs: &'static BlockCacheVfs,
+        attachment: AttachSpec,
+        session_id: impl AsRef<str>,
+        scope: SessionScope,
+        operation_id: SessionOperationId,
+    ) -> Result<Self> {
+        let mut attachment = attachment;
+        let canonical_provider =
+            crate::blockcachevfs::canonical_session_storage_provider(&attachment.storage.provider)?;
+        attachment.storage.provider = canonical_provider;
+        let session_id = crate::blockcachevfs::SessionId::new(session_id)?;
+        let alias = session_alias(&attachment, &session_id)?;
+        Ok(Self {
+            target: BlockCacheSessionTarget::Vfs {
+                vfs,
+                attachment,
+                alias,
+            },
+            session_id,
+            scope,
+            operation_id,
+            auth_refresh: None,
+            upload_progress: None,
+            upload_concurrency: None,
+        })
+    }
+
+    /// Construct a session payload whose VFS is owned by a GCS/S3 URI open.
+    ///
+    /// `session_id` is the client-stable UUID for one logical transfer.
+    /// `operation_id` identifies one logical request and should remain stable
+    /// for exact retries. The URI's decoded database option must match
+    /// `scope.target_database()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Canonical non-nil UUID shared by requests in one transfer.
+    /// * `scope` - Caller-authorized principal, exact database, and operation scope.
+    /// * `operation_id` - Opaque identifier for this request or exact retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `session_id` is not a canonical non-nil UUID.
+    pub fn for_uri(
+        session_id: impl AsRef<str>,
+        scope: SessionScope,
+        operation_id: SessionOperationId,
+    ) -> Result<Self> {
+        Ok(Self {
+            target: BlockCacheSessionTarget::Uri,
+            session_id: crate::blockcachevfs::SessionId::new(session_id)?,
+            scope,
+            operation_id,
+            auth_refresh: None,
+            upload_progress: None,
+            upload_concurrency: None,
+        })
+    }
+
+    /// Set the upper bound on simultaneous block uploads for this URI-owned
+    /// session. When both this option and the URI's `upload_concurrency` query
+    /// parameter are set, this explicit option takes precedence. The VFS may
+    /// use fewer requests to stay within its cache and staging-buffer
+    /// limits. Values outside `1..=i32::MAX` are rejected before opening the
+    /// cloud database. This option is supported only for URI-backed sessions;
+    /// static VFS sessions configure the shared VFS with
+    /// [`crate::blockcachevfs::Config::UploadConcurrency`] when it is built.
+    #[must_use]
+    pub fn upload_concurrency(mut self, upload_concurrency: u32) -> Self {
+        self.upload_concurrency = Some(upload_concurrency);
+        self
+    }
+
+    /// Supply credentials for a session-owned Google Cloud Storage URI.
+    ///
+    /// The callback runs once while the URI-owned VFS attaches its storage
+    /// container, before each cloud request, and again after an authorization
+    /// failure. It should return the current token for the requested storage
+    /// identity. This supplies refreshed tokens without rebuilding the URI
+    /// and lets an open database continue after a short-lived token expires. The callback
+    /// is supported only by [`Self::for_uri`] with a GCS URI; using it with a
+    /// static VFS session or S3 URI causes session open to fail.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rusqlite::blockcachevfs::AuthRefreshReason;
+    /// use rusqlite::{BlockCacheSessionOptions, SessionOperationId, SessionScope};
+    ///
+    /// # fn main() -> rusqlite::Result<()> {
+    /// let scope = SessionScope::new("alice", "default.db", "read,write")?;
+    /// let operation = SessionOperationId::from_request("POST", "/default.db/commit", b"")?;
+    /// let session = BlockCacheSessionOptions::for_uri(
+    ///     "9c539f0e-3913-4875-9f93-23627c3c015d",
+    ///     scope,
+    ///     operation,
+    /// )?
+    /// .auth_callback(|_storage, _project, _container, reason| match reason {
+    ///     AuthRefreshReason::Request | AuthRefreshReason::Unauthorized => {
+    ///         Ok("current-access-token".to_owned())
+    ///     }
+    /// });
+    /// let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn auth_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, &str, &str, AuthRefreshReason) -> std::result::Result<String, AuthError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.auth_refresh = Some(Arc::new(callback));
+        self
+    }
+
+    /// Report cumulative, complete-block upload progress for this URI-owned VFS.
+    ///
+    /// The callback runs synchronously after a complete block write succeeds
+    /// or an existing immutable block passes an exact-byte check. It also
+    /// reports a fixed `expected` plan after the
+    /// explicit final checkpoint has quiesced the WAL and counted remaining
+    /// dirty blocks. The plan includes already uploaded and verified-reused
+    /// blocks; its byte count is full block payload bytes, not predicted network
+    /// traffic, and excludes WAL, checkpoint, manifest, and other metadata
+    /// requests. `expected` stays `None` while DoltLite is producing data. A
+    /// complete block-work plan can reach 100% before the session manifest is
+    /// accepted or published. This callback may run during a remote transfer
+    /// or while the database is checkpointed. Do not re-enter this VFS or
+    /// connection from the callback. Panics are contained and never alter
+    /// upload or publication results. Keep the callback quick. This option is supported only for
+    /// URI-backed session options.
+    ///
+    /// ```
+    /// use rusqlite::blockcachevfs::UploadProgress;
+    /// use rusqlite::{BlockCacheSessionOptions, SessionOperationId, SessionScope};
+    ///
+    /// # fn main() -> rusqlite::Result<()> {
+    /// let scope = SessionScope::new("alice", "default.db", "push,read")?;
+    /// let operation = SessionOperationId::from_request("POST", "/default.db/commit", b"")?;
+    /// let session = BlockCacheSessionOptions::for_uri(
+    ///     "9c539f0e-3913-4875-9f93-23627c3c015d",
+    ///     scope,
+    ///     operation,
+    /// )?
+    /// .upload_progress_callback(|progress: UploadProgress| {
+    ///     eprintln!(
+    ///         "Uploaded {} blocks ({} bytes); reused {} blocks ({} bytes); plan {:?}",
+    ///         progress.uploaded_blocks,
+    ///         progress.uploaded_bytes,
+    ///         progress.reused_blocks,
+    ///         progress.reused_bytes,
+    ///         progress.expected,
+    ///     );
+    /// });
+    /// let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn upload_progress_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(crate::blockcachevfs::UploadProgress) + Send + Sync + 'static,
+    {
+        self.upload_progress = Some(Arc::new(callback));
+        self
+    }
+
+    /// Return the caller-authorized context carried by this payload.
+    #[must_use]
+    pub fn scope(&self) -> &SessionScope {
+        &self.scope
+    }
+
+    /// Return the opaque per-request operation identifier.
+    #[must_use]
+    pub fn operation_id(&self) -> &SessionOperationId {
+        &self.operation_id
+    }
+
+    pub(crate) fn is_uri(&self) -> bool {
+        matches!(self.target, BlockCacheSessionTarget::Uri)
+    }
+
+    /// Let crate tests inspect static attachment canonicalization without exposing session internals publicly.
+    #[cfg(test)]
+    pub(crate) fn attachment_for_test(&self) -> Option<&AttachSpec> {
+        match &self.target {
+            BlockCacheSessionTarget::Vfs { attachment, .. } => Some(attachment),
+            BlockCacheSessionTarget::Uri => None,
+        }
+    }
+
+    pub(crate) fn vfs_name(&self) -> Option<&str> {
+        match &self.target {
+            BlockCacheSessionTarget::Vfs { vfs, .. } => Some(vfs.name()),
+            BlockCacheSessionTarget::Uri => None,
+        }
+    }
+
+    /// Attach the configured static VFS with this payload's validated scope.
+    pub(crate) fn attach(&self) -> Result<SessionAttachment> {
+        if self.auth_refresh.is_some() {
+            return Err(session_error(
+                ffi::SQLITE_MISUSE,
+                "credential refresh callbacks require a session-owned GCS URI",
+            ));
+        }
+        if self.upload_progress.is_some() {
+            return Err(session_error(
+                ffi::SQLITE_MISUSE,
+                "upload progress callbacks require a URI-backed session",
+            ));
+        }
+        match &self.target {
+            BlockCacheSessionTarget::Vfs {
+                vfs, attachment, ..
+            } => vfs.attach_session_scoped(
+                attachment,
+                self.session_id.as_str(),
+                self.scope.principal(),
+                self.scope.target_database(),
+                self.scope.operations(),
+                &self.operation_id,
+            ),
+            BlockCacheSessionTarget::Uri => Err(session_error(
+                ffi::SQLITE_MISUSE,
+                "URI-backed sessions are attached while opening the cloud connection",
+            )),
+        }
+    }
+
+    /// Return the only directory a server may use for a static-VFS attachment.
+    pub(crate) fn expected_directory(&self) -> Option<String> {
+        match &self.target {
+            BlockCacheSessionTarget::Vfs { alias, .. } => Some(format!("/{alias}")),
+            BlockCacheSessionTarget::Uri => None,
+        }
+    }
+
+    /// Transfer validated scope and callbacks into the URI-owned attachment path.
+    pub(crate) fn uri_context(&self, storage_failure: StorageFailureSlot) -> UriSessionContext {
+        UriSessionContext {
+            session_id: self.session_id.clone(),
+            principal: self.scope.principal().to_owned(),
+            target_database: self.scope.target_database().to_owned(),
+            operations: self.scope.operations().to_owned(),
+            operation_id: self.operation_id,
+            upload_concurrency: self.upload_concurrency,
+            auth_refresh: self.auth_refresh.as_ref().map(Arc::clone),
+            upload_progress: self.upload_progress.as_ref().map(Arc::clone),
+            storage_failure,
+        }
+    }
+
+    /// Opens a cloud-backed Dolt database for direct file-remote operations.
+    ///
+    /// The returned handle uses the caller-scoped session overlay and exposes
+    /// a Dolt `file://` URL that selects the owned VFS. It does not start a
+    /// listener or publish the cloud manifest. The application stages only a
+    /// successful transfer and authorizes publication separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this is not a URI-backed session, if the URI is
+    /// invalid or its database does not match the scope, if the cloud database
+    /// cannot be opened, or if the operation is already in conflict.
+    pub fn open_cloud_uri(self, uri: &str) -> Result<CloudSession> {
+        if !self.is_uri() {
+            return Err(session_error(
+                ffi::SQLITE_MISUSE,
+                "direct cloud sessions require URI-backed session options",
+            ));
+        }
+        if let Some(upload_concurrency) = self.upload_concurrency {
+            crate::blockcachevfs::validate_upload_concurrency(upload_concurrency)?;
+        }
+
+        let storage_failure = Arc::new(Mutex::new(None));
+        let open_flags = OpenFlags::from_bits_retain(
+            OpenFlags::SQLITE_OPEN_READ_WRITE.bits()
+                | OpenFlags::SQLITE_OPEN_CREATE.bits()
+                | SQLITE_OPEN_DOLTLITE_NO_SEED,
+        );
+        let database = crate::blockcachevfs::open_connection_uri_with_session(
+            uri,
+            open_flags,
+            self.uri_context(Arc::clone(&storage_failure)),
+        )?;
+        let database_path = database.blockcachevfs_path().ok_or_else(|| {
+            session_error(
+                ffi::SQLITE_MISUSE,
+                "cloud session URI did not open with blockcachevfs",
+            )
+        })?;
+        let vfs_name = database.blockcachevfs_name().ok_or_else(|| {
+            session_error(
+                ffi::SQLITE_MISUSE,
+                "cloud session URI did not register a blockcachevfs VFS",
+            )
+        })?;
+        let database_url = format!("file://{database_path}?vfs={vfs_name}");
+        let session = database.blockcache_session().ok_or_else(|| {
+            session_error(
+                ffi::SQLITE_MISUSE,
+                "cloud session URI did not retain its scoped session attachment",
+            )
+        })?;
+        if session.operation_status()? == SessionOperationStatus::Conflict {
+            return Err(session_error(
+                ffi::SQLITE_CONSTRAINT,
+                "session operation conflicts with the durable accepted head",
+            ));
+        }
+
+        Ok(CloudSession {
+            database: Some(database),
+            database_url,
+            storage_failure,
+            sql_handle_open: true,
+        })
+    }
+}
+
+/// A direct cloud database session that stages Dolt writes through its VFS.
+///
+/// The owned cloud VFS connection remains bound to its caller-scoped session
+/// for the lifetime of this value. Dropping or closing it never publishes the
+/// database manifest; applications must explicitly stage the accepted
+/// checkpoint and authorize publication separately.
+#[cfg(feature = "remote")]
+pub struct CloudSession {
+    database: Option<Connection>,
+    database_url: String,
+    storage_failure: StorageFailureSlot,
+    sql_handle_open: bool,
+}
+
+#[cfg(feature = "remote")]
+impl CloudSession {
+    /// Keep access to the anchor explicit so closed sessions return a typed error.
+    fn database(&self) -> Result<&Connection> {
+        self.database
+            .as_ref()
+            .ok_or_else(|| session_error(ffi::SQLITE_MISUSE, "cloud session is already closed"))
+    }
+
+    /// Reach the durable CBS session state retained by the anchor connection.
+    fn session(&self) -> Result<&SessionAttachment> {
+        self.database()?.blockcache_session().ok_or_else(|| {
+            session_error(
+                ffi::SQLITE_MISUSE,
+                "cloud session has no scoped blockcachevfs attachment",
+            )
+        })
+    }
+
+    /// Returns the Dolt remote URL for this caller-scoped database session.
+    ///
+    /// Dolt's ordinary file remote opens this URL through the selected VFS,
+    /// keeping block reads and writes in the same scoped cloud session.
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    /// Returns the connection for validating the staged branch before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the SQL handle has been closed.
+    pub fn database_connection(&self) -> Result<&Connection> {
+        if !self.sql_handle_open {
+            return Err(session_error(
+                ffi::SQLITE_MISUSE,
+                "cloud session SQL handle is already closed",
+            ));
+        }
+        self.database()
+    }
+
+    /// Returns the durable status of this request's session operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cloud session is closed or its durable status
+    /// cannot be read.
+    pub fn operation_status(&self) -> Result<SessionOperationStatus> {
+        self.session()?.operation_status()
+    }
+
+    /// Closes the SQLite anchor, checkpoints its graph, and accepts the session operation.
+    ///
+    /// Acceptance keeps staged blocks private; it does not upload the database
+    /// manifest or make the branch visible. Call only after all Dolt remote
+    /// connections have closed and the caller has validated the target branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the anchor cannot close, the operation conflicts
+    /// or has failed, or the checkpoint/accept CAS fails.
+    pub fn stage_request(&mut self) -> Result<()> {
+        self.database
+            .as_mut()
+            .ok_or_else(|| session_error(ffi::SQLITE_MISUSE, "cloud session is already closed"))?
+            .close_sql_handle()?;
+        self.sql_handle_open = false;
+
+        match self.session()?.operation_status()? {
+            SessionOperationStatus::Accepted | SessionOperationStatus::Committed => Ok(()),
+            SessionOperationStatus::Conflict => Err(session_error(
+                ffi::SQLITE_CONSTRAINT,
+                "another operation owns the session accepted head",
+            )),
+            SessionOperationStatus::Failed => Err(session_error(
+                ffi::SQLITE_CONSTRAINT,
+                "the session operation has already failed",
+            )),
+            SessionOperationStatus::New => {
+                self.session()?.checkpoint()?;
+                self.session()?.accept()
+            }
+        }
+    }
+
+    /// Returns the first typed storage failure observed by the cloud VFS.
+    #[must_use]
+    pub fn first_storage_error(&self) -> Option<StorageFailure> {
+        *self
+            .storage_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Closes the cloud database and releases its session attachment without publishing it.
+    ///
+    /// If SQLite cannot close the database handle, the handle stays in this
+    /// value so the caller can retry or continue recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite cannot close its database handle or the VFS
+    /// cannot detach. This method never publishes a manifest.
+    pub fn close(&mut self) -> Result<()> {
+        if let Some(database) = self.database.take() {
+            match database.close() {
+                Ok(()) => {
+                    self.sql_handle_open = false;
+                }
+                Err((database, error)) => {
+                    self.database = Some(database);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connection> {

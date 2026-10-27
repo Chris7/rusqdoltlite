@@ -90,10 +90,11 @@ pub use crate::bind::BindIndex;
 #[cfg(all(
     feature = "remote",
     feature = "blockcachevfs",
-    not(target_arch = "wasm32")
+    not(all(target_family = "wasm", target_os = "unknown"))
 ))]
 pub use crate::blockcachevfs::{
-    SESSION_OPERATION_ID_BYTES, SessionOperationId, SessionOperationStatus,
+    BlockCacheSessionOptions, CloudSession, SESSION_OPERATION_ID_BYTES,
+    SESSION_SCOPE_MAX_FIELD_BYTES, SessionOperationId, SessionOperationStatus, SessionScope,
 };
 #[cfg(feature = "cache")]
 pub use crate::cache::CachedStatement;
@@ -106,14 +107,6 @@ pub use crate::ffi::ErrorCode;
 #[cfg(feature = "load_extension")]
 pub use crate::load_extension_guard::LoadExtensionGuard;
 pub use crate::params::{Params, ParamsFromIter, params_from_iter};
-#[cfg(all(
-    feature = "remote",
-    feature = "blockcachevfs",
-    not(target_arch = "wasm32")
-))]
-pub use crate::remote_server::{
-    BlockCacheSessionOptions, SESSION_SCOPE_MAX_FIELD_BYTES, SessionScope,
-};
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
 pub use crate::remote_server::{RemoteAuthenticator, RemoteServer, RemoteServerOptions};
 pub use crate::row::{AndThenRows, Map, MappedRows, Row, RowIndex, Rows};

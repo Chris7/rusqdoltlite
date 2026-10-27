@@ -19,7 +19,11 @@ bundled = ["cc", "bundled_bindings"]
 bundled-windows = ["cc", "bundled_bindings"]
 # Build the vendored Cloud Backed SQLite block-cache VFS into the bundled
 # DoltLite archive.
-blockcachevfs = ["bundled", "pkg-config", "dep:curl-sys", "dep:openssl-sys", "dep:libz-sys"]
+blockcachevfs = ["bundled", "pkg-config", "dep:curl-sys", "dep:openssl-sys", "dep:libz-sys", "dep:md-5", "dep:sha2"]
+# Add the normal remote client/server APIs to the browser-compatible VFS.
+browser-cloud = ["blockcachevfs", "remote"]
+# Compile browser dispatcher hooks used only by the Emscripten transport tests.
+browser-cloud-tests = ["browser-cloud"]
 # Enable the HTTP remote client and in-process remote server APIs.
 remote = []
 buildtime_bindgen = ["bindgen", "pkg-config", "vcpkg"]
@@ -43,8 +47,15 @@ with-asan = []
 wasm32-wasi-vfs = []
 
 [dependencies]
-# Bundle the native HTTP and TLS libraries used by CBS so blockcachevfs builds
-# do not require libcurl, OpenSSL, or zlib development packages on the target.
+# Browser CBS hashes use the same RustCrypto algorithms as the native digest
+# providers but do not link browser TLS or HTTP libraries.
+md-5 = { version = "0.10.6", optional = true, default-features = false }
+sha2 = { version = "0.10", optional = true, default-features = false }
+
+[target.'cfg(not(target_os = "emscripten"))'.dependencies]
+# Native CBS requests use bundled libcurl, OpenSSL and zlib. Keep these
+# dependencies out of the Emscripten target, which dispatches requests through
+# the browser worker's XMLHttpRequest adapter.
 curl-sys = { version = "0.4.83", optional = true, default-features = false, features = ["ssl", "static-curl", "static-ssl"] }
 openssl-sys = { version = "0.9.64", optional = true, default-features = false, features = ["vendored"] }
 libz-sys = { version = "1.1", optional = true, default-features = false, features = ["static"] }

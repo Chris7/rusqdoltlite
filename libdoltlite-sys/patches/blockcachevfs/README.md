@@ -199,6 +199,33 @@ After installation, verified resident mappings are persisted as clean and
 returned to the LRU. A newer local rewrite remains dirty and follows normal
 manifest conflict handling.
 
+0019-browser-http-xhr.patch routes Emscripten cloud requests from the
+existing CBS dispatcher through synchronous XMLHttpRequest in the dedicated
+browser worker. It preserves CBS request callbacks, response limits, and
+conditional object writes. A bearer-authenticated 401/403 invokes the
+unauthorized refresh callback and replays the same request once, retaining its
+body and conditional headers. Retryable transport and server errors get at most
+the native zero-delay retry; delayed retries and Retry-After are unsupported
+because synchronous worker XHR cannot yield to a timer without Asyncify or
+shared-memory waiting. If that immediate retry also fails, CBS returns the
+error. Requests
+carry only the explicit bearer header; XHR credentials are disabled and
+same-origin URLs are rejected so app cookies cannot be attached. The
+Emscripten build registers the Google module only; Azure and S3 signing remain
+native-only. Browser block-name MD5 and session SHA-256 use the sys crate's
+RustCrypto FFI wrappers, preserving native digest bytes without linking curl
+or OpenSSL into the browser target. Native builds continue using the existing
+libcurl/OpenSSL dispatcher.
+
+Google JSON media writes use POST with ifGenerationMatch in the URL and
+X-Goog-Hash: crc32c=... in the request headers. Browser reads and writes
+require response access to x-goog-generation
+and x-goog-hash for CBS generation tracking and CRC32C validation. The
+production Google JSON API provides its documented CORS behavior without a
+per-bucket CORS rule; a custom endpoint or emulator must allow the app origin,
+Authorization, Content-Type, and X-Goog-Hash request headers and expose those
+two response headers.
+
 `0021-local-logical-file-size.patch` keeps the in-memory exact EOF current
 after successful ordinary local copy-on-write writes and truncates. The
 published manifest remains unchanged until the normal upload path runs.

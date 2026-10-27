@@ -344,6 +344,9 @@ mod build_bundled {
         // only CBS's VFS files and the bundled DoltLite public header under
         // the name expected by CBS instead.
         let stage = Path::new(out_dir).join("blockcachevfs-src");
+        if stage.exists() {
+            fs::remove_dir_all(&stage).expect("could not clear CBS source staging directory");
+        }
         fs::create_dir_all(&stage).expect("could not create CBS source staging directory");
         let sources = [
             "blockcachevfs.c",
@@ -382,28 +385,36 @@ mod build_bundled {
         // feature. Their metadata keeps the static libraries registered once
         // and in Cargo's dependency order. CBS itself needs CURL_STATICLIB so
         // curl headers use static declarations on Windows as well.
+        let browser_target =
+            env::var("CARGO_CFG_TARGET_OS").is_ok_and(|target_os| target_os == "emscripten");
+        if browser_target && env::var_os("CARGO_FEATURE_BROWSER_CLOUD_TESTS").is_some() {
+            cfg.define("BCV_BROWSER_CLOUD_TESTS", None);
+        }
         cfg.files(sources.iter().map(|name| stage.join(name)))
             .include(&stage)
             .flag("-DSQLITE_CORE")
             .flag("-DSQLITE_THREADSAFE=1")
             .define("BCV_DOLTLITE_INTEGRATION", None)
-            .define("CURL_STATICLIB", None)
-            .define("DOLTLITE_BCV_BUNDLED_CURL", None)
             .warnings(false);
 
-        // These include paths come from the same Cargo native dependencies
-        // that build and link CBS's static curl, OpenSSL, and zlib libraries.
-        for (variable, library) in [
-            ("DEP_CURL_INCLUDE", "bundled libcurl"),
-            ("DEP_OPENSSL_INCLUDE", "vendored OpenSSL"),
-        ] {
-            let include = env::var_os(variable)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| panic!("{variable} metadata is missing for {library}"));
-            if !include.is_dir() {
-                panic!("{variable} does not name an include directory for {library}");
+        if !browser_target {
+            // Native CBS uses the bundled curl and OpenSSL implementations.
+            // The Emscripten dispatcher uses synchronous worker XHR and RustCrypto
+            // hashes, so its build must not require either native library.
+            cfg.define("CURL_STATICLIB", None)
+                .define("DOLTLITE_BCV_BUNDLED_CURL", None);
+            for (variable, library) in [
+                ("DEP_CURL_INCLUDE", "bundled libcurl"),
+                ("DEP_OPENSSL_INCLUDE", "vendored OpenSSL"),
+            ] {
+                let include = env::var_os(variable)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| panic!("{variable} metadata is missing for {library}"));
+                if !include.is_dir() {
+                    panic!("{variable} does not name an include directory for {library}");
+                }
+                cfg.include(include);
             }
-            cfg.include(include);
         }
     }
 
@@ -1003,7 +1014,7 @@ mod bindings {
             }
             _ => bindings
                 .write_to_file(out_path)
-                .unwrap_or_else(|_| panic!("Could not write to {out_path:?}"))
+                .unwrap_or_else(|_| panic!("Could not write to {out_path:?}")),
         }
     }
 }
