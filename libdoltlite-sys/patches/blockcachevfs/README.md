@@ -226,6 +226,14 @@ per-bucket CORS rule; a custom endpoint or emulator must allow the app origin,
 Authorization, Content-Type, and X-Goog-Hash request headers and expose those
 two response headers.
 
+`0020-local-writes-only.patch` adds an opt-in VFS mode that leaves ordinary
+SQLite writes in the bounded local dirty-block cache and disables automatic
+staging, including the separate session staging path. When cache pressure
+cannot be relieved by evicting clean blocks, SQLite receives `SQLITE_FULL`
+without an upload attempt. Explicit CBS cloud-write and publication APIs fail
+before dispatch; reads continue fetching missing blocks on demand. The native
+default remains the existing staging behavior.
+
 `0021-local-logical-file-size.patch` keeps the in-memory exact EOF current
 after successful ordinary local copy-on-write writes and truncates. The
 published manifest remains unchanged until the normal upload path runs.

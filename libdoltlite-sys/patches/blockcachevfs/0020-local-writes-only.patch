@@ -1,0 +1,198 @@
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+index d3b8955..ebd1416 100644
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -246,6 +246,7 @@ struct sqlite3_bcvfs {
+   char *zCacheFile;               /* Full path to cache file */
+   int nRequest;                   /* SQLITE_BCV_NREQUEST value */
+   int nHttpTimeout;               /* SQLITE_BCV_HTTPTIMEOUT value */
++  int bLocalWritesOnly;           /* Keep dirty blocks local; never upload */
+ 
+   i64 iNextLocalId;
+   BcvfsFile *pFileList;
+@@ -413,6 +414,32 @@ static void bcvfsMutexLeave(Mutex *p){
+ #endif
+ }
+ 
++/* Read the opt-in mode under the VFS lock because callers may configure a
++** process-lifetime VFS after it has been created. */
++static int bcvfsLocalWritesOnly(sqlite3_bcvfs *pFs){
++  int bLocal = 0;
++  if( pFs ){
++    ENTER_VFS_MUTEX; {
++      bLocal = pFs->bLocalWritesOnly;
++    } LEAVE_VFS_MUTEX;
++  }
++  return bLocal;
++}
++
++/* Mutating CBS APIs use this before opening a provider handle or dispatching
++** a request, so a read-capability VFS never attempts a cloud write. */
++static int bcvfsDenyCloudWrites(sqlite3_bcvfs *pFs, char **pzErr){
++  if( pzErr ) *pzErr = 0;
++  if( bcvfsLocalWritesOnly(pFs) ){
++    if( pzErr ) *pzErr = sqlite3_mprintf(
++        "VFS is configured for local writes only"
++    );
++    return SQLITE_READONLY;
++  }
++  return SQLITE_OK;
++}
++
++
+ /*
+ ** The mutex must be held when this function is called. It releases the
+ ** mutex and then blocks, waiting for the condition to by signalled by
+@@ -2478,10 +2505,15 @@ static int bcvfsStageOneForFileInternal(
+ }
+ 
+ static int bcvfsStageOneForFile(BcvfsFile *pFile){
++  /* Preserve dirty cache contents when no upload capability is available.
++  ** The caller can still write while a clean cache slot is available. */
++  if( bcvfsLocalWritesOnly(pFile->pFs) ) return SQLITE_FULL;
+   return bcvfsStageOneForFileInternal(pFile, 0);
+ }
+ 
+ static int bcvfsStageOneForSession(BcvfsFile *pFile){
++  /* Session writes use a separate staging path; keep them local as well. */
++  if( bcvfsLocalWritesOnly(pFile->pFs) ) return SQLITE_FULL;
+   return bcvfsStageOneForFileInternal(pFile, pFile->pCont);
+ }
+ 
+@@ -2943,7 +2975,9 @@ static int bcvfsAtStageWatermark(sqlite3_bcvfs *pFs){
+   int bAtWatermark = 0;
+   int ii;
+   ENTER_VFS_MUTEX; {
+-    if( p->szBlk>0 && p->nMaxCache>0 && p->nStageWatermark>0 ){
++    if( !pFs->bLocalWritesOnly
++     && p->szBlk>0 && p->nMaxCache>0 && p->nStageWatermark>0
++    ){
+       nTargetBytes = (p->nMaxCache/100)*p->nStageWatermark
+                    + ((p->nMaxCache%100)*p->nStageWatermark)/100;
+       nTargetSlots = nTargetBytes/p->szBlk
+@@ -6474,6 +6508,13 @@ int sqlite3_bcvfs_config(sqlite3_bcvfs *pFs, int op, sqlite3_int64 iVal){
+             pFs->c.nStageWatermark = (int)iVal;
+           }
+           break;
++        case SQLITE_BCV_LOCALWRITESONLY:
++          if( iVal!=0 && iVal!=1 ){
++            rc = SQLITE_MISUSE;
++          }else{
++            pFs->bLocalWritesOnly = (int)iVal;
++          }
++          break;
+         case SQLITE_BCV_NREQUEST:
+           if( iVal<1 || iVal>INT_MAX ){
+             rc = SQLITE_MISUSE;
+@@ -8257,7 +8298,8 @@ int sqlite3_bcvfs_upload(
+   char **pzErr                    /* OUT: Error message */
+ ){
+   int rc = SQLITE_OK;
+-  if( pzErr ) *pzErr = 0;
++  rc = bcvfsDenyCloudWrites(pFs,pzErr);
++  if( rc!=SQLITE_OK ) return rc;
+   /* A session-owned alias must be finalized through the fenced publication
+   ** state machine. The legacy upload path has no session identity and may
+   ** otherwise publish a stale or incomplete local manifest. */
+@@ -8287,6 +8329,9 @@ int sqlite3_bcvfs_copy(
+   int rc = SQLITE_OK;
+   char *zErr = 0;
+ 
++  rc = bcvfsDenyCloudWrites(pFs,pzErr);
++  if( rc!=SQLITE_OK ) return rc;
++
+   /* A copied destination becomes a CBS manifest name without raw upload's
+   ** shared guard, so reject SQLite sidecars and local DoltLite lock names. */
+   if( bcvDatabaseNameIsReserved(zTo) ){
+@@ -8465,6 +8510,9 @@ int sqlite3_bcvfs_delete(
+ ){
+   int rc = SQLITE_OK;
+   char *zErr = 0;
++
++  rc = bcvfsDenyCloudWrites(pFs,pzErr);
++  if( rc!=SQLITE_OK ) return rc;
+   
+   if( pFs->zPortnumber ){ 
+     rc = SQLITE_READONLY;
+@@ -10533,6 +10581,12 @@ static int bcvKVStorePush(bcv_kv_vtab *pTab){
+   if( pFile->kv.db ){
+     BcvKVStore *pKv = &pFile->kv;
+     sqlite3_bcvfs *pFs = pFile->pFs;
++    if( bcvfsLocalWritesOnly(pFs) ){
++      bcvSetVtabErr(&pTab->base,
++          "VFS is configured for local writes only"
++      );
++      return SQLITE_READONLY;
++    }
+     BcvContainer *pBcv = 0;
+     BcvDispatch *pDisp = 0;
+     int iIter = 0;
+@@ -13595,6 +13649,8 @@ int sqlite3_bcvfs_session_checkpoint(
+   if( pFs->zPortnumber ){
+     return bcvSessionError(SQLITE_MISUSE,pzErr,"session checkpoints are unavailable through the CBS daemon");
+   }
++  rc = bcvfsDenyCloudWrites(pFs,pzErr);
++  if( rc!=SQLITE_OK ) return rc;
+   ENTER_VFS_MUTEX; {
+     pCont = bcvfsFindContAlias(&pFs->c,zAlias,pzErr);
+     if( pCont==0 ){
+@@ -14262,6 +14318,8 @@ int sqlite3_bcvfs_session_put(
+   }
+   rc = bcvSessionConditionValid(zIfMatch,pzErr);
+   if( rc!=SQLITE_OK ) return rc;
++  rc = bcvfsDenyCloudWrites(pFs,pzErr);
++  if( rc!=SQLITE_OK ) return rc;
+   rc = sqlite3_bcvfs_session_object_name(eType,zSessionId,aObjectId,zName,sizeof(zName),pzErr);
+   if( rc!=SQLITE_OK ) return rc;
+   rc = bcvSessionAcquire(pFs,zAlias,zSessionId,&pCont,&pDisp,&pBcv,pzErr);
+@@ -16075,6 +16133,8 @@ int sqlite3_bcvfs_session_upload(
+   const char *zSessionId,
+   char **pzErr
+ ){
++  int rc = bcvfsDenyCloudWrites(pFs,pzErr);
++  if( rc!=SQLITE_OK ) return rc;
+   return bcvfsSessionPublish(pFs,zAlias,zSessionId,pzErr);
+ }
+ 
+@@ -16468,6 +16528,8 @@ int sqlite3_bcvfs_session_finalize(
+   const char *zSessionId,
+   char **pzErr
+ ){
++  int rc = bcvfsDenyCloudWrites(pFs,pzErr);
++  if( rc!=SQLITE_OK ) return rc;
+   return bcvfsSessionFinalizeNew(pFs,zAlias,zSessionId,pzErr);
+ }
+ static int bcvfsSessionVerifyCheckpointBlocks(
+@@ -17050,6 +17112,8 @@ int sqlite3_bcvfs_session_accept(
+   memset(aHistoryRecordHash,0,sizeof(aHistoryRecordHash));
+   memset(aNewHistoryRoot,0,sizeof(aNewHistoryRoot));
+   memset(aScope,0,sizeof(aScope));
++  rc = bcvfsDenyCloudWrites(pFs,pzErr);
++  if( rc!=SQLITE_OK ) return rc;
+   if( pFs==0 || zAlias==0 || !bcvfsValidSessionId(zSessionId) ){
+     return bcvSessionError(SQLITE_MISUSE,pzErr,"session acceptance identity is invalid");
+   }
+diff --git a/blockcachevfs.h b/blockcachevfs.h
+index af09a62..bc4b897 100644
+--- a/blockcachevfs.h
++++ b/blockcachevfs.h
+@@ -704,6 +704,11 @@ int sqlite3_bcvfs_config(sqlite3_bcvfs *pFs, int op, sqlite3_int64 iVal);
+ **   staged. The value must be between 1 and 100, inclusive. The default is
+ **   90. Allocation at the hard cache limit stages blocks regardless of this
+ **   setting.
++**
++** SQLITE_BCV_LOCALWRITESONLY:
++**   When non-zero, keep dirty blocks local, disable automatic staging, and
++**   reject cloud-write APIs. A full cache that cannot evict clean blocks
++**   returns SQLITE_FULL without uploading dirty data. The default is zero.
+ */
+ #define SQLITE_BCV_CACHESIZE   1
+ #define SQLITE_BCV_NREQUEST    2
+@@ -712,6 +717,7 @@ int sqlite3_bcvfs_config(sqlite3_bcvfs *pFs, int op, sqlite3_int64 iVal);
+ #define SQLITE_BCV_HTTPLOG_TIMEOUT 5
+ #define SQLITE_BCV_HTTPLOG_NENTRY  6
+ #define SQLITE_BCV_STAGEWATERMARK  7
++#define SQLITE_BCV_LOCALWRITESONLY 8
+ 
+ /*
+ ** Return true if this VFS is connected to a daemon process. Or false if

@@ -573,6 +573,61 @@ impl Connection {
         })
     }
 
+    /// Open a GCS URI while keeping credential renewal attached to its owned VFS.
+    ///
+    /// The URI may include `local_writes_only=true` to keep SQLite edits in
+    /// its local cache and prevent cloud mutations through this VFS. Missing
+    /// blocks are still fetched as they are read. The callback supplies a
+    /// token for the fixed storage identity selected by the URI; it cannot
+    /// change the bucket, prefix, or database behind this connection.
+    ///
+    /// The callback runs before cloud requests and after an authorization
+    /// failure. Return the current token for
+    /// [`crate::blockcachevfs::AuthRefreshReason::Request`] and a renewed token
+    /// for [`crate::blockcachevfs::AuthRefreshReason::Unauthorized`]. This
+    /// entry point is available with `blockcachevfs` and `remote` on native
+    /// targets and Emscripten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `path` is not a GCS BlockCacheVFS URI, if the URI
+    /// is malformed, if the callback fails, or if the cloud database cannot
+    /// be opened.
+    #[cfg(all(
+        feature = "remote",
+        feature = "blockcachevfs",
+        not(all(target_family = "wasm", target_os = "unknown"))
+    ))]
+    pub fn open_with_flags_and_cloud_auth_refresh<P, F>(
+        path: P,
+        flags: OpenFlags,
+        callback: F,
+    ) -> Result<Self>
+    where
+        P: AsRef<Path>,
+        F: Fn(
+                &str,
+                &str,
+                &str,
+                crate::blockcachevfs::AuthRefreshReason,
+            ) -> std::result::Result<String, crate::blockcachevfs::AuthError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let Some(uri) = path
+            .as_ref()
+            .to_str()
+            .filter(|path| path.starts_with("gcs://"))
+        else {
+            return Err(Error::SqliteFailure(
+                ffi::Error::new(ffi::SQLITE_MISUSE),
+                Some("cloud credential refresh requires a gcs:// BlockCacheVFS URI".into()),
+            ));
+        };
+        crate::blockcachevfs::open_connection_uri_with_auth_refresh(uri, flags, callback)
+    }
+
     /// Open a new connection to a SQLite database using the specific flags and
     /// vfs name.
     ///

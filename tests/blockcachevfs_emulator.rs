@@ -2743,6 +2743,14 @@ struct BlockPutObservation {
 
 #[cfg(feature = "remote")]
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct BlockGetObservation {
+    path: String,
+    authorization: Option<String>,
+    injected_status: Option<u16>,
+}
+
+#[cfg(feature = "remote")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GuardGetObservation {
     path: String,
     status: u16,
@@ -2760,6 +2768,8 @@ struct StorageFaultProxy {
     faulted: Arc<AtomicUsize>,
     kill_pid: Arc<AtomicUsize>,
     upload_checksums_valid: Arc<Mutex<Vec<bool>>>,
+    mutating_requests: Arc<AtomicUsize>,
+    block_get_observations: Arc<Mutex<Vec<BlockGetObservation>>>,
     block_put_observations: Arc<Mutex<Vec<BlockPutObservation>>>,
     guard_get_observations: Arc<Mutex<Vec<GuardGetObservation>>>,
     guard_epoch_transition: Arc<AtomicBool>,
@@ -2794,6 +2804,10 @@ impl StorageFaultProxy {
         let kill_pid = Arc::new(AtomicUsize::new(0));
         let upload_checksums_valid = Arc::new(Mutex::new(Vec::new()));
         let upload_checksums_valid_thread = Arc::clone(&upload_checksums_valid);
+        let mutating_requests = Arc::new(AtomicUsize::new(0));
+        let mutating_requests_thread = Arc::clone(&mutating_requests);
+        let block_get_observations = Arc::new(Mutex::new(Vec::new()));
+        let block_get_observations_thread = Arc::clone(&block_get_observations);
         let block_put_observations = Arc::new(Mutex::new(Vec::new()));
         let block_put_observations_thread = Arc::clone(&block_put_observations);
         let guard_get_observations = Arc::new(Mutex::new(Vec::new()));
@@ -2832,6 +2846,8 @@ impl StorageFaultProxy {
                         faulted: &thread_faulted,
                         kill_pid: &thread_kill_pid,
                         upload_checksums_valid: &upload_checksums_valid_thread,
+                        mutating_requests: &mutating_requests_thread,
+                        block_get_observations: &block_get_observations_thread,
                         block_put_observations: &block_put_observations_thread,
                         guard_get_observations: &guard_get_observations_thread,
                         guard_epoch_transition: &guard_epoch_transition_thread,
@@ -2860,6 +2876,8 @@ impl StorageFaultProxy {
             faulted,
             kill_pid,
             upload_checksums_valid,
+            mutating_requests,
+            block_get_observations,
             block_put_observations,
             guard_get_observations,
             guard_epoch_transition,
@@ -2907,6 +2925,24 @@ impl StorageFaultProxy {
             .lock()
             .expect("lock recorded GCS checksums")
             .clone()
+    }
+
+    fn mutating_requests(&self) -> usize {
+        self.mutating_requests.load(Ordering::Acquire)
+    }
+
+    fn block_get_observations(&self) -> Vec<BlockGetObservation> {
+        self.block_get_observations
+            .lock()
+            .expect("lock recorded GCS block GETs")
+            .clone()
+    }
+
+    fn clear_block_get_observations(&self) {
+        self.block_get_observations
+            .lock()
+            .expect("lock recorded GCS block GETs")
+            .clear();
     }
 
     fn block_put_observations(&self) -> Vec<BlockPutObservation> {
@@ -3236,6 +3272,8 @@ struct StorageFaultControls<'a> {
     faulted: &'a AtomicUsize,
     kill_pid: &'a AtomicUsize,
     upload_checksums_valid: &'a Mutex<Vec<bool>>,
+    mutating_requests: &'a AtomicUsize,
+    block_get_observations: &'a Mutex<Vec<BlockGetObservation>>,
     block_put_observations: &'a Mutex<Vec<BlockPutObservation>>,
     guard_get_observations: &'a Mutex<Vec<GuardGetObservation>>,
     guard_epoch_transition: &'a AtomicBool,
@@ -3253,6 +3291,12 @@ fn handle_storage_fault_connection(
     stream.set_write_timeout(Some(HTTP_TEST_TIMEOUT))?;
     let (method, request_target, headers, body) = read_storage_proxy_request(stream)?;
     let request_path = storage_request_path(&request_target);
+    if ["POST", "PUT", "PATCH", "DELETE"]
+        .iter()
+        .any(|verb| method.eq_ignore_ascii_case(verb))
+    {
+        controls.mutating_requests.fetch_add(1, Ordering::AcqRel);
+    }
     let session_guard_get =
         method.eq_ignore_ascii_case("GET") && request_path.ends_with("/bcv-session/v1/guard.bcv");
     if session_guard_get && controls.guard_epoch_transition.load(Ordering::Acquire) {
@@ -3348,6 +3392,20 @@ fn handle_storage_fault_connection(
     } else {
         None
     };
+    if request_fault == Some(StorageFaultTarget::BlockGet) {
+        controls
+            .block_get_observations
+            .lock()
+            .expect("lock recorded GCS block GETs")
+            .push(BlockGetObservation {
+                path: request_path.clone(),
+                authorization: headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.clone()),
+                injected_status,
+            });
+    }
     if request_fault == Some(StorageFaultTarget::BlockPut) {
         if controls.guard_epoch_transition.load(Ordering::Acquire) {
             let guard_gets = controls.guard_get_sequence.load(Ordering::Acquire);
@@ -8059,6 +8117,17 @@ fn seed_uri_session_fault_data(database: &Connection) -> rusqlite::Result<()> {
 }
 
 #[cfg(feature = "remote")]
+fn seed_local_writes_only_data(database: &Connection) -> rusqlite::Result<()> {
+    database.execute_batch(
+        "CREATE TABLE local_values(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO local_values VALUES (1, 'seed');
+         CREATE TABLE block_data(id INTEGER PRIMARY KEY, data BLOB NOT NULL);
+         INSERT INTO block_data VALUES (1, zeroblob(4194304));",
+    )?;
+    database.upload()
+}
+
+#[cfg(feature = "remote")]
 fn configure_uri_session_test_cache(database: &Connection) {
     configure_uri_session_test_cache_with(database, 8 * 1024 * 1024, 50);
 }
@@ -10399,6 +10468,292 @@ fn google_uri_session_retries_the_same_block_after_401_and_403() {
             .close()
             .unwrap_or_else(|error| panic!("close HTTP {status} database reader: {error:?}"));
     }
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_vfs_local_writes_only_never_stages_or_publishes_dirty_blocks() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let prefix = format!("{}/vfs/local-writes-only/", unique_suffix());
+    let direct_uri = format!(
+        "{}&block_size=65536",
+        remote_server_database_uri("google", &endpoint, bucket, &prefix)
+    );
+    let create_flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let seed = Connection::open_with_flags(&direct_uri, create_flags)
+        .expect("create direct GCS database for local-only test");
+    seed_local_writes_only_data(&seed).expect("seed direct GCS database");
+    seed.close().expect("close seeded GCS database");
+
+    let proxy = StorageFaultProxy::start(&endpoint);
+    let container = format!("{bucket}/{prefix}");
+    let storage = Storage::google_json_with_endpoint("test-project", &container, &proxy.url);
+    let cache_directory = tempfile::tempdir().expect("local-only VFS cache directory");
+    let alias = format!("local_only_{}", std::process::id());
+    let vfs = BlockCacheVfs::builder(cache_directory.path())
+        .expect("local-only VFS builder")
+        .name(&format!("local-writes-only-{}", unique_suffix()))
+        .expect("valid local-only VFS name")
+        .config(Config::CacheSize(1024 * 1024))
+        .config(Config::StageWatermark(1))
+        .config(Config::LocalWritesOnly(true))
+        .auth_callback(|_, _, _| Ok("remote-server-token".to_owned()))
+        .init_owned()
+        .expect("initialize local-only VFS with a bounded cache");
+    vfs.attach(&AttachSpec::new(storage).alias(&alias))
+        .expect("attach existing remote database through local-only VFS");
+    let read_write_flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let database = vfs
+        .open_with_flags(format!("/{alias}/remote.db"), read_write_flags)
+        .expect("open existing GCS database with local-only VFS writes");
+
+    database
+        .execute(
+            "UPDATE local_values SET value = ?1 WHERE id = 1",
+            ["local edit"],
+        )
+        .expect("write a local edit before cache pressure");
+    let pressure = database.execute(
+        "UPDATE block_data SET data = randomblob(4194304) WHERE id = 1",
+        [],
+    );
+    assert!(
+        matches!(pressure, Err(rusqlite::Error::SqliteFailure(code, _))
+            if code.extended_code == ffi::SQLITE_FULL
+                || code.extended_code & 0xff == ffi::SQLITE_FULL),
+        "cache pressure should return SQLITE_FULL without staging: {pressure:?}"
+    );
+    let local_value: String = database
+        .query_row("SELECT value FROM local_values WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read dirty local edit after pressure failure");
+    assert_eq!(local_value, "local edit");
+
+    let upload_error = vfs
+        .upload(&alias)
+        .expect_err("explicit upload must be blocked for the read CAB VFS");
+    assert!(
+        matches!(&upload_error, rusqlite::Error::SqliteFailure(code, _)
+            if code.extended_code == ffi::SQLITE_READONLY),
+        "explicit upload should fail locally with SQLITE_READONLY: {upload_error:?}"
+    );
+    assert_eq!(
+        proxy.mutating_requests(),
+        0,
+        "local-only writes, pressure, and explicit upload must issue no cloud mutation requests"
+    );
+    database.close().expect("discard local-only cache");
+    drop(vfs);
+    assert_eq!(
+        proxy.mutating_requests(),
+        0,
+        "closing a local-only connection must not stage or publish its dirty cache"
+    );
+
+    let canonical = Connection::open_with_flags(
+        &direct_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("reopen canonical direct GCS database");
+    let canonical_value: String = canonical
+        .query_row("SELECT value FROM local_values WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read canonical value after discarding local cache");
+    assert_eq!(canonical_value, "seed");
+    let canonical_blob_length: i64 = canonical
+        .query_row(
+            "SELECT length(data) FROM block_data WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read canonical blob length after discarding local cache");
+    assert_eq!(canonical_blob_length, 4_194_304);
+    canonical.close().expect("close canonical GCS reader");
+}
+
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires the pinned local GCS emulator container"]
+fn google_uri_auth_refresh_preserves_local_only_dirty_cache() {
+    let endpoint = std::env::var("BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT")
+        .or_else(|_| std::env::var("BLOCKCACHEVFS_GCS_EMULATOR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:19025".into());
+    let bucket = "app_storage";
+    ensure_google_bucket(&endpoint, bucket);
+    let prefix = format!("{}/uri/local-writes-only-refresh/", unique_suffix());
+    let direct_uri = format!(
+        "{}&block_size=65536",
+        remote_server_database_uri("google", &endpoint, bucket, &prefix)
+    );
+    let create_flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let seed = Connection::open_with_flags(&direct_uri, create_flags)
+        .expect("create direct GCS database for auth-refresh test");
+    seed_local_writes_only_data(&seed).expect("seed direct GCS database");
+    seed.close().expect("close seeded GCS database");
+    let secondary_direct_uri = direct_uri.replace("database=remote.db", "database=secondary.db");
+    let secondary_seed = Connection::open_with_flags(&secondary_direct_uri, create_flags)
+        .expect("create second direct GCS database for an uncached read");
+    seed_local_writes_only_data(&secondary_seed).expect("seed second direct GCS database");
+    secondary_seed
+        .close()
+        .expect("close second seeded GCS database");
+
+    let proxy = StorageFaultProxy::start(&endpoint);
+    let local_uri = format!(
+        "{}&block_size=65536&local_writes_only=true",
+        remote_server_database_uri("google", &proxy.url, bucket, &prefix)
+    );
+    let read_write_flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let unauthorized_calls = Arc::new(AtomicUsize::new(0));
+    let callback_unauthorized_calls = Arc::clone(&unauthorized_calls);
+    let callback_scopes = Arc::new(Mutex::new(Vec::new()));
+    let callback_scopes_record = Arc::clone(&callback_scopes);
+    let database = Connection::open_with_flags_and_cloud_auth_refresh(
+        &local_uri,
+        read_write_flags,
+        move |storage, account, container, reason| {
+            callback_scopes_record
+                .lock()
+                .expect("record stable URI auth identity")
+                .push((
+                    storage.to_owned(),
+                    account.to_owned(),
+                    container.to_owned(),
+                    reason,
+                ));
+            match reason {
+                AuthRefreshReason::Request => Ok("expired-read-token".to_owned()),
+                AuthRefreshReason::Unauthorized => {
+                    callback_unauthorized_calls.fetch_add(1, Ordering::AcqRel);
+                    Ok("fresh-read-token".to_owned())
+                }
+            }
+        },
+    )
+    .expect("open existing GCS database with a URI-owned auth callback");
+    database
+        .execute(
+            "UPDATE local_values SET value = ?1 WHERE id = 1",
+            ["dirty survives renewal"],
+        )
+        .expect("write a dirty local value before auth renewal");
+    let database_path = database
+        .blockcachevfs_path()
+        .expect("URI-owned connection should expose its CBS path");
+    let (container_path, _) = database_path
+        .rsplit_once('/')
+        .expect("CBS database path should have a container component");
+    let vfs_name = database
+        .blockcachevfs_name()
+        .expect("URI-owned connection should expose its CBS VFS name");
+    let secondary_uri = format!("file://{container_path}/secondary.db?vfs={vfs_name}");
+
+    proxy.configure(
+        StorageFaultTarget::BlockGet,
+        StorageFaultAction::Unauthorized,
+    );
+    proxy.clear_block_get_observations();
+    proxy.arm();
+    let secondary = Connection::open_with_flags(
+        &secondary_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open a second database through the anchored local-only VFS");
+    let remote_slice: Vec<u8> = secondary
+        .query_row(
+            "SELECT substr(data, 3500000, 16) FROM block_data WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("fetch an uncached remote block after one denied request");
+    proxy.disarm();
+    secondary.close().expect("close second VFS-backed reader");
+    assert_eq!(remote_slice.len(), 16);
+    assert!(remote_slice.iter().all(|byte| *byte == 0));
+
+    assert!(
+        proxy.matched() >= 1,
+        "the proxy should observe at least one block fetch"
+    );
+    assert_eq!(proxy.faulted(), 1, "the proxy should inject one 401");
+    assert_eq!(
+        unauthorized_calls.load(Ordering::Acquire),
+        1,
+        "the URI-owned callback should renew once after the 401"
+    );
+    let observations = proxy.block_get_observations();
+    let denied = observations
+        .iter()
+        .find(|observation| observation.injected_status == Some(401))
+        .expect("proxy should record the denied block GET");
+    let retry = observations
+        .iter()
+        .find(|observation| {
+            observation.path == denied.path && observation.injected_status.is_none()
+        })
+        .expect("CBS should retry the same block GET after renewal");
+    assert_ne!(denied.authorization, retry.authorization);
+
+    let scopes = callback_scopes
+        .lock()
+        .expect("read stable URI auth identity")
+        .clone();
+    let first_scope = scopes
+        .first()
+        .expect("URI auth callback should receive an initial request");
+    assert!(
+        scopes.iter().all(|scope| scope.0 == first_scope.0
+            && scope.1 == first_scope.1
+            && scope.2 == first_scope.2),
+        "credential renewal must retain storage, account, and container identity: {scopes:?}"
+    );
+
+    let local_value: String = database
+        .query_row("SELECT value FROM local_values WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read the dirty local value after auth renewal");
+    assert_eq!(local_value, "dirty survives renewal");
+    let upload_error = database
+        .upload()
+        .expect_err("URI-owned local-only VFS must block explicit publication");
+    assert!(
+        matches!(&upload_error, rusqlite::Error::SqliteFailure(code, _)
+            if code.extended_code == ffi::SQLITE_READONLY),
+        "URI-owned explicit upload should fail locally with SQLITE_READONLY: {upload_error:?}"
+    );
+    assert_eq!(
+        proxy.mutating_requests(),
+        0,
+        "a read-only auth renewal and local write must issue no cloud mutation requests"
+    );
+    drop(database);
+    assert_eq!(
+        proxy.mutating_requests(),
+        0,
+        "dropping a local-only URI connection must discard, not publish, its dirty cache"
+    );
 }
 
 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
