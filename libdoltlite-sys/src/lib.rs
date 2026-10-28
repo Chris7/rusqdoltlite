@@ -89,6 +89,8 @@ pub mod blockcachevfs {
     pub const SQLITE_BCV_HTTPLOG_NENTRY: c_int = 6;
     /// Proactively stage dirty blocks once this percentage of the cache is occupied.
     pub const SQLITE_BCV_STAGEWATERMARK: c_int = 7;
+    /// Keep writes local and reject cloud mutations for this VFS.
+    pub const SQLITE_BCV_LOCALWRITESONLY: c_int = 8;
     pub const SQLITE_BCV_AUTH_REQUEST: c_int = 0;
     pub const SQLITE_BCV_AUTH_UNAUTHORIZED: c_int = 1;
     pub const SQLITE_BCVFS_UPLOAD_PROGRESS_UPLOADED_BLOCK: c_int = 1;

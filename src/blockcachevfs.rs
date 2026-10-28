@@ -233,7 +233,7 @@ impl UploadProgressState {
     }
 }
 
-/// Why a session-owned cloud VFS is requesting an authentication token.
+/// Why a cloud VFS is requesting an authentication token.
 #[cfg(feature = "remote")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthRefreshReason {
@@ -1065,6 +1065,12 @@ pub enum Config {
     /// values from 1 through 100, inclusive; its default is 90. Values outside
     /// that range make VFS initialization fail with `SQLITE_MISUSE`.
     StageWatermark(i64),
+    /// Keep SQLite writes in the local dirty-block cache and prevent this VFS
+    /// from staging or publishing them to cloud storage. Reads still fetch
+    /// missing blocks on demand. A full cache that contains only dirty blocks
+    /// returns `SQLITE_FULL` until the caller closes or discards the VFS.
+    /// The default is `false`.
+    LocalWritesOnly(bool),
 }
 
 impl Config {
@@ -1077,6 +1083,7 @@ impl Config {
             Self::HttpLogTimeout(v) => (raw::SQLITE_BCV_HTTPLOG_TIMEOUT, v),
             Self::HttpLogEntries(v) => (raw::SQLITE_BCV_HTTPLOG_NENTRY, v),
             Self::StageWatermark(v) => (raw::SQLITE_BCV_STAGEWATERMARK, v),
+            Self::LocalWritesOnly(v) => (raw::SQLITE_BCV_LOCALWRITESONLY, i64::from(v)),
         }
     }
 }
@@ -1218,6 +1225,15 @@ impl Builder {
     }
 
     fn build(self) -> Result<BlockCacheVfs> {
+        let local_writes_only = self
+            .config
+            .iter()
+            .rev()
+            .find_map(|config| match config {
+                Config::LocalWritesOnly(value) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or(false);
         check(crate::ffi::initialize_doltlite())?;
         let directory = cstring_path(&self.directory)?;
         let mut fs = ptr::null_mut();
@@ -1301,6 +1317,7 @@ impl Builder {
         Ok(BlockCacheVfs {
             fs,
             name: self.name,
+            local_writes_only,
             _auth: Some(auth),
         })
     }
@@ -1310,6 +1327,7 @@ impl Builder {
 pub struct BlockCacheVfs {
     fs: *mut raw::sqlite3_bcvfs,
     name: CString,
+    local_writes_only: bool,
     _auth: Option<Box<AuthState>>,
 }
 
@@ -1460,6 +1478,7 @@ impl BlockCacheVfs {
         operations: &str,
         operation_id: &SessionOperationId,
     ) -> Result<(SessionId, String)> {
+        self.ensure_cloud_writes_allowed("session attachment")?;
         let session_id = SessionId::new(session_id)?;
         if self.is_daemon() {
             return Err(Error::SqliteFailure(
@@ -1568,6 +1587,7 @@ impl BlockCacheVfs {
 
     /// Upload local changes in an attached container.
     pub fn upload(&self, container: &str) -> Result<()> {
+        self.ensure_cloud_writes_allowed("upload")?;
         self.with_container(container, |container, err| unsafe {
             raw::sqlite3_bcvfs_upload(self.fs, container.as_ptr(), None, ptr::null_mut(), err)
         })
@@ -1578,6 +1598,7 @@ impl BlockCacheVfs {
     /// The remote database is deleted only after [`Self::upload`] is called
     /// for the same container.
     pub fn delete_database(&self, container: &str, database: &str) -> Result<()> {
+        self.ensure_cloud_writes_allowed("database deletion")?;
         let database = CString::new(database).map_err(Error::NulError)?;
         self.with_container(container, |container, err| unsafe {
             raw::sqlite3_bcvfs_delete(self.fs, container.as_ptr(), database.as_ptr(), err)
@@ -1602,6 +1623,7 @@ impl BlockCacheVfs {
     /// Configure the local cache to hold at least one block and to be an exact
     /// multiple of the block size.
     pub fn initialize_container(&self, storage: &Storage, block_size: Option<u32>) -> Result<()> {
+        self.ensure_cloud_writes_allowed("container initialization")?;
         let block_size = block_size
             .map(validate_container_block_size)
             .transpose()?
@@ -1622,6 +1644,7 @@ impl BlockCacheVfs {
     /// it. Fractional seconds are rounded up so an object is never treated as
     /// older than the requested duration.
     pub fn cleanup(&self, storage: &Storage, minimum_age: Duration) -> Result<()> {
+        self.ensure_cloud_writes_allowed("orphan cleanup")?;
         let minimum_age_seconds = cleanup_age_seconds(minimum_age)?;
         let handle = self.open_bcv(storage, "cleanup")?;
         let rc = unsafe { raw_util::sqlite3_bcv_cleanup(handle.0, minimum_age_seconds) };
@@ -1641,6 +1664,7 @@ impl BlockCacheVfs {
         local_path: impl AsRef<Path>,
         remote_name: &str,
     ) -> Result<()> {
+        self.ensure_cloud_writes_allowed("database creation")?;
         let local_path = local_path.as_ref();
         let metadata = std::fs::metadata(local_path).map_err(|error| {
             Error::SqliteFailure(
@@ -1742,6 +1766,20 @@ impl BlockCacheVfs {
             }
         };
         CString::new(token).map_err(Error::NulError)
+    }
+
+    fn ensure_cloud_writes_allowed(&self, operation: &str) -> Result<()> {
+        // Management and publication methods bypass SQLite's write path, so
+        // they need an explicit guard before calling the native cloud API.
+        if self.local_writes_only {
+            return Err(Error::SqliteFailure(
+                crate::ffi::Error::new(crate::ffi::SQLITE_READONLY),
+                Some(format!(
+                    "{operation} is disabled for a local-writes-only CBS VFS"
+                )),
+            ));
+        }
+        Ok(())
     }
 
     fn with_container<F>(&self, name: &str, call: F) -> Result<()>
@@ -1852,6 +1890,7 @@ pub struct CloudConnectionUri {
     storage: CloudStorageUri,
     endpoint: Option<String>,
     upload_concurrency: Option<u32>,
+    local_writes_only: bool,
     uri: String,
     block_size: Option<u32>,
 }
@@ -2671,8 +2710,15 @@ impl CloudSession {
     }
 }
 
+/// Optional callbacks for opening a cloud URI without creating a write session.
+#[derive(Default)]
+struct UriOpenCallbacks {
+    #[cfg(feature = "remote")]
+    auth_refresh: Option<Arc<AuthRefreshCallback>>,
+}
+
 pub(crate) fn open_connection_uri(uri: &str, flags: OpenFlags) -> Result<Connection> {
-    open_connection_uri_inner(uri, flags, None)
+    open_connection_uri_inner(uri, flags, None, UriOpenCallbacks::default())
 }
 
 #[cfg(feature = "remote")]
@@ -2681,7 +2727,30 @@ pub(crate) fn open_connection_uri_with_session(
     flags: OpenFlags,
     session: UriSessionContext,
 ) -> Result<Connection> {
-    open_connection_uri_inner(uri, flags, Some(session))
+    open_connection_uri_inner(uri, flags, Some(session), UriOpenCallbacks::default())
+}
+
+#[cfg(feature = "remote")]
+/// Open one owned cloud VFS with a credential callback independent of a write session.
+pub(crate) fn open_connection_uri_with_auth_refresh<F>(
+    uri: &str,
+    flags: OpenFlags,
+    callback: F,
+) -> Result<Connection>
+where
+    F: Fn(&str, &str, &str, AuthRefreshReason) -> std::result::Result<String, AuthError>
+        + Send
+        + Sync
+        + 'static,
+{
+    open_connection_uri_inner(
+        uri,
+        flags,
+        None,
+        UriOpenCallbacks {
+            auth_refresh: Some(Arc::new(callback)),
+        },
+    )
 }
 
 fn bootstrap_session_database(
@@ -2760,8 +2829,14 @@ fn open_connection_uri_inner(
     uri: &str,
     flags: OpenFlags,
     session: Option<UriSessionContext>,
+    callbacks: UriOpenCallbacks,
 ) -> Result<Connection> {
     let uri = CloudConnectionUri::parse(uri)?;
+    if session.is_some() && uri.local_writes_only {
+        return Err(cbs_uri_error(
+            "local_writes_only cannot be combined with a cloud write session",
+        ));
+    }
     let upload_concurrency = effective_upload_concurrency(
         uri.upload_concurrency,
         session
@@ -2799,7 +2874,8 @@ fn open_connection_uri_inner(
     #[cfg(feature = "remote")]
     let auth_refresh = session
         .as_ref()
-        .and_then(|session| session.auth_refresh.as_ref().map(Arc::clone));
+        .and_then(|session| session.auth_refresh.as_ref().map(Arc::clone))
+        .or(callbacks.auth_refresh);
     #[cfg(feature = "remote")]
     let upload_progress = session
         .as_ref()
@@ -2824,10 +2900,10 @@ fn open_connection_uri_inner(
             #[cfg(feature = "remote")]
             if let Some(callback) = auth_refresh_for_initial.as_ref() {
                 let token = callback(storage, account, container, AuthRefreshReason::Request)
-                    .map_err(|_| AuthError("session URI credential provider failed".to_owned()))?;
+                    .map_err(|_| AuthError("cloud URI credential provider failed".to_owned()))?;
                 if !valid_refresh_token(&token) {
                     return Err(AuthError(
-                        "session URI credential provider returned an invalid token".to_owned(),
+                        "cloud URI credential provider returned an invalid token".to_owned(),
                     ));
                 }
                 return Ok(token);
@@ -2836,6 +2912,9 @@ fn open_connection_uri_inner(
         });
     if let Some(upload_concurrency) = upload_concurrency {
         builder = builder.config(Config::UploadConcurrency(upload_concurrency));
+    }
+    if uri.local_writes_only {
+        builder = builder.config(Config::LocalWritesOnly(true));
     }
     #[cfg(feature = "remote")]
     if let Some(callback) = auth_refresh {
@@ -3131,6 +3210,11 @@ impl CloudConnectionUri {
             ));
         }
         let upload_concurrency = parse_upload_concurrency(options.remove("upload_concurrency"))?;
+        let local_writes_only = match options.remove("local_writes_only").as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            _ => return Err(cbs_uri_error("local_writes_only must be true or false")),
+        };
         if !options.is_empty() {
             return Err(cbs_uri_error("unsupported CBS URI option"));
         }
@@ -3141,6 +3225,7 @@ impl CloudConnectionUri {
             storage,
             endpoint,
             upload_concurrency,
+            local_writes_only,
             uri: uri.to_owned(),
             block_size,
         })
@@ -3187,6 +3272,36 @@ impl CloudConnectionUri {
             uri.push_str(&percent_encode_uri_component(endpoint, false));
         }
         Self::parse(&uri)
+    }
+
+    /// Keep SQLite writes in this VFS's local cache and disable its cloud-write
+    /// operations. Missing blocks are still fetched as they are read. A full
+    /// cache of dirty blocks returns `SQLITE_FULL`.
+    #[must_use]
+    pub fn with_local_writes_only(mut self) -> Self {
+        if !self.local_writes_only {
+            let (location, query) = self
+                .uri
+                .split_once('?')
+                .expect("validated cloud URI should include its query");
+            let mut options = Vec::new();
+            let mut replaced = false;
+            for option in query.split('&') {
+                let (key, _) = option.split_once('=').unwrap_or((option, ""));
+                if decode_uri_component(key).ok().as_deref() == Some("local_writes_only") {
+                    options.push(format!("{key}=true"));
+                    replaced = true;
+                } else {
+                    options.push(option.to_owned());
+                }
+            }
+            if !replaced {
+                options.push("local_writes_only=true".to_owned());
+            }
+            self.uri = format!("{location}?{}", options.join("&"));
+            self.local_writes_only = true;
+        }
+        self
     }
 
     /// Return the original validated URI, including its credentials.
@@ -4354,6 +4469,53 @@ mod tests {
     }
 
     #[test]
+    fn local_writes_only_uri_option_is_exact_and_builder_replaces_false() {
+        let base = "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token";
+        let default = CloudConnectionUri::parse(base).expect("valid default GCS URI");
+        assert!(!default.local_writes_only);
+        let false_override = CloudConnectionUri::parse(&format!("{base}&local_writes_only=false"))
+            .expect("valid false option")
+            .with_local_writes_only();
+        assert!(false_override.local_writes_only);
+        assert!(
+            CloudConnectionUri::parse(false_override.as_str())
+                .expect("builder output remains a valid URI")
+                .local_writes_only
+        );
+        let encoded_false_override =
+            CloudConnectionUri::parse(&format!("{base}&%6Cocal_writes_only=false"))
+                .expect("valid percent-encoded option")
+                .with_local_writes_only();
+        assert!(encoded_false_override.local_writes_only);
+        assert!(
+            CloudConnectionUri::parse(encoded_false_override.as_str())
+                .expect("encoded builder output remains a valid URI")
+                .local_writes_only
+        );
+
+        for value in ["true", "false"] {
+            assert_eq!(
+                CloudConnectionUri::parse(&format!("{base}&local_writes_only={value}"))
+                    .expect("valid local-write mode")
+                    .local_writes_only,
+                value == "true"
+            );
+        }
+        for value in ["", "1", "TRUE", "yes"] {
+            assert!(
+                CloudConnectionUri::parse(&format!("{base}&local_writes_only={value}")).is_err(),
+                "accepted local_writes_only={value:?}"
+            );
+        }
+        assert!(
+            CloudConnectionUri::parse(&format!(
+                "{base}&local_writes_only=true&%6Cocal_writes_only=false"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn upload_concurrency_uri_option_accepts_native_integer_range_for_both_providers() {
         let gcs = CloudConnectionUri::parse(
             "gcs://bucket/repository?vfs=blockcachevfs&project=project&access_token=token&upload_concurrency=1",
@@ -4557,6 +4719,14 @@ mod tests {
             Config::StageWatermark(75).raw(),
             (raw::SQLITE_BCV_STAGEWATERMARK, 75)
         );
+        assert_eq!(
+            Config::LocalWritesOnly(true).raw(),
+            (raw::SQLITE_BCV_LOCALWRITESONLY, 1)
+        );
+        assert_eq!(
+            Config::LocalWritesOnly(false).raw(),
+            (raw::SQLITE_BCV_LOCALWRITESONLY, 0)
+        );
     }
 
     #[test]
@@ -4621,6 +4791,43 @@ mod tests {
                 unsafe { raw::sqlite3_bcvfs_config(fs, raw::SQLITE_BCV_STAGEWATERMARK, value) },
                 crate::ffi::SQLITE_MISUSE,
                 "watermark {value} should be rejected"
+            );
+        }
+
+        assert_eq!(
+            unsafe { raw::sqlite3_bcvfs_destroy(fs) },
+            crate::ffi::SQLITE_OK
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_writes_only_native_config_accepts_booleans_only() -> Result<()> {
+        let directory = tempfile::tempdir().expect("temporary CBS directory");
+        let directory = CString::new(directory.path().to_str().expect("UTF-8 temp path"))
+            .expect("path has no NUL");
+        let name = CString::new("local-writes-only-test").expect("name has no NUL");
+
+        let mut fs = ptr::null_mut();
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            raw::sqlite3_bcvfs_create(directory.as_ptr(), name.as_ptr(), &mut fs, &mut err)
+        };
+        result_with_err(rc, &mut err)?;
+        assert!(!fs.is_null());
+
+        for value in [0, 1] {
+            assert_eq!(
+                unsafe { raw::sqlite3_bcvfs_config(fs, raw::SQLITE_BCV_LOCALWRITESONLY, value) },
+                crate::ffi::SQLITE_OK,
+                "local-write mode {value} should be accepted"
+            );
+        }
+        for value in [-1, 2, i64::MAX] {
+            assert_eq!(
+                unsafe { raw::sqlite3_bcvfs_config(fs, raw::SQLITE_BCV_LOCALWRITESONLY, value) },
+                crate::ffi::SQLITE_MISUSE,
+                "local-write mode {value} should be rejected"
             );
         }
 
