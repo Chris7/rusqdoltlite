@@ -198,3 +198,18 @@ matches the full immutable object at its candidate database/block position.
 After installation, verified resident mappings are persisted as clean and
 returned to the LRU. A newer local rewrite remains dirty and follows normal
 manifest conflict handling.
+
+`0021-local-logical-file-size.patch` keeps the in-memory exact EOF current
+after successful ordinary local copy-on-write writes and truncates. The
+published manifest remains unchanged until the normal upload path runs.
+Manifests without exact-size metadata retain the existing block-rounded size
+fallback. The session publication test appends across a block boundary through
+two ordinary VFS handles, checks truncate and reopen sizes, and verifies the
+session upload fence while keeping database content and the remote manifest
+unchanged. Run that focused test against a local Google JSON emulator with:
+
+```sh
+BLOCKCACHEVFS_GOOGLE_JSON_ENDPOINT=http://127.0.0.1:4443 \
+BLOCKCACHEVFS_TEST_PATTERN=bcvfs_session_publication.test \
+tools/run_blockcachevfs_cbs_tests
+```

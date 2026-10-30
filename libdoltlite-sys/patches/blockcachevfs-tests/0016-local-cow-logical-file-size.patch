@@ -1,0 +1,272 @@
+--- a/blockcachevfstest.c
++++ b/blockcachevfstest.c
+@@ -4492,8 +4492,98 @@
+   return rcRet;
+ }
+ 
++/* Verify the exact logical EOF after an ordinary COW write crosses a block
++** boundary, and after truncating the local extension back near the base EOF.
++** Both open handles must observe each size change. */
++static int bcvfsTestOrdinaryFileSizeWrite(
++  sqlite3 *db,
++  sqlite3 *dbShared,
++  sqlite3_int64 iBlockSize,
++  sqlite3_int64 iExpectedStart,
++  sqlite3_int64 *piExpectedAfterTruncate,
++  char **pzErr
++){
++  static const unsigned char aTail[] = {0xA7};
++  sqlite3_file *pFile = 0;
++  sqlite3_file *pShared = 0;
++  sqlite3_int64 iStart = 0;
++  sqlite3_int64 iShared = 0;
++  sqlite3_int64 iWrite = 0;
++  sqlite3_int64 iWriteEnd = 0;
++  sqlite3_int64 iExpectedWriteEnd = 0;
++  sqlite3_int64 iTruncate = 0;
++  sqlite3_int64 iExpectedTruncate = 0;
++  int rc;
++  if( pzErr ) *pzErr = 0;
++  if( db==0 || dbShared==0 || iBlockSize<=0
++   || piExpectedAfterTruncate==0
++  ){
++    if( pzErr ) *pzErr = sqlite3_mprintf("invalid local file-size test input");
++    return SQLITE_MISUSE;
++  }
++  rc = sqlite3_file_control(db,"main",82460214,&pFile);
++  if( rc==SQLITE_OK && pFile && pFile->pMethods ){
++    rc = pFile->pMethods->xFileSize(pFile,&iStart);
++  }else if( rc==SQLITE_OK ){
++    rc = SQLITE_ERROR;
++  }
++  if( rc!=SQLITE_OK || iStart!=iExpectedStart ){
++    if( pzErr ) *pzErr = sqlite3_mprintf("local file-size test start mismatch");
++    return rc==SQLITE_OK ? SQLITE_ERROR : rc;
++  }
++  rc = sqlite3_file_control(dbShared,"main",82460214,&pShared);
++  if( rc==SQLITE_OK && pShared && pShared->pMethods ){
++    rc = pShared->pMethods->xFileSize(pShared,&iShared);
++  }else if( rc==SQLITE_OK ){
++    rc = SQLITE_ERROR;
++  }
++  if( rc!=SQLITE_OK || iShared!=iStart ){
++    if( pzErr ) *pzErr = sqlite3_mprintf("shared handle started at a different file size");
++    return rc==SQLITE_OK ? SQLITE_ERROR : rc;
++  }
++
++  iWrite = iStart + iBlockSize + 7;
++  iWriteEnd = iWrite + sizeof(aTail);
++  rc = pFile->pMethods->xWrite(pFile,aTail,sizeof(aTail),iWrite);
++  if( rc!=SQLITE_OK ){
++    if( pzErr ) *pzErr = sqlite3_mprintf("ordinary local append failed");
++    return rc;
++  }
++  iExpectedWriteEnd = iWriteEnd;
++  rc = pFile->pMethods->xFileSize(pFile,&iStart);
++  if( rc==SQLITE_OK && iStart!=iExpectedWriteEnd ){
++    if( pzErr ) *pzErr = sqlite3_mprintf("ordinary local append lost the logical EOF");
++    return SQLITE_ERROR;
++  }
++  if( rc==SQLITE_OK ) rc = pShared->pMethods->xFileSize(pShared,&iShared);
++  if( rc!=SQLITE_OK || iShared!=iExpectedWriteEnd ){
++    if( pzErr ) *pzErr = sqlite3_mprintf("ordinary append was not visible to a shared handle");
++    return rc==SQLITE_OK ? SQLITE_ERROR : rc;
++  }
++
++  iTruncate = iExpectedStart + 17;
++  rc = pFile->pMethods->xTruncate(pFile,iTruncate);
++  if( rc!=SQLITE_OK ){
++    if( pzErr ) *pzErr = sqlite3_mprintf("ordinary local truncate failed");
++    return rc;
++  }
++  iExpectedTruncate = iTruncate;
++  rc = pFile->pMethods->xFileSize(pFile,&iStart);
++  if( rc==SQLITE_OK && iStart!=iExpectedTruncate ){
++    if( pzErr ) *pzErr = sqlite3_mprintf("ordinary local truncate lost the file size");
++    return SQLITE_ERROR;
++  }
++  if( rc==SQLITE_OK ) rc = pShared->pMethods->xFileSize(pShared,&iShared);
++  if( rc!=SQLITE_OK || iShared!=iExpectedTruncate ){
++    if( pzErr ) *pzErr = sqlite3_mprintf("ordinary truncate was not visible to a shared handle");
++    return rc==SQLITE_OK ? SQLITE_ERROR : rc;
++  }
++  *piExpectedAfterTruncate = iExpectedTruncate;
++  return SQLITE_OK;
++}
++
+ /*
+-** $vfs session_publication_test VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR
++** $vfs session_publication_test VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR BLOCKSIZE
+ **
+ ** Check that checkpoint bytes remain unpublished until the explicit fenced
+ ** upload call, that the legacy upload entry point cannot bypass that fence,
+@@ -4546,6 +4636,7 @@
+   sqlite3_bcvfs_session_body nextCheckpointBody;
+   sqlite3_bcvfs *pFresh = 0;
+   sqlite3 *dbFresh = 0;
++  sqlite3 *dbFreshShared = 0;
+   sqlite3_stmt *pStmt = 0;
+   sqlite3_vfs *pClockVfs;
+   sqlite3_vfs *pSessionVfs = 0;
+@@ -4559,6 +4650,7 @@
+   char *zBaseEtag = 0;
+   char *zBaseManifestEtag = 0;
+   char *zCurrentManifestEtag = 0;
++  char *zOrdinaryManifestEtag = 0;
+   char *zRestoredManifestEtag = 0;
+   char *zLegacyErr = 0;
+   char zNextSessionId[SQLITE_BCVFS_SESSION_ID_TEXT_BYTES];
+@@ -4575,6 +4667,9 @@
+   int nNextHeadEncoded = 0;
+   sqlite3_int64 iCandidateFileSize = 0;
+   sqlite3_int64 iPublishedFileSize = 0;
++  sqlite3_int64 iTestBlockSize = 0;
++  sqlite3_int64 iExpectedLocalSize = 0;
++  Tcl_WideInt iBlockSizeArg = 0;
+   sqlite3_int64 iNow = 0;
+   int rc = SQLITE_OK;
+   int rcRet = TCL_OK;
+@@ -4583,10 +4678,10 @@
+   int bNextAttached = 0;
+   int bRawOpen = 0;
+ 
+-  if( objc!=9 ){
++  if( objc!=10 ){
+     Tcl_WrongNumArgs(
+         interp,2,objv,
+-        "VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR"
++        "VFS MODULE ACCOUNT CONTAINER SESSION_ID DATABASE FRESH_DIR BLOCKSIZE"
+     );
+     return TCL_ERROR;
+   }
+@@ -4597,6 +4692,14 @@
+   zSessionId = Tcl_GetString(objv[6]);
+   zDatabase = Tcl_GetString(objv[7]);
+   zFreshDir = Tcl_GetString(objv[8]);
++  if( Tcl_GetWideIntFromObj(interp,objv[9],&iBlockSizeArg) ){
++    return TCL_ERROR;
++  }
++  iTestBlockSize = (sqlite3_int64)iBlockSizeArg;
++  if( iTestBlockSize<=0 ){
++    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid block size",-1));
++    return TCL_ERROR;
++  }
+   memset(aOperationId,0,sizeof(aOperationId));
+   aOperationId[0] = 0x19;
+   aOperationId[1] = 0x01;
+@@ -5093,8 +5196,12 @@
+   bFreshAttached = 1;
+   zFreshPath = sqlite3_mprintf("/fresh-publication/%s",zDatabase);
+   SESSION_PUBLICATION_REQUIRE(zFreshPath!=0, "post-publication path allocation failed");
+-  rc = sqlite3_open_v2(zFreshPath,&dbFresh,SQLITE_OPEN_READONLY,zFreshVfs);
++  rc = sqlite3_open_v2(zFreshPath,&dbFresh,SQLITE_OPEN_READWRITE,zFreshVfs);
+   SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK && dbFresh!=0, "post-publication open failed");
++  rc = sqlite3_open_v2(zFreshPath,&dbFreshShared,SQLITE_OPEN_READONLY,zFreshVfs);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && dbFreshShared!=0, "post-publication shared open failed"
++  );
+   {
+     sqlite3_file *pPublishedFile = 0;
+     /* BCV_FCNTL_FD is intentionally private to the VFS implementation. The
+@@ -5129,6 +5236,85 @@
+        && 0==strcmp((const char*)sqlite3_column_text(pStmt,0),"fenced-row"),
+       "visible manifest is not the exact pending candidate"
+   );
++  sqlite3_finalize(pStmt); pStmt = 0;
++  rc = bcvfsSessionFetchObject(
++      dbFresh,"manifest.bcv",&aCurrentManifest,&nCurrentManifest,
++      &zCurrentManifestEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && aCurrentManifest!=0 && nCurrentManifest>0
++       && zCurrentManifestEtag!=0,
++      "ordinary COW manifest snapshot failed"
++  );
++  zOrdinaryManifestEtag = sqlite3_mprintf("%s",zCurrentManifestEtag);
++  SESSION_PUBLICATION_REQUIRE(
++      zOrdinaryManifestEtag!=0, "ordinary COW manifest ETag copy failed"
++  );
++  sqlite3_free(aBaseManifest);
++  aBaseManifest = (unsigned char*)sqlite3_malloc64((sqlite3_uint64)nCurrentManifest);
++  SESSION_PUBLICATION_REQUIRE(
++      aBaseManifest!=0, "ordinary COW manifest copy failed"
++  );
++  memcpy(aBaseManifest,aCurrentManifest,(size_t)nCurrentManifest);
++  nBaseManifest = nCurrentManifest;
++  rc = bcvfsTestOrdinaryFileSizeWrite(
++      dbFresh,dbFreshShared,iTestBlockSize,iCandidateFileSize,
++      &iExpectedLocalSize,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK, zErr ? zErr : "ordinary COW file-size update failed"
++  );
++  sqlite3_close(dbFreshShared); dbFreshShared = 0;
++  sqlite3_close(dbFresh); dbFresh = 0;
++  rc = sqlite3_open_v2(zFreshPath,&dbFresh,SQLITE_OPEN_READONLY,zFreshVfs);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && dbFresh!=0, "ordinary COW reopen failed"
++  );
++  {
++    sqlite3_file *pReopenedFile = 0;
++    sqlite3_int64 iReopenedSize = 0;
++    rc = sqlite3_file_control(dbFresh,"main",82460214,&pReopenedFile);
++    SESSION_PUBLICATION_REQUIRE(
++        rc==SQLITE_OK && pReopenedFile && pReopenedFile->pMethods,
++        "ordinary COW reopened file handle lookup failed"
++    );
++    rc = pReopenedFile->pMethods->xFileSize(pReopenedFile,&iReopenedSize);
++    SESSION_PUBLICATION_REQUIRE(
++        rc==SQLITE_OK && iReopenedSize==iExpectedLocalSize,
++        "ordinary COW EOF did not survive reopen"
++    );
++  }
++  rc = sqlite3_prepare_v2(dbFresh,"SELECT count(*) FROM t",-1,&pStmt,0);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "ordinary COW content count failed");
++  rc = sqlite3_step(pStmt);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_ROW && sqlite3_column_int(pStmt,0)==1,
++      "ordinary local COW changed the published content"
++  );
++  sqlite3_finalize(pStmt); pStmt = 0;
++  rc = sqlite3_prepare_v2(dbFresh,"SELECT v FROM t",-1,&pStmt,0);
++  SESSION_PUBLICATION_REQUIRE(rc==SQLITE_OK, "ordinary COW row query failed");
++  rc = sqlite3_step(pStmt);
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_ROW
++       && 0==strcmp((const char*)sqlite3_column_text(pStmt,0),"fenced-row"),
++      "ordinary local COW changed the published row"
++  );
++  sqlite3_finalize(pStmt); pStmt = 0;
++  sqlite3_free(aCurrentManifest); aCurrentManifest = 0;
++  sqlite3_free(zCurrentManifestEtag); zCurrentManifestEtag = 0;
++  rc = bcvfsSessionFetchObject(
++      dbFresh,"manifest.bcv",&aCurrentManifest,&nCurrentManifest,
++      &zCurrentManifestEtag,&zErr
++  );
++  SESSION_PUBLICATION_REQUIRE(
++      rc==SQLITE_OK && aCurrentManifest!=0 && nCurrentManifest>0
++       && zCurrentManifestEtag!=0
++       && nCurrentManifest==nBaseManifest
++       && 0==memcmp(aCurrentManifest,aBaseManifest,(size_t)nBaseManifest)
++       && 0==strcmp(zCurrentManifestEtag,zOrdinaryManifestEtag),
++      "ordinary local COW changed the published manifest"
++  );
+ 
+ session_publication_done:
+   sqlite3_free(zErr);
+@@ -5140,6 +5326,7 @@
+   sqlite3_free(zBaseEtag);
+   sqlite3_free(zBaseManifestEtag);
+   sqlite3_free(zCurrentManifestEtag);
++  sqlite3_free(zOrdinaryManifestEtag);
+   sqlite3_free(zRestoredManifestEtag);
+   sqlite3_free(zImage);
+   sqlite3_free(aCheckpointData);
+@@ -5157,6 +5344,7 @@
+   if( bRawOpen && pRaw && pRaw->pMethods ) pRaw->pMethods->xClose(pRaw);
+   sqlite3_free(pRaw);
+   if( dbFresh ) sqlite3_close(dbFresh);
++  if( dbFreshShared ) sqlite3_close(dbFreshShared);
+   if( bFreshAttached && pFresh ){
+     char *zDetachErr = 0;
+     sqlite3_bcvfs_detach(pFresh,"fresh-publication",&zDetachErr);
