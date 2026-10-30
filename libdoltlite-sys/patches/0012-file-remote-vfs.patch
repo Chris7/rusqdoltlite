@@ -50,14 +50,15 @@
    }
    if( strncmp(zUrl, "http://", 7)==0 || strncmp(zUrl, "https://", 8)==0 ){
      return doltliteHttpRemoteOpen(zUrl);
-@@ -574231,7 +574265,9 @@
+@@ -588077,7 +588077,8 @@
  ){
    DoltliteRemote *pRemote = 0;
    if( strncmp(zUrl, "file://", 7)==0 ){
--    pRemote = doltliteFsRemoteOpen(pVfs, zUrl + 7);
-+    pRemote = doltliteFileRemoteOpen(
+-    pRemote = bWrite ? doltliteFsRemoteOpen(pVfs, zUrl + 7)
+-                    : doltliteRemoteOpenReadOnly(pVfs, zUrl);
++    pRemote = bWrite ? doltliteFileRemoteOpen(
 +        pVfs, zUrl, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_DB
-+    );
++    ) : doltliteRemoteOpenReadOnly(pVfs, zUrl);
      doltliteRemoteSetBusyHandler(pRemote, remoteSqlBusyHandler, db);
      return pRemote;
    }
