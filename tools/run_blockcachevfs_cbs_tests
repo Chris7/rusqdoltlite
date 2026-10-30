@@ -91,6 +91,8 @@ git -C "$tmp/src" apply \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0016-session-publication-after-ordinary-upload.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0017-session-upload-safety-and-parallel-staging.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0018-pending-publish-byte-verification.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0019-browser-http-xhr.patch" \
+  "$repo_root/libdoltlite-sys/patches/blockcachevfs/0020-local-writes-only.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs/0021-local-logical-file-size.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0014-streaming-and-serverless-tests.patch" \
   "$repo_root/libdoltlite-sys/patches/blockcachevfs-tests/0015-wal-mode-fixtures.patch" \
