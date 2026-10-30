@@ -24,6 +24,8 @@ struct DoltliteConn {
   int useTls;
   int ownsConf;
   long long deadlineMs;
+  int idleTimeoutMs;
+  int timedOut;
   mbedtls_net_context net;
 
   mbedtls_ssl_context ssl;
@@ -56,28 +58,44 @@ static int connApplyDeadline(DoltliteConn *c) {
   long long remaining;
   if (c->deadlineMs == 0) return 0;
   remaining = c->deadlineMs - doltliteMonotonicMs();
-  if (remaining <= 0) return 1;
+  if (remaining <= 0) { c->timedOut = 1; return 1; }
   if (remaining > 0x7fffffff) remaining = 0x7fffffff;
   return doltliteSocketSetTimeout(c->net.fd, (int)remaining);
 }
 
+static int connIoResult(DoltliteConn *c, int n) {
+  if (n > 0 && c->idleTimeoutMs > 0) {
+    c->deadlineMs = doltliteMonotonicMs() + c->idleTimeoutMs;
+  } else if (n < 0 && doltliteSocketTimedOut()) {
+    c->timedOut = 1;
+  }
+  return n;
+}
+
 static int connSend(void *pCtx, const unsigned char *pBuf, size_t nBuf) {
-  int fd = ((mbedtls_net_context *)pCtx)->fd;
-  int flags = 0;
+  DoltliteConn *c = (DoltliteConn*)pCtx;
+  int flags = 0, n;
+  if (c->idleTimeoutMs && connApplyDeadline(c)) return MBEDTLS_ERR_SSL_TIMEOUT;
 #ifdef MSG_NOSIGNAL
   flags = MSG_NOSIGNAL;
 #endif
 #ifdef _WIN32
-  {
-    int n = send(fd, (const char *)pBuf, (int)nBuf, flags);
-    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
-  }
+  n = send(c->net.fd, (const char *)pBuf, (int)nBuf, flags);
 #else
-  {
-    int n = (int)send(fd, pBuf, nBuf, flags);
-    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
-  }
+  n = (int)send(c->net.fd, pBuf, nBuf, flags);
 #endif
+  connIoResult(c, n);
+  return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
+}
+
+static int connRecv(void *pCtx, unsigned char *pBuf, size_t nBuf) {
+  DoltliteConn *c = (DoltliteConn*)pCtx;
+  int n;
+  if (c->idleTimeoutMs && connApplyDeadline(c)) return MBEDTLS_ERR_SSL_TIMEOUT;
+  n = mbedtls_net_recv(&c->net, pBuf, nBuf);
+  if (n > 0) connIoResult(c, n);
+  else if (n < 0 && n != MBEDTLS_ERR_SSL_WANT_READ) connIoResult(c, n);
+  return n;
 }
 
 #ifdef _WIN32
@@ -178,7 +196,7 @@ DoltliteConn *doltliteConnOpenTimeout(
   if (mbedtls_ssl_setup(&c->ssl, &c->conf) != 0) goto fail_tls;
 
   if (mbedtls_ssl_set_hostname(&c->ssl, host) != 0) goto fail_tls;
-  mbedtls_ssl_set_bio(&c->ssl, &c->net, connSend, mbedtls_net_recv, NULL);
+  mbedtls_ssl_set_bio(&c->ssl, c, connSend, connRecv, NULL);
 
   do {
     if (connApplyDeadline(c) != 0) goto fail_tls;
@@ -210,7 +228,7 @@ int doltliteConnWriteAll(DoltliteConn *c, const void *buf, int nbuf) {
     if (c->useTls) {
       n = mbedtls_ssl_write(&c->ssl, p + off, (size_t)(nbuf - off));
     } else {
-      n = connSend(&c->net, p + off, (size_t)(nbuf - off));
+      n = connSend(c, p + off, (size_t)(nbuf - off));
     }
     if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
     if (n <= 0) return 1;
@@ -219,27 +237,53 @@ int doltliteConnWriteAll(DoltliteConn *c, const void *buf, int nbuf) {
   return 0;
 }
 
+static int connReadOnce(DoltliteConn *c, void *buf, int nbuf) {
+  int n;
+  if (c->useTls) {
+    n = mbedtls_ssl_read(&c->ssl, (unsigned char *)buf, (size_t)nbuf);
+  } else {
+    n = connRecv(c, (unsigned char *)buf, (size_t)nbuf);
+  }
+  if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) return -2;
+  if (c->useTls && n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
+  if (n < 0) return -1;
+  return n;
+}
+
 int doltliteConnRead(DoltliteConn *c, void *buf, int nbuf) {
   int n;
   for (;;) {
     if (connApplyDeadline(c) != 0) return -1;
-    if (c->useTls) {
-      n = mbedtls_ssl_read(&c->ssl, (unsigned char *)buf, (size_t)nbuf);
-    } else {
-      n = (int)mbedtls_net_recv(&c->net, (unsigned char *)buf, (size_t)nbuf);
-    }
-    if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-
-    if (c->useTls && n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
-    if (n < 0) return -1;
+    n = connReadOnce(c, buf, nbuf);
+    if (n == -2) continue;
     return n;
   }
 }
 
+int doltliteConnReadNonblock(DoltliteConn *c, void *buf, int nbuf) {
+  if (!c || nbuf <= 0) return -1;
+  if (!c->useTls) return doltliteSocketRecv(c->net.fd, buf, nbuf);
+  return connReadOnce(c, buf, nbuf);
+}
+
 int doltliteConnSetTimeout(DoltliteConn *c, int timeoutMs) {
+  c->idleTimeoutMs = 0;
+  c->timedOut = 0;
   c->deadlineMs = timeoutMs > 0 ? doltliteMonotonicMs() + timeoutMs : 0;
   if (timeoutMs <= 0) return doltliteSocketSetTimeout(c->net.fd, 0);
   return connApplyDeadline(c);
+}
+
+int doltliteConnSetIdleTimeout(DoltliteConn *c, int idleMs, int initialMs) {
+  int rc = doltliteConnSetTimeout(c, initialMs);
+  if (!rc) c->idleTimeoutMs = idleMs > 0 ? idleMs : 0;
+  return rc;
+}
+
+int doltliteConnTimeoutRemaining(DoltliteConn *c) {
+  long long remaining = c->deadlineMs - doltliteMonotonicMs();
+  if (c->timedOut || remaining <= 0) return 0;
+  return remaining > 0x7fffffff ? 0x7fffffff : (int)remaining;
 }
 
 void doltliteConnClose(DoltliteConn *c) {
@@ -308,9 +352,8 @@ void doltliteTlsServerFree(DoltliteTlsServer *s) {
   sqlite3_free(s);
 }
 
-DoltliteConn *doltliteConnServerAccept(DoltliteTlsServer *s, int clientFd) {
+DoltliteConn *doltliteConnServerAttach(DoltliteTlsServer *s, int clientFd) {
   DoltliteConn *c = (DoltliteConn *)sqlite3_malloc((int)sizeof(*c));
-  int ret;
   if (!c) {
     doltliteCloseSocket(clientFd);
     return NULL;
@@ -324,11 +367,7 @@ DoltliteConn *doltliteConnServerAccept(DoltliteTlsServer *s, int clientFd) {
   mbedtls_ssl_init(&c->ssl);
 
   if (mbedtls_ssl_setup(&c->ssl, &s->conf) != 0) goto fail;
-  mbedtls_ssl_set_bio(&c->ssl, &c->net, connSend, mbedtls_net_recv, NULL);
-  do {
-    ret = mbedtls_ssl_handshake(&c->ssl);
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-  if (ret != 0) goto fail;
+  mbedtls_ssl_set_bio(&c->ssl, c, connSend, connRecv, NULL);
   return c;
 
 fail:
@@ -336,6 +375,16 @@ fail:
   mbedtls_net_free(&c->net);
   sqlite3_free(c);
   return NULL;
+}
+
+int doltliteConnHandshakeStep(DoltliteConn *c) {
+  int ret;
+  if (!c || !c->useTls) return -1;
+  ret = mbedtls_ssl_handshake(&c->ssl);
+  if (ret == 0) return 0;
+  if (ret == MBEDTLS_ERR_SSL_WANT_READ) return 1;
+  if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) return 2;
+  return -1;
 }
 
 DoltliteConn *doltliteConnFromFd(int clientFd) {

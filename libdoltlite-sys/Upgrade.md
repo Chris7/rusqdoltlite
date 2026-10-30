@@ -5,10 +5,24 @@ belong in [`patches/`](patches/README.md) and are applied to a build-directory
 copy of the amalgamation. This separation is intentional: `upgrade_git.sh` may
 replace the upstream files without erasing or hiding local behavior.
 
-Use `upgrade_git.sh` to clone the exact upstream Git release ref configured by
-`DOLTLITE_GIT_REF` in that script, build its amalgamation, vendor the matching
-remote sources, regenerate bindings, check the local patch series, and run the
-same bundled test suites.
+Use `upgrade_git.sh` to fetch the exact upstream Git ref configured by
+`DOLTLITE_GIT_REF` in that script. It builds the amalgamation, vendors matching
+remote sources, regenerates bindings, checks the local patch series, and runs
+the same bundled test suites. Commit SHAs and release tags are supported; the
+current vendored source is DoltLite master snapshot
+`ffa0eafa93ab695f7863703a2cdaaa3fb7663374` from 2026-10-30.
+
+The HTTP regression review for this snapshot confirmed that upstream refreshes
+its inactivity deadline after successful reads. The progressing-response
+fixture completes after about 0.8 seconds, though the `http_idle_timeout_ms`
+query remains in the requested path and fails that test's path assertion. A
+separate stalled-response fixture returns `SQLITE_ERROR` rather than the
+expected `SQLITE_IOERR` phase diagnostic. Upstream's response parser also
+rejects the valid chunked response in
+`http_response_parser_accepts_chunked_framing_and_rejects_malformed_framing`.
+Keep those URL, diagnostic, and chunked-response contracts in the local patch
+series; only remove upstreamed behavior after the corresponding regressions
+pass against upstream.
 
 Some releases, including `v0.11.52`, keep `doltlite_remotesrv.c` in the native
 library but omit it from the published amalgamation. Both upgraders vendor that

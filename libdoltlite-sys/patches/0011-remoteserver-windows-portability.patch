@@ -1,43 +1,24 @@
-Subject: [PATCH] Port native RemoteServer workers and sockets to Windows
-Base: DoltLite v0.50.15 with local patches 0001-0010 applied
+Subject: [PATCH] Make the remote server portable across Windows and TLS threads
+Base: DoltLite master ffa0eafa93ab695f7863703a2cdaaa3fb7663374 with patches 0001-0010
 
-This patch enables the native RemoteServer on Windows and preserves the
-existing public SQL and HTTP interfaces. Keep these behaviors when refreshing
-the staged upstream sources:
-- Use SRW locks, condition variables, and CRT threads on Windows; use POSIX
-  mutexes, conditions, and pthreads on macOS/Linux.
-- Preserve full-width Windows SOCKET handles through listen, accept, polling,
-  active-worker tracking, shutdown, timeout configuration, and close.
-- Initialize Winsock and Mbed TLS threading exactly once before concurrent
-  network or TLS use.
-- Keep the TLS client and server connections as distinct opaque C types. The
-  server must not pass its connection object into embedded client functions.
-- Send TLS close-notify while a worker socket is tracked, then untrack before
-  final connection cleanup so shutdown cannot race with a reused handle.
-- Apply one Mbed TLS feature configuration to the amalgamation, added TLS
-  server/threading units, and TLS sidecar. The amalgamation intentionally omits
-  those server-only implementations, so compile them as staged units rather
-  than relying on declarations or stubs.
-- Use alternate mutex hooks for TLS 1.3/PSA global state and the shared server
-  DRBG; do not rely on separate per-connection contexts for thread safety.
-- Keep Windows worker sockets nonblocking and check server stop between
-  bounded readiness waits; preserve per-I/O timeouts and worker-owned final close.
-- On POSIX, retry interrupted blocking reads and writes through Mbed TLS WANT
-  results, while keeping socket-timeout EAGAIN terminal so request limits remain
-  effective.
+Use full-width Windows sockets, once-only Winsock startup, and native Windows
+locks and worker threads. Keep server TLS connections separate from embedded
+client connections, initialize shared Mbed TLS threading, and use stop-aware
+nonblocking socket waits on Windows. Preserve upstream pending-connection,
+request-body-budget, timeout, and rollback flow.
 
 diff --git a/doltlite.c b/doltlite.c
-index 22bc4a1604a5ff3aaea4f8b910313ffdc9e271c5..8007722d4ed0e87811d1d4cdf348c7860dd652da 100644
+index d991baf..ce33a3e 100644
 --- a/doltlite.c
 +++ b/doltlite.c
-@@ -24612,14 +24612,20 @@ static inline int doltliteSocketSetTimeout(int fd, int timeoutMs) {
+@@ -24785,14 +24785,20 @@ static inline int doltliteSocketSetTimeout(int fd, int timeoutMs) {
    return rc1 == 0 && rc2 == 0 ? 0 : 1;
  }
  
 -/* WSAStartup is refcounted; process exit reclaims it. */
 -static inline int doltliteNetInit(void) {
 -  static int done = 0;
-+/* WSAStartup can be reached by parallel transfers; retain process-wide startup. */
++/* WSAStartup can be reached by parallel transfers; initialize it once. */
 +static INIT_ONCE doltliteWinsockInitOnce = INIT_ONCE_STATIC_INIT;
 +static BOOL CALLBACK doltliteInitializeWinsock(
 +  PINIT_ONCE once, PVOID parameter, PVOID *context)
@@ -58,46 +39,26 @@ index 22bc4a1604a5ff3aaea4f8b910313ffdc9e271c5..8007722d4ed0e87811d1d4cdf348c786
  }
  
  #else
-@@ -300924,37 +300930,7 @@ int ed25519_verify(const unsigned char *signature, const unsigned char *message,
+@@ -302027,6 +302033,9 @@ int ed25519_verify(const unsigned char *signature, const unsigned char *message,
  
  /************** End of mbedtls_config.h **************************************/
  /************** Begin file doltlite_mbedtls_config.h *************************/
--#ifndef DOLTLITE_MBEDTLS_CONFIG_H
--#define DOLTLITE_MBEDTLS_CONFIG_H
--
--#undef MBEDTLS_SELF_TEST
--#undef MBEDTLS_AESCE_C
--#undef MBEDTLS_AESNI_C
--#undef MBEDTLS_ARIA_C
--#undef MBEDTLS_CAMELLIA_C
--#undef MBEDTLS_CCM_C
--#undef MBEDTLS_CMAC_C
--#undef MBEDTLS_DES_C
--#undef MBEDTLS_ECJPAKE_C
--#undef MBEDTLS_LMS_C
--#undef MBEDTLS_MD5_C
--#undef MBEDTLS_NIST_KW_C
--#undef MBEDTLS_PKCS12_C
--#undef MBEDTLS_PKCS7_C
--#undef MBEDTLS_PADLOCK_C
--#undef MBEDTLS_RIPEMD160_C
--#undef MBEDTLS_SHA3_C
--#undef MBEDTLS_SSL_SRV_C
--#undef MBEDTLS_THREADING_C
--#undef MBEDTLS_THREADING_PTHREAD
--#undef MBEDTLS_X509_CREATE_C
--#undef MBEDTLS_X509_CRL_PARSE_C
--#undef MBEDTLS_X509_CSR_PARSE_C
--#undef MBEDTLS_X509_CSR_WRITE_C
--#undef MBEDTLS_X509_CRT_WRITE_C
--
--#endif
--
++#ifdef DOLTLITE_REMOTE_SERVER
 +#include "doltlite_mbedtls_config.h"
++#else
+ #ifndef DOLTLITE_MBEDTLS_CONFIG_H
+ #define DOLTLITE_MBEDTLS_CONFIG_H
+ 
+@@ -302057,7 +302066,7 @@ int ed25519_verify(const unsigned char *signature, const unsigned char *message,
+ #undef MBEDTLS_X509_CRT_WRITE_C
+ 
+ #endif
+-
++#endif
  /************** End of doltlite_mbedtls_config.h *****************************/
  /************** Continuing where we left off in build_info.h *****************/
  #else
-@@ -417598,7 +417574,16 @@ void mbedtls_net_free(mbedtls_net_context *ctx);
+@@ -418701,7 +418710,16 @@ void mbedtls_net_free(mbedtls_net_context *ctx);
  #define write(fd, buf, len)       send(fd, (char *) (buf), (int) (len), 0)
  #define close(fd)               closesocket(fd)
  
@@ -115,7 +76,7 @@ index 22bc4a1604a5ff3aaea4f8b910313ffdc9e271c5..8007722d4ed0e87811d1d4cdf348c786
  
  #else /* ( _WIN32 || _WIN32_WCE ) && !EFIX64 && !EFI32 */
  
-@@ -417641,14 +417626,9 @@ static int net_prepare(void)
+@@ -418744,14 +418762,9 @@ static int net_prepare(void)
  {
  #if (defined(_WIN32) || defined(_WIN32_WCE)) && !defined(EFIX64) && \
      !defined(EFI32)
@@ -133,9 +94,31 @@ index 22bc4a1604a5ff3aaea4f8b910313ffdc9e271c5..8007722d4ed0e87811d1d4cdf348c786
      }
  #else
  #if !defined(EFIX64) && !defined(EFI32)
-@@ -476202,6 +476182,58 @@ void doltliteConnClose(DoltliteConn *conn);
- SQLITE_API void *sqlite3_malloc(int);
- SQLITE_API void sqlite3_free(void*);
+@@ -477769,6 +477782,8 @@ int doltliteConnTimeoutRemaining(DoltliteConn*);
+ 
+ void doltliteConnClose(DoltliteConn *conn);
+ 
++int doltliteMbedtlsThreadingInit(void);
++
+ #if 0
+ }
+ #endif
+@@ -477930,6 +477945,12 @@ DoltliteConn *doltliteConnOpenTimeout(
+   int ret;
+ 
+   if (!c) return NULL;
++#ifdef MBEDTLS_THREADING_ALT
++  if (doltliteMbedtlsThreadingInit() != 0) {
++    sqlite3_free(c);
++    return NULL;
++  }
++#endif
+   memset(c, 0, sizeof(*c));
+   c->useTls = useTls;
+   c->ownsConf = 1;
+@@ -478080,6 +478101,60 @@ void doltliteConnClose(DoltliteConn *c) {
+   sqlite3_free(c);
+ }
  
 +#ifdef MBEDTLS_THREADING_ALT
 +#include "doltlite_thread.h"
@@ -187,27 +170,16 @@ index 22bc4a1604a5ff3aaea4f8b910313ffdc9e271c5..8007722d4ed0e87811d1d4cdf348c786
 +                      doltliteInitializeMbedtlsThreading);
 +}
 +#endif
++#else
++int doltliteMbedtlsThreadingInit(void) { return 0; }
 +#endif
 +
- struct DoltliteConn {
-   int useTls;
-   int ownsConf;
-@@ -476338,6 +476370,12 @@ DoltliteConn *doltliteConnOpenTimeout(
-   if (timeoutMs > 0) {
-     c->deadlineMs = doltliteMonotonicMs() + timeoutMs;
-   }
-+#ifdef MBEDTLS_THREADING_ALT
-+  if (doltliteMbedtlsThreadingInit() != 0) {
-+    sqlite3_free(c);
-+    return NULL;
-+  }
-+#endif
-   mbedtls_net_init(&c->net);
- 
-   snprintf(portstr, sizeof(portstr), "%d", port);
+ #ifndef DOLTLITE_AUTH_CLIENT_ONLY
+ DoltliteTlsServer *doltliteTlsServerNew(const char *certFile, const char *keyFile) {
+   DoltliteTlsServer *s = (DoltliteTlsServer *)sqlite3_malloc((int)sizeof(*s));
 diff --git a/doltlite_mbedtls_config.h b/doltlite_mbedtls_config.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..c7052fde6f6a0569b36f9ed13d14bf9958db0560
+index 0000000..c7052fd
 --- /dev/null
 +++ b/doltlite_mbedtls_config.h
 @@ -0,0 +1,39 @@
@@ -251,7 +223,7 @@ index 0000000000000000000000000000000000000000..c7052fde6f6a0569b36f9ed13d14bf99
 +
 +#endif /* DOLTLITE_MBEDTLS_CONFIG_H */
 diff --git a/doltlite_net.h b/doltlite_net.h
-index 7cc079c762256eeadf7af379e7dd57325814f1f8..4126b967bb42eec458b45cd237ffd699c8864fc6 100644
+index 4d19717..dce2b1a 100644
 --- a/doltlite_net.h
 +++ b/doltlite_net.h
 @@ -32,14 +32,20 @@ static inline int doltliteSocketSetTimeout(int fd, int timeoutMs) {
@@ -261,7 +233,7 @@ index 7cc079c762256eeadf7af379e7dd57325814f1f8..4126b967bb42eec458b45cd237ffd699
 -/* WSAStartup is refcounted; process exit reclaims it. */
 -static inline int doltliteNetInit(void) {
 -  static int done = 0;
-+/* WSAStartup can be reached by parallel transfers; retain process-wide startup. */
++/* WSAStartup can be reached by parallel transfers; initialize it once. */
 +static INIT_ONCE doltliteWinsockInitOnce = INIT_ONCE_STATIC_INIT;
 +static BOOL CALLBACK doltliteInitializeWinsock(
 +  PINIT_ONCE once, PVOID parameter, PVOID *context
@@ -283,7 +255,7 @@ index 7cc079c762256eeadf7af379e7dd57325814f1f8..4126b967bb42eec458b45cd237ffd699
  
  #else
 diff --git a/doltlite_remotesrv.c b/doltlite_remotesrv.c
-index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a910c2a13 100644
+index e5a4366..c161f05 100644
 --- a/doltlite_remotesrv.c
 +++ b/doltlite_remotesrv.c
 @@ -8,6 +8,8 @@
@@ -302,8 +274,30 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
 -#include <pthread.h>
  #include <errno.h>
  
- /* Bound resource use; keep a slow client off the accept loop. */
-@@ -46,28 +47,28 @@ struct RemoteDbHandle {
+ /* Workers run only after the request has arrived. Idle connections
+@@ -39,8 +40,8 @@ typedef struct RemoteDbHandle RemoteDbHandle;
+ typedef struct PendingConn PendingConn;
+ 
+ struct ServerJob {
+-  int fd;
+-  DoltliteConn *conn;
++  doltlite_server_socket_t fd;
++  DoltliteServerConn *conn;
+   char *zPrefix;
+   int nPrefix;
+   int nHeader;
+@@ -52,8 +53,8 @@ struct ServerJob {
+ 
+ /* Request bytes collected before a worker is taken. conn is set for TLS. */
+ struct PendingConn {
+-  int fd;
+-  DoltliteConn *conn;
++  doltlite_server_socket_t fd;
++  DoltliteServerConn *conn;
+   i64 startMs;
+   char aBuf[MAX_HEADER_SIZE];
+   int nBuf;
+@@ -83,28 +84,28 @@ struct RemoteDbHandle {
    int bWritable;
    int nReservations;
    i64 lastUseMs;
@@ -331,17 +325,16 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
 +  DoltliteCond workReady;
    int mutexInit;
    int condInit;
--  int queue[SERVER_QUEUE_SIZE];
-+  doltlite_server_socket_t queue[SERVER_QUEUE_SIZE];
+   struct ServerJob queue[SERVER_QUEUE_SIZE];
    int queueHead;
    int nQueue;
 -  int activeFd[SERVER_WORKERS];
 +  doltlite_server_socket_t activeFd[SERVER_WORKERS];
    int timeoutMs;
+   int bSessionLoopbackTransfer;
    int maxRequestBytes;
-   int maxChunkBytes;
-@@ -83,7 +84,7 @@ struct DoltliteServer {
- };
+@@ -172,7 +173,7 @@ static int remotesrvPendingAdd(const void *p, int n){
+ }
  
  static void sendResponseEx(
 -  DoltliteConn *fd,
@@ -349,10 +342,10 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    int status,
    const char *zStatus,
    const char *zContentType,
-@@ -109,24 +110,24 @@ static void sendResponseEx(
-       status, zStatus, nBody);
+@@ -206,24 +207,24 @@ static void sendResponseEx(
+     }
+     return;
    }
-   nHeader = (int)strlen(zHeader);
 -  if( doltliteConnWriteAll(fd, zHeader, nHeader)!=0 ) return;
 +  if( doltliteServerConnWriteAll(fd, zHeader, nHeader)!=0 ) return;
    if( pBody && nBody>0 ){
@@ -379,7 +372,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    int httpStatus,
    const char *zHttpReason,
    const char *zCode,
-@@ -146,17 +147,17 @@ static void sendStructuredError(
+@@ -243,17 +244,17 @@ static void sendStructuredError(
                   (const u8*)zBody, nBody);
  }
  
@@ -400,7 +393,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    switch( rc ){
      case SQLITE_LOCKED:
        sendStructuredError(fd, 409, "Conflict", "working_set", rc,
-@@ -214,12 +215,12 @@ static void sendSqliteError(DoltliteConn *fd, int rc){
+@@ -311,12 +312,12 @@ static void sendSqliteError(DoltliteConn *fd, int rc){
    }
  }
  
@@ -415,8 +408,8 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    sendStructuredError(fd, 401, "Unauthorized", "unauthorized", SQLITE_AUTH,
                        "unauthorized");
  }
-@@ -251,9 +252,7 @@
- #define SERVER_BODY_MIN_RATE     (64 * 1024)
+@@ -353,9 +354,7 @@ static int remoteSrvCommitPending(ChunkStore *pStore){
+ #define SERVER_BODY_BUFFER_MAX   ((i64)MAX_REQUEST_BYTES_MAX)
  
  static i64 monotonicMs(void){
 -  struct timespec ts;
@@ -425,40 +418,8 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
 +  return (i64)doltliteMonotonicMs();
  }
  
- /* Grow *pp to need bytes, capped at MAX_RESPONSE_BYTES (realloc64). */
-@@ -289,11 +290,11 @@ static int remoteSrvGrowBuf(u8 **pp, i64 *pnAlloc, i64 need){
-   return SQLITE_OK;
- }
- 
--static int readExact(DoltliteConn *fd, u8 *pBuf, int nBytes,
-+static int readExact(DoltliteServerConn *fd, u8 *pBuf, int nBytes,
-                      i64 startMs, int graceMs, int bAllowSlowProgress){
-   int nRead = 0;
-   while( nRead < nBytes ){
--    int n = doltliteConnRead(fd, pBuf + nRead, nBytes - nRead);
-+    int n = doltliteServerConnRead(fd, pBuf + nRead, nBytes - nRead);
-     if( n <= 0 ) return -1;
-     nRead += n;
-     if( !bAllowSlowProgress && monotonicMs() - startMs
-@@ -334,7 +335,7 @@ static int parseContentLength(
- }
- 
- static int parseRequest(
--  DoltliteConn *fd,
-+  DoltliteServerConn *fd,
-   char *zMethod, int nMethodMax,
-   char *zPath, int nPathMax,
-   char *zAuth, int nAuthMax,
-@@ -357,7 +358,7 @@ static int parseRequest(
-   if( zAuth && nAuthMax>0 ) zAuth[0] = '\0';
- 
-   while( nBuf < MAX_HEADER_SIZE-1 ){
--    int n = doltliteConnRead(fd, &aBuf[nBuf], 1);
-+    int n = doltliteServerConnRead(fd, &aBuf[nBuf], 1);
-     if( n <= 0 ) return -1;
-     if( monotonicMs() - startMs > timeoutMs ) return -1;
-     nBuf++;
-@@ -521,14 +522,14 @@ int doltliteRemoteSrvResolveRootForTest(
+ /* Grow *pp to need bytes, capped by the caller's protocol limit. */
+@@ -604,14 +603,14 @@ int doltliteRemoteSrvResolveRootForTest(
    return remoteSrvResolveRoot(pStore, pRoot);
  }
  
@@ -475,16 +436,16 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
                              const u8 *pBody, int nBody){
    int nHashes;
    u8 *aResult;
-@@ -569,7 +570,7 @@ static void handleHasChunks(ChunkStore *pStore, DoltliteConn *fd,
+@@ -652,7 +651,7 @@ static void handleHasChunks(ChunkStore *pStore, DoltliteConn *fd,
  
  /* Body is N concatenated hashes; reply is per-hash [u32be len][bytes],
  ** 0xFFFFFFFF if absent. Capped at MAX_RESPONSE_BYTES (413). */
 -static void handleGetChunks(ChunkStore *pStore, DoltliteConn *fd,
 +static void handleGetChunks(ChunkStore *pStore, DoltliteServerConn *fd,
                              const u8 *pBody, int nBody){
-   int nHashes, i, rc;
-   u8 *pOut = 0;
-@@ -639,7 +640,7 @@ static void handleGetChunks(ChunkStore *pStore, DoltliteConn *fd,
+   int nHashes, i, j, rc = SQLITE_OK;
+   int bTooLarge = 0;
+@@ -709,7 +708,7 @@ get_chunks_done:
    sqlite3_free(pOut);
  }
  
@@ -493,7 +454,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    ProllyHash hash;
    u8 *pData = 0;
    int nData = 0;
-@@ -735,7 +736,7 @@ static int remoteSrvStoreChunkBatch(ChunkStore *pStore,
+@@ -805,7 +804,7 @@ static int remoteSrvStoreChunkBatch(ChunkStore *pStore,
  }
  
  static void handlePostChunks(DoltliteServer *pSrv, ChunkStore *pStore,
@@ -502,7 +463,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    int rc = remoteSrvStoreChunkBatchWithLimit(
        pStore, pBody, nBody, pSrv->maxChunkBytes
    );
-@@ -751,7 +752,7 @@ static void handlePostChunks(DoltliteServer *pSrv, ChunkStore *pStore,
+@@ -821,7 +820,7 @@ static void handlePostChunks(DoltliteServer *pSrv, ChunkStore *pStore,
    sendOk(fd, 0, 0);
  }
  
@@ -511,25 +472,34 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    u8 *pData = 0;
    int nData = 0;
    int rc;
-@@ -874,7 +875,7 @@ static int remoteSrvParseRefsPrefix(
-   return SQLITE_OK;
+@@ -963,7 +962,7 @@ static int remoteSrvParseRefsPrefix(
+ 
+ /* 409 + BUSY_SNAPSHOT keeps older clients retrying; the code tells newer
+ ** ones to rescan below chunks this server already holds. */
+-static void remoteSrvSendRefsError(DoltliteConn *fd, int rc, int bMissing){
++static void remoteSrvSendRefsError(DoltliteServerConn *fd, int rc, int bMissing){
+   if( rc==SQLITE_BUSY_SNAPSHOT && bMissing ){
+     sendStructuredError(fd, 409, "Conflict", "missing_chunks", rc,
+                         "remote is missing chunks of the pushed history; "
+@@ -973,7 +972,7 @@ static void remoteSrvSendRefsError(DoltliteConn *fd, int rc, int bMissing){
+   sendSqliteError(fd, rc);
  }
  
 -static void handlePutRefs(ChunkStore *pStore, DoltliteConn *fd,
 +static void handlePutRefs(ChunkStore *pStore, DoltliteServerConn *fd,
                            const u8 *pBody, int nBody){
+   int bMissing = 0;
    char *zBranch = 0;
-   int bForce = 0;
-@@ -900,7 +901,7 @@ static void handlePutRefs(ChunkStore *pStore, DoltliteConn *fd,
+@@ -1000,7 +999,7 @@ static void handlePutRefs(ChunkStore *pStore, DoltliteConn *fd,
    sendOk(fd, 0, 0);
  }
  
 -static void handlePutRefsIf(ChunkStore *pStore, DoltliteConn *fd,
 +static void handlePutRefsIf(ChunkStore *pStore, DoltliteServerConn *fd,
                              const u8 *pBody, int nBody){
+   int bMissing = 0;
    ProllyHash expectedRefsHash;
-   char *zBranch = 0;
-@@ -964,7 +965,7 @@ int doltliteRemoteSrvApplyRefsForTest(
+@@ -1066,7 +1065,7 @@ int doltliteRemoteSrvApplyRefsForTest(
    return remoteSrvCommitPending(pStore);
  }
  
@@ -538,7 +508,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    int rc;
  
    rc = remoteSrvPersistRefs(pStore);
-@@ -1012,7 +1013,7 @@ static void remoteDbHandleFree(RemoteDbHandle *h){
+@@ -1114,7 +1113,7 @@ static void remoteDbHandleFree(RemoteDbHandle *h){
    if( !h ) return;
    remoteDbHandleCloseStore(h);
    if( h->muInit ){
@@ -547,7 +517,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
      h->muInit = 0;
    }
    sqlite3_free(h->zPath);
-@@ -1040,21 +1041,21 @@ static void remoteDbCacheEvictOne(DoltliteServer *pSrv){
+@@ -1142,21 +1141,21 @@ static void remoteDbCacheEvictOne(DoltliteServer *pSrv){
  
    for(h=pSrv->pDbCache; h; pPrev=h, h=h->pNext){
      if( h->nReservations>0 ) continue;
@@ -573,7 +543,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    remoteDbHandleFree(pBest);
  }
  
-@@ -1069,7 +1070,7 @@ static int remoteDbAcquire(
+@@ -1171,7 +1170,7 @@ static int remoteDbAcquire(
    int rc;
  
    *ppOut = 0;
@@ -582,7 +552,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    for(h=pSrv->pDbCache; h; h=h->pNext){
      if( strcmp(h->zPath, zPath)==0 ) break;
    }
-@@ -1081,15 +1082,15 @@ static int remoteDbAcquire(
+@@ -1183,15 +1182,15 @@ static int remoteDbAcquire(
      }
      h = (RemoteDbHandle*)sqlite3_malloc(sizeof(*h));
      if( !h ){
@@ -601,7 +571,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
        return SQLITE_NOMEM;
      }
      h->muInit = 1;
-@@ -1098,9 +1099,9 @@ static int remoteDbAcquire(
+@@ -1200,9 +1199,9 @@ static int remoteDbAcquire(
      pSrv->nDbCache++;
    }
    h->nReservations++;
@@ -613,10 +583,10 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    h->lastUseMs = monotonicMs();
  
    /* Drop any leftover staging from a failed prior request before refresh. */
-@@ -1141,10 +1142,10 @@ static int remoteDbAcquire(
-   return SQLITE_OK;
- 
- acquire_error:
+@@ -1246,10 +1245,10 @@ acquire_error:
+ #if SQLITE_OS_WIN
+   remoteDbHandleCloseStore(h);
+ #endif
 -  pthread_mutex_unlock(&h->mu);
 -  pthread_mutex_lock(&pSrv->mutex);
 +  doltliteMutexUnlock(&h->mu);
@@ -627,10 +597,10 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    return rc;
  }
  
-@@ -1155,13 +1156,13 @@ static void remoteDbRelease(DoltliteServer *pSrv, RemoteDbHandle *h){
-    && (h->store.staging.nPending>0 || h->store.staging.nRecentUncommitted>0) ){
-     chunkStoreRollback(&h->store);
-   }
+@@ -1263,15 +1262,15 @@ static void remoteDbRelease(DoltliteServer *pSrv, RemoteDbHandle *h){
+   /* An idle open handle prevents a Windows peer from replacing the file. */
+   remoteDbHandleCloseStore(h);
+ #endif
 -  pthread_mutex_unlock(&h->mu);
 -  pthread_mutex_lock(&pSrv->mutex);
 +  doltliteMutexUnlock(&h->mu);
@@ -640,27 +610,39 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
 +  doltliteMutexUnlock(&pSrv->mutex);
  }
  
--static void handleRequest(DoltliteServer *pSrv, DoltliteConn *fd){
-+static void handleRequest(DoltliteServer *pSrv, DoltliteServerConn *fd){
-   char zMethod[16];
-   char zPath[512];
-   char zDbName[256];
-@@ -1286,41 +1287,52 @@ static void handleRequest(DoltliteServer *pSrv, DoltliteConn *fd){
+ static void handleRequest(
+   DoltliteServer *pSrv,
+-  DoltliteConn *fd,
++  DoltliteServerConn *fd,
+   char *zPrefix,
+   int nPrefix,
+   int nHeader,
+@@ -1395,50 +1394,61 @@ static void handleRequest(
+     sqlite3_free(pending.pMsg);
+     sendSqliteError(fd, SQLITE_NOMEM);
+   }else if( pending.pMsg && pending.nMsg>0 ){
+-    doltliteConnWriteAll(fd, pending.pMsg, pending.nMsg);
++    doltliteServerConnWriteAll(fd, pending.pMsg, pending.nMsg);
+     sqlite3_free(pending.pMsg);
+   }
  }
  
  static void serverCleanup(DoltliteServer *pSrv);
-+static int serverStopRequested(void *pContext);
++static int serverIsRunning(DoltliteServer *pSrv);
  
 -static void *serverWorkerEntry(void *pArg){
++static int serverStopRequested(void *pContext){
++  return !serverIsRunning((DoltliteServer*)pContext);
++}
++
 +DOLTLITE_THREAD_ENTRY(serverWorkerEntry){
    DoltliteWorkerArg *pWorker = (DoltliteWorkerArg*)pArg;
    DoltliteServer *pSrv = pWorker->pSrv;
  
    for(;;){
 -    DoltliteConn *conn;
--    int clientFd;
 +    DoltliteServerConn *conn;
-+    doltlite_server_socket_t clientFd;
+     struct ServerJob job;
  
 -    pthread_mutex_lock(&pSrv->mutex);
 +    doltliteMutexLock(&pSrv->mutex);
@@ -673,56 +655,51 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
 +      doltliteMutexUnlock(&pSrv->mutex);
        break;
      }
-     clientFd = pSrv->queue[pSrv->queueHead];
+     job = pSrv->queue[pSrv->queueHead];
      pSrv->queueHead = (pSrv->queueHead + 1) % SERVER_QUEUE_SIZE;
      pSrv->nQueue--;
-     pSrv->activeFd[pWorker->index] = clientFd;
+     pSrv->activeFd[pWorker->index] = job.fd;
 -    pthread_mutex_unlock(&pSrv->mutex);
-+    doltliteMutexUnlock(&pSrv->mutex);
-+
-+    conn = pSrv->tls
-+      ? doltliteServerConnAccept(pSrv->tls, clientFd, pSrv->timeoutMs,
-+                                 serverStopRequested, pSrv)
-+      : doltliteServerConnFromSocket(clientFd, pSrv->timeoutMs,
-+                                     serverStopRequested, pSrv);
-+    if( conn ) handleRequest(pSrv, conn);
-+
-+    /* TLS close-notify can write; keep the socket tracked so stop can interrupt it. */
-+    if( conn ) doltliteServerConnCloseNotify(conn);
-+
-+    /* Clear the tracked handle before the nonblocking free-and-close phase. */
-+    doltliteMutexLock(&pSrv->mutex);
-+    pSrv->activeFd[pWorker->index] = DOLTLITE_SERVER_INVALID_SOCKET;
 +    doltliteMutexUnlock(&pSrv->mutex);
  
--    conn = pSrv->tls ? doltliteConnServerAccept(pSrv->tls, clientFd)
--                     : doltliteConnFromFd(clientFd);
+-    conn = job.conn ? job.conn : doltliteConnFromFd(job.fd);
++    conn = job.conn ? job.conn
++                    : doltliteServerConnFromSocket(
++                          job.fd, pSrv->timeoutMs, serverStopRequested, pSrv);
      if( conn ){
--      handleRequest(pSrv, conn);
++      doltliteServerConnConfigureWorker(
++          conn, pSrv->timeoutMs, serverStopRequested, pSrv);
+       handleRequest(pSrv, conn, job.zPrefix, job.nPrefix, job.nHeader,
+                     job.pBody, job.nBody, job.requestStatus);
 -      doltliteConnClose(conn);
-+      doltliteServerConnClose(conn);
-+    }else{
-+      doltliteServerSocketClose(clientFd);
++      doltliteServerConnCloseNotify(conn);
      }
--
+     sqlite3_free(job.zPrefix);
+     sqlite3_free(job.pBody);
+ 
 -    pthread_mutex_lock(&pSrv->mutex);
++    doltliteMutexLock(&pSrv->mutex);
+     pSrv->nBodyAlloc -= job.nBodyAlloc;
 -    pSrv->activeFd[pWorker->index] = -1;
 -    pthread_mutex_unlock(&pSrv->mutex);
++    pSrv->activeFd[pWorker->index] = DOLTLITE_SERVER_INVALID_SOCKET;
++    doltliteMutexUnlock(&pSrv->mutex);
++    if( conn ) doltliteServerConnClose(conn);
++    else doltliteServerSocketClose(job.fd);
    }
 -  return 0;
 +  DOLTLITE_THREAD_RETURN;
  }
  
  static int serverStartWorkers(DoltliteServer *pSrv){
-@@ -1328,14 +1340,14 @@ static int serverStartWorkers(DoltliteServer *pSrv){
+@@ -1446,14 +1456,14 @@ static int serverStartWorkers(DoltliteServer *pSrv){
    for(i=0; i<SERVER_WORKERS; i++){
      pSrv->workerArgs[i].pSrv = pSrv;
      pSrv->workerArgs[i].index = i;
 -    if( pthread_create(&pSrv->workers[i], 0, serverWorkerEntry,
--                       &pSrv->workerArgs[i])!=0 ){
--      pthread_mutex_lock(&pSrv->mutex);
 +    if( doltliteThreadCreate(&pSrv->workers[i], serverWorkerEntry,
-+                             &pSrv->workerArgs[i])!=0 ){
+                        &pSrv->workerArgs[i])!=0 ){
+-      pthread_mutex_lock(&pSrv->mutex);
 +      doltliteMutexLock(&pSrv->mutex);
        pSrv->running = 0;
 -      pthread_cond_broadcast(&pSrv->workReady);
@@ -735,7 +712,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
        }
        return SQLITE_ERROR;
      }
-@@ -1346,41 +1358,46 @@ static int serverStartWorkers(DoltliteServer *pSrv){
+@@ -1464,43 +1474,43 @@ static int serverStartWorkers(DoltliteServer *pSrv){
  
  static void serverRequestStop(DoltliteServer *pSrv){
    int i;
@@ -743,18 +720,22 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
 +  doltliteMutexLock(&pSrv->mutex);
    pSrv->running = 0;
    while( pSrv->nQueue>0 ){
--    int fd = pSrv->queue[pSrv->queueHead];
-+    doltlite_server_socket_t fd = pSrv->queue[pSrv->queueHead];
+     struct ServerJob job;
+     job = pSrv->queue[pSrv->queueHead];
      pSrv->queueHead = (pSrv->queueHead + 1) % SERVER_QUEUE_SIZE;
      pSrv->nQueue--;
--    doltliteShutdownSocket(fd);
--    doltliteCloseSocket(fd);
-+    doltliteServerSocketShutdown(fd);
-+    doltliteServerSocketClose(fd);
+-    if( job.fd>=0 ) doltliteShutdownSocket(job.fd);
+-    if( job.conn ) doltliteConnClose(job.conn);
+-    else if( job.fd>=0 ) doltliteCloseSocket(job.fd);
++    if( doltliteServerSocketIsValid(job.fd) ) doltliteServerSocketShutdown(job.fd);
++    if( job.conn ) doltliteServerConnClose(job.conn);
++    else if( doltliteServerSocketIsValid(job.fd) ) doltliteServerSocketClose(job.fd);
+     sqlite3_free(job.zPrefix);
+     sqlite3_free(job.pBody);
+     pSrv->nBodyAlloc -= job.nBodyAlloc;
    }
 -  /* shutdown() wakes blocking I/O without descriptor reuse. */
-+  /* POSIX shutdown wakes blocking I/O; Windows workers observe stop in bounded
-+     nonblocking polls and retain final close ownership. */
++  /* shutdown() interrupts worker I/O without closing a tracked descriptor. */
    for(i=0; i<pSrv->nWorkers; i++){
 -    if( pSrv->activeFd[i]>=0 ){
 -      doltliteShutdownSocket(pSrv->activeFd[i]);
@@ -787,14 +768,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    return running;
  }
  
-+static int serverStopRequested(void *pContext){
-+  return !serverIsRunning((DoltliteServer*)pContext);
-+}
-+
- static char *dupStr(const char *z){
-   int n;
-   char *s;
-@@ -1393,14 +1410,14 @@ static char *dupStr(const char *z){
+@@ -1516,14 +1526,14 @@ static char *dupStr(const char *z){
  
  static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
    struct sockaddr_in addr;
@@ -811,15 +785,13 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    if( o->bSessionLoopbackTransfer!=0 && o->bSessionLoopbackTransfer!=1 ){
      return SQLITE_MISUSE;
    }
-@@ -1411,10 +1428,12 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+@@ -1534,10 +1544,10 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
    if( !pSrv->pVfs ) return SQLITE_ERROR;
    pSrv->timeoutMs = o->timeoutMs>0 ? o->timeoutMs
                                     : SERVER_DEFAULT_TIMEOUT_MS;
 -  for(i=0; i<SERVER_WORKERS; i++) pSrv->activeFd[i] = -1;
 -  if( pthread_mutex_init(&pSrv->mutex, 0)!=0 ) return SQLITE_ERROR;
-+  for(i=0; i<SERVER_WORKERS; i++) {
-+    pSrv->activeFd[i] = DOLTLITE_SERVER_INVALID_SOCKET;
-+  }
++  for(i=0; i<SERVER_WORKERS; i++) pSrv->activeFd[i] = DOLTLITE_SERVER_INVALID_SOCKET;
 +  if( doltliteMutexInit(&pSrv->mutex)!=0 ) return SQLITE_ERROR;
    pSrv->mutexInit = 1;
 -  if( pthread_cond_init(&pSrv->workReady, 0)!=0 ){
@@ -827,7 +799,16 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
      serverCleanup(pSrv);
      return SQLITE_ERROR;
    }
-@@ -1459,7 +1478,7 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+@@ -1547,7 +1557,7 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+     serverCleanup(pSrv);
+     return SQLITE_NOMEM;
+   }
+-  for(i=0; i<SERVER_PENDING_MAX; i++) pSrv->aPending[i].fd = -1;
++  for(i=0; i<SERVER_PENDING_MAX; i++) pSrv->aPending[i].fd = DOLTLITE_SERVER_INVALID_SOCKET;
+ 
+   if( zBindAddr==0 || zBindAddr[0]=='\0' ){
+     zBindAddr = "127.0.0.1";
+@@ -1588,7 +1598,7 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
      if( !pSrv->audience ){ serverCleanup(pSrv); return SQLITE_NOMEM; }
    }
    if( o->certFile && o->keyFile ){
@@ -836,94 +817,275 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
      if( !pSrv->tls ){ serverCleanup(pSrv); return SQLITE_ERROR; }
    }
  
-@@ -1483,8 +1502,11 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
+@@ -1612,8 +1622,12 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
    }
  
    if( doltliteNetInit()!=0 ){ serverCleanup(pSrv); return SQLITE_ERROR; }
 -  pSrv->listenFd = (int)socket(AF_INET, SOCK_STREAM, 0);
 -  if( pSrv->listenFd < 0 ){ serverCleanup(pSrv); return SQLITE_ERROR; }
 +  pSrv->listenFd = socket(AF_INET, SOCK_STREAM, 0);
-+  if( !doltliteServerSocketIsValid(pSrv->listenFd) ){
++  if( !doltliteServerSocketIsValid(pSrv->listenFd) ){ serverCleanup(pSrv); return SQLITE_ERROR; }
++  if( doltliteServerSocketSetNonblocking(pSrv->listenFd)!=0 ){
 +    serverCleanup(pSrv);
 +    return SQLITE_ERROR;
 +  }
  
    setsockopt(pSrv->listenFd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
  
-@@ -1493,14 +1515,20 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
-   addr.sin_addr = bindIn;
-   addr.sin_port = htons((u16)o->port);
+@@ -1667,21 +1681,21 @@ static i64 pendingBudget(const DoltliteServer *pSrv, const PendingConn *p){
  
--  if( bind(pSrv->listenFd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ){
-+  if( bind(pSrv->listenFd, (struct sockaddr*)&addr, sizeof(addr)) != 0 ){
-+    serverCleanup(pSrv);
-+    return SQLITE_ERROR;
-+  }
-+  if( listen(pSrv->listenFd, 5) != 0 ){
-     serverCleanup(pSrv);
-     return SQLITE_ERROR;
+ static void pendingClose(DoltliteServer *pSrv, PendingConn *p){
+   if( p->conn ){
+-    doltliteConnClose(p->conn);
++    doltliteServerConnClose(p->conn);
+     p->conn = 0;
+-    p->fd = -1;
+-  }else if( p->fd>=0 ){
+-    doltliteCloseSocket(p->fd);
+-    p->fd = -1;
++    p->fd = DOLTLITE_SERVER_INVALID_SOCKET;
++  }else if( doltliteServerSocketIsValid(p->fd) ){
++    doltliteServerSocketClose(p->fd);
++    p->fd = DOLTLITE_SERVER_INVALID_SOCKET;
    }
--  if( listen(pSrv->listenFd, 5) < 0 ){
-+#ifdef _WIN32
-+  if( doltliteServerSocketSetNonblocking(pSrv->listenFd)!=0 ){
-     serverCleanup(pSrv);
-     return SQLITE_ERROR;
-   }
-+#endif
+   p->nBuf = 0;
+   p->bHandshake = 0;
+   p->bWantWrite = 0;
+   sqlite3_free(p->pBody);
+   p->pBody = 0;
+-  pthread_mutex_lock(&pSrv->mutex);
++  doltliteMutexLock(&pSrv->mutex);
+   pSrv->nBodyAlloc -= p->nBodyAlloc;
+-  pthread_mutex_unlock(&pSrv->mutex);
++  doltliteMutexUnlock(&pSrv->mutex);
+   p->nBodyAlloc = 0;
+ }
  
-   addrLen = sizeof(addr);
-   if( getsockname(pSrv->listenFd, (struct sockaddr*)&addr, &addrLen)==0 ){
-@@ -1519,42 +1547,49 @@ static int serverInit(DoltliteServer *pSrv, const DoltliteServeOpts *o){
- 
- static void serverLoop(DoltliteServer *pSrv){
-   while( serverIsRunning(pSrv) ){
--    doltlite_pollfd pfd;
--    int clientFd;
-+    doltlite_server_pollfd pfd;
-+    doltlite_server_socket_t clientFd;
- 
-     pfd.fd = pSrv->listenFd;
--    pfd.events = POLLIN;
-+    pfd.events = DOLTLITE_SERVER_POLLIN;
-     pfd.revents = 0;
- 
--    if( doltlitePoll(&pfd, 1, 100) <= 0 ) continue;
-+    if( doltliteServerPoll(&pfd, 1, 100) <= 0 ) continue;
- 
--    clientFd = (int)accept(pSrv->listenFd, NULL, NULL);
--    if( clientFd < 0 ) continue;
--    if( doltliteSocketSetTimeout(clientFd, pSrv->timeoutMs)!=0 ){
--      doltliteCloseSocket(clientFd);
-+    clientFd = accept(pSrv->listenFd, NULL, NULL);
-+    if( !doltliteServerSocketIsValid(clientFd) ) continue;
-+#ifdef _WIN32
-+    /* Worker I/O stays pollable so stop can interrupt partial requests. */
-+    if( doltliteServerSocketSetNonblocking(clientFd)!=0 ){
-+      doltliteServerSocketClose(clientFd);
-+      continue;
-+    }
-+#endif
-+    if( doltliteServerSocketSetTimeout(clientFd, pSrv->timeoutMs)!=0 ){
-+      doltliteServerSocketClose(clientFd);
-       continue;
+@@ -1701,19 +1715,19 @@ static int pendingAppendBody(DoltliteServer *pSrv, PendingConn *p,
+       }
+       nAlloc *= 2;
      }
- 
 -    pthread_mutex_lock(&pSrv->mutex);
 +    doltliteMutexLock(&pSrv->mutex);
-     if( !pSrv->running || pSrv->nQueue==SERVER_QUEUE_SIZE ){
+     if( nAlloc-p->nBodyAlloc > SERVER_BODY_BUFFER_MAX-pSrv->nBodyAlloc ){
 -      pthread_mutex_unlock(&pSrv->mutex);
--      doltliteCloseSocket(clientFd);
 +      doltliteMutexUnlock(&pSrv->mutex);
-+      doltliteServerSocketClose(clientFd);
-       continue;
+       return SQLITE_NOMEM;
      }
-     pSrv->queue[(pSrv->queueHead + pSrv->nQueue) % SERVER_QUEUE_SIZE] = clientFd;
-     pSrv->nQueue++;
--    pthread_cond_signal(&pSrv->workReady);
+     pSrv->nBodyAlloc += nAlloc-p->nBodyAlloc;
 -    pthread_mutex_unlock(&pSrv->mutex);
-+    doltliteCondSignal(&pSrv->workReady);
 +    doltliteMutexUnlock(&pSrv->mutex);
+     rc = remoteSrvGrowBuf(&p->pBody, &p->nBodyAlloc, nAlloc,
+                           pSrv->maxRequestBytes);
+     if( rc!=SQLITE_OK ){
+-      pthread_mutex_lock(&pSrv->mutex);
++      doltliteMutexLock(&pSrv->mutex);
+       pSrv->nBodyAlloc -= nAlloc-p->nBodyAlloc;
+-      pthread_mutex_unlock(&pSrv->mutex);
++      doltliteMutexUnlock(&pSrv->mutex);
+       return rc;
+     }
    }
+@@ -1735,8 +1749,8 @@ static int pendingHeaderEnd(const char *aBuf, int nBuf){
+ 
+ static int enqueueJob(
+   DoltliteServer *pSrv,
+-  int fd,
+-  DoltliteConn *conn,
++  doltlite_server_socket_t fd,
++  DoltliteServerConn *conn,
+   char *zPrefix,
+   int nPrefix,
+   int nHeader,
+@@ -1748,14 +1762,14 @@ static int enqueueJob(
+   int idx;
+   struct ServerJob *job;
+ 
+-  pthread_mutex_lock(&pSrv->mutex);
++  doltliteMutexLock(&pSrv->mutex);
+   if( !pSrv->running || pSrv->nQueue==SERVER_QUEUE_SIZE ){
+     pSrv->nBodyAlloc -= nBodyAlloc;
+-    pthread_mutex_unlock(&pSrv->mutex);
++    doltliteMutexUnlock(&pSrv->mutex);
+     sqlite3_free(zPrefix);
+     sqlite3_free(pBody);
+-    if( conn ) doltliteConnClose(conn);
+-    else if( fd>=0 ) doltliteCloseSocket(fd);
++    if( conn ) doltliteServerConnClose(conn);
++    else if( doltliteServerSocketIsValid(fd) ) doltliteServerSocketClose(fd);
+     return -1;
+   }
+   idx = (pSrv->queueHead + pSrv->nQueue) % SERVER_QUEUE_SIZE;
+@@ -1770,8 +1784,8 @@ static int enqueueJob(
+   job->nBodyAlloc = nBodyAlloc;
+   job->requestStatus = requestStatus;
+   pSrv->nQueue++;
+-  pthread_cond_signal(&pSrv->workReady);
+-  pthread_mutex_unlock(&pSrv->mutex);
++  doltliteCondSignal(&pSrv->workReady);
++  doltliteMutexUnlock(&pSrv->mutex);
+   return 0;
+ }
+ 
+@@ -1784,23 +1798,28 @@ static int pendingPromote(
+ ){
+   char *zCopy;
+   int nPrefix;
+-  int fd;
+-  DoltliteConn *conn;
++  doltlite_server_socket_t fd;
++  DoltliteServerConn *conn;
+ 
+   nPrefix = p->nBuf;
+   zCopy = sqlite3_malloc(nPrefix + 1);
+   if( !zCopy ) return -1;
+   memcpy(zCopy, p->aBuf, (size_t)nPrefix);
+   zCopy[nPrefix] = 0;
+-  if( doltliteSocketSetBlocking(p->fd, 1)!=0
+-   || (p->conn ? doltliteConnSetTimeout(p->conn, pSrv->timeoutMs)
+-               : doltliteSocketSetTimeout(p->fd, pSrv->timeoutMs))!=0 ){
++#ifndef _WIN32
++  if( doltliteServerSocketSetBlocking(p->fd, 1)!=0 ){
++    sqlite3_free(zCopy);
++    return -1;
++  }
++#endif
++  if( (p->conn ? doltliteServerConnSetTimeout(p->conn, pSrv->timeoutMs)
++               : doltliteServerSocketSetTimeout(p->fd, pSrv->timeoutMs))!=0 ){
+     sqlite3_free(zCopy);
+     return -1;
+   }
+   fd = p->fd;
+   conn = p->conn;
+-  p->fd = -1;
++  p->fd = DOLTLITE_SERVER_INVALID_SOCKET;
+   p->conn = 0;
+   p->nBuf = 0;
+   p->bHandshake = 0;
+@@ -1815,9 +1834,9 @@ static int pendingPromote(
+ static int pendingIngest(DoltliteServer *pSrv, PendingConn *p){
+   int nHeader = 0;
+ 
+-  if( p->fd<0 ) return 1;
++  if( !doltliteServerSocketIsValid(p->fd) ) return 1;
+   if( p->bHandshake ){
+-    int step = doltliteConnHandshakeStep(p->conn);
++    int step = doltliteServerConnHandshakeStep(p->conn);
+     if( step<0 ){
+       pendingClose(pSrv, p);
+       return 1;
+@@ -1838,9 +1857,9 @@ static int pendingIngest(DoltliteServer *pSrv, PendingConn *p){
+     int n;
+     int space = MAX_HEADER_SIZE - 1 - p->nBuf;
+     if( p->conn ){
+-      n = doltliteConnReadNonblock(p->conn, p->aBuf + p->nBuf, space);
++      n = doltliteServerConnReadNonblock(p->conn, p->aBuf + p->nBuf, space);
+     }else{
+-      n = doltliteSocketRecv(p->fd, p->aBuf + p->nBuf, space);
++      n = doltliteServerSocketRecvNonblock(p->fd, p->aBuf + p->nBuf, space);
+     }
+     if( n==-2 ) return 0;
+     if( n<=0 ){
+@@ -1877,8 +1896,8 @@ static int pendingIngest(DoltliteServer *pSrv, PendingConn *p){
+       p->requestStatus = 400;
+     }else if( nRead>0 ){
+       if( nRead>(int)sizeof(aData) ) nRead = sizeof(aData);
+-      n = p->conn ? doltliteConnReadNonblock(p->conn, aData, nRead)
+-                  : doltliteSocketRecv(p->fd, aData, nRead);
++      n = p->conn ? doltliteServerConnReadNonblock(p->conn, aData, nRead)
++                  : doltliteServerSocketRecvNonblock(p->fd, aData, nRead);
+       if( n==-2 ) return 0;
+       if( n<=0 ){
+         p->requestStatus = 400;
+@@ -1904,16 +1923,16 @@ static int pendingAdd(
+   DoltliteServer *pSrv,
+   PendingConn *aPending,
+   int *pnPending,
+-  int clientFd
++  doltlite_server_socket_t clientFd
+ ){
+   PendingConn *p;
+ 
+   if( *pnPending>=SERVER_PENDING_MAX ){
+-    doltliteCloseSocket(clientFd);
++    doltliteServerSocketClose(clientFd);
+     return -1;
+   }
+-  if( doltliteSocketSetBlocking(clientFd, 0)!=0 ){
+-    doltliteCloseSocket(clientFd);
++  if( doltliteServerSocketSetNonblocking(clientFd)!=0 ){
++    doltliteServerSocketClose(clientFd);
+     return -1;
+   }
+   p = &aPending[*pnPending];
+@@ -1921,9 +1940,9 @@ static int pendingAdd(
+   p->fd = clientFd;
+   p->startMs = monotonicMs();
+   if( pSrv->tls ){
+-    p->conn = doltliteConnServerAttach(pSrv->tls, clientFd);
++    p->conn = doltliteServerConnAttach(pSrv->tls, clientFd);
+     if( !p->conn ){
+-      p->fd = -1;
++      p->fd = DOLTLITE_SERVER_INVALID_SOCKET;
+       return -1;
+     }
+     p->bHandshake = 1;
+@@ -1934,7 +1953,7 @@ static int pendingAdd(
+ 
+ static void serverLoop(DoltliteServer *pSrv){
+   PendingConn *aPending = pSrv->aPending;
+-  doltlite_pollfd aPoll[SERVER_PENDING_MAX + 1];
++  doltlite_server_pollfd aPoll[SERVER_PENDING_MAX + 1];
+   int nPending = 0;
+   int i;
+ 
+@@ -1942,26 +1961,26 @@ static void serverLoop(DoltliteServer *pSrv){
+   while( serverIsRunning(pSrv) ){
+     int nReady;
+     int nPolled;
+-    int clientFd;
++    doltlite_server_socket_t clientFd;
+     int pollMs = 100;
+ 
+     nPolled = nPending;
+     aPoll[0].fd = pSrv->listenFd;
+-    aPoll[0].events = POLLIN;
++    aPoll[0].events = DOLTLITE_SERVER_POLLIN;
+     aPoll[0].revents = 0;
+     for(i=0; i<nPending; i++){
+       aPoll[i+1].fd = aPending[i].fd;
+-      aPoll[i+1].events = POLLIN;
+-      if( aPending[i].bWantWrite ) aPoll[i+1].events |= POLLOUT;
++      aPoll[i+1].events = DOLTLITE_SERVER_POLLIN;
++      if( aPending[i].bWantWrite ) aPoll[i+1].events |= DOLTLITE_SERVER_POLLOUT;
+       aPoll[i+1].revents = 0;
+       if( aPending[i].bReadAgain ) pollMs = 0;
+     }
+-    nReady = doltlitePoll(aPoll, 1 + nPending, pollMs);
++    nReady = doltliteServerPoll(aPoll, 1 + nPending, pollMs);
+     if( nReady<0 ) continue;
+ 
+-    if( (aPoll[0].revents & POLLIN)!=0 ){
+-      clientFd = (int)accept(pSrv->listenFd, 0, 0);
+-      if( clientFd>=0
++    if( (aPoll[0].revents & DOLTLITE_SERVER_POLLIN)!=0 ){
++      clientFd = accept(pSrv->listenFd, 0, 0);
++      if( doltliteServerSocketIsValid(clientFd)
+        && pendingAdd(pSrv, aPending, &nPending, clientFd)==0
+        && pendingIngest(pSrv, &aPending[nPending-1]) ){
+         nPending--;
+@@ -1972,8 +1991,8 @@ static void serverLoop(DoltliteServer *pSrv){
+       int remove = 0;
+       int ready = aPoll[i+1].revents;
+       PendingConn *p = &aPending[i];
+-      if( p->bReadAgain || (ready & (POLLIN|POLLERR|POLLHUP|POLLNVAL))!=0
+-       || (p->bWantWrite && (ready & POLLOUT)!=0) ){
++      if( p->bReadAgain || (ready & (DOLTLITE_SERVER_POLLIN|DOLTLITE_SERVER_POLLERR|DOLTLITE_SERVER_POLLHUP|DOLTLITE_SERVER_POLLNVAL))!=0
++       || (p->bWantWrite && (ready & DOLTLITE_SERVER_POLLOUT)!=0) ){
+         remove = pendingIngest(pSrv, p);
+       }
+       if( !remove && monotonicMs() - p->startMs > pendingBudget(pSrv, p) ){
+@@ -1993,12 +2012,12 @@ static void serverLoop(DoltliteServer *pSrv){
  }
  
  static void serverCleanup(DoltliteServer *pSrv){
@@ -940,9 +1102,9 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
      pSrv->tls = 0;
    }
    remoteDbCacheClear(pSrv);
-@@ -1565,11 +1600,11 @@ static void serverCleanup(DoltliteServer *pSrv){
-   sqlite3_free(pSrv->audience);
-   pSrv->audience = 0;
+@@ -2011,11 +2030,11 @@ static void serverCleanup(DoltliteServer *pSrv){
+   sqlite3_free(pSrv->aPending);
+   pSrv->aPending = 0;
    if( pSrv->condInit ){
 -    pthread_cond_destroy(&pSrv->workReady);
 +    doltliteCondDestroy(&pSrv->workReady);
@@ -954,7 +1116,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
      pSrv->mutexInit = 0;
    }
  }
-@@ -1616,10 +1651,10 @@ int doltliteServe(const char *zDir, int port, const char *zBindAddr){
+@@ -2062,10 +2081,10 @@ int doltliteServe(const char *zDir, int port, const char *zBindAddr){
    return doltliteServeOpts(&o);
  }
  
@@ -967,7 +1129,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
  }
  
  DoltliteServer *doltliteServeAsyncOpts(const DoltliteServeOpts *o){
-@@ -1635,7 +1670,7 @@ DoltliteServer *doltliteServeAsyncOpts(const DoltliteServeOpts *o){
+@@ -2081,7 +2100,7 @@ DoltliteServer *doltliteServeAsyncOpts(const DoltliteServeOpts *o){
      return 0;
    }
  
@@ -976,7 +1138,7 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
      serverRequestStop(pSrv);
      serverJoinWorkers(pSrv);
      serverCleanup(pSrv);
-@@ -1659,7 +1694,7 @@ DoltliteServer *doltliteServeAsync(const char *zDir, int port,
+@@ -2105,7 +2124,7 @@ DoltliteServer *doltliteServeAsync(const char *zDir, int port,
  void doltliteServerStop(DoltliteServer *pServer){
    if( !pServer ) return;
    serverRequestStop(pServer);
@@ -987,10 +1149,10 @@ index b89bafac34c5687a2bb71ecf56b3211a0edbf861..7a3b69137b4b5ed7655b30be4f74216a
    sqlite3_free(pServer);
 diff --git a/doltlite_server_socket.h b/doltlite_server_socket.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..701805476a4a565399360c6511b83350ec764579
+index 0000000..959ef75
 --- /dev/null
 +++ b/doltlite_server_socket.h
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,176 @@
 +#ifndef DOLTLITE_SERVER_SOCKET_H
 +#define DOLTLITE_SERVER_SOCKET_H
 +
@@ -1036,6 +1198,19 @@ index 0000000000000000000000000000000000000000..701805476a4a565399360c6511b83350
 +  return recv(fd, (char *)buffer, (int)length, 0);
 +}
 +
++static inline int doltliteServerSocketRecvNonblock(
++  doltlite_server_socket_t fd,
++  void *buffer,
++  size_t length
++){
++  int n = doltliteServerSocketRecv(fd, buffer, length);
++  if( n == SOCKET_ERROR ){
++    int err = WSAGetLastError();
++    if( err == WSAEINTR || err == WSAEWOULDBLOCK ) return -2;
++  }
++  return n;
++}
++
 +static inline int doltliteServerSocketSetTimeout(
 +  doltlite_server_socket_t fd,
 +  int timeoutMs
@@ -1055,7 +1230,17 @@ index 0000000000000000000000000000000000000000..701805476a4a565399360c6511b83350
 +  return ioctlsocket(fd, FIONBIO, &enabled) == 0 ? 0 : 1;
 +}
 +
++static inline int doltliteServerSocketSetBlocking(
++  doltlite_server_socket_t fd,
++  int blocking
++){
++  u_long enabled = blocking ? 0 : 1;
++  return ioctlsocket(fd, FIONBIO, &enabled) == 0 ? 0 : 1;
++}
++
 +#else
++#include <errno.h>
++#include <fcntl.h>
 +#include <poll.h>
 +#include <sys/socket.h>
 +#include <sys/time.h>
@@ -1098,6 +1283,18 @@ index 0000000000000000000000000000000000000000..701805476a4a565399360c6511b83350
 +  return (int)recv(fd, buffer, length, 0);
 +}
 +
++static inline int doltliteServerSocketRecvNonblock(
++  doltlite_server_socket_t fd,
++  void *buffer,
++  size_t length
++){
++  int n = doltliteServerSocketRecv(fd, buffer, length);
++  if( n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) ){
++    return -2;
++  }
++  return n;
++}
++
 +static inline int doltliteServerSocketSetTimeout(
 +  doltlite_server_socket_t fd,
 +  int timeoutMs
@@ -1110,12 +1307,31 @@ index 0000000000000000000000000000000000000000..701805476a4a565399360c6511b83350
 +  rc2 = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 +  return rc1 == 0 && rc2 == 0 ? 0 : 1;
 +}
++
++static inline int doltliteServerSocketSetNonblocking(
++  doltlite_server_socket_t fd
++){
++  int flags = fcntl(fd, F_GETFL, 0);
++  if (flags < 0) return 1;
++  return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 ? 0 : 1;
++}
++
++static inline int doltliteServerSocketSetBlocking(
++  doltlite_server_socket_t fd,
++  int blocking
++){
++  int flags = fcntl(fd, F_GETFL, 0);
++  if (flags < 0) return 1;
++  if (blocking) flags &= ~O_NONBLOCK;
++  else flags |= O_NONBLOCK;
++  return fcntl(fd, F_SETFL, flags) == 0 ? 0 : 1;
++}
 +#endif
 +
 +#endif
 diff --git a/doltlite_thread.h b/doltlite_thread.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..0a72a2f66384c8d499b86eb9dab50f9779d5f70a
+index 0000000..0a72a2f
 --- /dev/null
 +++ b/doltlite_thread.h
 @@ -0,0 +1,128 @@
@@ -1248,14 +1464,15 @@ index 0000000000000000000000000000000000000000..0a72a2f66384c8d499b86eb9dab50f97
 +
 +#endif
 diff --git a/doltlite_tls.c b/doltlite_tls.c
-index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a48d47e67 100644
+index 13b3fbd..72a5c9b 100644
 --- a/doltlite_tls.c
 +++ b/doltlite_tls.c
-@@ -7,8 +7,12 @@
+@@ -6,9 +6,13 @@
+ #include "mbedtls/net_sockets.h"
  #include "mbedtls/pk.h"
  #include "mbedtls/ssl.h"
- #include "mbedtls/x509_crt.h"
 +#include "mbedtls/threading.h"
+ #include "mbedtls/x509_crt.h"
  
  #include "doltlite_net.h"
 +#include "doltlite_thread.h"
@@ -1264,68 +1481,91 @@ index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a
  #ifdef _WIN32
  #include <wincrypt.h>
  #endif
-@@ -35,6 +38,15 @@ struct DoltliteConn {
+@@ -43,6 +47,16 @@ struct DoltliteTlsServer {
+   mbedtls_ctr_drbg_context drbg;
+   mbedtls_entropy_context entropy;
  };
- 
- #ifndef DOLTLITE_AUTH_CLIENT_ONLY
++
 +struct DoltliteServerConn {
 +  int useTls;
++  int bPolling;
 +  doltlite_server_socket_t serverFd;
 +  int timeoutMs;
 +  DoltliteServerStopCheck stopCheck;
 +  void *stopContext;
 +  mbedtls_ssl_context ssl;
 +};
-+
- struct DoltliteTlsServer {
-   mbedtls_x509_crt cert;
-   mbedtls_pk_context key;
-@@ -44,7 +56,7 @@ struct DoltliteTlsServer {
- };
  #endif
  
--static void configureSocket(int fd) {
-+static void configureSocket(doltlite_server_socket_t fd) {
- #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
-   int one = 1;
-   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-@@ -53,6 +65,92 @@ static void configureSocket(int fd) {
+ static void configureSocket(int fd) {
+@@ -83,6 +97,7 @@ static int connSend(void *pCtx, const unsigned char *pBuf, size_t nBuf) {
+   n = send(c->net.fd, (const char *)pBuf, (int)nBuf, flags);
+ #else
+   n = (int)send(c->net.fd, pBuf, nBuf, flags);
++  if (n < 0 && errno == EINTR) return MBEDTLS_ERR_SSL_WANT_WRITE;
  #endif
+   connIoResult(c, n);
+   return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
+@@ -93,6 +108,11 @@ static int connRecv(void *pCtx, unsigned char *pBuf, size_t nBuf) {
+   int n;
+   if (c->idleTimeoutMs && connApplyDeadline(c)) return MBEDTLS_ERR_SSL_TIMEOUT;
+   n = mbedtls_net_recv(&c->net, pBuf, nBuf);
++#ifndef _WIN32
++  if (n == MBEDTLS_ERR_NET_RECV_FAILED && errno == EINTR) {
++    return MBEDTLS_ERR_SSL_WANT_READ;
++  }
++#endif
+   if (n > 0) connIoResult(c, n);
+   else if (n < 0 && n != MBEDTLS_ERR_SSL_WANT_READ) connIoResult(c, n);
+   return n;
+@@ -155,6 +175,12 @@ DoltliteConn *doltliteConnOpenTimeout(
+   if (!c) return NULL;
+   memset(c, 0, sizeof(*c));
+   c->useTls = useTls;
++#ifdef MBEDTLS_THREADING_ALT
++  if (doltliteMbedtlsThreadingInit() != 0) {
++    sqlite3_free(c);
++    return NULL;
++  }
++#endif
+   c->ownsConf = 1;
+   if (timeoutMs > 0) {
+     c->deadlineMs = doltliteMonotonicMs() + timeoutMs;
+@@ -304,10 +330,119 @@ void doltliteConnClose(DoltliteConn *c) {
  }
  
-+
+ #ifndef DOLTLITE_AUTH_CLIENT_ONLY
+-DoltliteTlsServer *doltliteTlsServerNew(const char *certFile, const char *keyFile) {
 +static int serverConnWait(
 +  DoltliteServerConn *c,
 +  short events,
 +  unsigned long long startMs
 +){
 +#ifdef _WIN32
-+  for (;;) {
++  for(;;){
 +    doltlite_server_pollfd pfd;
 +    unsigned long long nowMs = (unsigned long long)doltliteMonotonicMs();
 +    int waitMs = 100;
 +    int rc;
-+
-+    if (c->stopCheck && c->stopCheck(c->stopContext)) return -1;
-+    if (c->timeoutMs > 0) {
-+      unsigned long long elapsedMs = nowMs - startMs;
-+      if (elapsedMs >= (unsigned)c->timeoutMs) return -1;
-+      if ((unsigned long long)waitMs > (unsigned)c->timeoutMs - elapsedMs) {
-+        waitMs = c->timeoutMs - (int)elapsedMs;
++    if( c->stopCheck && c->stopCheck(c->stopContext) ) return -1;
++    if( c->timeoutMs > 0 ){
++      unsigned long long elapsed = nowMs - startMs;
++      if( elapsed >= (unsigned)c->timeoutMs ) return -1;
++      if( (unsigned long long)waitMs > (unsigned)c->timeoutMs - elapsed ){
++        waitMs = c->timeoutMs - (int)elapsed;
 +      }
 +    }
-+
 +    pfd.fd = c->serverFd;
 +    pfd.events = events;
 +    pfd.revents = 0;
 +    rc = WSAPoll(&pfd, 1, waitMs);
-+    if (rc > 0
-+        && (pfd.revents & (events | DOLTLITE_SERVER_POLLERR
-+                           | DOLTLITE_SERVER_POLLHUP
-+                           | DOLTLITE_SERVER_POLLNVAL)) != 0) {
++    if( rc > 0
++     && (pfd.revents & (events | DOLTLITE_SERVER_POLLERR
++                        | DOLTLITE_SERVER_POLLHUP
++                        | DOLTLITE_SERVER_POLLNVAL))!=0 ){
 +      return c->stopCheck && c->stopCheck(c->stopContext) ? -1 : 0;
 +    }
-+    if (rc < 0 && WSAGetLastError() != WSAEINTR) return -1;
++    if( rc < 0 && WSAGetLastError()!=WSAEINTR ) return -1;
 +  }
 +#else
 +  (void)c;
@@ -1335,81 +1575,116 @@ index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a
 +#endif
 +}
 +
-+static int serverConnSend(void *pCtx, const unsigned char *pBuf, size_t nBuf) {
-+  DoltliteServerConn *c = (DoltliteServerConn *)pCtx;
-+  unsigned long long startMs = 0;
-+#ifdef _WIN32
-+  startMs = (unsigned long long)doltliteMonotonicMs();
-+#endif
-+  for (;;) {
++static int serverConnSend(void *pCtx, const unsigned char *pBuf, size_t nBuf){
++  DoltliteServerConn *c = (DoltliteServerConn*)pCtx;
++  unsigned long long startMs = (unsigned long long)doltliteMonotonicMs();
++  for(;;){
 +    int n;
-+    if (serverConnWait(c, DOLTLITE_SERVER_POLLOUT, startMs) != 0) {
++    if( !c->bPolling
++     && serverConnWait(c, DOLTLITE_SERVER_POLLOUT, startMs)!=0 ){
 +      return MBEDTLS_ERR_NET_SEND_FAILED;
 +    }
 +    n = doltliteServerSocketSend(c->serverFd, pBuf, nBuf);
++    if( n >= 0 ) return n;
 +#ifdef _WIN32
-+    if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) continue;
-+    if (n < 0 && WSAGetLastError() == WSAEINTR) continue;
++    {
++      int err = WSAGetLastError();
++      if( err==WSAEINTR ){
++        if( c->bPolling ) return MBEDTLS_ERR_SSL_WANT_WRITE;
++        continue;
++      }
++      if( err==WSAEWOULDBLOCK ){
++        if( c->bPolling ) return MBEDTLS_ERR_SSL_WANT_WRITE;
++        continue;
++      }
++    }
 +#else
-+    if (n < 0 && errno == EINTR) return MBEDTLS_ERR_SSL_WANT_WRITE;
++    if( errno==EINTR ) return MBEDTLS_ERR_SSL_WANT_WRITE;
++    if( c->bPolling && (errno==EAGAIN || errno==EWOULDBLOCK) ){
++      return MBEDTLS_ERR_SSL_WANT_WRITE;
++    }
 +#endif
-+    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
++    return MBEDTLS_ERR_NET_SEND_FAILED;
 +  }
 +}
 +
-+static int serverConnRecv(void *pCtx, unsigned char *pBuf, size_t nBuf) {
-+  DoltliteServerConn *c = (DoltliteServerConn *)pCtx;
-+  unsigned long long startMs = 0;
-+#ifdef _WIN32
-+  startMs = (unsigned long long)doltliteMonotonicMs();
-+#endif
-+  for (;;) {
++static int serverConnRecv(void *pCtx, unsigned char *pBuf, size_t nBuf){
++  DoltliteServerConn *c = (DoltliteServerConn*)pCtx;
++  unsigned long long startMs = (unsigned long long)doltliteMonotonicMs();
++  for(;;){
 +    int n;
-+    if (serverConnWait(c, DOLTLITE_SERVER_POLLIN, startMs) != 0) {
++    if( !c->bPolling
++     && serverConnWait(c, DOLTLITE_SERVER_POLLIN, startMs)!=0 ){
 +      return MBEDTLS_ERR_NET_RECV_FAILED;
 +    }
 +    n = doltliteServerSocketRecv(c->serverFd, pBuf, nBuf);
++    if( n >= 0 ) return n;
 +#ifdef _WIN32
-+    if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) continue;
-+    if (n < 0 && WSAGetLastError() == WSAEINTR) continue;
++    {
++      int err = WSAGetLastError();
++      if( err==WSAEINTR ){
++        if( c->bPolling ) return MBEDTLS_ERR_SSL_WANT_READ;
++        continue;
++      }
++      if( err==WSAEWOULDBLOCK ){
++        if( c->bPolling ) return MBEDTLS_ERR_SSL_WANT_READ;
++        continue;
++      }
++    }
 +#else
-+    if (n < 0 && errno == EINTR) return MBEDTLS_ERR_SSL_WANT_READ;
++    if( errno==EINTR ) return MBEDTLS_ERR_SSL_WANT_READ;
++    if( c->bPolling && (errno==EAGAIN || errno==EWOULDBLOCK) ){
++      return MBEDTLS_ERR_SSL_WANT_READ;
++    }
 +#endif
-+    return n < 0 ? MBEDTLS_ERR_NET_RECV_FAILED : n;
++    return MBEDTLS_ERR_NET_RECV_FAILED;
 +  }
 +}
 +
- static int connApplyDeadline(DoltliteConn *c) {
-   long long remaining;
-   if (c->deadlineMs == 0) return 0;
-@@ -138,6 +232,10 @@ DoltliteConn *doltliteConnOpenTimeout(
-   if (!c) return NULL;
-   memset(c, 0, sizeof(*c));
-   c->useTls = useTls;
-+  if (doltliteMbedtlsThreadingInit() != 0) {
-+    sqlite3_free(c);
-+    return NULL;
-+  }
-   c->ownsConf = 1;
-   if (timeoutMs > 0) {
-     c->deadlineMs = doltliteMonotonicMs() + timeoutMs;
-@@ -261,10 +359,14 @@ void doltliteConnClose(DoltliteConn *c) {
- }
- 
- #ifndef DOLTLITE_AUTH_CLIENT_ONLY
--DoltliteTlsServer *doltliteTlsServerNew(const char *certFile, const char *keyFile) {
-+DoltliteTlsServer *doltliteServerTlsNew(const char *certFile, const char *keyFile) {
++DoltliteTlsServer *doltliteServerTlsNew(const char *certFile, const char *keyFile){
    DoltliteTlsServer *s = (DoltliteTlsServer *)sqlite3_malloc((int)sizeof(*s));
-   if (!s) return NULL;
+-  if (!s) return NULL;
++  if( !s ) return NULL;
    memset(s, 0, sizeof(*s));
-+  if (doltliteMbedtlsThreadingInit() != 0) {
++  if( doltliteMbedtlsThreadingInit()!=0 ){
 +    sqlite3_free(s);
 +    return NULL;
 +  }
  
    mbedtls_x509_crt_init(&s->cert);
    mbedtls_pk_init(&s->key);
-@@ -295,11 +397,11 @@ DoltliteTlsServer *doltliteTlsServerNew(const char *certFile, const char *keyFil
+@@ -315,35 +450,33 @@ DoltliteTlsServer *doltliteTlsServerNew(const char *certFile, const char *keyFil
+   mbedtls_ctr_drbg_init(&s->drbg);
+   mbedtls_entropy_init(&s->entropy);
+ 
+-  if (mbedtls_ctr_drbg_seed(&s->drbg, mbedtls_entropy_func, &s->entropy,
+-                            (const unsigned char *)"doltlite-tls-srv", 16) != 0) {
++  if( mbedtls_ctr_drbg_seed(&s->drbg, mbedtls_entropy_func, &s->entropy,
++                            (const unsigned char *)"doltlite-tls-srv", 16)!=0 ){
+     goto fail;
+   }
+-  if (mbedtls_x509_crt_parse_file(&s->cert, certFile) != 0) goto fail;
+-  if (mbedtls_pk_parse_keyfile(&s->key, keyFile, NULL,
+-                               mbedtls_ctr_drbg_random, &s->drbg) != 0) {
++  if( mbedtls_x509_crt_parse_file(&s->cert, certFile)!=0 ) goto fail;
++  if( mbedtls_pk_parse_keyfile(&s->key, keyFile, NULL,
++                               mbedtls_ctr_drbg_random, &s->drbg)!=0 ){
+     goto fail;
+   }
+-  if (mbedtls_ssl_config_defaults(&s->conf, MBEDTLS_SSL_IS_SERVER,
++  if( mbedtls_ssl_config_defaults(&s->conf, MBEDTLS_SSL_IS_SERVER,
+                                   MBEDTLS_SSL_TRANSPORT_STREAM,
+-                                  MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
++                                  MBEDTLS_SSL_PRESET_DEFAULT)!=0 ){
+     goto fail;
+   }
+   mbedtls_ssl_conf_min_tls_version(&s->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+   mbedtls_ssl_conf_rng(&s->conf, mbedtls_ctr_drbg_random, &s->drbg);
+-
+   mbedtls_ssl_conf_authmode(&s->conf, MBEDTLS_SSL_VERIFY_NONE);
+-  if (mbedtls_ssl_conf_own_cert(&s->conf, &s->cert, &s->key) != 0) goto fail;
+-
++  if( mbedtls_ssl_conf_own_cert(&s->conf, &s->cert, &s->key)!=0 ) goto fail;
    return s;
  
  fail:
@@ -1419,59 +1694,70 @@ index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a
  }
  
 -void doltliteTlsServerFree(DoltliteTlsServer *s) {
-+void doltliteServerTlsFree(DoltliteTlsServer *s) {
-   if (!s) return;
+-  if (!s) return;
++void doltliteServerTlsFree(DoltliteTlsServer *s){
++  if( !s ) return;
    mbedtls_ssl_config_free(&s->conf);
    mbedtls_x509_crt_free(&s->cert);
-@@ -309,23 +411,31 @@ void doltliteTlsServerFree(DoltliteTlsServer *s) {
+   mbedtls_pk_free(&s->key);
+@@ -352,53 +485,126 @@ void doltliteTlsServerFree(DoltliteTlsServer *s) {
    sqlite3_free(s);
  }
  
--DoltliteConn *doltliteConnServerAccept(DoltliteTlsServer *s, int clientFd) {
+-DoltliteConn *doltliteConnServerAttach(DoltliteTlsServer *s, int clientFd) {
 -  DoltliteConn *c = (DoltliteConn *)sqlite3_malloc((int)sizeof(*c));
-+DoltliteServerConn *doltliteServerConnAccept(
-+  DoltliteTlsServer *s,
-+  doltlite_server_socket_t clientFd,
-+  int timeoutMs,
-+  DoltliteServerStopCheck stopCheck,
-+  void *stopContext
-+) {
-+  DoltliteServerConn *c = (DoltliteServerConn *)sqlite3_malloc((int)sizeof(*c));
-   int ret;
 -  if (!c) {
 -    doltliteCloseSocket(clientFd);
--    return NULL;
--  }
-+  if (!c) return NULL;
++DoltliteServerConn *doltliteServerConnAttach(
++  DoltliteTlsServer *s,
++  doltlite_server_socket_t clientFd
++){
++  DoltliteServerConn *c = (DoltliteServerConn*)sqlite3_malloc((int)sizeof(*c));
++  if( !c ){
++    doltliteServerSocketClose(clientFd);
+     return NULL;
+   }
    memset(c, 0, sizeof(*c));
    c->useTls = 1;
 -  c->ownsConf = 0;
 -  mbedtls_net_init(&c->net);
 -  c->net.fd = clientFd;
++  c->bPolling = 1;
 +  c->serverFd = clientFd;
-+  c->timeoutMs = timeoutMs;
-+  c->stopCheck = stopCheck;
-+  c->stopContext = stopContext;
++  if( doltliteMbedtlsThreadingInit()!=0 ) goto fail_no_ssl;
    configureSocket(clientFd);
-+  if (doltliteMbedtlsThreadingInit() != 0) {
-+    sqlite3_free(c);
-+    return NULL;
-+  }
    mbedtls_ssl_init(&c->ssl);
- 
-   if (mbedtls_ssl_setup(&c->ssl, &s->conf) != 0) goto fail;
--  mbedtls_ssl_set_bio(&c->ssl, &c->net, connSend, mbedtls_net_recv, NULL);
+-
+-  if (mbedtls_ssl_setup(&c->ssl, &s->conf) != 0) goto fail;
+-  mbedtls_ssl_set_bio(&c->ssl, c, connSend, connRecv, NULL);
++  if( mbedtls_ssl_setup(&c->ssl, &s->conf)!=0 ) goto fail_ssl;
 +  mbedtls_ssl_set_bio(&c->ssl, c, serverConnSend, serverConnRecv, NULL);
-   do {
-     ret = mbedtls_ssl_handshake(&c->ssl);
-   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-@@ -334,23 +444,62 @@ DoltliteConn *doltliteConnServerAccept(DoltliteTlsServer *s, int clientFd) {
+   return c;
  
- fail:
+-fail:
++fail_ssl:
    mbedtls_ssl_free(&c->ssl);
 -  mbedtls_net_free(&c->net);
++fail_no_ssl:
++  doltliteServerSocketClose(clientFd);
    sqlite3_free(c);
    return NULL;
+ }
+ 
+-int doltliteConnHandshakeStep(DoltliteConn *c) {
++int doltliteServerConnHandshakeStep(DoltliteServerConn *c){
+   int ret;
+-  if (!c || !c->useTls) return -1;
++  if( !c || !c->useTls ) return -1;
++  c->bPolling = 1;
+   ret = mbedtls_ssl_handshake(&c->ssl);
+-  if (ret == 0) return 0;
+-  if (ret == MBEDTLS_ERR_SSL_WANT_READ) return 1;
+-  if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) return 2;
++  if( ret==0 ) return 0;
++  if( ret==MBEDTLS_ERR_SSL_WANT_READ ) return 1;
++  if( ret==MBEDTLS_ERR_SSL_WANT_WRITE ) return 2;
+   return -1;
  }
  
 -DoltliteConn *doltliteConnFromFd(int clientFd) {
@@ -1485,11 +1771,11 @@ index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a
 +  int timeoutMs,
 +  DoltliteServerStopCheck stopCheck,
 +  void *stopContext
-+) {
-+  DoltliteServerConn *c = (DoltliteServerConn *)sqlite3_malloc((int)sizeof(*c));
-+  if (!c) return NULL;
++){
++  DoltliteServerConn *c = (DoltliteServerConn*)sqlite3_malloc((int)sizeof(*c));
++  if( !c ) return NULL;
    memset(c, 0, sizeof(*c));
-   c->useTls = 0;
+-  c->useTls = 0;
 -  c->ownsConf = 0;
 -  mbedtls_net_init(&c->net);
 -  c->net.fd = clientFd;
@@ -1500,46 +1786,76 @@ index 85a1aa26dc92b273639ad4cca337d70f6d2de61f..3ae40a47690976be077f39550ac59f2a
    configureSocket(clientFd);
    return c;
  }
-+int doltliteServerConnWriteAll(DoltliteServerConn *c, const void *buf, int nbuf) {
-+  const unsigned char *p = (const unsigned char *)buf;
++
++int doltliteServerConnReadNonblock(DoltliteServerConn *c, void *buf, int nbuf){
++  int n;
++  if( !c || nbuf<=0 ) return -1;
++  if( !c->useTls ) return doltliteServerSocketRecvNonblock(c->serverFd, buf, nbuf);
++  c->bPolling = 1;
++  n = mbedtls_ssl_read(&c->ssl, (unsigned char*)buf, (size_t)nbuf);
++  if( n==MBEDTLS_ERR_SSL_WANT_READ || n==MBEDTLS_ERR_SSL_WANT_WRITE ) return -2;
++  if( n==MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY ) return 0;
++  return n<0 ? -1 : n;
++}
++
++int doltliteServerConnWriteAll(DoltliteServerConn *c, const void *buf, int nbuf){
++  const unsigned char *p = (const unsigned char*)buf;
 +  int off = 0;
-+  while (off < nbuf) {
++  while( off<nbuf ){
 +    int n = c->useTls
-+      ? mbedtls_ssl_write(&c->ssl, p + off, (size_t)(nbuf - off))
-+      : serverConnSend(c, p + off, (size_t)(nbuf - off));
-+    if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-+    if (n <= 0) return 1;
++          ? mbedtls_ssl_write(&c->ssl, p+off, (size_t)(nbuf-off))
++          : serverConnSend(c, p+off, (size_t)(nbuf-off));
++    if( n==MBEDTLS_ERR_SSL_WANT_READ || n==MBEDTLS_ERR_SSL_WANT_WRITE ) continue;
++    if( n<=0 ) return 1;
 +    off += n;
 +  }
 +  return 0;
 +}
-+int doltliteServerConnRead(DoltliteServerConn *c, void *buf, int nbuf) {
-+  for (;;) {
-+    int n = c->useTls ? mbedtls_ssl_read(&c->ssl, (unsigned char *)buf, (size_t)nbuf)
-+                      : serverConnRecv(c, buf, (size_t)nbuf);
-+    if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-+    if (c->useTls && n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
-+    return n < 0 ? -1 : n;
++
++int doltliteServerConnRead(DoltliteServerConn *c, void *buf, int nbuf){
++  for(;;){
++    int n = c->useTls
++          ? mbedtls_ssl_read(&c->ssl, (unsigned char*)buf, (size_t)nbuf)
++          : serverConnRecv(c, (unsigned char*)buf, (size_t)nbuf);
++    if( n==MBEDTLS_ERR_SSL_WANT_READ || n==MBEDTLS_ERR_SSL_WANT_WRITE ) continue;
++    if( c->useTls && n==MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY ) return 0;
++    return n<0 ? -1 : n;
 +  }
 +}
-+int doltliteServerConnSetTimeout(DoltliteServerConn *c, int timeoutMs) {
++
++int doltliteServerConnSetTimeout(DoltliteServerConn *c, int timeoutMs){
++  if( !c ) return 1;
++  c->timeoutMs = timeoutMs;
 +  return doltliteServerSocketSetTimeout(c->serverFd, timeoutMs);
 +}
-+void doltliteServerConnCloseNotify(DoltliteServerConn *c) {
-+  if (c && c->useTls) (void)mbedtls_ssl_close_notify(&c->ssl);
++
++void doltliteServerConnConfigureWorker(
++  DoltliteServerConn *c,
++  int timeoutMs,
++  DoltliteServerStopCheck stopCheck,
++  void *stopContext
++){
++  if( !c ) return;
++  c->bPolling = 0;
++  c->timeoutMs = timeoutMs;
++  c->stopCheck = stopCheck;
++  c->stopContext = stopContext;
 +}
-+void doltliteServerConnClose(DoltliteServerConn *c) {
-+  if (!c) return;
-+  if (c->useTls) {
-+    mbedtls_ssl_free(&c->ssl);
-+  }
++
++void doltliteServerConnCloseNotify(DoltliteServerConn *c){
++  if( c && c->useTls ) (void)mbedtls_ssl_close_notify(&c->ssl);
++}
++
++void doltliteServerConnClose(DoltliteServerConn *c){
++  if( !c ) return;
++  if( c->useTls ) mbedtls_ssl_free(&c->ssl);
 +  doltliteServerSocketClose(c->serverFd);
 +  sqlite3_free(c);
 +}
 +
  #endif
 diff --git a/doltlite_tls.h b/doltlite_tls.h
-index 790d01b86e9241403a2a61eb2b066b93b3141bb9..a684acd0f4399e9fd106a7474936b2e1ac17dca7 100644
+index d3f4fae..f85e931 100644
 --- a/doltlite_tls.h
 +++ b/doltlite_tls.h
 @@ -2,6 +2,7 @@
@@ -1550,7 +1866,7 @@ index 790d01b86e9241403a2a61eb2b066b93b3141bb9..a684acd0f4399e9fd106a7474936b2e1
  
  #ifdef __cplusplus
  extern "C" {
-@@ -21,12 +22,29 @@ static inline DoltliteConn *doltliteConnOpen(const char *host, int port, int use
+@@ -21,18 +22,40 @@ static inline DoltliteConn *doltliteConnOpen(const char *host, int port, int use
  
  #ifndef DOLTLITE_AUTH_CLIENT_ONLY
  typedef struct DoltliteTlsServer DoltliteTlsServer;
@@ -1560,43 +1876,47 @@ index 790d01b86e9241403a2a61eb2b066b93b3141bb9..a684acd0f4399e9fd106a7474936b2e1
 -DoltliteTlsServer *doltliteTlsServerNew(const char *certFile, const char *keyFile);
 -void doltliteTlsServerFree(DoltliteTlsServer *s);
 -
--DoltliteConn *doltliteConnServerAccept(DoltliteTlsServer *s, int clientFd);
--DoltliteConn *doltliteConnFromFd(int clientFd);
+-/* Own clientFd. Handshake is doltliteConnHandshakeStep; the socket must be
+-** nonblocking or that step waits inside recv. */
+-DoltliteConn *doltliteConnServerAttach(DoltliteTlsServer *s, int clientFd);
 +DoltliteTlsServer *doltliteServerTlsNew(const char *certFile, const char *keyFile);
 +void doltliteServerTlsFree(DoltliteTlsServer *s);
-+DoltliteServerConn *doltliteServerConnAccept(
++DoltliteServerConn *doltliteServerConnAttach(
 +  DoltliteTlsServer *s,
-+  doltlite_server_socket_t clientFd,
-+  int timeoutMs,
-+  DoltliteServerStopCheck stopCheck,
-+  void *stopContext
++  doltlite_server_socket_t clientFd
 +);
+ /* 0 done, 1 want read, 2 want write, -1 failed. */
+-int doltliteConnHandshakeStep(DoltliteConn *conn);
+-DoltliteConn *doltliteConnFromFd(int clientFd);
++int doltliteServerConnHandshakeStep(DoltliteServerConn *conn);
 +DoltliteServerConn *doltliteServerConnFromSocket(
 +  doltlite_server_socket_t clientFd,
 +  int timeoutMs,
 +  DoltliteServerStopCheck stopCheck,
 +  void *stopContext
 +);
-+void doltliteServerConnCloseNotify(DoltliteServerConn *conn);
++int doltliteServerConnReadNonblock(DoltliteServerConn *conn, void *buf, int nbuf);
 +int doltliteServerConnWriteAll(DoltliteServerConn *conn, const void *buf, int nbuf);
 +int doltliteServerConnRead(DoltliteServerConn *conn, void *buf, int nbuf);
 +int doltliteServerConnSetTimeout(DoltliteServerConn *conn, int timeoutMs);
++void doltliteServerConnConfigureWorker(
++  DoltliteServerConn *conn,
++  int timeoutMs,
++  DoltliteServerStopCheck stopCheck,
++  void *stopContext
++);
++void doltliteServerConnCloseNotify(DoltliteServerConn *conn);
 +void doltliteServerConnClose(DoltliteServerConn *conn);
  #endif
  
- int doltliteConnWriteAll(DoltliteConn *conn, const void *buf, int nbuf);
-@@ -37,6 +55,9 @@ int doltliteConnSetTimeout(DoltliteConn *conn, int timeoutMs);
- 
- void doltliteConnClose(DoltliteConn *conn);
- 
-+/* Initialize the embedded Mbed TLS threading hooks before any TLS operation. */
++/* Initialize the configured Mbed TLS thread hooks before network/TLS use. */
 +int doltliteMbedtlsThreadingInit(void);
 +
- #ifdef __cplusplus
- }
- #endif
+ /* >0 bytes, 0 on EOF, -1 on error, -2 if a nonblocking read would wait. */
+ int doltliteConnReadNonblock(DoltliteConn *conn, void *buf, int nbuf);
+ 
 diff --git a/mbedtls/library/net_sockets.c b/mbedtls/library/net_sockets.c
-index c919f6f5748b70eb4274045b8cca6e4bf1a131ef..64b109ff2c1b7339dc810e5b7ee5f52b6b0ad4ea 100644
+index c919f6f..64b109f 100644
 --- a/mbedtls/library/net_sockets.c
 +++ b/mbedtls/library/net_sockets.c
 @@ -35,9 +35,8 @@
@@ -1649,7 +1969,7 @@ index c919f6f5748b70eb4274045b8cca6e4bf1a131ef..64b109ff2c1b7339dc810e5b7ee5f52b
  #if !defined(EFIX64) && !defined(EFI32)
 diff --git a/threading_alt.h b/threading_alt.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..8a5bdbbcad12f1ae9fe385381d590d50ae21ec04
+index 0000000..8a5bdbb
 --- /dev/null
 +++ b/threading_alt.h
 @@ -0,0 +1,8 @@

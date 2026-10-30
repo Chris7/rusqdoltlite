@@ -12,9 +12,10 @@ DoltLite source.
 
 To update DoltLite:
 
-1. Set `DOLTLITE_GIT_REF` in `../upgrade_git.sh` to the upstream release tag.
+1. Set `DOLTLITE_GIT_REF` in `../upgrade_git.sh` to the upstream commit SHA or
+   exact release tag.
 2. Run `../upgrade_git.sh`. It builds the pristine amalgamation from a fresh
-   clone of that exact ref, vendors matching remote sidecars, regenerates
+   shallow fetch of that exact ref, vendors matching remote sidecars, regenerates
    bindings, and runs the validation workflow.
 3. If a patch no longer applies, check whether upstream incorporated that
    behavior. Remove the obsolete hunk or refresh only that patch; never edit
@@ -26,14 +27,33 @@ To update DoltLite:
 matches. A failed build is an upgrade-review signal, not permission to silently
 skip a local change.
 
+## DoltLite master snapshot 2026-10-30
+
+The current pristine source is master commit
+`ffa0eafa93ab695f7863703a2cdaaa3fb7663374`. Upstream now refreshes its HTTP
+inactivity deadline after successful reads; the existing 100 ms by eight byte
+progress fixture completed after about 0.8 seconds with a 500 ms timeout.
+That timer refresh can use the upstream implementation.
+
+The same snapshot fails the tracked chunked response regression: its HTTP
+parser returns `SQLITE_PROTOCOL` for the valid chunked response. The
+progressing-response fixture survives its 500 ms timeout, but
+`http_idle_timeout_ms` remains in the request path and fails that test's path
+assertion. A separate stalled-response fixture returns `SQLITE_ERROR` instead
+of the expected `SQLITE_IOERR` phase diagnostic. Preserve the tested chunk
+parser, per-URL timeout handling, and transport error mapping locally. The
+timeout checks above used Linux plaintext HTTP; they do not establish TLS or
+Windows behavior.
+
 Keep each patch scoped to one source tree. A behavior may have coordinated
 parts in the DoltLite and CBS series; apply each series directly to its own
 staged source tree and document any dependency between them. The numbered core
 patches apply to `doltlite.c`; remote-server sidecar patches apply to the
 staged `doltlite_remotesrv.c` and `doltlite_remotesrv.h` files before the
-server is appended to the amalgamation. Patch `0009` also applies to the staged
-`doltlite_tls.c` sidecar so its opaque connection allocation matches the
-amalgamation's `DoltliteConn` layout. Currently, `0001` and `0002` add
+server is appended to the amalgamation. `0009` applies to the staged
+`doltlite.c`; the native TLS client transport and inactivity refresh come from
+upstream. `0011` owns the local Windows server and staged server-side TLS
+portability changes. Currently, `0001` and `0002` add
 `dolt_remote('set-url', ...)`, `0003` adds the CBS upload lock hooks, and
 `0004-remote-server-vfs.patch` lets each native remote server select an
 optional named SQLite VFS while preserving the process default when omitted.
@@ -46,19 +66,17 @@ adds a NO_SEED-only native helper that commits an empty refs table for a new
 CBS DoltLite store without a SQL write that would create an unborn zero-tip
 branch. `0008-http-upload-batch-16mb.patch` reduces the maximum buffered HTTP
 upload batch from 32 MiB to 16 MiB.
-`0009-http-session-transfer-and-progress.patch` is one regenerated net patch
-for the former DoltLite patches 0009-0016. Its retention checklist is also in
-the patch header so an upstream refresh keeps every behavior. It keeps the
+`0009-http-session-transfer-and-progress.patch` carries the remaining
+fork-specific HTTP behavior on the upstream master snapshot. It keeps the
 public RemoteServer limits at 64 MiB per chunk and 128 MiB per request, while a
 session-owned numeric IPv4 loopback server may accept a request up to the native
 signed-int bound (with 24 bytes reserved for Prolly hash and length framing).
-HTTP operation timeouts are inactivity limits refreshed on successful reads and
-writes; connect and TLS handshake remain bounded at 30 seconds. The request URL
-option `http_idle_timeout_ms` is capped at five minutes and takes precedence
-over `DOLTLITE_HTTP_TIMEOUT_MS`; zero is accepted only for clear HTTP URLs with
-a numeric address in 127/8, as used by URI-backed session loopback servers.
-Transport diagnostics retain fixed phase and configured timeout context without
-including URLs, headers, credentials, provider bodies, or false timeout claims.
+The request URL option `http_idle_timeout_ms` is capped at five minutes and
+takes precedence over `DOLTLITE_HTTP_TIMEOUT_MS`; zero is accepted only for
+clear HTTP URLs with a numeric address in 127/8, as used by URI-backed session
+loopback servers. Transport diagnostics retain fixed phase and configured
+timeout context without including URLs, headers, credentials, provider bodies,
+or false timeout claims.
 
 The same patch provides an opt-in per-connection Rust callback for logical Dolt
 chunk progress without changing public SQL or HTTP behavior. It plans reachable,

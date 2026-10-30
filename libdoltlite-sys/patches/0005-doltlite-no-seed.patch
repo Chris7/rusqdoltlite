@@ -28,10 +28,11 @@ index 2393b15..4a518d1 100644
    db->openFlags = flags;
    assert( SQLITE_OPEN_READONLY  == 0x01 );
    assert( SQLITE_OPEN_READWRITE == 0x02 );
-@@ -491971,6 +491976,7 @@ SQLITE_PRIVATE int sqlite3BtreeOpen(
+@@ -491971,7 +491976,8 @@ SQLITE_PRIVATE int sqlite3BtreeOpen(
    pBt->store.corruptMidStream = poisonAfterOpen;
    if( hasMainBtree
     && !p->isDetached
+    && !pBt->store.openPending
 +   && !db->bSkipDoltSeed
     && !pBt->store.notADatabase
     && !pBt->store.corruptMidStream ){

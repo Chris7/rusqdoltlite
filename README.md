@@ -4,6 +4,11 @@ This project is a fork of [`Rusqlite`](https://github.com/rusqlite/rusqlite) usi
 
 The Rust wrapper is synced to upstream `rusqlite` commit `0f491a0e19d7a956031ea4ce354e085680766b28` and requires SQLite 3.45.3 or newer.
 
+The pristine DoltLite sources under `libdoltlite-sys/doltlite/` are pinned to
+master snapshot `ffa0eafa93ab695f7863703a2cdaaa3fb7663374` from 2026-10-30.
+Regeneration fetches that exact commit; RusqDoltLite-specific native behavior
+is maintained in numbered patches under `libdoltlite-sys/patches/`.
+
 ## Cloud Backed SQLite block-cache VFS
 
 The optional `blockcachevfs` feature builds Cloud Backed SQLite's VFS into the
@@ -110,7 +115,15 @@ flush changes to that existing remote database.
 creating a new container can choose a smaller size in bytes:
 
 ```rust,no_run
+use rusqlite::blockcachevfs::{BlockCacheVfs, Storage};
+
+# fn main() -> rusqlite::Result<()> {
+let vfs = BlockCacheVfs::builder("cache")?
+    .auth_callback(|_, _, _| Ok("test-token".to_owned()))
+    .init()?;
+let storage = Storage::google_json("test-project", "bucket/tenant-a");
 vfs.initialize_container(&storage, Some(256 * 1024))?; // 256 KiB
+# Ok(()) }
 ```
 
 Explicit block sizes must be powers of two, at least 32 KiB, and fit in the

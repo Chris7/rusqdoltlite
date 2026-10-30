@@ -542,8 +542,20 @@ mod build_bundled {
             .define("doltliteConnWriteAll", "doltliteBundledClientConnWriteAll")
             .define("doltliteConnRead", "doltliteBundledClientConnRead")
             .define(
+                "doltliteConnReadNonblock",
+                "doltliteBundledClientConnReadNonblock",
+            )
+            .define(
                 "doltliteConnSetTimeout",
                 "doltliteBundledClientConnSetTimeout",
+            )
+            .define(
+                "doltliteConnSetIdleTimeout",
+                "doltliteBundledClientConnSetIdleTimeout",
+            )
+            .define(
+                "doltliteConnTimeoutRemaining",
+                "doltliteBundledClientConnTimeoutRemaining",
             )
             .define("doltliteConnClose", "doltliteBundledClientConnClose")
             .include(staged_remote_dir)

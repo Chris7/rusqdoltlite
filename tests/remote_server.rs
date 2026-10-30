@@ -2087,7 +2087,15 @@ fn pull_persists_remote_branch_to_current_local_branch() -> Result<()> {
         params![format!("file://{}", remote_path.display())],
         |row| row.get(0),
     )?;
-    let _: i64 = clone.query_row("SELECT dolt_branch('-D', 'feature')", [], |row| row.get(0))?;
+    let feature_before_pull: bool = clone.query_row(
+        "SELECT EXISTS(SELECT 1 FROM dolt_branches WHERE name = 'feature')",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        !feature_before_pull,
+        "default clone should leave the non-default branch as a remote-tracking ref"
+    );
     let _: i64 = clone.query_row("SELECT dolt_pull('origin', 'feature')", [], |row| {
         row.get(0)
     })?;

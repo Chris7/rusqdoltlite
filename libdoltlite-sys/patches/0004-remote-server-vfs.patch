@@ -7,9 +7,11 @@ use the selected VFS for both database existence checks and ChunkStore opens.
 diff --git a/doltlite_remotesrv.c b/doltlite_remotesrv.c
 --- a/doltlite_remotesrv.c
 +++ b/doltlite_remotesrv.c
-@@ -70,5 +70,6 @@ struct DoltliteServer {
+@@ -70,7 +70,8 @@ struct DoltliteServer {
    int activeFd[SERVER_WORKERS];
    int timeoutMs;
+   PendingConn *aPending;
+   i64 nBodyAlloc;
 +  sqlite3_vfs *pVfs;
  
    DoltliteTlsServer *tls;

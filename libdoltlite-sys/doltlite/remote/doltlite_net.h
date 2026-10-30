@@ -78,6 +78,15 @@ static inline int doltliteNetInit(void) { return 0; }
 
 #endif
 
+static inline int doltliteSocketTimedOut(void) {
+#ifdef _WIN32
+  int err = WSAGetLastError();
+  return err == WSAETIMEDOUT || err == WSAEWOULDBLOCK;
+#else
+  return errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT;
+#endif
+}
+
 static inline int doltliteSocketSetBlocking(int fd, int blocking) {
 #ifdef _WIN32
   u_long mode = blocking ? 0 : 1;
@@ -91,6 +100,28 @@ static inline int doltliteSocketSetBlocking(int fd, int blocking) {
     flags |= O_NONBLOCK;
   }
   return fcntl(fd, F_SETFL, flags) == 0 ? 0 : 1;
+#endif
+}
+
+/* >0 bytes, 0 on EOF, -1 on error, -2 if the nonblocking socket would wait. */
+static inline int doltliteSocketRecv(int fd, void *buf, int nBuf) {
+#ifdef _WIN32
+  int n;
+  if (nBuf <= 0) return -1;
+  n = recv(fd, (char *)buf, nBuf, 0);
+  if (n == 0) return 0;
+  if (n > 0) return n;
+  n = WSAGetLastError();
+  if (n == WSAEWOULDBLOCK || n == WSAEINTR) return -2;
+  return -1;
+#else
+  int n;
+  if (nBuf <= 0) return -1;
+  n = (int)recv(fd, buf, (size_t)nBuf, 0);
+  if (n == 0) return 0;
+  if (n > 0) return n;
+  if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return -2;
+  return -1;
 #endif
 }
 

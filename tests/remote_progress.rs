@@ -42,6 +42,7 @@ enum CloneProxyFault {
     RejectGetChunks,
     CorruptGetChunks,
     TruncateGetChunks,
+    TruncateGetChunksOnce,
 }
 
 struct RecordingProxy {
@@ -304,12 +305,21 @@ fn handle_proxy_request(
         read_http_response(&mut upstream)?
     };
 
-    if is_get_chunks && get_chunks_number == 1 {
+    if is_get_chunks {
         match fault {
-            value if value == CloneProxyFault::CorruptGetChunks as usize => {
+            value
+                if value == CloneProxyFault::CorruptGetChunks as usize
+                    && get_chunks_number == 1 =>
+            {
                 corrupt_first_get_chunk_payload(&mut response)?;
             }
             value if value == CloneProxyFault::TruncateGetChunks as usize => {
+                response.truncate(response.len().saturating_sub(1));
+            }
+            value
+                if value == CloneProxyFault::TruncateGetChunksOnce as usize
+                    && get_chunks_number == 1 =>
+            {
                 response.truncate(response.len().saturating_sub(1));
             }
             _ => {}
@@ -906,6 +916,176 @@ fn progress_guard_is_scoped_and_reports_noop_and_delete_plans() -> Result<()> {
 }
 
 #[test]
+fn tag_push_progress_reports_missing_chunks_and_repeated_tag_is_noop() -> Result<()> {
+    let context = TestContext::new(1, 64)?;
+    let _: i64 = context
+        .source
+        .query_row("SELECT dolt_tag('push-progress-tag')", [], |row| row.get(0))?;
+    let callback_trace = Arc::clone(&context.trace);
+    let _guard = context.source.dolt_push_progress_callback(move |event| {
+        callback_trace
+            .lock()
+            .expect("should lock progress callback trace")
+            .push(TraceEntry::Progress(event));
+    })?;
+
+    let _: i64 = context.source.query_row(
+        "SELECT dolt_push('origin', 'refs/tags/push-progress-tag')",
+        [],
+        |row| row.get(0),
+    )?;
+    let first_attempt = trace_snapshot(&context.trace);
+    let first_events = progress_events(&first_attempt);
+    let first_plan = first_events
+        .iter()
+        .find_map(|event| match event {
+            DoltPushProgressEvent::Plan {
+                missing_chunk_count,
+                missing_payload_bytes,
+            } => Some((*missing_chunk_count, *missing_payload_bytes)),
+            DoltPushProgressEvent::Uploaded { .. } => None,
+        })
+        .expect("tag push should report its transfer plan");
+    let first_records = chunk_requests(&first_attempt)
+        .iter()
+        .flat_map(|(_, request)| chunk_records(&request.body))
+        .collect::<Vec<_>>();
+    let uploaded = (
+        first_records.len() as u64,
+        first_records.iter().map(|(_, size)| size).sum::<u64>(),
+    );
+    assert!(first_plan.0 > 0, "tag push should transfer missing chunks");
+    assert_eq!(first_plan, uploaded);
+    assert!(matches!(
+        first_events.last(),
+        Some(DoltPushProgressEvent::Uploaded {
+            acknowledged_chunk_count,
+            acknowledged_payload_bytes
+        }) if (*acknowledged_chunk_count, *acknowledged_payload_bytes) == uploaded
+    ));
+
+    let repeat_trace_start = first_attempt.len();
+    let _: i64 = context.source.query_row(
+        "SELECT dolt_push('origin', 'refs/tags/push-progress-tag')",
+        [],
+        |row| row.get(0),
+    )?;
+    let complete_trace = trace_snapshot(&context.trace);
+    let repeat_attempt = &complete_trace[repeat_trace_start..];
+    assert_eq!(
+        progress_events(repeat_attempt),
+        vec![DoltPushProgressEvent::Plan {
+            missing_chunk_count: 0,
+            missing_payload_bytes: 0,
+        }],
+        "an unchanged remote tag reports a zero-work plan"
+    );
+    assert!(
+        chunk_requests(repeat_attempt).is_empty(),
+        "an unchanged tag push does not upload chunks"
+    );
+    assert!(
+        context.proxy.error().is_none(),
+        "proxy error: {:?}",
+        context.proxy.error()
+    );
+    Ok(())
+}
+
+#[test]
+fn interrupted_sync_file_remote_stops_after_ack_without_publishing_refs() -> Result<()> {
+    let temporary = tempfile::tempdir().expect("should create file push progress tempdir");
+    let source = Connection::open(temporary.path().join("file-push-source.db"))?;
+    source.execute_batch(
+        "CREATE TABLE values_for_push(id INTEGER PRIMARY KEY, value BLOB NOT NULL);",
+    )?;
+    for id in 0..4 {
+        let payload = deterministic_payload(256 * 1024, id as u32 + 1);
+        source.execute(
+            "INSERT INTO values_for_push(id, value) VALUES (?1, ?2)",
+            params![id as i64 + 1, &payload[..]],
+        )?;
+    }
+    let _: i64 = source.query_row("SELECT dolt_add('-A')", [], |row| row.get(0))?;
+    let _: String = source.query_row(
+        "SELECT dolt_commit('-m', 'file push progress seed')",
+        [],
+        |row| row.get(0),
+    )?;
+    let remote_path = temporary.path().join("file-push-remote.db");
+    let remote_url = format!("file://{}", remote_path.display());
+    let _: i64 = source.query_row(
+        "SELECT dolt_remote('add', 'origin', ?1)",
+        params![remote_url],
+        |row| row.get(0),
+    )?;
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback_events = Arc::clone(&events);
+    let interrupt = source.get_interrupt_handle();
+    let _guard = source.dolt_push_progress_callback(move |event| {
+        callback_events
+            .lock()
+            .expect("should lock file push progress events")
+            .push(event);
+        if matches!(event, DoltPushProgressEvent::Uploaded { .. }) {
+            interrupt.interrupt();
+        }
+    })?;
+    let interrupted =
+        source.query_row::<i64, _, _>("SELECT dolt_push('origin', 'main')", [], |row| row.get(0));
+    assert!(matches!(
+        interrupted,
+        Err(Error::SqliteFailure(code, _)) if code.extended_code == rusqlite::ffi::SQLITE_INTERRUPT
+    ));
+    let events = events
+        .lock()
+        .expect("should read file push progress events");
+    let plans = events
+        .iter()
+        .filter_map(|event| match event {
+            DoltPushProgressEvent::Plan {
+                missing_chunk_count,
+                ..
+            } => Some(*missing_chunk_count),
+            DoltPushProgressEvent::Uploaded { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let acknowledged = events
+        .iter()
+        .filter(|event| matches!(event, DoltPushProgressEvent::Uploaded { .. }))
+        .count();
+    assert_eq!(plans.len(), 1);
+    assert!(plans[0] > 1, "fixture must plan multiple chunks");
+    assert_eq!(acknowledged, 1, "sync must stop after the interrupted ACK");
+    drop(events);
+
+    let incomplete_clone = Connection::open(temporary.path().join("incomplete-file-clone.db"))?;
+    assert!(
+        incomplete_clone
+            .query_row::<i64, _, _>("SELECT dolt_clone(?1)", params![remote_url], |row| {
+                row.get(0)
+            })
+            .is_err(),
+        "an interrupted sync must not publish remote refs"
+    );
+    drop(incomplete_clone);
+
+    drop(_guard);
+    let _: i64 = source.query_row("SELECT dolt_push('origin', 'main')", [], |row| row.get(0))?;
+    let retry_clone = Connection::open(temporary.path().join("retry-file-clone.db"))?;
+    let _: i64 = retry_clone.query_row("SELECT dolt_clone(?1)", params![remote_url], |row| {
+        row.get(0)
+    })?;
+    let pushed_hash: String =
+        retry_clone.query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))?;
+    let source_hash: String =
+        source.query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))?;
+    assert_eq!(pushed_hash, source_hash);
+    Ok(())
+}
+
+#[test]
 fn interrupted_plan_and_final_acknowledgement_do_not_publish_refs() -> Result<()> {
     let context = TestContext::new(1, 64)?;
     let plan_interrupt = context.source.get_interrupt_handle();
@@ -1244,6 +1424,101 @@ fn observed_lazy_clone_is_rejected() -> Result<()> {
     assert!(
         get_chunks_requests(&trace_snapshot(&context.trace)).is_empty(),
         "lazy clone does not acquire graph chunks"
+    );
+    Ok(())
+}
+
+#[test]
+fn truncated_get_chunks_auto_retry_does_not_ack_failed_attempt() -> Result<()> {
+    let context = TestContext::new(1, 256)?;
+    push(&context.source, "main")?;
+    context
+        .proxy
+        .set_get_chunks_fault(CloneProxyFault::TruncateGetChunksOnce);
+    context.trace.lock().expect("should clear trace").clear();
+
+    let clone = Connection::open(context._temporary.path().join("truncated-retry-clone.db"))?;
+    let callback_trace = Arc::clone(&context.trace);
+    let _guard = clone.dolt_clone_progress_callback(move |event| {
+        callback_trace
+            .lock()
+            .expect("should lock truncated retry progress trace")
+            .push(TraceEntry::CloneProgress(event));
+    })?;
+    let _: i64 = clone.query_row(
+        "SELECT dolt_clone(?1)",
+        params![context.proxy.database_url()],
+        |row| row.get(0),
+    )?;
+
+    let trace = trace_snapshot(&context.trace);
+    let requests = get_chunks_requests(&trace);
+    assert!(
+        requests.len() >= 2,
+        "one transient truncation should retry the first batch"
+    );
+    let first = &requests[0].1;
+    let retry = &requests[1].1;
+    assert_eq!(first.status, Some(200));
+    assert_eq!(retry.status, Some(200));
+    assert_eq!(first.body, retry.body, "retry the same missing hash batch");
+    assert_eq!(first.response_body.len() + 1, retry.response_body.len());
+    assert_eq!(
+        retry.response_body.get(..first.response_body.len()),
+        Some(first.response_body.as_slice()),
+        "the first response is truncated by one byte"
+    );
+
+    let events = clone_progress_events(&trace);
+    assert_eq!(events.first(), Some(&DoltCloneProgressEvent::Started));
+    assert_eq!(events.last(), Some(&DoltCloneProgressEvent::Completed));
+    let retry_position = requests[1].0;
+    let first_progress_position = trace
+        .iter()
+        .position(|entry| {
+            matches!(
+                entry,
+                TraceEntry::CloneProgress(DoltCloneProgressEvent::Progress { .. })
+            )
+        })
+        .expect("successful retry should report clone progress");
+    assert!(
+        retry_position < first_progress_position,
+        "the truncated batch must not emit progress before the retry succeeds"
+    );
+    let expected_lengths = requests
+        .iter()
+        .skip(1)
+        .flat_map(|(_, request)| get_chunk_payload_lengths(request))
+        .collect::<Vec<_>>();
+    let expected_count = expected_lengths.len() as u64;
+    let expected_bytes = expected_lengths.iter().sum::<u64>();
+    let final_progress = events
+        .iter()
+        .filter_map(|event| match event {
+            DoltCloneProgressEvent::Progress {
+                downloaded_chunk_count,
+                downloaded_payload_bytes,
+                ..
+            } => Some((*downloaded_chunk_count, *downloaded_payload_bytes)),
+            DoltCloneProgressEvent::Started
+            | DoltCloneProgressEvent::Finalizing
+            | DoltCloneProgressEvent::Completed => None,
+        })
+        .next_back()
+        .expect("retry should finish with downloaded payload progress");
+    assert_eq!(final_progress, (expected_count, expected_bytes));
+
+    let clone_hash: String = clone.query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))?;
+    let source_hash: String =
+        context
+            .source
+            .query_row("SELECT dolt_hashof('main')", [], |row| row.get(0))?;
+    assert_eq!(clone_hash, source_hash);
+    assert!(
+        context.proxy.error().is_none(),
+        "proxy error: {:?}",
+        context.proxy.error()
     );
     Ok(())
 }

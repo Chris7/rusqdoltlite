@@ -9,8 +9,8 @@ export DOLTLITE_LIB_DIR="$SCRIPT_DIR/doltlite"
 export DOLTLITE_INCLUDE_DIR="$SCRIPT_DIR/doltlite"
 mkdir -p "$TARGET_DIR" "$DOLTLITE_LIB_DIR"
 
-# Set this to an exact upstream release tag for a reproducible upgrade.
-DOLTLITE_GIT_REF=v0.50.15
+# DoltLite master snapshot pinned on 2026-10-30 so regeneration stays reproducible.
+DOLTLITE_GIT_REF=ffa0eafa93ab695f7863703a2cdaaa3fb7663374
 
 # Build pristine upstream artifacts from the configured Git ref. RusqDoltLite
 # behavior is maintained separately in patches/ and applied only to Cargo's
@@ -26,9 +26,18 @@ trap cleanup 0 1 2 15
 
 SOURCE_DIR="$WORK_DIR/doltlite"
 BUILD_DIR="$SOURCE_DIR/build"
-git clone --depth 1 --branch "$DOLTLITE_GIT_REF" \
-  https://github.com/dolthub/doltlite.git "$SOURCE_DIR"
+git init --quiet "$SOURCE_DIR"
+git -C "$SOURCE_DIR" remote add origin \
+  https://github.com/dolthub/doltlite.git
+git -C "$SOURCE_DIR" fetch --depth 1 origin "$DOLTLITE_GIT_REF"
+git -C "$SOURCE_DIR" checkout --quiet --detach FETCH_HEAD
 DOLTLITE_REVISION=$(git -C "$SOURCE_DIR" rev-parse HEAD)
+if [ "${#DOLTLITE_GIT_REF}" -eq 40 ] \
+  && [ "$DOLTLITE_REVISION" != "$DOLTLITE_GIT_REF" ]; then
+  printf 'Expected DoltLite commit %s, got %s\n' \
+    "$DOLTLITE_GIT_REF" "$DOLTLITE_REVISION" >&2
+  exit 1
+fi
 printf 'Building DoltLite ref %s at %s\n' \
   "$DOLTLITE_GIT_REF" "$DOLTLITE_REVISION"
 
@@ -73,12 +82,16 @@ cp -R "$SOURCE_DIR/ext/mbedtls/include" \
 # Fail early if upstream master has moved beyond the local patch context. The
 # bundled Cargo builds below apply the same patch series to an OUT_DIR copy.
 PATCH_CHECK_DIR="$WORK_DIR/patch-check"
-mkdir -p "$PATCH_CHECK_DIR"
+mkdir -p "$PATCH_CHECK_DIR/mbedtls/library"
 cp "$DOLTLITE_LIB_DIR/doltlite.c" "$PATCH_CHECK_DIR/doltlite.c"
 cp "$DOLTLITE_LIB_DIR/remote/doltlite_remotesrv.c" \
   "$DOLTLITE_LIB_DIR/remote/doltlite_remotesrv.h" \
   "$DOLTLITE_LIB_DIR/remote/doltlite_tls.c" \
+  "$DOLTLITE_LIB_DIR/remote/doltlite_tls.h" \
+  "$DOLTLITE_LIB_DIR/remote/doltlite_net.h" \
   "$PATCH_CHECK_DIR/"
+cp "$DOLTLITE_LIB_DIR/remote/mbedtls/library/net_sockets.c" \
+  "$PATCH_CHECK_DIR/mbedtls/library/net_sockets.c"
 (
   cd "$PATCH_CHECK_DIR" || exit 1
   for PATCH_FILE in "$SCRIPT_DIR"/patches/*.patch; do
@@ -89,7 +102,6 @@ cp "$DOLTLITE_LIB_DIR/remote/doltlite_remotesrv.c" \
 
 # Regenerate bindgen file for doltlite.h
 rm -f "$DOLTLITE_LIB_DIR/bindgen_bundled_version.rs"
-cargo update --quiet
 # Just to make sure there is only one bindgen.rs file in target dir
 find "$TARGET_DIR" -type f -name bindgen.rs -exec rm {} \;
 env LIBDOLTLITE_SYS_BUNDLING=1 cargo build --features "buildtime_bindgen session" --no-default-features
@@ -109,7 +121,6 @@ rm -f "$DOLTLITE_LIB_DIR/sqlite3ext.h"
 
 # Sanity checks
 cd "$SCRIPT_DIR/.." || { echo "fatal error" >&2; exit 1; }
-cargo update --quiet
 cargo test --features "backup blob chrono functions limits load_extension serde_json trace vtab bundled"
 printf '    \e[35;1mFinished\e[0m bundled DoltLite tests\n'
 cargo test --features "bundled remote" --test remote_server

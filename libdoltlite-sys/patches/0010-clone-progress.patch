@@ -1,23 +1,23 @@
 Subject: [PATCH] Report native Dolt clone transfer progress
-Base: DoltLite v0.50.15 with local patches 0001-0009 applied
+Base: DoltLite master ffa0eafa93ab695f7863703a2cdaaa3fb7663374 with local patches 0001-0009
 
 Intent:
-- Preserve the existing `dolt_clone(...)` SQL API and unobserved transfer path.
-- Add an opt-in connection-scoped callback with Started, actual cumulative
-  verified transfer/reuse counters, Finalizing, and Completed events.
-- Do not scan or download the source graph to estimate totals or percentages.
-  During the existing sync, count successful source payload transfers and read
-  already-present chunks only from the local destination to find descendants
-  and report reuse. Do not add source payload requests for local reuse.
-- Keep completion after native refs installation and SQL working-tree setup.
-  Lazy clones reject an active observer because they do not fetch the full graph.
-- Keep all implementation in this patch, applied to staged DoltLite sources.
+- Preserve the existing dolt_clone SQL API and unobserved transfer path.
+- Add an opt-in connection-scoped callback with Started, verified transfer and
+  local reuse counters, Finalizing, and Completed events.
+- During observed sync, count successful source payload transfers and read
+  already-present chunks only from the local destination. Do not add source
+  payload requests for local reuse.
+- Preserve upstream clone refs rollback, durable install, and SQL session
+  recovery behavior. Report Finalizing before refs installation and honor an
+  interrupt there; report Completed only after final refs and working-tree
+  state are sealed.
+- Release the active callback guard on every post-attach return path. Lazy
+  clones reject an active observer because they do not fetch the full graph.
 
-diff --git a/doltlite.c b/doltlite.c
-index 22bc4a1..5d7a174 100644
 --- a/doltlite.c
 +++ b/doltlite.c
-@@ -514983,6 +514983,15 @@ typedef void (SQLITE_APICALL *DoltlitePushProgressCallback)(
+@@ -519919,6 +519919,15 @@
      void*, int, sqlite3_int64, sqlite3_int64
  );
  
@@ -33,7 +33,7 @@ index 22bc4a1..5d7a174 100644
  typedef struct DoltliteRemote DoltliteRemote;
  struct DoltliteRemote {
    int (*xGetChunk)(DoltliteRemote*, const ProllyHash*, u8**, int*);
-@@ -515020,6 +515029,14 @@ struct DoltliteRemote {
+@@ -519959,6 +519968,14 @@
    sqlite3_int64 nPushAcknowledgedChunks;
    sqlite3_int64 nPushAcknowledgedBytes;
    int bPushPutsAckOnFlush;
@@ -45,13 +45,15 @@ index 22bc4a1..5d7a174 100644
 +  sqlite3_int64 nCloneDownloadedBytes;
 +  sqlite3_int64 nCloneReusedChunks;
 +  sqlite3_int64 nCloneReusedBytes;
+   char zMissingChunkError[96];
  };
  
- typedef struct DoltlitePushProgressRegistration DoltlitePushProgressRegistration;
-@@ -515132,6 +515149,152 @@ static int doltlitePushProgressInterrupted(DoltliteRemote *pRemote){
+@@ -520070,6 +520087,152 @@
+ static int doltlitePushProgressInterrupted(DoltliteRemote *pRemote){
+   return pRemote && pRemote->pPushProgressDb
        && sqlite3_is_interrupted(pRemote->pPushProgressDb);
- }
- 
++}
++
 +typedef struct DoltliteCloneProgressRegistration DoltliteCloneProgressRegistration;
 +struct DoltliteCloneProgressRegistration {
 +  void *pContext;
@@ -196,14 +198,12 @@ index 22bc4a1..5d7a174 100644
 +      pRemote->nCloneDownloadedChunks, pRemote->nCloneDownloadedBytes,
 +      pRemote->nCloneReusedChunks, pRemote->nCloneReusedBytes);
 +  return doltliteCloneProgressInterrupted(pRemote) ? SQLITE_INTERRUPT : SQLITE_OK;
-+}
-+
- static inline int doltliteRemotePersistRefs(ChunkStore *cs){
-   int rc = chunkStoreSerializeRefs(cs);
-   if( rc==SQLITE_OK ) rc = chunkStoreCommit(cs);
-@@ -572977,6 +573140,109 @@ int doltliteSyncChunks(
-   return rc;
  }
+ 
+ static inline int doltliteRemotePersistRefs(ChunkStore *cs){
+@@ -585838,6 +586001,109 @@
+ }
+ 
  
 +/* Observed clone progress walks local chunks too, because their descendants
 +** may still be missing. Source chunks are fetched only when the destination
@@ -311,19 +311,19 @@ index 22bc4a1..5d7a174 100644
  /* FsRemote and LocalAsRemote both start with the vtable then ChunkStore*,
  ** so chunk/refs reads can use one cast. */
  typedef struct RemoteStoreHdr RemoteStoreHdr;
-@@ -574582,6 +574848,11 @@ int doltliteClone(
-   oldRefsStale = pLocal->bRefsStale;
+@@ -588363,6 +588629,11 @@
+   if( pbMissingBranch ) *pbMissingBranch = 0;
+   if( pbOccupied ) *pbOccupied = 0;
    if( !zUrl ) return SQLITE_MISUSE;
- 
 +  if( pRemote->xCloneProgress ){
 +    doltliteCloneProgressReport(
 +        pRemote, DOLTLITE_CLONE_PROGRESS_STARTED, 0, 0, 0, 0);
 +    if( doltliteCloneProgressInterrupted(pRemote) ) return SQLITE_INTERRUPT;
 +  }
-   rc = pRemote->xGetRefs(pRemote, &refsData, &nRefsData);
-   if( rc!=SQLITE_OK ) return rc;
  
-@@ -574599,7 +574870,10 @@ int doltliteClone(
+   doltliteTestRunBeforeCloneRefsHook();
+   clonePauseBeforeRefs();
+@@ -588383,7 +588654,10 @@
        return SQLITE_NOMEM;
      }
  
@@ -335,113 +335,104 @@ index 22bc4a1..5d7a174 100644
  
      if( rc==SQLITE_OK ) rc = pLocalDst->xCommit(pLocalDst);
      pLocalDst->xClose(pLocalDst);
-@@ -574612,6 +574886,15 @@ int doltliteClone(
-       return rc;
-     }
-   }
+@@ -588428,6 +588702,15 @@
+   sqlite3_free(aRoots);
+   aRoots = 0;
+   if( rc!=SQLITE_OK ) goto clone_restore_refs;
++
 +  if( pRemote->xCloneProgress ){
 +    doltliteCloneProgressReport(
 +        pRemote, DOLTLITE_CLONE_PROGRESS_FINALIZING, 0, 0, 0, 0);
 +    if( doltliteCloneProgressInterrupted(pRemote) ){
-+      sqlite3_free(aRoots);
-+      sqlite3_free(refsData);
-+      return SQLITE_INTERRUPT;
++      rc = SQLITE_INTERRUPT;
++      goto clone_restore_refs;
 +    }
 +  }
  
-   /* Hold the store lock across validate+install+commit. Re-walk roots under
-   ** the gc lock; BUSY_SNAPSHOT so a retry re-syncs. */
-@@ -575579,6 +575862,7 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
-   DoltliteTxnState savedState;
+   if( refsData && nRefsData > 0 ){
+     csDetachSavedRefsState(pLocal, &savedRefs);
+@@ -590618,6 +590901,7 @@
    int bLazy = 0;
+   int bSingle = 0;
    int dirty = 0;
 +  void *pCloneProgressCtx = 0;
+   int branchMissing = 0;
+   int occupied = 0;
    int rc;
- 
-   if( !cs ){ doltliteVcResultError(ctx, db, "no database"); return; }
-@@ -575675,9 +575959,23 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
-     return;
+@@ -590762,6 +591046,19 @@
+       return;
+     }
    }
- 
++
 +  rc = doltliteCloneProgressAttach(db, pRemote, bLazy);
 +  if( rc!=SQLITE_OK ){
 +    pRemote->xClose(pRemote);
++    sqlite3_free(zRemoteOwned);
++    sqlite3_free(zUrlOwned);
 +    remoteSqlRestoreAndReport(
 +        ctx, db, cs, &savedState, rc,
 +        bLazy ? "clone progress does not support lazy clone"
 +              : "clone progress is already active on this connection");
 +    return;
 +  }
-+  if( pRemote->xCloneProgress ){
-+    pCloneProgressCtx = pRemote->pCloneProgressCtx;
-+  }
-+
++  if( pRemote->xCloneProgress ) pCloneProgressCtx = pRemote->pCloneProgressCtx;
+ 
    if( bLazy ){
      rc = doltliteOriginSourceEnable(cs, db, 0);
-     if( rc!=SQLITE_OK ){
-+      doltliteCloneProgressEnd(db, pCloneProgressCtx);
-       pRemote->xClose(pRemote);
-       remoteSqlRestoreAndReport(ctx, db, cs, &savedState, rc,
-                                 "failed to initialize lazy clone");
-@@ -575693,6 +575991,7 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
-       zMsg = "clone failed (graph changed during install; retry)";
+@@ -590798,6 +591095,7 @@
+       rc = SQLITE_ERROR;
      }
      zOwned = zMsg ? sqlite3_mprintf("%s", zMsg) : 0;
 +    doltliteCloneProgressEnd(db, pCloneProgressCtx);
      pRemote->xClose(pRemote);
-     remoteSqlRestoreAndReport(ctx, db, cs, &savedState, rc,
-                               zOwned ? zOwned : "clone failed");
-@@ -575705,6 +576004,7 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+     /* Keep the post-refresh refs. The saved hash is the pre-clone root, and
+     ** restoring it would publish that over a peer on the next commit. */
+@@ -590822,6 +591120,7 @@
      Btree *pBtree = sqlite3DbNameToBtree(db, 0);
      char *zPreparedBranch = 0;
      if( !pBtree || !sqlite3BtreeIsDoltliteFormat(pBtree) ){
 +      doltliteCloneProgressEnd(db, pCloneProgressCtx);
-       remoteSqlRestoreAndReport(ctx, db, cs, &savedState, SQLITE_ERROR,
-                                 "failed to initialize lazy clone");
+       remoteSqlFailAfterCloneCommit(ctx, db, cs, &savedState, SQLITE_ERROR,
+                                     "failed to initialize lazy clone");
        return;
-@@ -575722,11 +576022,13 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+@@ -590839,6 +591138,7 @@
      }
      sqlite3_free(zPreparedBranch);
      if( rc!=SQLITE_OK ){
 +      doltliteCloneProgressEnd(db, pCloneProgressCtx);
-       remoteSqlRestoreAndReport(ctx, db, cs, &savedState, rc,
-                                 "failed to initialize lazy clone");
+       remoteSqlFailAfterCloneCommit(ctx, db, cs, &savedState, rc,
+                                     "failed to initialize lazy clone");
        return;
-     }
-     remoteSqlExpireCurrentStatement(db);
-+    doltliteCloneProgressEnd(db, pCloneProgressCtx);
-     remoteSqlClearAndSucceed(ctx, &savedState);
-     return;
-   }
-@@ -575745,12 +576047,14 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+@@ -590863,6 +591163,7 @@
      if( zDefault ){
        rc = chunkStoreFindBranch(cs, zDefault, &branchCommit);
        if( rc!=SQLITE_OK || prollyHashIsEmpty(&branchCommit) ){
 +        doltliteCloneProgressEnd(db, pCloneProgressCtx);
-         remoteSqlRestoreAndReport(ctx, db, cs, &savedState, SQLITE_ERROR,
-                                   "default branch missing from cloned refs");
-         return;
+         remoteSqlFailAfterCloneCommit(
+             ctx, db, cs, &savedState,
+             rc!=SQLITE_OK ? rc : SQLITE_ERROR,
+@@ -590872,6 +591173,7 @@
        }
        rc = remoteSqlResetSessionToCommit(db, zDefault, &branchCommit);
        if( rc!=SQLITE_OK ){
 +        doltliteCloneProgressEnd(db, pCloneProgressCtx);
-         remoteSqlRestoreAndReport(
-             ctx, db, cs, &savedState, SQLITE_ERROR,
+         remoteSqlFailAfterCloneCommit(
+             ctx, db, cs, &savedState, rc,
              "failed to initialize working tree from default branch");
-@@ -575758,6 +576062,7 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+@@ -590887,6 +591189,7 @@
+         rc = chunkStoreDeleteBranch(cs, aBr[k].zName);
        }
-       rc = chunkStoreSetDefaultBranch(cs, zDefault);
        if( rc!=SQLITE_OK ){
 +        doltliteCloneProgressEnd(db, pCloneProgressCtx);
-         remoteSqlRestoreAndReport(ctx, db, cs, &savedState, SQLITE_ERROR,
-                                   "failed to record default branch");
+         remoteSqlFailAfterCloneCommit(ctx, db, cs, &savedState, rc,
+                                       "failed to record default branch");
          return;
-@@ -575767,10 +576072,13 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+@@ -590896,10 +591199,13 @@
  
    rc = doltliteRemotePersistRefs(cs);
    if( rc!=SQLITE_OK ){
 +    doltliteCloneProgressEnd(db, pCloneProgressCtx);
-     remoteSqlRestoreAndReport(ctx, db, cs, &savedState, rc, 0);
+     remoteSqlFailAfterCloneCommit(ctx, db, cs, &savedState, rc, 0);
      return;
    }
    remoteSqlExpireCurrentStatement(db);
