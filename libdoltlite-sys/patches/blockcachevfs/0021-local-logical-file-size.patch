@@ -1,0 +1,74 @@
+diff --git a/bcv_int.h b/bcv_int.h
+--- a/bcv_int.h
++++ b/bcv_int.h
+@@ -153,8 +153,9 @@ struct ManifestDb {
+   i64 iParentId;                  /* Id of parent database, if any */
+   char zDName[BCV_DBNAME_SIZE];   /* Database display name */
+   int iVersion;                   /* Database version */
+-  /* Exact logical EOF when a session publication records one.  A value of
+-  ** zero means that the legacy block-rounded extent is authoritative. */
++  /* Exact logical EOF from the manifest trailer. Ordinary local writes and
++  ** truncates update this in-memory value; zero keeps the block-rounded
++  ** fallback for manifests without exact size metadata. */
+   i64 iFileSize;
+ 
+   /* Original block array (as it exists or existed in cloud storage). */
+diff --git a/blockcachevfs.c b/blockcachevfs.c
+--- a/blockcachevfs.c
++++ b/blockcachevfs.c
+@@ -3282,6 +3282,33 @@ static void bcvfsSessionEnsureWriteSizeLocked(BcvfsFile *pFile){
+   pCont->bSessionWriteFileSizeValid = 1;
+ }
+ 
++/* Keep the in-memory manifest's exact size current for ordinary local
++** copy-on-write updates. The published manifest remains unchanged until the
++** normal upload path composes a new one. When the manifest has no exact EOF,
++** leave iFileSize at zero so bcvfsFileSize continues using the block-rounded
++** local extent. */
++static void bcvfsLocalNoteWrite21(
++  BcvfsFile *pFile,
++  sqlite3_int64 iOfst,
++  int iAmt
++){
++  sqlite3_bcvfs *pFs = pFile ? pFile->pFs : 0;
++  Container *pCont = pFile ? pFile->pCont : 0;
++  sqlite3_int64 iEnd;
++  if( pFs==0 || pCont==0 || iAmt<=0 || iOfst<0
++   || iOfst>(sqlite3_int64)0x7fffffffffffffffLL-(sqlite3_int64)iAmt
++   || (pCont->zSessionId && pCont->bSessionContext)
++  ) return;
++  iEnd = iOfst + (sqlite3_int64)iAmt;
++  ENTER_VFS_MUTEX; {
++    if( pFile->pManDb && pFile->pManDb->iFileSize>0
++     && iEnd>pFile->pManDb->iFileSize
++    ){
++      pFile->pManDb->iFileSize = iEnd;
++    }
++  } LEAVE_VFS_MUTEX;
++}
++
+ static void bcvfsSessionNoteWrite17(
+   BcvfsFile *pFile,
+   sqlite3_int64 iOfst,
+@@ -3390,5 +3419,6 @@ static int bcvfsWrite(
+       assert( bcvfsFileType(pFile)==BCVFS_DATABASE_FILE );
+       rc = bcvfsReadWriteDatabaseWithRetry(1, pFile, (void*)pBuf, iAmt, iOfst);
++      if( rc==SQLITE_OK ) bcvfsLocalNoteWrite21(pFile,iOfst,iAmt);
+       if( rc==SQLITE_OK ) bcvfsSessionNoteWrite17(pFile,iOfst,iAmt);
+       break;
+     }
+@@ -3537,8 +3565,14 @@ static int bcvfsTruncate(sqlite3_file *pFd, sqlite3_int64 size){
++          if( rc==SQLITE_OK && pFile->pManDb
++           && pFile->pManDb->iFileSize>0
++           && !(pFile->pCont->zSessionId && pFile->pCont->bSessionContext)
++          ){
++            pFile->pManDb->iFileSize = size;
++          }
+           if( bTempRef && pFile->lockMask==0 ){
+             bcvManifestDeref(pFile->pMan);
+             pFile->pMan = 0;
+             pFile->pManDb = 0;
+           }
+           if( rc==SQLITE_OK ) bcvfsSessionNoteTruncateLocked17(pFile,size);
+         } LEAVE_VFS_MUTEX;
+       }

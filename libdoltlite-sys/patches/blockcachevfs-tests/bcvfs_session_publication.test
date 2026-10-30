@@ -16,9 +16,11 @@ set session_id [format "550e8400-e29b-41d4-a716-%012x" $nonce]
 set fresh_dir [file join testdir [format "session-publication-fresh-%012x" $nonce]]
 bcv_mkdir $fresh_dir
 
+# The test also opens the exact-size candidate through an ordinary VFS, then
+# checks a cross-block COW append updates EOF without publishing.
 do_test 1.1 {
   $cmd session_publication_test bcvfs $C(module) $C(user) \
-      $session_container $session_id publication.db $fresh_dir
+      $session_container $session_id publication.db $fresh_dir $D(blocksize)
 } {}
 
 $cmd destroy
